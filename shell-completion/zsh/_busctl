@@ -17,6 +17,181 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with systemd; If not, see <http://www.gnu.org/licenses/>.
+#
+
+__get_busnames() {
+        local a b
+        busctl $_sys_service_mgr list --no-legend --no-pager | { while read a b; do echo " $a"; done; };
+}
+
+__get_objects() {
+        local busname=$1
+        local a b
+        busctl $_sys_service_mgr tree --list --no-legend --no-pager $busname | { while read a b; do echo " $a"; done; };
+}
+
+__get_interfaces() {
+        local busname=$1
+        local db_path=$2
+        local a b
+        busctl $_sys_service_mgr introspect --list --no-legend --no-pager $busname $db_path | { while read a b c; do [[ "$b" == "interface" ]] && echo " $a"; done; };
+}
+
+__get_members() {
+        local busname=$1
+        local db_path=$2
+        local interface=$3
+        local type=$4
+        local a b
+        busctl $_sys_service_mgr introspect --list --no-legend --no-pager $busname $db_path $interface | sed -e 's/^\.//' | { while read a b c; do [[ "$b" == "$type" ]] && echo " $a"; done; };
+}
+
+__get_signature() {
+        local busname=$1
+        local db_path=$2
+        local interface=$3
+        local member=$4
+        local a b
+        busctl $_sys_service_mgr introspect --list --no-legend --no-pager $busname $db_path $interface | sed -e 's/^\.//' | { while read a b c d; do [[ "$a" == "$member" ]] && echo " $c"; done; };
+}
+
+_busctl_tree()
+{
+		local curcontext="$curcontext" state line
+		typeset -A opt_args
+
+		_arguments \
+		'1: :->busname'\
+
+		case $state in
+		busname)
+			compadd "$@" $(__get_busnames)
+		;;
+		esac
+}
+
+_busctl_capture()
+{
+		_busctl_tree
+}
+
+_busctl_monitor()
+{
+		_busctl_tree
+}
+
+_busctl_capture()
+{
+		_busctl_tree
+}
+
+_busctl_introspect()
+{
+		local curcontext="$curcontext" state line
+		typeset -A opt_args
+
+		_arguments \
+		'1: :->busname'\
+		'2: :->objects'\
+
+		case $state in
+		busname)
+			compadd "$@" $(__get_busnames)
+		;;
+		objects)
+			compadd "$@" $(__get_objects $words[2])
+		;;
+		esac
+}
+
+_busctl_call()
+{
+		local curcontext="$curcontext" state line
+		typeset -A opt_args
+
+		_arguments \
+		'1: :->busname'\
+		'2: :->objects'\
+		'3: :->interface'\
+		'4: :->member'\
+		'5: :->signature'\
+
+		case $state in
+		busname)
+			compadd "$@" $(__get_busnames)
+		;;
+		objects)
+			compadd "$@" $(__get_objects $words[2])
+		;;
+		interface)
+			compadd "$@" $(__get_interfaces $words[2] $words[3])
+		;;
+		member)
+			compadd "$@" $(__get_members $words[2] $words[3] $words[4] method)
+		;;
+		signature)
+			compadd "$@" $(__get_signature $words[2] $words[3] $words[4] $words[5])
+		;;
+		esac
+}
+
+_busctl_get-property()
+{
+		local curcontext="$curcontext" state line
+		typeset -A opt_args
+
+		_arguments \
+		'1: :->busname'\
+		'2: :->objects'\
+		'3: :->interface'\
+		'4: :->member'\
+
+		case $state in
+		busname)
+			compadd "$@" $(__get_busnames)
+		;;
+		objects)
+			compadd "$@" $(__get_objects $words[2])
+		;;
+		interface)
+			compadd "$@" $(__get_interfaces $words[2] $words[3])
+		;;
+		member)
+			compadd "$@" $(__get_members $words[2] $words[3] $words[4] property)
+		;;
+		esac
+}
+
+_busctl_set-property()
+{
+		local curcontext="$curcontext" state line
+		typeset -A opt_args
+
+		_arguments \
+		'1: :->busname'\
+		'2: :->objects'\
+		'3: :->interface'\
+		'4: :->member'\
+		'5: :->signature'\
+
+		case $state in
+		busname)
+			compadd "$@" $(__get_busnames)
+		;;
+		objects)
+			compadd "$@" $(__get_objects $words[2])
+		;;
+		interface)
+			compadd "$@" $(__get_interfaces $words[2] $words[3])
+		;;
+		member)
+			compadd "$@" $(__get_members $words[2] $words[3] $words[4] property)
+		;;
+		signature)
+			compadd "$@" $(__get_signature $words[2] $words[3] $words[4] $words[5])
+		;;
+		esac
+}
 
 (( $+functions[_busctl_commands] )) || _busctl_commands()
 {
