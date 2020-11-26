@@ -29,7 +29,7 @@
 static int node_symlink(sd_device *dev, const char *node, const char *slink) {
         _cleanup_free_ char *slink_dirname = NULL, *target = NULL;
         const char *id_filename, *slink_tmp;
-        struct stat stats;
+        struct stat link_stats, target_stats;
         int r;
 
         assert(dev);
@@ -46,11 +46,18 @@ static int node_symlink(sd_device *dev, const char *node, const char *slink) {
                 return log_device_error_errno(dev, r, "Failed to get relative path from '%s' to '%s': %m", slink, node);
 
         /* preserve link with correct target, do not replace node of other device */
-        if (lstat(slink, &stats) == 0) {
-                if (S_ISBLK(stats.st_mode) || S_ISCHR(stats.st_mode))
+        if (lstat(slink, &link_stats) == 0) {
+                if (S_ISBLK(link_stats.st_mode) || S_ISCHR(link_stats.st_mode)) {
+                        if (lstat(node, &target_stats))
+                                return log_device_error_errno(dev, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                                              "Failed to read stats of target %s", node);
+                        /* if it's already the same block device as target it's fine,
+                         * could have been created by someone else like initramfs */
+                        if (target_stats.st_rdev == link_stats.st_rdev)
+                                return 0;
                         return log_device_error_errno(dev, SYNTHETIC_ERRNO(EOPNOTSUPP),
                                                       "Conflicting device node '%s' found, link to '%s' will not be created.", slink, node);
-                else if (S_ISLNK(stats.st_mode)) {
+                } else if (S_ISLNK(link_stats.st_mode)) {
                         _cleanup_free_ char *buf = NULL;
 
                         if (readlink_malloc(slink, &buf) >= 0 &&
