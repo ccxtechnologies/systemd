@@ -390,10 +390,10 @@ int main(int argc, char *argv[]) {
         disable_binfmt();
 
         log_info("Sending SIGTERM to remaining processes...");
-        broadcast_signal(SIGTERM, true, true, arg_timeout);
+        broadcast_signal(SIGTERM, true, true, 1*USEC_PER_SEC);
 
         log_info("Sending SIGKILL to remaining processes...");
-        broadcast_signal(SIGKILL, true, false, arg_timeout);
+        broadcast_signal(SIGKILL, true, false, 1*USEC_PER_SEC);
 
         need_umount = !in_container;
         need_swapoff = !in_container;
