@@ -35,7 +35,7 @@ Before=rescue.service
 # the entered username.
 ExecStart=-/sbin/agetty -o '-p -- \\u' --keep-baud 115200,38400,9600 %I $TERM
 Type=idle
-Restart=always
+Restart=on-failure
 UtmpIdentifier=%I
 TTYPath=/dev/%I
 TTYReset=yes
