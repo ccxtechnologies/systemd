@@ -499,7 +499,7 @@ int link_config_apply(link_config_ctx *ctx, link_config *config,
 
         r = rtnl_set_link_properties(&ctx->rtnl, ifindex, config->alias, mac, config->mtu);
         if (r < 0)
-                return log_warning_errno(r, "Could not set Alias=, MACAddress= or MTU= on %s: %m", old_name);
+                return log_debug_errno(r, "Could not set Alias=, MACAddress= or MTU= on %s: %m", old_name);
 
         if (config->alternative_names) {
                 altnames = strv_copy(config->alternative_names);

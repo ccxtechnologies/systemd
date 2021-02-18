@@ -62,7 +62,7 @@ const NamingScheme* naming_scheme(void) {
 
         cache = naming_scheme_from_name(DEFAULT_NET_NAMING_SCHEME);
         assert(cache);
-        log_info("Using default interface naming scheme '%s'.", cache->name);
+        log_debug("Using default interface naming scheme '%s'.", cache->name);
 
         return cache;
 }

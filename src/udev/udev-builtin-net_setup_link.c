@@ -32,7 +32,7 @@ static int builtin_net_setup_link(sd_device *dev, int argc, char **argv, bool te
 
         r = link_config_apply(ctx, link, dev, &name);
         if (r < 0)
-                log_device_warning_errno(dev, r, "Could not apply link config, ignoring: %m");
+                log_device_debug_errno(dev, r, "Could not apply link config, ignoring: %m");
 
         udev_builtin_add_property(dev, test, "ID_NET_LINK_FILE", link->filename);
 

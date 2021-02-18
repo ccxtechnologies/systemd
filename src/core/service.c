@@ -3947,7 +3947,7 @@ static bool service_notify_message_authorized(Service *s, pid_t pid, FDSet *fds)
 
         if (s->notify_access == NOTIFY_MAIN && pid != s->main_pid) {
                 if (s->main_pid != 0)
-                        log_unit_warning(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID "PID_FMT, pid, s->main_pid);
+                        log_unit_debug(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID "PID_FMT, pid, s->main_pid);
                 else
                         log_unit_warning(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID which is currently not known", pid);
 
@@ -3959,7 +3959,7 @@ static bool service_notify_message_authorized(Service *s, pid_t pid, FDSet *fds)
                         log_unit_warning(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID "PID_FMT" and control PID "PID_FMT,
                                          pid, s->main_pid, s->control_pid);
                 else if (s->main_pid != 0)
-                        log_unit_warning(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID "PID_FMT, pid, s->main_pid);
+                        log_unit_debug(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for main PID "PID_FMT, pid, s->main_pid);
                 else if (s->control_pid != 0)
                         log_unit_warning(UNIT(s), "Got notification message from PID "PID_FMT", but reception only permitted for control PID "PID_FMT, pid, s->control_pid);
                 else

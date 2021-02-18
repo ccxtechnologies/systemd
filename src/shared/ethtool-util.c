@@ -765,7 +765,7 @@ int ethtool_set_glinksettings(
         assert(advertise);
 
         if (autonegotiation != AUTONEG_DISABLE && memeqzero(advertise, sizeof(uint32_t) * N_ADVERTISE)) {
-                log_info("ethtool: autonegotiation is unset or enabled, the speed and duplex are not writable.");
+                log_debug("ethtool: autonegotiation is unset or enabled, the speed and duplex are not writable.");
                 return 0;
         }
 
