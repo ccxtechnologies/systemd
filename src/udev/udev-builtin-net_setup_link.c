@@ -27,7 +27,7 @@ static int builtin_net_setup_link(sd_device *dev, int argc, char **argv, bool te
                 if (r == -ENOENT)
                         return log_device_debug_errno(dev, r, "No matching link configuration found.");
 
-                return log_device_error_errno(dev, r, "Failed to get link config: %m");
+                return log_device_warning_errno(dev, r, "Failed to get link config: %m");
         }
 
         r = link_config_apply(ctx, link, dev, &name);
