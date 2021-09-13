@@ -877,7 +877,7 @@ static int rename_netif(UdevEvent *event) {
 
         r = rtnl_set_link_name(&event->rtnl, ifindex, event->name);
         if (r < 0)
-                return log_device_error_errno(dev, r, "Failed to rename network interface %i from '%s' to '%s': %m",
+                return log_device_debug_errno(dev, r, "Failed to rename network interface %i from '%s' to '%s': %m",
                                               ifindex, oldname, event->name);
 
         log_device_debug(dev, "Network interface %i is renamed from '%s' to '%s'", ifindex, oldname, event->name);
