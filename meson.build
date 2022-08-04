@@ -457,16 +457,29 @@ conf.set('SIZEOF_RLIM_T', cc.sizeof('rlim_t', prefix : '#include <sys/resource.h
 
 decl_headers = '''
 #include <uchar.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 '''
 
 foreach decl : ['char16_t',
                 'char32_t',
+                'struct mount_attr',
                 'struct statx',
                ]
 
         # We get -1 if the size cannot be determined
         have = cc.sizeof(decl, prefix : decl_headers, args : '-D_GNU_SOURCE') > 0
+
+        if decl == 'struct mount_attr'
+                if have
+                        want_linux_fs_h = false
+                else
+                        have = cc.sizeof(decl,
+                                         prefix : decl_headers + '#include <linux/fs.h>',
+                                         args : '-D_GNU_SOURCE') > 0
+                        want_linux_fs_h = have
+                endif
+        endif
 
         if decl == 'struct statx'
                 if have
@@ -483,6 +496,7 @@ foreach decl : ['char16_t',
 endforeach
 
 conf.set10('WANT_LINUX_STAT_H', want_linux_stat_h)
+conf.set10('WANT_LINUX_FS_H', want_linux_fs_h)
 
 foreach ident : ['secure_getenv', '__secure_getenv']
         conf.set10('HAVE_' + ident.to_upper(), cc.has_function(ident))
@@ -528,6 +542,7 @@ foreach ident : [
                                  #include <unistd.h>
                                  #include <signal.h>
                                  #include <sys/wait.h>'''],
+        ['mount_setattr', '''#include <sys/mount.h>'''],
 ]
 
         have = cc.has_function(ident[0], prefix : ident[1], args : '-D_GNU_SOURCE')

@@ -586,3 +586,44 @@ static inline int missing_rt_sigqueueinfo(pid_t tgid, int sig, siginfo_t *info) 
 
 #  define rt_sigqueueinfo missing_rt_sigqueueinfo
 #endif
+
+/* ======================================================================= */
+
+#if !HAVE_MOUNT_SETATTR
+
+#if !HAVE_STRUCT_MOUNT_ATTR
+struct mount_attr {
+        uint64_t attr_set;
+        uint64_t attr_clr;
+        uint64_t propagation;
+        uint64_t userns_fd;
+};
+#else
+struct mount_attr;
+#endif
+
+#ifndef MOUNT_ATTR_IDMAP
+#define MOUNT_ATTR_IDMAP 0x00100000
+#endif
+
+#ifndef AT_RECURSIVE
+#define AT_RECURSIVE 0x8000
+#endif
+
+static inline int missing_mount_setattr(
+                int dfd,
+                const char *path,
+                unsigned flags,
+                struct mount_attr *attr,
+                size_t size) {
+
+#  if defined __NR_mount_setattr && __NR_mount_setattr >= 0
+        return syscall(__NR_mount_setattr, dfd, path, flags, attr, size);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define mount_setattr missing_mount_setattr
+#endif
