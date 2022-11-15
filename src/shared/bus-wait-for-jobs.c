@@ -34,13 +34,12 @@ static int match_disconnected(sd_bus_message *m, void *userdata, sd_bus_error *e
 
 static int match_job_removed(sd_bus_message *m, void *userdata, sd_bus_error *error) {
         const char *path, *unit, *result;
-        BusWaitForJobs *d = userdata;
+        BusWaitForJobs *d = ASSERT_PTR(userdata);
         uint32_t id;
         char *found;
         int r;
 
         assert(m);
-        assert(d);
 
         r = sd_bus_message_read(m, "uoss", &id, &path, &unit, &result);
         if (r < 0) {
@@ -323,12 +322,12 @@ int bus_wait_for_jobs_add(BusWaitForJobs *d, const char *path) {
         return set_put_strdup(&d->jobs, path);
 }
 
-int bus_wait_for_jobs_one(BusWaitForJobs *d, const char *path, bool quiet) {
+int bus_wait_for_jobs_one(BusWaitForJobs *d, const char *path, bool quiet, const char* const* extra_args) {
         int r;
 
         r = bus_wait_for_jobs_add(d, path);
         if (r < 0)
                 return log_oom();
 
-        return bus_wait_for_jobs(d, quiet, NULL);
+        return bus_wait_for_jobs(d, quiet, extra_args);
 }

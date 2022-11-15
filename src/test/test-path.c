@@ -24,7 +24,6 @@ typedef void (*test_function_t)(Manager *m);
 static int setup_test(Manager **m) {
         char **tests_path = STRV_MAKE("exists", "existsglobFOOBAR", "changed", "modified", "unit",
                                       "directorynotempty", "makedirectory");
-        char **test_path;
         Manager *tmp = NULL;
         int r;
 
@@ -34,11 +33,11 @@ static int setup_test(Manager **m) {
         if (r == -ENOMEDIUM)
                 return log_tests_skipped("cgroupfs not available");
 
-        r = manager_new(UNIT_FILE_USER, MANAGER_TEST_RUN_BASIC, &tmp);
+        r = manager_new(LOOKUP_SCOPE_USER, MANAGER_TEST_RUN_BASIC, &tmp);
         if (manager_errno_skip_test(r))
                 return log_tests_skipped_errno(r, "manager_new");
         assert_se(r >= 0);
-        assert_se(manager_startup(tmp, NULL, NULL) >= 0);
+        assert_se(manager_startup(tmp, NULL, NULL, NULL) >= 0);
 
         STRV_FOREACH(test_path, tests_path) {
                 _cleanup_free_ char *p = NULL;
@@ -95,7 +94,7 @@ static int _check_states(unsigned line,
                          UNIT(path)->id,
                          path_state_to_string(path->state),
                          path_result_to_string(path->result),
-                         end - n);
+                         (int64_t) (end - n));
                 log_info("line %u: %s: state = %s; result = %s",
                          line,
                          UNIT(service)->id,
@@ -137,7 +136,7 @@ static void test_path_exists(Manager *m) {
         path = PATH(unit);
         service = service_for_path(m, path, NULL);
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
         if (check_states(m, path, service, PATH_WAITING, SERVICE_DEAD) < 0)
                 return;
 
@@ -171,7 +170,7 @@ static void test_path_existsglob(Manager *m) {
         path = PATH(unit);
         service = service_for_path(m, path, NULL);
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
         if (check_states(m, path, service, PATH_WAITING, SERVICE_DEAD) < 0)
                 return;
 
@@ -206,7 +205,7 @@ static void test_path_changed(Manager *m) {
         path = PATH(unit);
         service = service_for_path(m, path, NULL);
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
         if (check_states(m, path, service, PATH_WAITING, SERVICE_DEAD) < 0)
                 return;
 
@@ -248,7 +247,7 @@ static void test_path_modified(Manager *m) {
         path = PATH(unit);
         service = service_for_path(m, path, NULL);
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
         if (check_states(m, path, service, PATH_WAITING, SERVICE_DEAD) < 0)
                 return;
 
@@ -289,7 +288,7 @@ static void test_path_unit(Manager *m) {
         path = PATH(unit);
         service = service_for_path(m, path, "path-mycustomunit.service");
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
         if (check_states(m, path, service, PATH_WAITING, SERVICE_DEAD) < 0)
                 return;
 
@@ -306,7 +305,7 @@ static void test_path_unit(Manager *m) {
 }
 
 static void test_path_directorynotempty(Manager *m) {
-        const char *test_path = "/tmp/test-path_directorynotempty/";
+        const char *test_file, *test_path = "/tmp/test-path_directorynotempty/";
         Unit *unit = NULL;
         Path *path = NULL;
         Service *service = NULL;
@@ -320,7 +319,7 @@ static void test_path_directorynotempty(Manager *m) {
 
         assert_se(access(test_path, F_OK) < 0);
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
         if (check_states(m, path, service, PATH_WAITING, SERVICE_DEAD) < 0)
                 return;
 
@@ -328,7 +327,8 @@ static void test_path_directorynotempty(Manager *m) {
         assert_se(access(test_path, F_OK) < 0);
 
         assert_se(mkdir_p(test_path, 0755) >= 0);
-        assert_se(touch(strjoina(test_path, "test_file")) >= 0);
+        test_file = strjoina(test_path, "test_file");
+        assert_se(touch(test_file) >= 0);
         if (check_states(m, path, service, PATH_RUNNING, SERVICE_RUNNING) < 0)
                 return;
 
@@ -356,7 +356,7 @@ static void test_path_makedirectory_directorymode(Manager *m) {
 
         assert_se(access(test_path, F_OK) < 0);
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
 
         /* Check if the directory has been created */
         assert_se(access(test_path, F_OK) >= 0);

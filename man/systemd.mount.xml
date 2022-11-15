@@ -3,7 +3,7 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
-<refentry id="systemd.mount">
+<refentry id="systemd.mount" xmlns:xi="http://www.w3.org/2001/XInclude">
   <refentryinfo>
     <title>systemd.mount</title>
     <productname>systemd</productname>
@@ -59,12 +59,13 @@
     does not read any options from <filename>/etc/fstab</filename>, and
     must be run as UID 0.</para>
 
-    <para>Mount units must be named after the mount point directories they control. Example: the mount point <filename
-    index="false">/home/lennart</filename> must be configured in a unit file <filename>home-lennart.mount</filename>.
-    For details about the escaping logic used to convert a file system path to a unit name, see
-    <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.  Note that mount
-    units cannot be templated, nor is possible to add multiple names to a mount unit by creating additional symlinks to
-    it.</para>
+    <para>Mount units must be named after the mount point directories they control. Example: the mount point
+    <filename index="false">/home/lennart</filename> must be configured in a unit file
+    <filename>home-lennart.mount</filename>.  For details about the escaping logic used to convert a file
+    system path to a unit name, see
+    <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>. Note
+    that mount units cannot be templated, nor is possible to add multiple names to a mount unit by creating
+    symlinks to its unit file.</para>
 
     <para>Optionally, a mount unit may be accompanied by an automount
     unit, to allow on-demand or parallelized mounting. See
@@ -155,16 +156,14 @@
   <refsect1>
     <title><filename>fstab</filename></title>
 
-    <para>Mount units may either be configured via unit files, or via
-    <filename>/etc/fstab</filename> (see
+    <para>Mount units may either be configured via unit files, or via <filename>/etc/fstab</filename> (see
     <citerefentry project='man-pages'><refentrytitle>fstab</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-    for details). Mounts listed in <filename>/etc/fstab</filename>
-    will be converted into native units dynamically at boot and when
-    the configuration of the system manager is reloaded. In general,
-    configuring mount points through <filename>/etc/fstab</filename>
-    is the preferred approach. See
-    <citerefentry><refentrytitle>systemd-fstab-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    for details about the conversion.</para>
+    for details). Mounts listed in <filename>/etc/fstab</filename> will be converted into native units
+    dynamically at boot and when the configuration of the system manager is reloaded. In general, configuring
+    mount points through <filename>/etc/fstab</filename> is the preferred approach to manage mounts for
+    humans. For tooling, writing mount units should be preferred over editing <filename>/etc/fstab</filename>.
+    See <citerefentry><refentrytitle>systemd-fstab-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+    for details about the conversion from <filename>/etc/fstab</filename> to mount units.</para>
 
     <para>The NFS mount option <option>bg</option> for NFS background mounts
     as documented in <citerefentry project='man-pages'><refentrytitle>nfs</refentrytitle><manvolnum>5</manvolnum></citerefentry>
@@ -399,11 +398,13 @@
         <term><option>auto</option></term>
 
         <listitem><para>With <option>noauto</option>, the mount unit will not be added as a dependency for
-        <filename>local-fs.target</filename> or <filename>remote-fs.target</filename>. This means that it will not be
-        mounted automatically during boot, unless it is pulled in by some other unit. The <option>auto</option> option
-        has the opposite meaning and is the default. Note that the <option>noauto</option> option has an effect on the
-        mount unit itself only — if <option>x-systemd.automount</option> is used (see above), then the matching
-        automount unit will still be pulled in by these targets.</para>
+        <filename>local-fs.target</filename> or <filename>remote-fs.target</filename>. This means that it
+        will not be mounted automatically during boot, unless it is pulled in by some other unit. The
+        <option>auto</option> option has the opposite meaning and is the default.</para>
+
+        <para>Note that if <option>x-systemd.automount</option> (see above) is used, neither
+        <option>auto</option> nor <option>noauto</option> have any effect. The matching automount unit will
+        be added as a dependency to the appropriate target.</para>
         </listitem>
       </varlistentry>
 
@@ -420,9 +421,8 @@
       <varlistentry>
         <term><option>x-initrd.mount</option></term>
 
-        <listitem><para>An additional filesystem to be mounted in the
-        initramfs. See <filename>initrd-fs.target</filename>
-        description in
+        <listitem><para>An additional filesystem to be mounted in the initrd. See
+        <filename>initrd-fs.target</filename> description in
         <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
         </para></listitem>
       </varlistentry>
@@ -442,7 +442,11 @@
   <refsect1>
     <title>Options</title>
 
-    <para>Mount files must include a [Mount] section, which carries
+    <para>Mount unit files may include [Unit] and [Install] sections, which are described in
+    <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+    </para>
+
+    <para>Mount unit files must include a [Mount] section, which carries
     information about the file system mount points it supervises. A
     number of options that may be used in this section are shared with
     other unit types. These options are documented in
@@ -567,11 +571,7 @@
       </varlistentry>
     </variablelist>
 
-    <para>Check
-    <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-    and
-    <citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-    for more settings.</para>
+    <xi:include href="systemd.service.xml" xpointer="shared-unit-options" />
   </refsect1>
 
   <refsect1>

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
 #include "fd-util.h"
@@ -9,10 +10,9 @@
 
 static int operation_done(sd_event_source *s, const siginfo_t *si, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        Operation *o = userdata;
+        Operation *o = ASSERT_PTR(userdata);
         int r;
 
-        assert(o);
         assert(si);
 
         log_debug("Operating " PID_FMT " is now complete with code=%s status=%i",

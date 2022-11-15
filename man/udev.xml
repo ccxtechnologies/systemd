@@ -647,13 +647,11 @@
                 <varlistentry>
                   <term><option>db_persist</option></term>
                   <listitem>
-                    <para>Set the flag (sticky bit) on the udev database entry
-                    of the event device. Device properties are then kept in the
-                    database even when
-                    <command>udevadm info --cleanup-db</command> is called.
-                    This option can be useful in certain cases
-                    (e.g. Device Mapper devices) for persisting device state
-                    on the transition from initramfs.</para>
+                    <para>Set the flag (sticky bit) on the udev database entry of the event device. Device
+                    properties are then kept in the database even when <command>udevadm info
+                    --cleanup-db</command> is called.  This option can be useful in certain cases
+                    (e.g. Device Mapper devices) for persisting device state on the transition from
+                    initrd.</para>
                   </listitem>
                 </varlistentry>
                 <varlistentry>
@@ -669,7 +667,7 @@
                     log level is applied when the line including this rule is processed. So, for
                     debugging, it is recommended that this is specified at earlier place, e.g., the
                     first line of <filename>00-debug.rules</filename>.</para>
-                    <para>Example for debugging uevent processing for network interfaces.
+                    <para>Example for debugging uevent processing for network interfaces:
                     <programlisting># /etc/udev/rules.d/00-debug-net.rules
 SUBSYSTEM=="net", OPTIONS="log_level=debug"</programlisting></para>
                   </listitem>

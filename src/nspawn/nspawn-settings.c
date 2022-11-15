@@ -27,6 +27,7 @@ Settings *settings_new(void) {
 
         *s = (Settings) {
                 .start_mode = _START_MODE_INVALID,
+                .ephemeral = -1,
                 .personality = PERSONALITY_INVALID,
 
                 .resolv_conf = _RESOLV_CONF_MODE_INVALID,
@@ -57,6 +58,9 @@ Settings *settings_new(void) {
 
                 .clone_ns_flags = ULONG_MAX,
                 .use_cgns = -1,
+
+                .notify_ready = -1,
+                .suppress_sync = -1,
         };
 
         return s;
@@ -170,6 +174,8 @@ Settings* settings_free(Settings *s) {
 bool settings_private_network(Settings *s) {
         assert(s);
 
+        /* Determines whether we shall open up our own private network */
+
         return
                 s->private_network > 0 ||
                 s->network_veth > 0 ||
@@ -188,6 +194,25 @@ bool settings_network_veth(Settings *s) {
                 s->network_veth > 0 ||
                 s->network_bridge ||
                 s->network_zone;
+}
+
+bool settings_network_configured(Settings *s) {
+        assert(s);
+
+        /* Determines whether any network configuration setting was used. (i.e. in contrast to
+         * settings_private_network() above this might also indicate if private networking was explicitly
+         * turned off.) */
+
+        return
+                s->private_network >= 0 ||
+                s->network_veth >= 0 ||
+                s->network_bridge ||
+                s->network_zone ||
+                s->network_interfaces ||
+                s->network_macvlan ||
+                s->network_ipvlan ||
+                s->network_veth_extra ||
+                s->network_namespace_path;
 }
 
 int settings_allocate_properties(Settings *s) {
@@ -284,9 +309,6 @@ int config_parse_capability(
                         u |= UINT64_C(1) << r;
                 }
         }
-
-        if (u == 0)
-                return 0;
 
         *result |= u;
         return 0;
@@ -601,6 +623,11 @@ int config_parse_private_users(
                 settings->userns_mode = USER_NAMESPACE_PICK;
                 settings->uid_shift = UID_INVALID;
                 settings->uid_range = UINT32_C(0x10000);
+        } else if (streq(rvalue, "identity")) {
+                /* identity: User namespacing on, UID range is 0:65536 */
+                settings->userns_mode = USER_NAMESPACE_FIXED;
+                settings->uid_shift = 0;
+                settings->uid_range = UINT32_C(0x10000);
         } else {
                 const char *range, *shift;
                 uid_t sh, rn;
@@ -609,7 +636,7 @@ int config_parse_private_users(
 
                 range = strchr(rvalue, ':');
                 if (range) {
-                        shift = strndupa(rvalue, range - rvalue);
+                        shift = strndupa_safe(rvalue, range - rvalue);
                         range++;
 
                         r = safe_atou32(range, &rn);
@@ -688,31 +715,6 @@ int config_parse_syscall_filter(
         }
 }
 
-int config_parse_hostname(
-                const char *unit,
-                const char *filename,
-                unsigned line,
-                const char *section,
-                unsigned section_line,
-                const char *lvalue,
-                int ltype,
-                const char *rvalue,
-                void *data,
-                void *userdata) {
-
-        char **s = data;
-
-        assert(rvalue);
-        assert(s);
-
-        if (!hostname_is_valid(rvalue, 0)) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid hostname, ignoring: %s", rvalue);
-                return 0;
-        }
-
-        return free_and_strdup_warn(s, empty_to_null(rvalue));
-}
-
 int config_parse_oom_score_adjust(
                 const char *unit,
                 const char *filename,
@@ -725,11 +727,10 @@ int config_parse_oom_score_adjust(
                 void *data,
                 void *userdata) {
 
-        Settings *settings = data;
+        Settings *settings = ASSERT_PTR(data);
         int oa, r;
 
         assert(rvalue);
-        assert(settings);
 
         if (isempty(rvalue)) {
                 settings->oom_score_adjust_set = false;
@@ -764,10 +765,9 @@ int config_parse_cpu_affinity(
                 void *data,
                 void *userdata) {
 
-        Settings *settings = data;
+        Settings *settings = ASSERT_PTR(data);
 
         assert(rvalue);
-        assert(settings);
 
         return parse_cpu_set_extend(rvalue, &settings->cpu_set, true, unit, filename, line, lvalue);
 }
@@ -842,11 +842,10 @@ int config_parse_link_journal(
                 void *data,
                 void *userdata) {
 
-        Settings *settings = data;
+        Settings *settings = ASSERT_PTR(data);
         int r;
 
         assert(rvalue);
-        assert(settings);
 
         r = parse_link_journal(rvalue, &settings->link_journal, &settings->link_journal_try);
         if (r < 0)
@@ -891,11 +890,10 @@ int config_parse_userns_chown(
                 void *data,
                 void *userdata) {
 
-        UserNamespaceOwnership *ownership = data;
+        UserNamespaceOwnership *ownership = ASSERT_PTR(data);
         int r;
 
         assert(rvalue);
-        assert(ownership);
 
         /* Compatibility support for UserNamespaceChown=, whose job has been taken over by UserNamespaceOwnership= */
 
@@ -921,11 +919,10 @@ int config_parse_bind_user(
                 void *data,
                 void *userdata) {
 
-        char ***bind_user = data;
+        char ***bind_user = ASSERT_PTR(data);
         int r;
 
         assert(rvalue);
-        assert(bind_user);
 
         if (isempty(rvalue)) {
                 *bind_user = strv_free(*bind_user);

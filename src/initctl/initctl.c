@@ -103,7 +103,7 @@ static int change_runlevel(Server *s, int runlevel) {
         else
                 mode = "replace-irreversibly";
 
-        log_debug("Running request %s/start/%s", target, mode);
+        log_debug("Requesting %s/start/%s", target, mode);
 
         r = sd_bus_call_method(
                         s->bus,
@@ -311,7 +311,7 @@ static int process_event(Server *s, struct epoll_event *ev) {
 
 static int run(int argc, char *argv[]) {
         _cleanup_(server_done) Server server = { .epoll_fd = -1 };
-        _cleanup_(notify_on_cleanup) const char *notify_stop = NULL;
+        _unused_ _cleanup_(notify_on_cleanup) const char *notify_stop = NULL;
         int r, n;
 
         if (argc > 1)

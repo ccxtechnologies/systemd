@@ -20,24 +20,23 @@
  * is suitably validated. */
 
 static void lock_down_efi_variables(void) {
-        const char *p;
         int r;
 
         /* Paranoia: let's restrict access modes of these a bit, so that unprivileged users can't use them to
          * identify the system or gain too much insight into what we might have credited to the entropy
          * pool. */
-        FOREACH_STRING(p,
+        FOREACH_STRING(path,
                        EFIVAR_PATH(EFI_LOADER_VARIABLE(LoaderRandomSeed)),
                        EFIVAR_PATH(EFI_LOADER_VARIABLE(LoaderSystemToken))) {
 
-                r = chattr_path(p, 0, FS_IMMUTABLE_FL, NULL);
+                r = chattr_path(path, 0, FS_IMMUTABLE_FL, NULL);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)
-                        log_warning_errno(r, "Failed to drop FS_IMMUTABLE_FL from %s, ignoring: %m", p);
+                        log_warning_errno(r, "Failed to drop FS_IMMUTABLE_FL from %s, ignoring: %m", path);
 
-                if (chmod(p, 0600) < 0)
-                        log_warning_errno(errno, "Failed to reduce access mode of %s, ignoring: %m", p);
+                if (chmod(path, 0600) < 0)
+                        log_warning_errno(errno, "Failed to reduce access mode of %s, ignoring: %m", path);
         }
 }
 
@@ -77,7 +76,7 @@ int efi_take_random_seed(void) {
                 return log_warning_errno(SYNTHETIC_ERRNO(EINVAL), "Random seed passed from boot loader has zero size? Ignoring.");
 
         /* Before we use the seed, let's mark it as used, so that we never credit it twice. Also, it's a nice
-         * way to let users known that we successfully acquired entropy from the boot laoder. */
+         * way to let users known that we successfully acquired entropy from the boot loader. */
         r = touch("/run/systemd/efi-random-seed-taken");
         if (r < 0)
                 return log_warning_errno(r, "Unable to mark EFI random seed as used, not using it: %m");

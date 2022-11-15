@@ -21,7 +21,7 @@ static void test_libmount_unescaping_one(
         _cleanup_(mnt_free_iterp) struct libmnt_iter *iter = NULL;
         _cleanup_fclose_ FILE *f = NULL;
 
-        f = fmemopen((char*) string, strlen(string), "re");
+        f = fmemopen((char*) string, strlen(string), "r");
         assert_se(f);
 
         assert_se(libmount_parse(title, f, &table, &iter) >= 0);
@@ -66,7 +66,7 @@ static void test_libmount_unescaping_one(
         assert_se(mnt_table_next_fs(table, iter, &fs) == 1);
 }
 
-static void test_libmount_unescaping(void) {
+TEST(libmount_unescaping) {
         test_libmount_unescaping_one(
                         "escaped space + utf8",
                         "729 38 0:59 / /tmp/„zupa\\040zębowa” rw,relatime shared:395 - tmpfs die\\040Brühe rw,seclabel",
@@ -107,9 +107,4 @@ static void test_libmount_unescaping(void) {
         );
 }
 
-int main(int argc, char *argv[]) {
-        test_setup_logging(LOG_DEBUG);
-
-        test_libmount_unescaping();
-        return 0;
-}
+DEFINE_TEST_MAIN(LOG_DEBUG);

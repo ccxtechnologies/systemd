@@ -7,14 +7,14 @@
 #include "systemctl-util.h"
 #include "systemctl.h"
 
-int preset_all(int argc, char *argv[], void *userdata) {
-        UnitFileChange *changes = NULL;
+int verb_preset_all(int argc, char *argv[], void *userdata) {
+        InstallChange *changes = NULL;
         size_t n_changes = 0;
         int r;
 
         if (install_client_side()) {
                 r = unit_file_preset_all(arg_scope, unit_file_flags_from_args(), arg_root, arg_preset_mode, &changes, &n_changes);
-                unit_file_dump_changes(r, "preset", changes, n_changes, arg_quiet);
+                install_changes_dump(r, "preset", changes, n_changes, arg_quiet);
 
                 if (r > 0)
                         r = 0;
@@ -51,11 +51,13 @@ int preset_all(int argc, char *argv[], void *userdata) {
                         goto finish;
                 }
 
-                r = daemon_reload(argc, argv, userdata);
+                r = daemon_reload(ACTION_RELOAD, /* graceful= */ false);
+                if (r > 0)
+                        r = 0;
         }
 
 finish:
-        unit_file_changes_free(changes, n_changes);
+        install_changes_free(changes, n_changes);
 
         return r;
 }

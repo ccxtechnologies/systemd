@@ -20,6 +20,7 @@
 
 #include "alloc-util.h"
 #include "env-file.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "io-util.h"
@@ -40,13 +41,7 @@ static int verify_vc_device(int fd) {
                 TIOCL_GETFGCONSOLE,
         };
 
-        int r;
-
-        r = ioctl(fd, TIOCLINUX, data);
-        if (r < 0)
-                return -errno;
-
-        return r;
+        return RET_NERRNO(ioctl(fd, TIOCLINUX, data));
 }
 
 static int verify_vc_allocation(unsigned idx) {
@@ -54,10 +49,7 @@ static int verify_vc_allocation(unsigned idx) {
 
         xsprintf(vcname, "/dev/vcs%u", idx);
 
-        if (access(vcname, F_OK) < 0)
-                return -errno;
-
-        return 0;
+        return RET_NERRNO(access(vcname, F_OK));
 }
 
 static int verify_vc_allocation_byfd(int fd) {
@@ -77,7 +69,7 @@ static int verify_vc_kbmode(int fd) {
          * Otherwise we would (likely) interfere with X11's processing of the
          * key events.
          *
-         * http://lists.freedesktop.org/archives/systemd-devel/2013-February/008573.html
+         * https://lists.freedesktop.org/archives/systemd-devel/2013-February/008573.html
          */
 
         if (ioctl(fd, KDGKBMODE, &curr_mode) < 0)

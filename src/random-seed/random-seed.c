@@ -25,6 +25,8 @@
 #include "parse-util.h"
 #include "random-util.h"
 #include "string-util.h"
+#include "sync-util.h"
+#include "sha256.h"
 #include "util.h"
 #include "xattr-util.h"
 
@@ -64,7 +66,7 @@ static CreditEntropy may_credit(int seed_fd) {
         /* Determine if the file is marked as creditable */
         r = fgetxattr_malloc(seed_fd, "user.random-seed-creditable", &creditable);
         if (r < 0) {
-                if (IN_SET(r, -ENODATA, -ENOSYS, -EOPNOTSUPP))
+                if (ERRNO_IS_XATTR_ABSENT(r))
                         log_debug_errno(r, "Seed file is not marked as creditable, not crediting.");
                 else
                         log_warning_errno(r, "Failed to read extended attribute, ignoring: %m");
@@ -102,12 +104,13 @@ static CreditEntropy may_credit(int seed_fd) {
 }
 
 static int run(int argc, char *argv[]) {
+        bool read_seed_file, write_seed_file, synchronous, hashed_old_seed = false;
         _cleanup_close_ int seed_fd = -1, random_fd = -1;
-        bool read_seed_file, write_seed_file, synchronous;
         _cleanup_free_ void* buf = NULL;
+        struct sha256_ctx hash_state;
         size_t buf_size;
         struct stat st;
-        ssize_t k;
+        ssize_t k, l;
         int r;
 
         log_setup();
@@ -210,6 +213,16 @@ static int run(int argc, char *argv[]) {
                 else {
                         CreditEntropy lets_credit;
 
+                        /* If we're going to later write out a seed file, initialize a hash state with
+                         * the contents of the seed file we just read, so that the new one can't regress
+                         * in entropy. */
+                        if (write_seed_file) {
+                                sha256_init_ctx(&hash_state);
+                                sha256_process_bytes(&k, sizeof(k), &hash_state); /* Hash length to distinguish from new seed. */
+                                sha256_process_bytes(buf, k, &hash_state);
+                                hashed_old_seed = true;
+                        }
+
                         (void) lseek(seed_fd, 0, SEEK_SET);
 
                         lets_credit = may_credit(seed_fd);
@@ -222,7 +235,7 @@ static int run(int argc, char *argv[]) {
                          * it. */
 
                         if (fremovexattr(seed_fd, "user.random-seed-creditable") < 0) {
-                                if (!IN_SET(errno, ENODATA, ENOSYS, EOPNOTSUPP))
+                                if (!ERRNO_IS_XATTR_ABSENT(errno))
                                         log_warning_errno(errno, "Failed to remove extended attribute, ignoring: %m");
 
                                 /* Otherwise, there was no creditable flag set, which is OK. */
@@ -250,7 +263,7 @@ static int run(int argc, char *argv[]) {
                  * ourselves the mode and owner should be correct anyway. */
                 r = fchmod_and_chown(seed_fd, 0600, 0, 0);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to adjust seed file ownership and access mode.");
+                        return log_error_errno(r, "Failed to adjust seed file ownership and access mode: %m");
 
                 /* Let's make this whole job asynchronous, i.e. let's make ourselves a barrier for
                  * proper initialization of the random pool. */
@@ -274,6 +287,18 @@ static int run(int argc, char *argv[]) {
                         if (k == 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                                        "Got EOF while reading from /dev/urandom.");
+                }
+
+                /* If we previously read in a seed file, then hash the new seed into the old one,
+                 * and replace the last 32 bytes of the seed with the hash output, so that the
+                 * new seed file can't regress in entropy. */
+                if (hashed_old_seed) {
+                        uint8_t hash[SHA256_DIGEST_SIZE];
+                        sha256_process_bytes(&k, sizeof(k), &hash_state); /* Hash length to distinguish from old seed. */
+                        sha256_process_bytes(buf, k, &hash_state);
+                        sha256_finish_ctx(&hash_state, hash);
+                        l = MIN((size_t)k, sizeof(hash));
+                        memcpy((uint8_t *)buf + k - l, hash, l);
                 }
 
                 r = loop_write(seed_fd, buf, (size_t) k, false);

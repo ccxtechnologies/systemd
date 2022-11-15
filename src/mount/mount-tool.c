@@ -9,6 +9,7 @@
 #include "bus-locator.h"
 #include "bus-unit-util.h"
 #include "bus-wait-for-jobs.h"
+#include "chase-symlinks.h"
 #include "device-util.h"
 #include "dirent-util.h"
 #include "escape.h"
@@ -329,8 +330,11 @@ static int parse_argv(int argc, char *argv[]) {
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
+
+        if (arg_user)
+                arg_ask_password = false;
 
         if (arg_user && arg_transport != BUS_TRANSPORT_LOCAL)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -597,7 +601,7 @@ static int start_transient_mount(
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = bus_wait_for_jobs_one(w, object, arg_quiet);
+                r = bus_wait_for_jobs_one(w, object, arg_quiet, NULL);
                 if (r < 0)
                         return r;
         }
@@ -706,7 +710,7 @@ static int start_transient_automount(
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = bus_wait_for_jobs_one(w, object, arg_quiet);
+                r = bus_wait_for_jobs_one(w, object, arg_quiet, NULL);
                 if (r < 0)
                         return r;
         }
@@ -773,7 +777,6 @@ static int find_mount_points(const char *what, char ***list) {
 
 static int find_loop_device(const char *backing_file, char **loop_dev) {
         _cleanup_closedir_ DIR *d = NULL;
-        struct dirent *de;
         _cleanup_free_ char *l = NULL;
 
         assert(backing_file);
@@ -872,7 +875,7 @@ static int stop_mount(
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = bus_wait_for_jobs_one(w, object, arg_quiet);
+                r = bus_wait_for_jobs_one(w, object, arg_quiet, NULL);
                 if (r < 0)
                         return r;
         }
@@ -1428,7 +1431,7 @@ static int list_devices(void) {
                 }
         }
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         r = table_print(table, NULL);
         if (r < 0)
@@ -1454,7 +1457,7 @@ static int run(int argc, char* argv[]) {
 
         r = bus_connect_transport_systemd(arg_transport, arg_host, arg_user, &bus);
         if (r < 0)
-                return bus_log_connect_error(r);
+                return bus_log_connect_error(r, arg_transport);
 
         if (arg_action == ACTION_UMOUNT)
                 return action_umount(bus, argc, argv);
@@ -1494,7 +1497,7 @@ static int run(int argc, char* argv[]) {
                 arg_fsck = false;
 
         if (arg_fsck && arg_mount_type && arg_transport == BUS_TRANSPORT_LOCAL) {
-                r = fsck_exists(arg_mount_type);
+                r = fsck_exists_for_fstype(arg_mount_type);
                 if (r < 0)
                         log_warning_errno(r, "Couldn't determine whether fsck for %s exists, proceeding anyway.", arg_mount_type);
                 else if (r == 0) {
@@ -1530,7 +1533,7 @@ static int run(int argc, char* argv[]) {
                 break;
 
         default:
-                assert_not_reached("Unexpected action.");
+                assert_not_reached();
         }
 
         return r;

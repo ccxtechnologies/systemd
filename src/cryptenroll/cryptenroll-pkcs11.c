@@ -50,7 +50,7 @@ int enroll_pkcs11(
         if (!decrypted_key)
                 return log_oom();
 
-        r = genuine_random_bytes(decrypted_key, decrypted_key_size, RANDOM_BLOCK);
+        r = crypto_random_bytes(decrypted_key, decrypted_key_size);
         if (r < 0)
                 return log_error_errno(r, "Failed to generate random key: %m");
 
@@ -83,7 +83,7 @@ int enroll_pkcs11(
 
         r = json_build(&v,
                        JSON_BUILD_OBJECT(
-                                       JSON_BUILD_PAIR("type", JSON_BUILD_STRING("systemd-pkcs11")),
+                                       JSON_BUILD_PAIR("type", JSON_BUILD_CONST_STRING("systemd-pkcs11")),
                                        JSON_BUILD_PAIR("keyslots", JSON_BUILD_ARRAY(JSON_BUILD_STRING(keyslot_as_string))),
                                        JSON_BUILD_PAIR("pkcs11-uri", JSON_BUILD_STRING(uri)),
                                        JSON_BUILD_PAIR("pkcs11-key", JSON_BUILD_BASE64(encrypted_key, encrypted_key_size))));

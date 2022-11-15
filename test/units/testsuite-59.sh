@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
 set -eux
 set -o pipefail
 
@@ -27,7 +28,6 @@ wait_on_state_or_fail () {
 }
 
 systemd-analyze log-level debug
-systemd-analyze log-target console
 
 
 cat >/run/systemd/system/testservice-fail-59.service <<EOF

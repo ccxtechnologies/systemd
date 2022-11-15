@@ -4,8 +4,9 @@
 #include <stdbool.h>
 
 #include "sd-device.h"
+#include "sd-netlink.h"
 
-typedef enum {
+typedef enum UdevBuiltinCommand {
 #if HAVE_BLKID
         UDEV_BUILTIN_BLKID,
 #endif
@@ -29,11 +30,11 @@ typedef enum {
 
 typedef struct UdevBuiltin {
         const char *name;
-        int (*cmd)(sd_device *dev, int argc, char *argv[], bool test);
+        int (*cmd)(sd_device *dev, sd_netlink **rtnl, int argc, char *argv[], bool test);
         const char *help;
         int (*init)(void);
         void (*exit)(void);
-        bool (*validate)(void);
+        bool (*should_reload)(void);
         bool run_once;
 } UdevBuiltin;
 
@@ -73,9 +74,9 @@ void udev_builtin_exit(void);
 UdevBuiltinCommand udev_builtin_lookup(const char *command);
 const char *udev_builtin_name(UdevBuiltinCommand cmd);
 bool udev_builtin_run_once(UdevBuiltinCommand cmd);
-int udev_builtin_run(sd_device *dev, UdevBuiltinCommand cmd, const char *command, bool test);
+int udev_builtin_run(sd_device *dev, sd_netlink **rtnl, UdevBuiltinCommand cmd, const char *command, bool test);
 void udev_builtin_list(void);
-bool udev_builtin_validate(void);
+bool udev_builtin_should_reload(void);
 int udev_builtin_add_property(sd_device *dev, bool test, const char *key, const char *val);
 int udev_builtin_hwdb_lookup(sd_device *dev, const char *prefix, const char *modalias,
                              const char *filter, bool test);

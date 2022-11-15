@@ -32,15 +32,13 @@ static const uint8_t default_acl[] = {
 static bool has_xattr(const char *p) {
         char buffer[sizeof(acl) * 4];
 
-        if (lgetxattr(p, "system.posix_acl_access", buffer, sizeof(buffer)) < 0) {
-                if (IN_SET(errno, EOPNOTSUPP, ENOTTY, ENODATA, ENOSYS))
-                        return false;
-        }
+        if (lgetxattr(p, "system.posix_acl_access", buffer, sizeof(buffer)) < 0)
+                return !ERRNO_IS_XATTR_ABSENT(errno);
 
         return true;
 }
 
-static void test_chown_recursive(void) {
+TEST(chown_recursive) {
         _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
         struct stat st;
         const char *p;
@@ -149,13 +147,11 @@ static void test_chown_recursive(void) {
         assert_se(!has_xattr(p));
 }
 
-int main(int argc, char *argv[]) {
-        test_setup_logging(LOG_DEBUG);
-
+static int intro(void) {
         if (geteuid() != 0)
                 return log_tests_skipped("not running as root");
 
-        test_chown_recursive();
-
         return EXIT_SUCCESS;
 }
+
+DEFINE_TEST_MAIN_WITH_INTRO(LOG_DEBUG, intro);

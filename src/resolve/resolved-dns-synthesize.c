@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
+#include "env-util.h"
 #include "hostname-util.h"
 #include "local-addresses.h"
 #include "missing_network.h"
@@ -394,7 +395,15 @@ int dns_synthesize_answer(
 
                 name = dns_resource_key_name(key);
 
-                if (is_localhost(name)) {
+                if (dns_name_is_empty(name)) {
+                        /* Do nothing. */
+
+                } else if (dns_name_dont_resolve(name)) {
+                        /* Synthesize NXDOMAIN for some of the domains in RFC6303 + RFC6761 */
+                        nxdomain = true;
+                        continue;
+
+                } else if (is_localhost(name)) {
 
                         r = synthesize_localhost_rr(m, key, ifindex, &answer);
                         if (r < 0)
@@ -402,6 +411,8 @@ int dns_synthesize_answer(
 
                 } else if (manager_is_own_hostname(m, name)) {
 
+                        if (getenv_bool("SYSTEMD_RESOLVED_SYNTHESIZE_HOSTNAME") == 0)
+                                continue;
                         r = synthesize_system_hostname_rr(m, key, ifindex, &answer);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to synthesize system hostname RRs: %m");
@@ -435,6 +446,9 @@ int dns_synthesize_answer(
 
                 } else if (dns_name_address(name, &af, &address) > 0) {
                         int v, w;
+
+                        if (getenv_bool("SYSTEMD_RESOLVED_SYNTHESIZE_HOSTNAME") == 0)
+                                continue;
 
                         v = synthesize_system_hostname_ptr(m, af, &address, ifindex, &answer);
                         if (v < 0)

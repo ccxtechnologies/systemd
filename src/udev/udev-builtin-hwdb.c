@@ -60,7 +60,7 @@ static const char *modalias_usb(sd_device *dev, char *s, size_t size) {
                 return NULL;
         (void) sd_device_get_sysattr_value(dev, "product", &n);
 
-        snprintf(s, size, "usb:v%04Xp%04X:%s", vn, pn, strempty(n));
+        (void) snprintf(s, size, "usb:v%04Xp%04X:%s", vn, pn, strempty(n));
         return s;
 }
 
@@ -118,7 +118,7 @@ next:
         return r;
 }
 
-static int builtin_hwdb(sd_device *dev, int argc, char *argv[], bool test) {
+static int builtin_hwdb(sd_device *dev, sd_netlink **rtnl, int argc, char *argv[], bool test) {
         static const struct option options[] = {
                 { "filter", required_argument, NULL, 'f' },
                 { "device", required_argument, NULL, 'd' },
@@ -207,8 +207,13 @@ static void builtin_hwdb_exit(void) {
 }
 
 /* called every couple of seconds during event activity; 'true' if config has changed */
-static bool builtin_hwdb_validate(void) {
-        return hwdb_validate(hwdb);
+static bool builtin_hwdb_should_reload(void) {
+        if (hwdb_should_reload(hwdb)) {
+                log_debug("hwdb needs reloading.");
+                return true;
+        }
+
+        return false;
 }
 
 const UdevBuiltin udev_builtin_hwdb = {
@@ -216,6 +221,6 @@ const UdevBuiltin udev_builtin_hwdb = {
         .cmd = builtin_hwdb,
         .init = builtin_hwdb_init,
         .exit = builtin_hwdb_exit,
-        .validate = builtin_hwdb_validate,
+        .should_reload = builtin_hwdb_should_reload,
         .help = "Hardware database",
 };

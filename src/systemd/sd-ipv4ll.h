@@ -16,7 +16,7 @@
   Lesser General Public License for more details.
 
   You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  along with systemd; If not, see <https://www.gnu.org/licenses/>.
 ***/
 
 #include <net/ethernet.h>
@@ -31,7 +31,7 @@ _SD_BEGIN_DECLARATIONS;
 enum {
         SD_IPV4LL_EVENT_STOP            = 0,
         SD_IPV4LL_EVENT_BIND            = 1,
-        SD_IPV4LL_EVENT_CONFLICT        = 2,
+        SD_IPV4LL_EVENT_CONFLICT        = 2
 };
 
 typedef struct sd_ipv4ll sd_ipv4ll;
@@ -47,7 +47,7 @@ int sd_ipv4ll_set_mac(sd_ipv4ll *ll, const struct ether_addr *addr);
 int sd_ipv4ll_set_ifindex(sd_ipv4ll *ll, int interface_index);
 int sd_ipv4ll_get_ifindex(sd_ipv4ll *ll);
 int sd_ipv4ll_set_ifname(sd_ipv4ll *ll, const char *interface_name);
-const char *sd_ipv4ll_get_ifname(sd_ipv4ll *ll);
+int sd_ipv4ll_get_ifname(sd_ipv4ll *ll, const char **ret);
 int sd_ipv4ll_set_address(sd_ipv4ll *ll, const struct in_addr *address);
 int sd_ipv4ll_set_address_seed(sd_ipv4ll *ll, uint64_t seed);
 int sd_ipv4ll_is_running(sd_ipv4ll *ll);

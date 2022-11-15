@@ -4,12 +4,13 @@
 #include <linux/magic.h>
 
 #include "alloc-util.h"
+#include "chase-symlinks.h"
 #include "escape.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
 #include "label.h"
-#include "mkdir.h"
+#include "mkdir-label.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "nspawn-mount.h"
@@ -82,13 +83,38 @@ static int custom_mount_compare(const CustomMount *a, const CustomMount *b) {
         return CMP(a->type, b->type);
 }
 
-static bool source_path_is_valid(const char *p) {
+static int source_path_parse(const char *p, char **ret) {
         assert(p);
+        assert(ret);
 
-        if (*p == '+')
-                p++;
+        if (isempty(p))
+                return -EINVAL;
 
-        return path_is_absolute(p);
+        if (*p == '+') {
+                if (!path_is_absolute(p + 1))
+                        return -EINVAL;
+
+                char *s = strdup(p);
+                if (!s)
+                        return -ENOMEM;
+
+                *ret = TAKE_PTR(s);
+                return 0;
+        }
+
+        return path_make_absolute_cwd(p, ret);
+}
+
+static int source_path_parse_nullable(const char *p, char **ret) {
+        assert(p);
+        assert(ret);
+
+        if (isempty(p)) {
+                *ret = NULL;
+                return 0;
+        }
+
+        return source_path_parse(p, ret);
 }
 
 static char *resolve_source_path(const char *dest, const char *source) {
@@ -165,8 +191,6 @@ int custom_mount_prepare_all(const char *dest, CustomMount *l, size_t n) {
                 }
 
                 if (m->type == CUSTOM_MOUNT_OVERLAY) {
-                        char **j;
-
                         STRV_FOREACH(j, m->lower) {
                                 char *s;
 
@@ -213,15 +237,14 @@ int custom_mount_prepare_all(const char *dest, CustomMount *l, size_t n) {
 }
 
 int bind_mount_parse(CustomMount **l, size_t *n, const char *s, bool read_only) {
-        _cleanup_free_ char *source = NULL, *destination = NULL, *opts = NULL;
-        const char *p = s;
+        _cleanup_free_ char *source = NULL, *destination = NULL, *opts = NULL, *p = NULL;
         CustomMount *m;
         int r;
 
         assert(l);
         assert(n);
 
-        r = extract_many_words(&p, ":", EXTRACT_DONT_COALESCE_SEPARATORS, &source, &destination, NULL);
+        r = extract_many_words(&s, ":", EXTRACT_DONT_COALESCE_SEPARATORS, &source, &destination, NULL);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -231,16 +254,15 @@ int bind_mount_parse(CustomMount **l, size_t *n, const char *s, bool read_only) 
                 if (!destination)
                         return -ENOMEM;
         }
-        if (r == 2 && !isempty(p)) {
-                opts = strdup(p);
+        if (r == 2 && !isempty(s)) {
+                opts = strdup(s);
                 if (!opts)
                         return -ENOMEM;
         }
 
-        if (isempty(source))
-                source = mfree(source);
-        else if (!source_path_is_valid(source))
-                return -EINVAL;
+        r = source_path_parse_nullable(source, &p);
+        if (r < 0)
+                return r;
 
         if (!path_is_absolute(destination))
                 return -EINVAL;
@@ -249,7 +271,7 @@ int bind_mount_parse(CustomMount **l, size_t *n, const char *s, bool read_only) 
         if (!m)
                 return -ENOMEM;
 
-        m->source = TAKE_PTR(source);
+        m->source = TAKE_PTR(p);
         m->destination = TAKE_PTR(destination);
         m->read_only = read_only;
         m->options = TAKE_PTR(opts);
@@ -259,13 +281,12 @@ int bind_mount_parse(CustomMount **l, size_t *n, const char *s, bool read_only) 
 
 int tmpfs_mount_parse(CustomMount **l, size_t *n, const char *s) {
         _cleanup_free_ char *path = NULL, *opts = NULL;
-        const char *p = s;
+        const char *p = ASSERT_PTR(s);
         CustomMount *m;
         int r;
 
         assert(l);
         assert(n);
-        assert(s);
 
         r = extract_first_word(&p, &path, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
         if (r < 0)
@@ -297,7 +318,7 @@ int overlay_mount_parse(CustomMount **l, size_t *n, const char *s, bool read_onl
         _cleanup_free_ char *upper = NULL, *destination = NULL;
         _cleanup_strv_free_ char **lower = NULL;
         CustomMount *m;
-        int k;
+        int r, k;
 
         k = strv_split_full(&lower, s, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
         if (k < 0)
@@ -305,12 +326,22 @@ int overlay_mount_parse(CustomMount **l, size_t *n, const char *s, bool read_onl
         if (k < 2)
                 return -EADDRNOTAVAIL;
         if (k == 2) {
+                _cleanup_free_ char *p = NULL;
+
                 /* If two parameters are specified, the first one is the lower, the second one the upper directory. And
                  * we'll also define the destination mount point the same as the upper. */
 
-                if (!source_path_is_valid(lower[0]) ||
-                    !source_path_is_valid(lower[1]))
-                        return -EINVAL;
+                r = source_path_parse(lower[0], &p);
+                if (r < 0)
+                        return r;
+
+                free_and_replace(lower[0], p);
+
+                r = source_path_parse(lower[1], &p);
+                if (r < 0)
+                        return r;
+
+                free_and_replace(lower[1], p);
 
                 upper = TAKE_PTR(lower[1]);
 
@@ -318,7 +349,7 @@ int overlay_mount_parse(CustomMount **l, size_t *n, const char *s, bool read_onl
                 if (!destination)
                         return -ENOMEM;
         } else {
-                char **i;
+                _cleanup_free_ char *p = NULL;
 
                 /* If more than two parameters are specified, the last one is the destination, the second to last one
                  * the "upper", and all before that the "lower" directories. */
@@ -326,16 +357,21 @@ int overlay_mount_parse(CustomMount **l, size_t *n, const char *s, bool read_onl
                 destination = lower[k - 1];
                 upper = TAKE_PTR(lower[k - 2]);
 
-                STRV_FOREACH(i, lower)
-                        if (!source_path_is_valid(*i))
-                                return -EINVAL;
+                STRV_FOREACH(i, lower) {
+                        r = source_path_parse(*i, &p);
+                        if (r < 0)
+                                return r;
+
+                        free_and_replace(*i, p);
+                }
 
                 /* If the upper directory is unspecified, then let's create it automatically as a throw-away directory
                  * in /var/tmp */
-                if (isempty(upper))
-                        upper = mfree(upper);
-                else if (!source_path_is_valid(upper))
-                        return -EINVAL;
+                r = source_path_parse_nullable(upper, &p);
+                if (r < 0)
+                        return r;
+
+                free_and_replace(upper, p);
 
                 if (!path_is_absolute(destination))
                         return -EINVAL;
@@ -407,7 +443,7 @@ int tmpfs_patch_options(
 }
 
 int mount_sysfs(const char *dest, MountSettingsMask mount_settings) {
-        const char *full, *top, *x;
+        const char *full, *top;
         int r;
         unsigned long extra_flags = 0;
 
@@ -467,7 +503,7 @@ int mount_sysfs(const char *dest, MountSettingsMask mount_settings) {
         /* Create mountpoint for cgroups. Otherwise we are not allowed since we
          * remount /sys read-only.
          */
-        x = prefix_roota(top, "/fs/cgroup");
+        const char *x = prefix_roota(top, "/fs/cgroup");
         (void) mkdir_p(x, 0755);
 
         return mount_nofollow_verbose(LOG_ERR, NULL, top, NULL,
@@ -544,7 +580,7 @@ int mount_all(const char *dest,
                   MOUNT_FATAL|MOUNT_APPLY_APIVFS_RO|MOUNT_MKDIR },    /* skipped if above was mounted */
                 { "sysfs",                  "/sys",                         "sysfs", NULL,                             MS_NOSUID|MS_NOEXEC|MS_NODEV,
                   MOUNT_FATAL|MOUNT_MKDIR },                          /* skipped if above was mounted */
-                { "tmpfs",                  "/dev",                         "tmpfs", "mode=755" TMPFS_LIMITS_DEV,      MS_NOSUID|MS_STRICTATIME,
+                { "tmpfs",                  "/dev",                         "tmpfs", "mode=755" TMPFS_LIMITS_PRIVATE_DEV, MS_NOSUID|MS_STRICTATIME,
                   MOUNT_FATAL|MOUNT_MKDIR },
                 { "tmpfs",                  "/dev/shm",                     "tmpfs", "mode=1777" NESTED_TMPFS_LIMITS,  MS_NOSUID|MS_NODEV|MS_STRICTATIME,
                   MOUNT_FATAL|MOUNT_MKDIR },
@@ -671,9 +707,10 @@ int mount_all(const char *dest,
         return 0;
 }
 
-static int parse_mount_bind_options(const char *options, unsigned long *mount_flags, char **mount_opts) {
+static int parse_mount_bind_options(const char *options, unsigned long *mount_flags, char **mount_opts, RemountIdmapping *idmapping) {
         unsigned long flags = *mount_flags;
         char *opts = NULL;
+        RemountIdmapping new_idmapping = *idmapping;
         int r;
 
         assert(options);
@@ -691,32 +728,45 @@ static int parse_mount_bind_options(const char *options, unsigned long *mount_fl
                         flags |= MS_REC;
                 else if (streq(word, "norbind"))
                         flags &= ~MS_REC;
+                else if (streq(word, "idmap"))
+                        new_idmapping = REMOUNT_IDMAPPING_HOST_ROOT;
+                else if (streq(word, "noidmap"))
+                        new_idmapping = REMOUNT_IDMAPPING_NONE;
+                else if (streq(word, "rootidmap"))
+                        new_idmapping = REMOUNT_IDMAPPING_HOST_OWNER;
                 else
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Invalid bind mount option: %s", word);
         }
 
         *mount_flags = flags;
+        *idmapping = new_idmapping;
         /* in the future mount_opts will hold string options for mount(2) */
         *mount_opts = opts;
 
         return 0;
 }
 
-static int mount_bind(const char *dest, CustomMount *m) {
+static int mount_bind(const char *dest, CustomMount *m, uid_t uid_shift, uid_t uid_range) {
         _cleanup_free_ char *mount_opts = NULL, *where = NULL;
         unsigned long mount_flags = MS_BIND | MS_REC;
         struct stat source_st, dest_st;
         int r;
+        RemountIdmapping idmapping = REMOUNT_IDMAPPING_NONE;
 
         assert(dest);
         assert(m);
 
         if (m->options) {
-                r = parse_mount_bind_options(m->options, &mount_flags, &mount_opts);
+                r = parse_mount_bind_options(m->options, &mount_flags, &mount_opts, &idmapping);
                 if (r < 0)
                         return r;
         }
+
+        /* If this is a bind mount from a temporary sources change ownership of the source to the container's
+         * root UID. Otherwise it would always show up as "nobody" if user namespacing is used. */
+        if (m->rm_rf_tmpdir && chown(m->source, uid_shift, uid_shift) < 0)
+                return log_error_errno(errno, "Failed to chown %s: %m", m->source);
 
         if (stat(m->source, &source_st) < 0)
                 return log_error_errno(errno, "Failed to stat %s: %m", m->source);
@@ -764,6 +814,12 @@ static int mount_bind(const char *dest, CustomMount *m) {
                 r = bind_remount_recursive(where, MS_RDONLY, MS_RDONLY, NULL);
                 if (r < 0)
                         return log_error_errno(r, "Read-only bind mount failed: %m");
+        }
+
+        if (idmapping != REMOUNT_IDMAPPING_NONE) {
+                r = remount_idmap(where, uid_shift, uid_range, source_st.st_uid, idmapping);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to map ids for bind mount %s: %m", where);
         }
 
         return 0;
@@ -905,6 +961,7 @@ int mount_custom(
                 const char *dest,
                 CustomMount *mounts, size_t n,
                 uid_t uid_shift,
+                uid_t uid_range,
                 const char *selinux_apifs_context,
                 MountSettingsMask mount_settings) {
         int r;
@@ -926,7 +983,7 @@ int mount_custom(
                 switch (m->type) {
 
                 case CUSTOM_MOUNT_BIND:
-                        r = mount_bind(dest, m);
+                        r = mount_bind(dest, m, uid_shift, uid_range);
                         break;
 
                 case CUSTOM_MOUNT_TMPFS:
@@ -946,7 +1003,7 @@ int mount_custom(
                         break;
 
                 default:
-                        assert_not_reached("Unknown custom mount type");
+                        assert_not_reached();
                 }
 
                 if (r < 0)
@@ -1213,10 +1270,9 @@ int setup_pivot_root(const char *directory, const char *pivot_root_new, const ch
          * This requires a temporary directory, pivot_tmp, which is
          * not a child of either.
          *
-         * This is typically used for OSTree-style containers, where
-         * the root partition contains several sysroots which could be
-         * run. Normally, one would be chosen by the bootloader and
-         * pivoted to / by initramfs.
+         * This is typically used for OSTree-style containers, where the root partition contains several
+         * sysroots which could be run. Normally, one would be chosen by the bootloader and pivoted to / by
+         * initrd.
          *
          * For example, for an OSTree deployment, pivot_root_new
          * would be: /ostree/deploy/$os/deploy/$checksum. Note that this

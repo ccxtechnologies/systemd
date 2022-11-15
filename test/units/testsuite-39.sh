@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-
+# SPDX-License-Identifier: LGPL-2.1-or-later
 set -eux
 set -o pipefail
 
 systemd-analyze log-level debug
-systemd-analyze log-target console
 
 export SYSTEMD_PAGER=
 SERVICE_PATH="$(mktemp /etc/systemd/system/execreloadXXX.service)"

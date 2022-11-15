@@ -17,20 +17,22 @@ struct state {
         int rcode;
         const char *error_message;
         const char *success_message;
+        const char *eexist_message;
 };
 
 static int generic_handler(sd_netlink *rtnl, sd_netlink_message *m, void *userdata) {
-        struct state *s = userdata;
+        struct state *s = ASSERT_PTR(userdata);
         int r;
 
-        assert(s);
         assert(s->n_messages > 0);
         s->n_messages--;
 
         errno = 0;
 
         r = sd_netlink_message_get_errno(m);
-        if (r < 0)
+        if (r == -EEXIST && s->eexist_message)
+                log_debug_errno(r, "%s", s->eexist_message);
+        else if (r < 0)
                 log_debug_errno(r, "%s: %m", s->error_message);
         else
                 log_debug("%s", s->success_message);
@@ -157,9 +159,11 @@ int loopback_setup(void) {
         struct state state_4 = {
                 .error_message = "Failed to add address 127.0.0.1 to loopback interface",
                 .success_message = "Successfully added address 127.0.0.1 to loopback interface",
+                .eexist_message = "127.0.0.1 has already been added to loopback interface",
         }, state_6 = {
                 .error_message = "Failed to add address ::1 to loopback interface",
                 .success_message = "Successfully added address ::1 to loopback interface",
+                .eexist_message = "::1 has already been added to loopback interface",
         }, state_up = {
                 .error_message = "Failed to bring loopback interface up",
                 .success_message = "Successfully brought loopback interface up",
@@ -203,10 +207,10 @@ int loopback_setup(void) {
                 /* If we lack the permissions to configure the loopback device,
                  * but we find it to be already configured, let's exit cleanly,
                  * in order to supported unprivileged containers. */
-                if (state_up.rcode == -EPERM && check_loopback(rtnl))
+                if (ERRNO_IS_PRIVILEGE(state_up.rcode) && check_loopback(rtnl))
                         return 0;
 
-                return log_warning_errno(state_up.rcode, "Failed to configure loopback device: %m");
+                return log_warning_errno(state_up.rcode, "Failed to configure loopback network device: %m");
         }
 
         return 0;

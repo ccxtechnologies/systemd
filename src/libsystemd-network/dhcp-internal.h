@@ -12,7 +12,8 @@
 #include "sd-dhcp-client.h"
 
 #include "dhcp-protocol.h"
-#include "log-link.h"
+#include "ether-addr-util.h"
+#include "network-common.h"
 #include "socket-util.h"
 
 typedef struct sd_dhcp_option {
@@ -32,10 +33,14 @@ extern const struct hash_ops dhcp_option_hash_ops;
 
 typedef struct sd_dhcp_client sd_dhcp_client;
 
-int dhcp_network_bind_raw_socket(int ifindex, union sockaddr_union *link, uint32_t xid,
-                                 const uint8_t *mac_addr, size_t mac_addr_len,
-                                 const uint8_t *bcast_addr, size_t bcast_addr_len,
-                                 uint16_t arp_type, uint16_t port);
+int dhcp_network_bind_raw_socket(
+                int ifindex,
+                union sockaddr_union *link,
+                uint32_t xid,
+                const struct hw_addr_data *hw_addr,
+                const struct hw_addr_data *bcast_addr,
+                uint16_t arp_type,
+                uint16_t port);
 int dhcp_network_bind_udp_socket(int ifindex, be32_t address, uint16_t port, int ip_service_type);
 int dhcp_network_send_raw_socket(int s, const union sockaddr_union *link,
                                  const void *packet, size_t len);
@@ -53,8 +58,8 @@ typedef int (*dhcp_option_callback_t)(uint8_t code, uint8_t len,
 int dhcp_option_parse(DHCPMessage *message, size_t len, dhcp_option_callback_t cb, void *userdata, char **error_message);
 
 int dhcp_message_init(DHCPMessage *message, uint8_t op, uint32_t xid,
-                      uint8_t type, uint16_t arp_type, size_t optlen,
-                      size_t *optoffset);
+                      uint8_t type, uint16_t arp_type, uint8_t hlen, const uint8_t *chaddr,
+                      size_t optlen, size_t *optoffset);
 
 uint16_t dhcp_packet_checksum(uint8_t *buf, size_t len);
 
@@ -75,10 +80,10 @@ void dhcp_client_set_test_mode(sd_dhcp_client *client, bool test_mode);
 #define log_dhcp_client_errno(client, error, fmt, ...)          \
         log_interface_prefix_full_errno(                        \
                 "DHCPv4 client: ",                              \
-                sd_dhcp_client_get_ifname(client),              \
+                sd_dhcp_client, client,                         \
                 error, fmt, ##__VA_ARGS__)
 #define log_dhcp_client(client, fmt, ...)                       \
         log_interface_prefix_full_errno_zerook(                 \
                 "DHCPv4 client: ",                              \
-                sd_dhcp_client_get_ifname(client),              \
+                sd_dhcp_client, client,                         \
                 0, fmt, ##__VA_ARGS__)

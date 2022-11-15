@@ -17,7 +17,6 @@
 #include "event-util.h"
 #include "fd-util.h"
 #include "in-addr-util.h"
-#include "log-link.h"
 #include "memory-util.h"
 #include "network-common.h"
 #include "random-util.h"
@@ -81,12 +80,12 @@ struct sd_ipv4acd {
 #define log_ipv4acd_errno(acd, error, fmt, ...)         \
         log_interface_prefix_full_errno(                \
                 "IPv4ACD: ",                            \
-                sd_ipv4acd_get_ifname(acd),             \
+                sd_ipv4acd, acd,                        \
                 error, fmt, ##__VA_ARGS__)
 #define log_ipv4acd(acd, fmt, ...)                      \
         log_interface_prefix_full_errno_zerook(         \
                 "IPv4ACD: ",                            \
-                sd_ipv4acd_get_ifname(acd),             \
+                sd_ipv4acd, acd,                        \
                 0, fmt, ##__VA_ARGS__)
 
 static const char * const ipv4acd_state_table[_IPV4ACD_STATE_MAX] = {
@@ -120,7 +119,7 @@ static void ipv4acd_reset(sd_ipv4acd *acd) {
         assert(acd);
 
         (void) event_source_disable(acd->timer_event_source);
-        acd->receive_message_event_source = sd_event_source_unref(acd->receive_message_event_source);
+        acd->receive_message_event_source = sd_event_source_disable_unref(acd->receive_message_event_source);
 
         acd->fd = safe_close(acd->fd);
 
@@ -130,9 +129,8 @@ static void ipv4acd_reset(sd_ipv4acd *acd) {
 static sd_ipv4acd *ipv4acd_free(sd_ipv4acd *acd) {
         assert(acd);
 
-        acd->timer_event_source = sd_event_source_unref(acd->timer_event_source);
-
         ipv4acd_reset(acd);
+        sd_event_source_unref(acd->timer_event_source);
         sd_ipv4acd_detach_event(acd);
         free(acd->ifname);
         return mfree(acd);
@@ -202,20 +200,18 @@ static int ipv4acd_set_next_wakeup(sd_ipv4acd *acd, usec_t usec, usec_t random_u
         if (random_usec > 0)
                 next_timeout += (usec_t) random_u64() % random_usec;
 
-        assert_se(sd_event_now(acd->event, clock_boottime_or_monotonic(), &time_now) >= 0);
+        assert_se(sd_event_now(acd->event, CLOCK_BOOTTIME, &time_now) >= 0);
 
         return event_reset_time(acd->event, &acd->timer_event_source,
-                                clock_boottime_or_monotonic(),
+                                CLOCK_BOOTTIME,
                                 time_now + next_timeout, 0,
                                 ipv4acd_on_timeout, acd,
                                 acd->event_priority, "ipv4acd-timer", true);
 }
 
 static int ipv4acd_on_timeout(sd_event_source *s, uint64_t usec, void *userdata) {
-        sd_ipv4acd *acd = userdata;
+        sd_ipv4acd *acd = ASSERT_PTR(userdata);
         int r = 0;
-
-        assert(acd);
 
         switch (acd->state) {
 
@@ -225,10 +221,8 @@ static int ipv4acd_on_timeout(sd_event_source *s, uint64_t usec, void *userdata)
                 ipv4acd_set_state(acd, IPV4ACD_STATE_WAITING_PROBE, true);
 
                 if (acd->n_conflict >= MAX_CONFLICTS) {
-                        char ts[FORMAT_TIMESPAN_MAX];
-
                         log_ipv4acd(acd, "Max conflicts reached, delaying by %s",
-                                    format_timespan(ts, sizeof(ts), RATE_LIMIT_INTERVAL_USEC, 0));
+                                    FORMAT_TIMESPAN(RATE_LIMIT_INTERVAL_USEC, 0));
                         r = ipv4acd_set_next_wakeup(acd, RATE_LIMIT_INTERVAL_USEC, PROBE_WAIT_USEC);
                 } else
                         r = ipv4acd_set_next_wakeup(acd, 0, PROBE_WAIT_USEC);
@@ -295,7 +289,7 @@ static int ipv4acd_on_timeout(sd_event_source *s, uint64_t usec, void *userdata)
                 break;
 
         default:
-                assert_not_reached("Invalid state.");
+                assert_not_reached();
         }
 
         return 0;
@@ -333,7 +327,7 @@ static bool ipv4acd_arp_conflict(sd_ipv4acd *acd, const struct ether_arp *arp, b
         if (acd->check_mac_callback &&
             acd->check_mac_callback(acd, (const struct ether_addr*) arp->arp_sha, acd->check_mac_userdata) > 0)
                 /* sender hardware is one of the host's interfaces, ignoring. */
-                return true;
+                return false;
 
         return true; /* conflict! */
 }
@@ -355,18 +349,17 @@ static int ipv4acd_on_packet(
                 uint32_t revents,
                 void *userdata) {
 
-        sd_ipv4acd *acd = userdata;
+        sd_ipv4acd *acd = ASSERT_PTR(userdata);
         struct ether_arp packet;
         ssize_t n;
         int r;
 
         assert(s);
-        assert(acd);
         assert(fd >= 0);
 
         n = recv(fd, &packet, sizeof(struct ether_arp), 0);
         if (n < 0) {
-                if (IN_SET(errno, EAGAIN, EINTR))
+                if (ERRNO_IS_TRANSIENT(errno) || ERRNO_IS_DISCONNECT(errno))
                         return 0;
 
                 log_ipv4acd_errno(acd, errno, "Failed to read ARP packet: %m");
@@ -385,7 +378,7 @@ static int ipv4acd_on_packet(
                 if (ipv4acd_arp_conflict(acd, &packet, true)) {
                         usec_t ts;
 
-                        assert_se(sd_event_now(acd->event, clock_boottime_or_monotonic(), &ts) >= 0);
+                        assert_se(sd_event_now(acd->event, CLOCK_BOOTTIME, &ts) >= 0);
 
                         /* Defend address */
                         if (ts > acd->defend_window) {
@@ -411,7 +404,7 @@ static int ipv4acd_on_packet(
                 break;
 
         default:
-                assert_not_reached("Invalid state.");
+                assert_not_reached();
         }
 
         return 0;
@@ -448,11 +441,19 @@ int sd_ipv4acd_set_ifname(sd_ipv4acd *acd, const char *ifname) {
         return free_and_strdup(&acd->ifname, ifname);
 }
 
-const char *sd_ipv4acd_get_ifname(sd_ipv4acd *acd) {
-        if (!acd)
-                return NULL;
+int sd_ipv4acd_get_ifname(sd_ipv4acd *acd, const char **ret) {
+        int r;
 
-        return get_ifname(acd->ifindex, &acd->ifname);
+        assert_return(acd, -EINVAL);
+
+        r = get_ifname(acd->ifindex, &acd->ifname);
+        if (r < 0)
+                return r;
+
+        if (ret)
+                *ret = acd->ifname;
+
+        return 0;
 }
 
 int sd_ipv4acd_set_mac(sd_ipv4acd *acd, const struct ether_addr *addr) {
@@ -582,7 +583,7 @@ int sd_ipv4acd_start(sd_ipv4acd *acd, bool reset_conflicts) {
         if (r < 0)
                 return r;
 
-        CLOSE_AND_REPLACE(acd->fd, r);
+        close_and_replace(acd->fd, r);
 
         if (reset_conflicts)
                 acd->n_conflict = 0;

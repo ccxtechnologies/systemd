@@ -7,7 +7,7 @@
 # but it assumes (and checks at the beginning) that networkd is not currently
 # running.
 #
-# This can be run on a normal installation, in QEMU, nspawn (with
+# This can be run on a normal installation, in qemu, systemd-nspawn (with
 # --private-network), LXD (with "--config raw.lxc=lxc.aa_profile=unconfined"),
 # or LXC system containers. You need at least the "ip" tool from the iproute
 # package; it is recommended to install dnsmasq too to get full test coverage.
@@ -91,7 +91,7 @@ def setUpModule():
 def tearDownModule():
     global tmpmounts
     for d in tmpmounts:
-        subprocess.check_call(["umount", d])
+        subprocess.check_call(["umount", "--lazy", d])
     for u in stopped_units:
         subprocess.call(["systemctl", "stop", u])
     for u in running_units:
@@ -138,7 +138,7 @@ class NetworkdTestingUtilities:
 
     def read_attr(self, link, attribute):
         """Read a link attributed from the sysfs."""
-        # Note we we don't want to check if interface `link' is managed, we
+        # Note we don't want to check if interface `link' is managed, we
         # want to evaluate link variable and pass the value of the link to
         # assert_link_states e.g. eth0=managed.
         self.assert_link_states(**{link:'managed'})
@@ -273,6 +273,7 @@ Priority=0
 [Bridge]
 UnicastFlood=true
 HairPin=true
+Isolated=true
 UseBPDU=true
 FastLeave=true
 AllowPortToBeRoot=true
@@ -286,11 +287,12 @@ Priority=23
 
         self.assertEqual(self.read_attr('port2', 'brport/priority'), '23')
         self.assertEqual(self.read_attr('port2', 'brport/hairpin_mode'), '1')
+        self.assertEqual(self.read_attr('port2', 'brport/isolated'), '1')
         self.assertEqual(self.read_attr('port2', 'brport/path_cost'), '555')
         self.assertEqual(self.read_attr('port2', 'brport/multicast_fast_leave'), '1')
         self.assertEqual(self.read_attr('port2', 'brport/unicast_flood'), '1')
-        self.assertEqual(self.read_attr('port2', 'brport/bpdu_guard'), '1')
-        self.assertEqual(self.read_attr('port2', 'brport/root_block'), '1')
+        self.assertEqual(self.read_attr('port2', 'brport/bpdu_guard'), '0')
+        self.assertEqual(self.read_attr('port2', 'brport/root_block'), '0')
 
 class ClientTestBase(NetworkdTestingUtilities):
     """Provide common methods for testing networkd against servers."""
@@ -635,7 +637,7 @@ Name={}
 [Network]
 DHCP=ipv4
 IPv6AcceptRA=False
-DNSSECNegativeTrustAnchors=megasearch.net
+DNSSECNegativeTrustAnchors=search.example.com
 '''.format(self.iface))
 
         # create second device/dnsmasq for a .company/.lab VPN interface
@@ -681,8 +683,8 @@ DNSSECNegativeTrustAnchors=company lab
         self.assertIn(b'kettle.cantina.company: 10.241.4.4', out)
 
         # test general domains
-        out = subprocess.check_output(['resolvectl', 'query', 'megasearch.net'])
-        self.assertIn(b'megasearch.net: 192.168.42.1', out)
+        out = subprocess.check_output(['resolvectl', 'query', 'search.example.com'])
+        self.assertIn(b'search.example.com: 192.168.42.1', out)
 
         with open(self.dnsmasq_log) as f:
             general_log = f.read()
@@ -696,8 +698,8 @@ DNSSECNegativeTrustAnchors=company lab
         self.assertNotIn('.company', general_log)
 
         # general domains should not be sent to the VPN DNS
-        self.assertRegex(general_log, 'query.*megasearch.net')
-        self.assertNotIn('megasearch.net', vpn_log)
+        self.assertRegex(general_log, 'query.*search.example.com')
+        self.assertNotIn('search.example.com', vpn_log)
 
     def test_resolved_etc_hosts(self):
         '''resolved queries to /etc/hosts'''

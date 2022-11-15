@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "sd-daemon.h"
 
@@ -22,8 +23,7 @@
 #include "main-func.h"
 #include "mkdir.h"
 #include "parse-argument.h"
-#include "parse-util.h"
-#include "path-util.h"
+#include "parse-helpers.h"
 #include "pretty-print.h"
 #include "process-util.h"
 #include "rlimit-util.h"
@@ -79,9 +79,7 @@ static size_t output_callback(char *buf,
                               size_t size,
                               size_t nmemb,
                               void *userp) {
-        Uploader *u = userp;
-
-        assert(u);
+        Uploader *u = ASSERT_PTR(userp);
 
         log_debug("The server answers (%zu bytes): %.*s",
                   size*nmemb, (int)(size*nmemb), buf);
@@ -291,10 +289,9 @@ int start_upload(Uploader *u,
 }
 
 static size_t fd_input_callback(void *buf, size_t size, size_t nmemb, void *userp) {
-        Uploader *u = userp;
+        Uploader *u = ASSERT_PTR(userp);
         ssize_t n;
 
-        assert(u);
         assert(nmemb < SSIZE_MAX / size);
 
         if (u->input < 0)
@@ -329,9 +326,8 @@ static int dispatch_fd_input(sd_event_source *event,
                              int fd,
                              uint32_t revents,
                              void *userp) {
-        Uploader *u = userp;
+        Uploader *u = ASSERT_PTR(userp);
 
-        assert(u);
         assert(fd >= 0);
 
         if (revents & EPOLLHUP) {
@@ -384,9 +380,7 @@ static int open_file_for_upload(Uploader *u, const char *filename) {
 static int dispatch_sigterm(sd_event_source *event,
                             const struct signalfd_siginfo *si,
                             void *userdata) {
-        Uploader *u = userdata;
-
-        assert(u);
+        Uploader *u = ASSERT_PTR(userdata);
 
         log_received_signal(LOG_INFO, si);
 
@@ -438,7 +432,7 @@ static int setup_uploader(Uploader *u, const char *url, const char *state_file) 
                 char *t;
                 size_t x;
 
-                t = strdupa(url);
+                t = strdupa_safe(url);
                 x = strlen(t);
                 while (x > 0 && t[x - 1] == '/')
                         t[x - 1] = '\0';
@@ -540,13 +534,12 @@ static int config_parse_path_or_ignore(
 
         _cleanup_free_ char *n = NULL;
         bool fatal = ltype;
-        char **s = data;
+        char **s = ASSERT_PTR(data);
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         if (isempty(rvalue))
                 goto finalize;
@@ -568,11 +561,11 @@ finalize:
 
 static int parse_config(void) {
         const ConfigTableItem items[] = {
-                { "Upload",  "URL",                    config_parse_string,         0, &arg_url                  },
-                { "Upload",  "ServerKeyFile",          config_parse_path_or_ignore, 0, &arg_key                  },
-                { "Upload",  "ServerCertificateFile",  config_parse_path_or_ignore, 0, &arg_cert                 },
-                { "Upload",  "TrustedCertificateFile", config_parse_path_or_ignore, 0, &arg_trust                },
-                { "Upload",  "NetworkTimeoutSec",      config_parse_sec,            0, &arg_network_timeout_usec },
+                { "Upload",  "URL",                    config_parse_string,         CONFIG_PARSE_STRING_SAFE, &arg_url                  },
+                { "Upload",  "ServerKeyFile",          config_parse_path_or_ignore, 0,                        &arg_key                  },
+                { "Upload",  "ServerCertificateFile",  config_parse_path_or_ignore, 0,                        &arg_cert                 },
+                { "Upload",  "TrustedCertificateFile", config_parse_path_or_ignore, 0,                        &arg_trust                },
+                { "Upload",  "NetworkTimeoutSec",      config_parse_sec,            0,                        &arg_network_timeout_usec },
                 {}
         };
 
@@ -667,7 +660,7 @@ static int parse_argv(int argc, char *argv[]) {
         opterr = 0;
 
         while ((c = getopt_long(argc, argv, "hu:mM:D:", options, NULL)) >= 0)
-                switch(c) {
+                switch (c) {
                 case 'h':
                         return help();
 
@@ -779,7 +772,7 @@ static int parse_argv(int argc, char *argv[]) {
                                                argv[optind - 1]);
 
                 default:
-                        assert_not_reached("Unhandled option code.");
+                        assert_not_reached();
                 }
 
         if (!arg_url)
@@ -820,7 +813,7 @@ static int open_journal(sd_journal **j) {
 
 static int run(int argc, char **argv) {
         _cleanup_(destroy_uploader) Uploader u = {};
-        _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
+        _unused_ _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         bool use_journal;
         int r;
 

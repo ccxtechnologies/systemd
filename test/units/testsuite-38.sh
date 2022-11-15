@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 set -eux
 set -o pipefail
 
 systemd-analyze log-level debug
-systemd-analyze log-target console
 
 unit=testsuite-38-sleep.service
 
@@ -17,7 +17,7 @@ dbus_freeze() {
     local name object_path suffix
 
     suffix="${1##*.}"
-    name="${1%.$suffix}"
+    name="${1%".$suffix"}"
     object_path="/org/freedesktop/systemd1/unit/${name//-/_2d}_2e${suffix}"
 
     busctl call \
@@ -31,7 +31,7 @@ dbus_thaw() {
     local name object_path suffix
 
     suffix="${1##*.}"
-    name="${1%.$suffix}"
+    name="${1%".$suffix"}"
     object_path="/org/freedesktop/systemd1/unit/${name//-/_2d}_2e${suffix}"
 
     busctl call \
@@ -65,7 +65,7 @@ dbus_can_freeze() {
     local name object_path suffix
 
     suffix="${1##*.}"
-    name="${1%.$suffix}"
+    name="${1%".$suffix"}"
     object_path="/org/freedesktop/systemd1/unit/${name//-/_2d}_2e${suffix}"
 
     busctl get-property \
@@ -79,7 +79,7 @@ check_freezer_state() {
     local name object_path suffix
 
     suffix="${1##*.}"
-    name="${1%.$suffix}"
+    name="${1%".$suffix"}"
     object_path="/org/freedesktop/systemd1/unit/${name//-/_2d}_2e${suffix}"
 
     for _ in {0..10}; do

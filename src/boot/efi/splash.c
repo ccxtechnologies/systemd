@@ -8,41 +8,51 @@
 #include "util.h"
 
 struct bmp_file {
-        CHAR8 signature[2];
-        UINT32 size;
-        UINT16 reserved[2];
-        UINT32 offset;
-} __attribute__((packed));
+        char signature[2];
+        uint32_t size;
+        uint16_t reserved[2];
+        uint32_t offset;
+} _packed_;
 
 /* we require at least BITMAPINFOHEADER, later versions are
    accepted, but their features ignored */
 struct bmp_dib {
-        UINT32 size;
-        UINT32 x;
-        UINT32 y;
-        UINT16 planes;
-        UINT16 depth;
-        UINT32 compression;
-        UINT32 image_size;
-        INT32 x_pixel_meter;
-        INT32 y_pixel_meter;
-        UINT32 colors_used;
-        UINT32 colors_important;
-} __attribute__((packed));
+        uint32_t size;
+        uint32_t x;
+        uint32_t y;
+        uint16_t planes;
+        uint16_t depth;
+        uint32_t compression;
+        uint32_t image_size;
+        int32_t x_pixel_meter;
+        int32_t y_pixel_meter;
+        uint32_t colors_used;
+        uint32_t colors_important;
+} _packed_;
 
 struct bmp_map {
-        UINT8 blue;
-        UINT8 green;
-        UINT8 red;
-        UINT8 reserved;
-} __attribute__((packed));
+        uint8_t blue;
+        uint8_t green;
+        uint8_t red;
+        uint8_t reserved;
+} _packed_;
 
-static EFI_STATUS bmp_parse_header(UINT8 *bmp, UINTN size, struct bmp_dib **ret_dib,
-                            struct bmp_map **ret_map, UINT8 **pixmap) {
+static EFI_STATUS bmp_parse_header(
+                const uint8_t *bmp,
+                UINTN size,
+                struct bmp_dib **ret_dib,
+                struct bmp_map **ret_map,
+                const uint8_t **pixmap) {
+
         struct bmp_file *file;
         struct bmp_dib *dib;
         struct bmp_map *map;
         UINTN row_size;
+
+        assert(bmp);
+        assert(ret_dib);
+        assert(ret_map);
+        assert(pixmap);
 
         if (size < sizeof(struct bmp_file) + sizeof(struct bmp_dib))
                 return EFI_INVALID_PARAMETER;
@@ -94,7 +104,7 @@ static EFI_STATUS bmp_parse_header(UINT8 *bmp, UINTN size, struct bmp_dib **ret_
                 return EFI_INVALID_PARAMETER;
 
         if (file->offset > sizeof(struct bmp_file) + dib->size) {
-                UINT32 map_count;
+                uint32_t map_count;
                 UINTN map_size;
 
                 if (dib->colors_used)
@@ -125,8 +135,10 @@ static EFI_STATUS bmp_parse_header(UINT8 *bmp, UINTN size, struct bmp_dib **ret_
         return EFI_SUCCESS;
 }
 
-static VOID pixel_blend(UINT32 *dst, const UINT32 source) {
-        UINT32 alpha, src, src_rb, src_g, dst_rb, dst_g, rb, g;
+static void pixel_blend(uint32_t *dst, const uint32_t source) {
+        uint32_t alpha, src, src_rb, src_g, dst_rb, dst_g, rb, g;
+
+        assert(dst);
 
         alpha = (source & 0xff);
 
@@ -147,10 +159,18 @@ static VOID pixel_blend(UINT32 *dst, const UINT32 source) {
         *dst = (rb | g);
 }
 
-static EFI_STATUS bmp_to_blt(EFI_GRAPHICS_OUTPUT_BLT_PIXEL *buf,
-                      struct bmp_dib *dib, struct bmp_map *map,
-                      UINT8 *pixmap) {
-        UINT8 *in;
+static EFI_STATUS bmp_to_blt(
+                EFI_GRAPHICS_OUTPUT_BLT_PIXEL *buf,
+                struct bmp_dib *dib,
+                struct bmp_map *map,
+                const uint8_t *pixmap) {
+
+        const uint8_t *in;
+
+        assert(buf);
+        assert(dib);
+        assert(map);
+        assert(pixmap);
 
         /* transform and copy pixels */
         in = pixmap;
@@ -199,7 +219,7 @@ static EFI_STATUS bmp_to_blt(EFI_GRAPHICS_OUTPUT_BLT_PIXEL *buf,
                                 break;
 
                         case 16: {
-                                UINT16 i = *(UINT16 *) in;
+                                uint16_t i = *(uint16_t *) in;
 
                                 out->Red = (i & 0x7c00) >> 7;
                                 out->Green = (i & 0x3e0) >> 2;
@@ -216,9 +236,9 @@ static EFI_STATUS bmp_to_blt(EFI_GRAPHICS_OUTPUT_BLT_PIXEL *buf,
                                 break;
 
                         case 32: {
-                                UINT32 i = *(UINT32 *) in;
+                                uint32_t i = *(uint32_t *) in;
 
-                                pixel_blend((UINT32 *)out, i);
+                                pixel_blend((uint32_t *)out, i);
 
                                 in += 3;
                                 break;
@@ -234,34 +254,34 @@ static EFI_STATUS bmp_to_blt(EFI_GRAPHICS_OUTPUT_BLT_PIXEL *buf,
         return EFI_SUCCESS;
 }
 
-EFI_STATUS graphics_splash(UINT8 *content, UINTN len, const EFI_GRAPHICS_OUTPUT_BLT_PIXEL *background) {
-        EFI_GRAPHICS_OUTPUT_BLT_PIXEL pixel = {};
-        EFI_GUID GraphicsOutputProtocolGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+EFI_STATUS graphics_splash(const uint8_t *content, UINTN len) {
+        EFI_GRAPHICS_OUTPUT_BLT_PIXEL background = {};
         EFI_GRAPHICS_OUTPUT_PROTOCOL *GraphicsOutput = NULL;
         struct bmp_dib *dib;
         struct bmp_map *map;
-        UINT8 *pixmap;
-        UINT64 blt_size;
-        _cleanup_freepool_ VOID *blt = NULL;
+        const uint8_t *pixmap;
+        _cleanup_free_ void *blt = NULL;
         UINTN x_pos = 0;
         UINTN y_pos = 0;
         EFI_STATUS err;
 
-        if (!background) {
-                if (StriCmp(L"Apple", ST->FirmwareVendor) == 0) {
-                        pixel.Red = 0xc0;
-                        pixel.Green = 0xc0;
-                        pixel.Blue = 0xc0;
-                }
-                background = &pixel;
+        if (len == 0)
+                return EFI_SUCCESS;
+
+        assert(content);
+
+        if (strcaseeq16(ST->FirmwareVendor, u"Apple")) {
+                background.Red = 0xc0;
+                background.Green = 0xc0;
+                background.Blue = 0xc0;
         }
 
-        err = LibLocateProtocol(&GraphicsOutputProtocolGuid, (VOID **)&GraphicsOutput);
-        if (EFI_ERROR(err))
+        err = BS->LocateProtocol(&GraphicsOutputProtocol, NULL, (void **) &GraphicsOutput);
+        if (err != EFI_SUCCESS)
                 return err;
 
         err = bmp_parse_header(content, len, &dib, &map, &pixmap);
-        if (EFI_ERROR(err))
+        if (err != EFI_SUCCESS)
                 return err;
 
         if (dib->x < GraphicsOutput->Mode->Info->HorizontalResolution)
@@ -269,33 +289,34 @@ EFI_STATUS graphics_splash(UINT8 *content, UINTN len, const EFI_GRAPHICS_OUTPUT_
         if (dib->y < GraphicsOutput->Mode->Info->VerticalResolution)
                 y_pos = (GraphicsOutput->Mode->Info->VerticalResolution - dib->y) / 2;
 
-        uefi_call_wrapper(GraphicsOutput->Blt, 10, GraphicsOutput,
-                          (EFI_GRAPHICS_OUTPUT_BLT_PIXEL *)background,
-                          EfiBltVideoFill, 0, 0, 0, 0,
-                          GraphicsOutput->Mode->Info->HorizontalResolution,
-                          GraphicsOutput->Mode->Info->VerticalResolution, 0);
+        err = GraphicsOutput->Blt(
+                        GraphicsOutput, &background,
+                        EfiBltVideoFill, 0, 0, 0, 0,
+                        GraphicsOutput->Mode->Info->HorizontalResolution,
+                        GraphicsOutput->Mode->Info->VerticalResolution, 0);
+        if (err != EFI_SUCCESS)
+                return err;
 
         /* EFI buffer */
-        blt_size = sizeof(EFI_GRAPHICS_OUTPUT_BLT_PIXEL) * dib->x * dib->y;
-        blt = AllocatePool(blt_size);
-        if (!blt)
-                return EFI_OUT_OF_RESOURCES;
+        blt = xnew(EFI_GRAPHICS_OUTPUT_BLT_PIXEL, dib->x * dib->y);
 
-        err = uefi_call_wrapper(GraphicsOutput->Blt, 10, GraphicsOutput,
-                                blt, EfiBltVideoToBltBuffer, x_pos, y_pos, 0, 0,
-                                dib->x, dib->y, 0);
-        if (EFI_ERROR(err))
+        err = GraphicsOutput->Blt(
+                        GraphicsOutput, blt,
+                        EfiBltVideoToBltBuffer, x_pos, y_pos, 0, 0,
+                        dib->x, dib->y, 0);
+        if (err != EFI_SUCCESS)
                 return err;
 
         err = bmp_to_blt(blt, dib, map, pixmap);
-        if (EFI_ERROR(err))
+        if (err != EFI_SUCCESS)
                 return err;
 
-        err = graphics_mode(TRUE);
-        if (EFI_ERROR(err))
+        err = graphics_mode(true);
+        if (err != EFI_SUCCESS)
                 return err;
 
-        return uefi_call_wrapper(GraphicsOutput->Blt, 10, GraphicsOutput,
-                                 blt, EfiBltBufferToVideo, 0, 0, x_pos, y_pos,
-                                 dib->x, dib->y, 0);
+        return GraphicsOutput->Blt(
+                        GraphicsOutput, blt,
+                        EfiBltBufferToVideo, 0, 0, x_pos, y_pos,
+                        dib->x, dib->y, 0);
 }

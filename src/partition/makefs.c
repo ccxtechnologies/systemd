@@ -49,7 +49,7 @@ static int run(int argc, char *argv[]) {
                 if (lock_fd < 0)
                         return log_error_errno(lock_fd, "Failed to lock whole block device of \"%s\": %m", device);
         } else
-                log_info("%s is not a block device.", device);
+                log_debug("%s is not a block device, no need to lock.", device);
 
         r = probe_filesystem(device, &detected);
         if (r == -EUCLEAN)
@@ -65,7 +65,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to generate UUID for file system: %m");
 
-        return make_filesystem(device, fstype, basename(device), uuid, true);
+        return make_filesystem(device, fstype, basename(device), NULL, uuid, true);
 }
 
 DEFINE_MAIN_FUNCTION(run);

@@ -104,6 +104,8 @@ Job* job_free(Job *j) {
         sd_bus_track_unref(j->bus_track);
         strv_free(j->deserialized_clients);
 
+        activation_details_unref(j->activation_details);
+
         return mfree(j);
 }
 
@@ -140,7 +142,7 @@ void job_uninstall(Job *j) {
 
         job_set_state(j, JOB_WAITING);
 
-        pj = (j->type == JOB_NOP) ? &j->unit->nop_job : &j->unit->job;
+        pj = j->type == JOB_NOP ? &j->unit->nop_job : &j->unit->job;
         assert(*pj == j);
 
         /* Detach from next 'bigger' objects */
@@ -180,9 +182,13 @@ static void job_merge_into_installed(Job *j, Job *other) {
         assert(j->installed);
         assert(j->unit == other->unit);
 
-        if (j->type != JOB_NOP)
+        if (j->type != JOB_NOP) {
                 assert_se(job_type_merge_and_collapse(&j->type, other->type, j->unit) == 0);
-        else
+
+                /* Keep the oldest ActivationDetails, if any */
+                if (!j->activation_details)
+                        j->activation_details = TAKE_PTR(other->activation_details);
+        } else
                 assert(other->type == JOB_NOP);
 
         j->irreversible = j->irreversible || other->irreversible;
@@ -197,7 +203,7 @@ Job* job_install(Job *j) {
         assert(j->type < _JOB_TYPE_MAX_IN_TRANSACTION);
         assert(j->state == JOB_WAITING);
 
-        pj = (j->type == JOB_NOP) ? &j->unit->nop_job : &j->unit->job;
+        pj = j->type == JOB_NOP ? &j->unit->nop_job : &j->unit->job;
         uj = *pj;
 
         if (uj) {
@@ -258,7 +264,7 @@ int job_install_deserialized(Job *j) {
                                        "Invalid job type %s in deserialization.",
                                        strna(job_type_to_string(j->type)));
 
-        pj = (j->type == JOB_NOP) ? &j->unit->nop_job : &j->unit->job;
+        pj = j->type == JOB_NOP ? &j->unit->nop_job : &j->unit->job;
         if (*pj)
                 return log_unit_debug_errno(j->unit, SYNTHETIC_ERRNO(EEXIST),
                                             "Unit already has a job installed. Not installing deserialized job.");
@@ -400,14 +406,28 @@ bool job_type_is_redundant(JobType a, UnitActiveState b) {
                         b == UNIT_RELOADING;
 
         case JOB_RESTART:
-                return
-                        b == UNIT_ACTIVATING;
+                /* Restart jobs must always be kept.
+                 *
+                 * For ACTIVE/RELOADING units, this is obvious.
+                 *
+                 * For ACTIVATING units, it's more subtle:
+                 *
+                 * Generally, if a service Requires= another unit, restarts of
+                 * the unit must be propagated to the service. If the service is
+                 * ACTIVATING, it must still be restarted since it might have
+                 * stale information regarding the other unit.
+                 *
+                 * For example, consider a service that Requires= a socket: if
+                 * the socket is restarted, but the service is still ACTIVATING,
+                 * it's necessary to restart the service so that it gets the new
+                 * socket. */
+                return false;
 
         case JOB_NOP:
                 return true;
 
         default:
-                assert_not_reached("Invalid job type");
+                assert_not_reached();
         }
 }
 
@@ -417,8 +437,12 @@ JobType job_type_collapse(JobType t, Unit *u) {
         switch (t) {
 
         case JOB_TRY_RESTART:
+                /* Be sure to keep the restart job even if the unit is
+                 * ACTIVATING.
+                 *
+                 * See the job_type_is_redundant(JOB_RESTART) for more info */
                 s = unit_active_state(u);
-                if (!UNIT_IS_ACTIVE_OR_RELOADING(s))
+                if (!UNIT_IS_ACTIVE_OR_ACTIVATING(s))
                         return JOB_NOP;
 
                 return JOB_RESTART;
@@ -604,7 +628,7 @@ static const char* job_done_message_format(Unit *u, JobType t, JobResult result)
         assert(t >= 0);
         assert(t < _JOB_TYPE_MAX);
 
-        /* Show condition check message if the job did not actually do anything due to failed condition. */
+        /* Show condition check message if the job did not actually do anything due to unmet condition. */
         if (t == JOB_START && result == JOB_DONE && !u->condition_result)
                 return "Condition check resulted in %s being skipped.";
 
@@ -696,7 +720,7 @@ static void job_emit_done_message(Unit *u, uint32_t job_id, JobType t, JobResult
         bool console_only = do_console && log_on_console();
 
         if (t == JOB_START && result == JOB_DONE && !u->condition_result) {
-                /* No message on the console if the job did not actually do anything due to failed condition. */
+                /* No message on the console if the job did not actually do anything due to unmet condition. */
                 if (console_only)
                         return;
                 else
@@ -705,19 +729,51 @@ static void job_emit_done_message(Unit *u, uint32_t job_id, JobType t, JobResult
 
         if (!console_only) {  /* Skip printing if output goes to the console, and job_print_status_message()
                                * will actually print something to the console. */
-
+                Condition *c;
                 const char *mid = job_done_mid(t, result);  /* mid may be NULL. log_unit_struct() will ignore it. */
-                const char *msg_fmt = strjoina("MESSAGE=", format);
 
-                DISABLE_WARNING_FORMAT_NONLITERAL;
-                log_unit_struct(u, job_done_messages[result].log_level,
-                                msg_fmt, ident,
-                                "JOB_ID=%" PRIu32, job_id,
-                                "JOB_TYPE=%s", job_type_to_string(t),
-                                "JOB_RESULT=%s", job_result_to_string(result),
-                                LOG_UNIT_INVOCATION_ID(u),
-                                mid);
-                REENABLE_WARNING;
+                c = t == JOB_START && result == JOB_DONE ? unit_find_failed_condition(u) : NULL;
+                if (c) {
+                        /* Special case units that were skipped because of a unmet condition check so that
+                         * we can add more information to the message. */
+                        if (c->trigger)
+                                log_unit_struct(
+                                        u,
+                                        job_done_messages[result].log_level,
+                                        LOG_MESSAGE("%s was skipped because no trigger condition checks were met.",
+                                                    ident),
+                                        "JOB_ID=%" PRIu32, job_id,
+                                        "JOB_TYPE=%s", job_type_to_string(t),
+                                        "JOB_RESULT=%s", job_result_to_string(result),
+                                        LOG_UNIT_INVOCATION_ID(u),
+                                        mid);
+                        else
+                                log_unit_struct(
+                                        u,
+                                        job_done_messages[result].log_level,
+                                        LOG_MESSAGE("%s was skipped because of an unmet condition check (%s=%s%s).",
+                                                    ident,
+                                                    condition_type_to_string(c->type),
+                                                    c->negate ? "!" : "",
+                                                    c->parameter),
+                                        "JOB_ID=%" PRIu32, job_id,
+                                        "JOB_TYPE=%s", job_type_to_string(t),
+                                        "JOB_RESULT=%s", job_result_to_string(result),
+                                        LOG_UNIT_INVOCATION_ID(u),
+                                        mid);
+                } else {
+                        const char *msg_fmt = strjoina("MESSAGE=", format);
+
+                        DISABLE_WARNING_FORMAT_NONLITERAL;
+                        log_unit_struct(u, job_done_messages[result].log_level,
+                                        msg_fmt, ident,
+                                        "JOB_ID=%" PRIu32, job_id,
+                                        "JOB_TYPE=%s", job_type_to_string(t),
+                                        "JOB_RESULT=%s", job_result_to_string(result),
+                                        LOG_UNIT_INVOCATION_ID(u),
+                                        mid);
+                        REENABLE_WARNING;
+                }
         }
 
         if (do_console) {
@@ -744,6 +800,7 @@ static void job_emit_done_message(Unit *u, uint32_t job_id, JobType t, JobResult
 }
 
 static int job_perform_on_unit(Job **j) {
+        ActivationDetails *a;
         uint32_t id;
         Manager *m;
         JobType t;
@@ -763,10 +820,11 @@ static int job_perform_on_unit(Job **j) {
         u = (*j)->unit;
         t = (*j)->type;
         id = (*j)->id;
+        a = (*j)->activation_details;
 
         switch (t) {
                 case JOB_START:
-                        r = unit_start(u);
+                        r = unit_start(u, a);
                         break;
 
                 case JOB_RESTART:
@@ -781,7 +839,7 @@ static int job_perform_on_unit(Job **j) {
                         break;
 
                 default:
-                        assert_not_reached("Invalid job type");
+                        assert_not_reached();
         }
 
         /* Log if the job still exists and the start/stop/reload function actually did something. Note that this means
@@ -849,7 +907,7 @@ int job_run_and_invalidate(Job *j) {
                         break;
 
                 default:
-                        assert_not_reached("Unknown job type");
+                        assert_not_reached();
         }
 
         if (j) {
@@ -857,7 +915,7 @@ int job_run_and_invalidate(Job *j) {
                         job_set_state(j, JOB_WAITING); /* Hmm, not ready after all, let's return to JOB_WAITING state */
                 else if (r == -EALREADY) /* already being executed */
                         r = job_finish_and_invalidate(j, JOB_DONE, true, true);
-                else if (r == -ECOMM)    /* condition failed, but all is good */
+                else if (r == -ECOMM)
                         r = job_finish_and_invalidate(j, JOB_DONE, true, false);
                 else if (r == -EBADR)
                         r = job_finish_and_invalidate(j, JOB_SKIPPED, true, false);
@@ -999,10 +1057,9 @@ finish:
 }
 
 static int job_dispatch_timer(sd_event_source *s, uint64_t monotonic, void *userdata) {
-        Job *j = userdata;
+        Job *j = ASSERT_PTR(userdata);
         Unit *u;
 
-        assert(j);
         assert(s == j->timer_event_source);
 
         log_unit_warning(j->unit, "Job %s/%s timed out.", j->unit->id, job_type_to_string(j->type));
@@ -1075,17 +1132,13 @@ void job_add_to_run_queue(Job *j) {
         if (j->in_run_queue)
                 return;
 
-        if (prioq_isempty(j->manager->run_queue)) {
-                r = sd_event_source_set_enabled(j->manager->run_queue_event_source, SD_EVENT_ONESHOT);
-                if (r < 0)
-                        log_warning_errno(r, "Failed to enable job run queue event source, ignoring: %m");
-        }
-
         r = prioq_put(j->manager->run_queue, j, &j->run_queue_idx);
         if (r < 0)
                 log_warning_errno(r, "Failed put job in run queue, ignoring: %m");
         else
                 j->in_run_queue = true;
+
+        manager_trigger_run_queue(j->manager);
 }
 
 void job_add_to_dbus_queue(Job *j) {
@@ -1131,6 +1184,8 @@ int job_serialize(Job *j, FILE *f) {
                 (void) serialize_usec(f, "job-begin-running", j->begin_running_usec);
 
         bus_track_serialize(j->bus_track, f, "subscribed");
+
+        activation_details_serialize(j->activation_details, f);
 
         /* End marker */
         fputc('\n', f);
@@ -1229,6 +1284,11 @@ int job_deserialize(Job *j, FILE *f) {
                 else if (streq(l, "subscribed")) {
                         if (strv_extend(&j->deserialized_clients, v) < 0)
                                 return log_oom();
+
+                } else if (startswith(l, "activation-details")) {
+                        if (activation_details_deserialize(l, v, &j->activation_details) < 0)
+                                log_debug("Failed to parse job ActivationDetails element: %s", v);
+
                 } else
                         log_debug("Unknown job serialization key: %s", l);
         }
@@ -1303,6 +1363,8 @@ void job_shutdown_magic(Job *j) {
         /* In case messages on console has been disabled on boot */
         j->unit->manager->no_console_output = false;
 
+        manager_invalidate_startup_units(j->unit->manager);
+
         if (detect_container() > 0)
                 return;
 
@@ -1311,10 +1373,8 @@ void job_shutdown_magic(Job *j) {
 
 int job_get_timeout(Job *j, usec_t *timeout) {
         usec_t x = USEC_INFINITY, y = USEC_INFINITY;
-        Unit *u = j->unit;
+        Unit *u = ASSERT_PTR(ASSERT_PTR(j)->unit);
         int r;
-
-        assert(u);
 
         if (j->timer_event_source) {
                 r = sd_event_source_get_time(j->timer_event_source, &x);
@@ -1511,44 +1571,44 @@ static const char* const job_state_table[_JOB_STATE_MAX] = {
 DEFINE_STRING_TABLE_LOOKUP(job_state, JobState);
 
 static const char* const job_type_table[_JOB_TYPE_MAX] = {
-        [JOB_START] = "start",
-        [JOB_VERIFY_ACTIVE] = "verify-active",
-        [JOB_STOP] = "stop",
-        [JOB_RELOAD] = "reload",
+        [JOB_START]           = "start",
+        [JOB_VERIFY_ACTIVE]   = "verify-active",
+        [JOB_STOP]            = "stop",
+        [JOB_RELOAD]          = "reload",
         [JOB_RELOAD_OR_START] = "reload-or-start",
-        [JOB_RESTART] = "restart",
-        [JOB_TRY_RESTART] = "try-restart",
-        [JOB_TRY_RELOAD] = "try-reload",
-        [JOB_NOP] = "nop",
+        [JOB_RESTART]         = "restart",
+        [JOB_TRY_RESTART]     = "try-restart",
+        [JOB_TRY_RELOAD]      = "try-reload",
+        [JOB_NOP]             = "nop",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(job_type, JobType);
 
 static const char* const job_mode_table[_JOB_MODE_MAX] = {
-        [JOB_FAIL] = "fail",
-        [JOB_REPLACE] = "replace",
+        [JOB_FAIL]                 = "fail",
+        [JOB_REPLACE]              = "replace",
         [JOB_REPLACE_IRREVERSIBLY] = "replace-irreversibly",
-        [JOB_ISOLATE] = "isolate",
-        [JOB_FLUSH] = "flush",
-        [JOB_IGNORE_DEPENDENCIES] = "ignore-dependencies",
-        [JOB_IGNORE_REQUIREMENTS] = "ignore-requirements",
-        [JOB_TRIGGERING] = "triggering",
+        [JOB_ISOLATE]              = "isolate",
+        [JOB_FLUSH]                = "flush",
+        [JOB_IGNORE_DEPENDENCIES]  = "ignore-dependencies",
+        [JOB_IGNORE_REQUIREMENTS]  = "ignore-requirements",
+        [JOB_TRIGGERING]           = "triggering",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(job_mode, JobMode);
 
 static const char* const job_result_table[_JOB_RESULT_MAX] = {
-        [JOB_DONE] = "done",
-        [JOB_CANCELED] = "canceled",
-        [JOB_TIMEOUT] = "timeout",
-        [JOB_FAILED] = "failed",
-        [JOB_DEPENDENCY] = "dependency",
-        [JOB_SKIPPED] = "skipped",
-        [JOB_INVALID] = "invalid",
-        [JOB_ASSERT] = "assert",
+        [JOB_DONE]        = "done",
+        [JOB_CANCELED]    = "canceled",
+        [JOB_TIMEOUT]     = "timeout",
+        [JOB_FAILED]      = "failed",
+        [JOB_DEPENDENCY]  = "dependency",
+        [JOB_SKIPPED]     = "skipped",
+        [JOB_INVALID]     = "invalid",
+        [JOB_ASSERT]      = "assert",
         [JOB_UNSUPPORTED] = "unsupported",
-        [JOB_COLLECTED] = "collected",
-        [JOB_ONCE] = "once",
+        [JOB_COLLECTED]   = "collected",
+        [JOB_ONCE]        = "once",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(job_result, JobResult);
@@ -1605,4 +1665,12 @@ int job_compare(Job *a, Job *b, UnitDependencyAtom assume_dep) {
                 return 1;
         else
                 return -1;
+}
+
+void job_set_activation_details(Job *j, ActivationDetails *info) {
+        /* Existing (older) ActivationDetails win, newer ones are discarded. */
+        if (!j || j->activation_details || !info)
+                return; /* Nothing to do. */
+
+        j->activation_details = activation_details_ref(info);
 }

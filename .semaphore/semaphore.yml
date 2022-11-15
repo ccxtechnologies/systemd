@@ -1,4 +1,5 @@
 ---
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # vi: ts=2 sw=2 et:
 
 version: v1.0
@@ -6,7 +7,7 @@ name: Debian autopkgtest (LXC)
 agent:
   machine:
     type: e1-standard-2
-    os_image: ubuntu1804
+    os_image: ubuntu2004
 
 # Cancel any running or queued job for the same ref
 auto_cancel:

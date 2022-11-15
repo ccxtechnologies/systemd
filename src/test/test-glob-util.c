@@ -10,11 +10,31 @@
 #include "glob-util.h"
 #include "macro.h"
 #include "rm-rf.h"
+#include "tests.h"
 #include "tmpfile-util.h"
 
-static void test_glob_exists(void) {
-        log_info("/* %s */", __func__);
+TEST(glob_first) {
+        char *first, name[] = "/tmp/test-glob_first.XXXXXX";
+        int fd = -1;
+        int r;
 
+        fd = mkostemp_safe(name);
+        assert_se(fd >= 0);
+        close(fd);
+
+        r = glob_first("/tmp/test-glob_first*", &first);
+        assert_se(r == 1);
+        assert_se(streq(name, first));
+        first = mfree(first);
+
+        r = unlink(name);
+        assert_se(r == 0);
+        r = glob_first("/tmp/test-glob_first*", &first);
+        assert_se(r == 0);
+        assert_se(first == NULL);
+}
+
+TEST(glob_exists) {
         char name[] = "/tmp/test-glob_exists.XXXXXX";
         int fd = -1;
         int r;
@@ -36,7 +56,7 @@ static void closedir_wrapper(void* v) {
         (void) closedir(v);
 }
 
-static void test_glob_no_dot(void) {
+TEST(glob_no_dot) {
         char template[] = "/tmp/test-glob-util.XXXXXXX";
         const char *fn;
 
@@ -49,8 +69,6 @@ static void test_glob_no_dot(void) {
         };
 
         int r;
-
-        log_info("/* %s */", __func__);
 
         assert_se(mkdtemp(template));
 
@@ -65,14 +83,12 @@ static void test_glob_no_dot(void) {
         (void) rm_rf(template, REMOVE_ROOT|REMOVE_PHYSICAL);
 }
 
-static void test_safe_glob(void) {
+TEST(safe_glob) {
         char template[] = "/tmp/test-glob-util.XXXXXXX";
         const char *fn, *fn2, *fname;
 
         _cleanup_globfree_ glob_t g = {};
         int r;
-
-        log_info("/* %s */", __func__);
 
         assert_se(mkdtemp(template));
 
@@ -106,9 +122,7 @@ static void test_glob_non_glob_prefix_one(const char *path, const char *expected
         assert_se(streq(t, expected));
 }
 
-static void test_glob_non_glob(void) {
-        log_info("/* %s */", __func__);
-
+TEST(glob_non_glob) {
         test_glob_non_glob_prefix_one("/tmp/.X11-*", "/tmp/");
         test_glob_non_glob_prefix_one("/tmp/*", "/tmp/");
         test_glob_non_glob_prefix_one("/tmp*", "/");
@@ -120,11 +134,4 @@ static void test_glob_non_glob(void) {
         assert_se(glob_non_glob_prefix("?", &x) == -ENOENT);
 }
 
-int main(void) {
-        test_glob_exists();
-        test_glob_no_dot();
-        test_safe_glob();
-        test_glob_non_glob();
-
-        return 0;
-}
+DEFINE_TEST_MAIN(LOG_INFO);

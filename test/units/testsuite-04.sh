@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
 set -eux
 set -o pipefail
 
@@ -7,7 +8,7 @@ trap "journalctl --rotate --vacuum-size=16M" EXIT
 
 # Rotation/flush test, see https://github.com/systemd/systemd/issues/19895
 journalctl --relinquish-var
-for i in {0..50}; do
+for _ in {0..50}; do
     dd if=/dev/urandom bs=1M count=1 | base64 | systemd-cat
 done
 journalctl --rotate
@@ -92,7 +93,7 @@ cmp /expected /output
 ID=$(systemd-id128 new)
 systemd-cat -t "$ID" bash -c 'echo parent; (echo child) & wait' &
 PID=$!
-wait %%
+wait $PID
 journalctl --sync
 # We can drop this grep when https://github.com/systemd/systemd/issues/13937
 # has a fix.
@@ -116,7 +117,45 @@ cmp /expected /output
 # test that LogLevelMax can also suppress logging about services, not only by services
 systemctl start silent-success
 journalctl --sync
-[[ -z `journalctl -b -q -u silent-success.service` ]]
+[[ -z "$(journalctl -b -q -u silent-success.service)" ]]
+
+# Exercise the matching machinery
+SYSTEMD_LOG_LEVEL=debug journalctl -b -n 1 /dev/null /dev/zero /dev/null /dev/null /dev/null
+journalctl -b -n 1 /bin/true /bin/false
+journalctl -b -n 1 /bin/true + /bin/false
+journalctl -b -n 1 -r --unit "systemd*"
+
+systemd-run --user -M "testuser@.host" /bin/echo hello
+journalctl --sync
+journalctl -b -n 1 -r --user-unit "*"
+
+(! journalctl -b /dev/lets-hope-this-doesnt-exist)
+(! journalctl -b /dev/null /dev/zero /dev/this-also-shouldnt-exist)
+(! journalctl -b --unit "this-unit-should-not-exist*")
+
+# Facilities & priorities
+journalctl --facility help
+journalctl --facility kern -n 1
+journalctl --facility syslog --priority 0..3 -n 1
+journalctl --facility syslog --priority 3..0 -n 1
+journalctl --facility user --priority 0..0 -n 1
+journalctl --facility daemon --priority warning -n 1
+journalctl --facility daemon --priority warning..info -n 1
+journalctl --facility daemon --priority notice..crit -n 1
+journalctl --facility daemon --priority 5..crit -n 1
+
+(! journalctl --facility hopefully-an-unknown-facility)
+(! journalctl --priority hello-world)
+(! journalctl --priority 0..128)
+(! journalctl --priority 0..systemd)
+
+# Other options
+journalctl --disk-usage
+journalctl --dmesg -n 1
+journalctl --fields
+journalctl --list-boots
+journalctl --update-catalog
+journalctl --list-catalog
 
 # Add new tests before here, the journald restarts below
 # may make tests flappy.

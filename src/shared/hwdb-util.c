@@ -12,7 +12,7 @@
 #include "hwdb-internal.h"
 #include "hwdb-util.h"
 #include "label.h"
-#include "mkdir.h"
+#include "mkdir-label.h"
 #include "nulstr-util.h"
 #include "path-util.h"
 #include "sort-util.h"
@@ -434,7 +434,7 @@ static int trie_store(struct trie *trie, const char *filename, bool compat) {
 
 static int insert_data(struct trie *trie, char **match_list, char *line, const char *filename,
                        uint16_t file_priority, uint32_t line_number, bool compat) {
-        char *value, **entry;
+        char *value;
 
         assert(line[0] == ' ');
 
@@ -583,7 +583,6 @@ int hwdb_update(const char *root, const char *hwdb_bin_dir, bool strict, bool co
         _cleanup_free_ char *hwdb_bin = NULL;
         _cleanup_(trie_freep) struct trie *trie = NULL;
         _cleanup_strv_free_ char **files = NULL;
-        char **f;
         uint16_t file_priority = 1;
         int r = 0, err;
 
@@ -639,7 +638,7 @@ int hwdb_update(const char *root, const char *hwdb_bin_dir, bool strict, bool co
         if (!hwdb_bin)
                 return -ENOMEM;
 
-        mkdir_parents_label(hwdb_bin, 0755);
+        (void) mkdir_parents_label(hwdb_bin, 0755);
         err = trie_store(trie, hwdb_bin, compat);
         if (err < 0)
                 return log_error_errno(err, "Failed to write database %s: %m", hwdb_bin);
@@ -651,14 +650,27 @@ int hwdb_update(const char *root, const char *hwdb_bin_dir, bool strict, bool co
         return r;
 }
 
-int hwdb_query(const char *modalias) {
+int hwdb_query(const char *modalias, const char *root) {
         _cleanup_(sd_hwdb_unrefp) sd_hwdb *hwdb = NULL;
-        const char *key, *value;
+        const char *key, *value, *p;
         int r;
 
         assert(modalias);
 
-        r = sd_hwdb_new(&hwdb);
+        if (!isempty(root))
+                NULSTR_FOREACH(p, hwdb_bin_paths) {
+                        _cleanup_free_ char *hwdb_bin = NULL;
+
+                        hwdb_bin = path_join(root, p);
+                        if (!hwdb_bin)
+                                return -ENOMEM;
+
+                        r = sd_hwdb_new_from_path(hwdb_bin, &hwdb);
+                        if (r >= 0)
+                                break;
+                }
+        else
+                r = sd_hwdb_new(&hwdb);
         if (r < 0)
                 return r;
 
@@ -668,7 +680,7 @@ int hwdb_query(const char *modalias) {
         return 0;
 }
 
-bool hwdb_validate(sd_hwdb *hwdb) {
+bool hwdb_should_reload(sd_hwdb *hwdb) {
         bool found = false;
         const char* p;
         struct stat st;

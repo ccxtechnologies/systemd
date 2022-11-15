@@ -12,9 +12,12 @@
 
 #include "alloc-util.h"
 #include "bus-error.h"
+#include "bus-locator.h"
 #include "bus-util.h"
+#include "chase-symlinks.h"
 #include "compress.h"
 #include "def.h"
+#include "dissect-image.h"
 #include "fd-util.h"
 #include "format-table.h"
 #include "fs-util.h"
@@ -24,6 +27,7 @@
 #include "log.h"
 #include "macro.h"
 #include "main-func.h"
+#include "mount-util.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
@@ -48,6 +52,8 @@ static const char* arg_field = NULL;
 static const char *arg_debugger = NULL;
 static char **arg_debugger_args = NULL;
 static const char *arg_directory = NULL;
+static char *arg_root = NULL;
+static char *arg_image = NULL;
 static char **arg_file = NULL;
 static JsonFormatFlags arg_json_format_flags = JSON_FORMAT_OFF;
 static PagerFlags arg_pager_flags = 0;
@@ -56,6 +62,7 @@ static size_t arg_rows_max = SIZE_MAX;
 static const char* arg_output = NULL;
 static bool arg_reverse = false;
 static bool arg_quiet = false;
+static bool arg_all = false;
 
 STATIC_DESTRUCTOR_REGISTER(arg_debugger_args, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_file, strv_freep);
@@ -90,7 +97,6 @@ static int add_match(sd_journal *j, const char *match) {
 }
 
 static int add_matches(sd_journal *j, char **matches) {
-        char **match;
         int r;
 
         r = sd_journal_add_match(j, "MESSAGE_ID=" SD_MESSAGE_COREDUMP_STR, 0);
@@ -120,12 +126,16 @@ static int acquire_journal(sd_journal **ret, char **matches) {
                 r = sd_journal_open_directory(&j, arg_directory, 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to open journals in directory: %s: %m", arg_directory);
+        } else if (arg_root) {
+                r = sd_journal_open_directory(&j, arg_root, SD_JOURNAL_OS_ROOT);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to open journals in root directory: %s: %m", arg_root);
         } else if (arg_file) {
                 r = sd_journal_open_files(&j, (const char**)arg_file, 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to open journal files: %m");
         } else {
-                r = sd_journal_open(&j, SD_JOURNAL_LOCAL_ONLY);
+                r = sd_journal_open(&j, arg_all ? 0 : SD_JOURNAL_LOCAL_ONLY);
                 if (r < 0)
                         return log_error_errno(r, "Failed to open journal: %m");
         }
@@ -184,6 +194,9 @@ static int verb_help(int argc, char **argv, void *userdata) {
                "     --file=PATH               Use journal file\n"
                "  -D --directory=DIR           Use journal files from directory\n\n"
                "  -q --quiet                   Do not show info messages and privilege warning\n"
+               "     --all                     Look at all journal files instead of local ones\n"
+               "     --root=PATH               Operate on an alternate filesystem root\n"
+               "     --image=PATH              Operate on disk image as filesystem root\n"
                "\nSee the %2$s for details.\n",
                program_invocation_short_name,
                link,
@@ -203,6 +216,9 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_JSON,
                 ARG_DEBUGGER,
                 ARG_FILE,
+                ARG_ROOT,
+                ARG_IMAGE,
+                ARG_ALL,
         };
 
         int c, r;
@@ -223,6 +239,9 @@ static int parse_argv(int argc, char *argv[]) {
                 { "until",              required_argument, NULL, 'U'           },
                 { "quiet",              no_argument,       NULL, 'q'           },
                 { "json",               required_argument, NULL, ARG_JSON      },
+                { "root",               required_argument, NULL, ARG_ROOT      },
+                { "image",              required_argument, NULL, ARG_IMAGE     },
+                { "all",                no_argument,       NULL, ARG_ALL       },
                 {}
         };
 
@@ -230,7 +249,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argv);
 
         while ((c = getopt_long(argc, argv, "hA:o:F:1D:rS:U:qn:", options, NULL)) >= 0)
-                switch(c) {
+                switch (c) {
                 case 'h':
                         return verb_help(0, NULL, NULL);
 
@@ -312,6 +331,18 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_directory = optarg;
                         break;
 
+                case ARG_ROOT:
+                        r = parse_path_argument(optarg, false, &arg_root);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                case ARG_IMAGE:
+                        r = parse_path_argument(optarg, false, &arg_image);
+                        if (r < 0)
+                                return r;
+                        break;
+
                 case 'r':
                         arg_reverse = true;
                         break;
@@ -327,17 +358,24 @@ static int parse_argv(int argc, char *argv[]) {
 
                         break;
 
+                case ARG_ALL:
+                        arg_all = true;
+                        break;
+
                 case '?':
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
 
         if (arg_since != USEC_INFINITY && arg_until != USEC_INFINITY &&
             arg_since > arg_until)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "--since= must be before --until=.");
+
+        if ((!!arg_directory + !!arg_image + !!arg_root) > 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Please specify either --root=, --image= or -D/--directory=, the combination of these options is not supported.");
 
         return 1;
 }
@@ -459,6 +497,25 @@ error:
         *ret_size = UINT64_MAX;
 }
 
+static int resolve_filename(const char *root, char **p) {
+        char *resolved = NULL;
+        int r;
+
+        if (!*p)
+                return 0;
+
+        r = chase_symlinks(*p, root, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &resolved, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to resolve \"%s%s\": %m", strempty(root), *p);
+
+        free_and_replace(*p, resolved);
+
+        /* chase_symlinks() with flag CHASE_NONEXISTENT will return 0 if the file doesn't exist and 1 if it does.
+         * Return that to the caller
+         */
+        return r;
+}
+
 static int print_list(FILE* file, sd_journal *j, Table *t) {
         _cleanup_free_ char
                 *mid = NULL, *pid = NULL, *uid = NULL, *gid = NULL,
@@ -507,9 +564,13 @@ static int print_list(FILE* file, sd_journal *j, Table *t) {
 
         normal_coredump = streq_ptr(mid, SD_MESSAGE_COREDUMP_STR);
 
-        if (filename)
+        if (filename) {
+                r = resolve_filename(arg_root, &filename);
+                if (r < 0)
+                        return r;
+
                 analyze_coredump_file(filename, &present, &color, &size);
-        else if (coredump)
+        } else if (coredump)
                 present = "journal";
         else if (normal_coredump) {
                 present = "none";
@@ -554,6 +615,8 @@ static int print_info(FILE *file, sd_journal *j, bool need_space) {
 
         assert(file);
         assert(j);
+
+        (void) sd_journal_set_data_threshold(j, 0);
 
         SD_JOURNAL_FOREACH_DATA(j, d, l) {
                 RETRIEVE(d, l, "MESSAGE_ID", mid);
@@ -645,15 +708,11 @@ static int print_info(FILE *file, sd_journal *j, bool need_space) {
                 usec_t u;
 
                 r = safe_atou64(timestamp, &u);
-                if (r >= 0) {
-                        char absolute[FORMAT_TIMESTAMP_MAX], relative[FORMAT_TIMESPAN_MAX];
+                if (r >= 0)
+                        fprintf(file, "     Timestamp: %s (%s)\n",
+                                FORMAT_TIMESTAMP(u), FORMAT_TIMESTAMP_RELATIVE(u));
 
-                        fprintf(file,
-                                "     Timestamp: %s (%s)\n",
-                                format_timestamp(absolute, sizeof(absolute), u),
-                                format_timestamp_relative(relative, sizeof(relative), u));
-
-                } else
+                else
                         fprintf(file, "     Timestamp: %s\n", timestamp);
         }
 
@@ -695,9 +754,12 @@ static int print_info(FILE *file, sd_journal *j, bool need_space) {
                 fprintf(file, "      Hostname: %s\n", hostname);
 
         if (filename) {
+                r = resolve_filename(arg_root, &filename);
+                if (r < 0)
+                        return r;
+
                 const char *state = NULL, *color = NULL;
                 uint64_t size = UINT64_MAX;
-                char buf[FORMAT_BYTES_MAX];
 
                 analyze_coredump_file(filename, &state, &color, &size);
 
@@ -712,9 +774,8 @@ static int print_info(FILE *file, sd_journal *j, bool need_space) {
                         ansi_normal());
 
                 if (size != UINT64_MAX)
-                        fprintf(file,
-                                "     Disk Size: %s\n",
-                                format_bytes(buf, sizeof(buf), size));
+                        fprintf(file, "  Size on Disk: %s\n", FORMAT_BYTES(size));
+
         } else if (coredump)
                 fprintf(file, "       Storage: journal\n");
         else
@@ -818,9 +879,9 @@ static int dump_list(int argc, char **argv, void *userdata) {
                 (void) table_set_align_percent(t, TABLE_HEADER_CELL(3), 100);
                 (void) table_set_align_percent(t, TABLE_HEADER_CELL(7), 100);
 
-                (void) table_set_empty_string(t, "-");
+                table_set_ersatz_string(t, TABLE_ERSATZ_DASH);
         } else
-                (void) pager_open(arg_pager_flags);
+                pager_open(arg_pager_flags);
 
         /* "info" without pattern implies "-1" */
         if ((arg_rows_max == 1 && arg_reverse) || (verb_is_info && argc == 1)) {
@@ -911,13 +972,18 @@ static int save_core(sd_journal *j, FILE *file, char **path, bool *unlink_temp) 
         /* Look for a coredump on disk first. */
         r = sd_journal_get_data(j, "COREDUMP_FILENAME", (const void**) &data, &len);
         if (r == 0) {
+                _cleanup_free_ char *resolved = NULL;
+
                 r = retrieve(data, len, "COREDUMP_FILENAME", &filename);
                 if (r < 0)
                         return r;
                 assert(r > 0);
 
-                if (access(filename, R_OK) < 0)
-                        return log_error_errno(errno, "File \"%s\" is not readable: %m", filename);
+                r = chase_symlinks_and_access(filename, arg_root, CHASE_PREFIX_ROOT, F_OK, &resolved, NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Cannot access \"%s%s\": %m", strempty(arg_root), filename);
+
+                free_and_replace(filename, resolved);
 
                 if (path && !ENDSWITH_SET(filename, ".xz", ".lz4", ".zst")) {
                         *path = TAKE_PTR(filename);
@@ -1138,6 +1204,10 @@ static int run_debug(int argc, char **argv, void *userdata) {
                 return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
                                        "Binary is not an absolute path.");
 
+        r = resolve_filename(arg_root, &exe);
+        if (r < 0)
+                return r;
+
         r = save_core(j, NULL, &path, &unlink_path);
         if (r < 0)
                 return r;
@@ -1145,6 +1215,24 @@ static int run_debug(int argc, char **argv, void *userdata) {
         r = strv_extend_strv(&debugger_call, STRV_MAKE(exe, "-c", path), false);
         if (r < 0)
                 return log_oom();
+
+        if (arg_root) {
+                if (streq(arg_debugger, "gdb")) {
+                        const char *sysroot_cmd;
+                        sysroot_cmd = strjoina("set sysroot ", arg_root);
+
+                        r = strv_extend_strv(&debugger_call, STRV_MAKE("-iex", sysroot_cmd), false);
+                        if (r < 0)
+                                return log_oom();
+                } else if (streq(arg_debugger, "lldb")) {
+                        const char *sysroot_cmd;
+                        sysroot_cmd = strjoina("platform select --sysroot ", arg_root, " host");
+
+                        r = strv_extend_strv(&debugger_call, STRV_MAKE("-O", sysroot_cmd), false);
+                        if (r < 0)
+                                return log_oom();
+                }
+        }
 
         /* Don't interfere with gdb and its handling of SIGINT. */
         (void) ignore_signals(SIGINT);
@@ -1186,16 +1274,14 @@ static int check_units_active(void) {
                 return false;
 
         r = sd_bus_default_system(&bus);
+        if (r == -ENOENT) {
+                log_debug("D-Bus is not running, skipping active unit check");
+                return 0;
+        }
         if (r < 0)
                 return log_error_errno(r, "Failed to acquire bus: %m");
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "ListUnitsByPatterns");
+        r = bus_message_new_method_call(bus, &m, bus_systemd_mgr, "ListUnitsByPatterns");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -1250,6 +1336,8 @@ static int coredumpctl_main(int argc, char *argv[]) {
 }
 
 static int run(int argc, char *argv[]) {
+        _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
+        _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
         int r, units_active;
 
         setlocale(LC_ALL, "");
@@ -1265,6 +1353,25 @@ static int run(int argc, char *argv[]) {
         sigbus_install();
 
         units_active = check_units_active(); /* error is treated the same as 0 */
+
+        if (arg_image) {
+                assert(!arg_root);
+
+                r = mount_image_privately_interactively(
+                                arg_image,
+                                DISSECT_IMAGE_GENERIC_ROOT |
+                                DISSECT_IMAGE_REQUIRE_ROOT |
+                                DISSECT_IMAGE_RELAX_VAR_CHECK |
+                                DISSECT_IMAGE_VALIDATE_OS,
+                                &mounted_dir,
+                                &loop_device);
+                if (r < 0)
+                        return r;
+
+                arg_root = strdup(mounted_dir);
+                if (!arg_root)
+                        return log_oom();
+        }
 
         r = coredumpctl_main(argc, argv);
 

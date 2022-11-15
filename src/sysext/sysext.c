@@ -2,10 +2,14 @@
 
 #include <fcntl.h>
 #include <getopt.h>
+#include <linux/loop.h>
+#include <sys/file.h>
 #include <sys/mount.h>
 #include <unistd.h>
 
 #include "capability-util.h"
+#include "chase-symlinks.h"
+#include "devnum-util.h"
 #include "discover-image.h"
 #include "dissect-image.h"
 #include "env-util.h"
@@ -29,7 +33,6 @@
 #include "pretty-print.h"
 #include "process-util.h"
 #include "sort-util.h"
-#include "stat-util.h"
 #include "terminal-util.h"
 #include "user-util.h"
 #include "verbs.h"
@@ -82,7 +85,7 @@ static int is_our_mount_point(const char *p) {
         if (r < 0)
                 return log_error_errno(r, "Failed to determine whether hierarchy '%s' contains '.systemd-sysext/dev': %m", p);
 
-        r = parse_dev(buf, &dev);
+        r = parse_devnum(buf, &dev);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse device major/minor stored in '.systemd-sysext/dev' file on '%s': %m", p);
 
@@ -122,7 +125,6 @@ static int unmerge_hierarchy(const char *p) {
 
 static int unmerge(void) {
         int r, ret = 0;
-        char **p;
 
         STRV_FOREACH(p, arg_hierarchies) {
                 _cleanup_free_ char *resolved = NULL;
@@ -159,13 +161,12 @@ static int verb_unmerge(int argc, char **argv, void *userdata) {
 static int verb_status(int argc, char **argv, void *userdata) {
         _cleanup_(table_unrefp) Table *t = NULL;
         int r, ret = 0;
-        char **p;
 
         t = table_new("hierarchy", "extensions", "since");
         if (!t)
                 return log_oom();
 
-        (void) table_set_empty_string(t, "-");
+        table_set_ersatz_string(t, TABLE_ERSATZ_DASH);
 
         STRV_FOREACH(p, arg_hierarchies) {
                 _cleanup_free_ char *resolved = NULL, *f = NULL, *buf = NULL;
@@ -243,7 +244,6 @@ static int mount_overlayfs(
 
         _cleanup_free_ char *options = NULL;
         bool separator = false;
-        char **l;
         int r;
 
         assert(where);
@@ -283,7 +283,6 @@ static int merge_hierarchy(
         _cleanup_free_ char *resolved_hierarchy = NULL, *f = NULL, *buf = NULL;
         _cleanup_strv_free_ char **layers = NULL;
         struct stat st;
-        char **p;
         int r;
 
         assert(hierarchy);
@@ -298,7 +297,7 @@ static int merge_hierarchy(
         else if (r < 0)
                 return log_error_errno(r, "Failed to resolve host hierarchy '%s': %m", hierarchy);
         else {
-                r = dir_is_empty(resolved_hierarchy);
+                r = dir_is_empty(resolved_hierarchy, /* ignore_hidden_or_backup= */ false);
                 if (r < 0)
                         return log_error_errno(r, "Failed to check if host hierarchy '%s' is empty: %m", resolved_hierarchy);
                 if (r > 0) {
@@ -339,7 +338,7 @@ static int merge_hierarchy(
                 if (r < 0)
                         return log_error_errno(r, "Failed to resolve hierarchy '%s' in extension '%s': %m", hierarchy, *p);
 
-                r = dir_is_empty(resolved);
+                r = dir_is_empty(resolved, /* ignore_hidden_or_backup= */ false);
                 if (r < 0)
                         return log_error_errno(r, "Failed to check if hierarchy '%s' in extension '%s' is empty: %m", resolved, *p);
                 if (r > 0) {
@@ -431,12 +430,17 @@ static int validate_version(
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Extension image contains /usr/lib/os-release file, which is not allowed (it may carry /etc/os-release), refusing.");
 
-        return extension_release_validate(
+        r = extension_release_validate(
                         img->name,
                         host_os_release_id,
                         host_os_release_version_id,
                         host_os_release_sysext_level,
+                        in_initrd() ? "initrd" : "system",
                         img->extension_release);
+        if (r < 0)
+                return log_error_errno(r, "Failed to validate extension release information: %m");
+
+        return r;
 }
 
 static int merge_subprocess(Hashmap *images, const char *workspace) {
@@ -446,7 +450,6 @@ static int merge_subprocess(Hashmap *images, const char *workspace) {
         size_t n_extensions = 0;
         unsigned n_ignored = 0;
         Image *img;
-        char **h;
         int r;
 
         /* Mark the whole of /run as MS_SLAVE, so that we can mount stuff below it that doesn't show up on
@@ -464,7 +467,7 @@ static int merge_subprocess(Hashmap *images, const char *workspace) {
          * but let the kernel do that entirely automatically, once our namespace dies. Note that this file
          * system won't be visible to anyone but us, since we opened our own namespace and then made the
          * /run/ hierarchy (which our workspace is contained in) MS_SLAVE, see above. */
-        r = mount_nofollow_verbose(LOG_ERR, "sysexit", workspace, "tmpfs", 0, "mode=0700");
+        r = mount_nofollow_verbose(LOG_ERR, "sysext", workspace, "tmpfs", 0, "mode=0700");
         if (r < 0)
                 return r;
 
@@ -476,6 +479,10 @@ static int merge_subprocess(Hashmap *images, const char *workspace) {
                         "SYSEXT_LEVEL", &host_os_release_sysext_level);
         if (r < 0)
                 return log_error_errno(r, "Failed to acquire 'os-release' data of OS tree '%s': %m", empty_to_root(arg_root));
+        if (isempty(host_os_release_id))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "'ID' field not found or empty in 'os-release' data of OS tree '%s': %m",
+                                       empty_to_root(arg_root));
 
         /* Let's now mount all images */
         HASHMAP_FOREACH(img, images) {
@@ -507,7 +514,6 @@ static int merge_subprocess(Hashmap *images, const char *workspace) {
                 case IMAGE_BLOCK: {
                         _cleanup_(dissected_image_unrefp) DissectedImage *m = NULL;
                         _cleanup_(loop_device_unrefp) LoopDevice *d = NULL;
-                        _cleanup_(decrypted_image_unrefp) DecryptedImage *di = NULL;
                         _cleanup_(verity_settings_done) VeritySettings verity_settings = VERITY_SETTINGS_DEFAULT;
                         DissectImageFlags flags =
                                 DISSECT_IMAGE_READ_ONLY |
@@ -523,27 +529,35 @@ static int merge_subprocess(Hashmap *images, const char *workspace) {
                         if (verity_settings.data_path)
                                 flags |= DISSECT_IMAGE_NO_PARTITION_TABLE;
 
-                        r = loop_device_make_by_path(img->path, O_RDONLY, 0, &d);
+                        r = loop_device_make_by_path(
+                                        img->path,
+                                        O_RDONLY,
+                                        FLAGS_SET(flags, DISSECT_IMAGE_NO_PARTITION_TABLE) ? 0 : LO_FLAGS_PARTSCAN,
+                                        LOCK_SH,
+                                        &d);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to set up loopback device for %s: %m", img->path);
 
-                        r = dissect_image_and_warn(
-                                        d->fd,
-                                        img->path,
+                        r = dissect_loop_device_and_warn(
+                                        d,
                                         &verity_settings,
                                         NULL,
-                                        d->uevent_seqnum_not_before,
-                                        d->timestamp_not_before,
                                         flags,
                                         &m);
+                        if (r < 0)
+                                return r;
+
+                        r = dissected_image_load_verity_sig_partition(
+                                        m,
+                                        d->fd,
+                                        &verity_settings);
                         if (r < 0)
                                 return r;
 
                         r = dissected_image_decrypt_interactively(
                                         m, NULL,
                                         &verity_settings,
-                                        flags,
-                                        &di);
+                                        flags);
                         if (r < 0)
                                 return r;
 
@@ -556,17 +570,13 @@ static int merge_subprocess(Hashmap *images, const char *workspace) {
                         if (r < 0)
                                 return r;
 
-                        if (di) {
-                                r = decrypted_image_relinquish(di);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to relinquish DM devices: %m");
-                        }
-
-                        loop_device_relinquish(d);
+                        r = dissected_image_relinquish(m);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to relinquish DM and loopback block devices: %m");
                         break;
                 }
                 default:
-                        assert_not_reached("Unsupported image type");
+                        assert_not_reached();
                 }
 
                 r = validate_version(
@@ -582,7 +592,7 @@ static int merge_subprocess(Hashmap *images, const char *workspace) {
                         continue;
                 }
 
-                /* Noice! This one is an extension we want. */
+                /* Nice! This one is an extension we want. */
                 r = strv_extend(&extensions, img->name);
                 if (r < 0)
                         return log_oom();
@@ -745,7 +755,6 @@ static int image_discover_and_read_metadata(Hashmap **ret_images) {
 
 static int verb_merge(int argc, char **argv, void *userdata) {
         _cleanup_(hashmap_freep) Hashmap *images = NULL;
-        char **p;
         int r;
 
         if (!have_effective_cap(CAP_SYS_ADMIN))
@@ -863,7 +872,7 @@ static int verb_help(int argc, char **argv, void *userdata) {
         if (r < 0)
                 return log_oom();
 
-        printf("%1$s [OPTIONS...] [DEVICE]\n"
+        printf("%1$s [OPTIONS...] COMMAND\n"
                "\n%5$sMerge extension images into /usr/ and /opt/ hierarchies.%6$s\n"
                "\n%3$sCommands:%4$s\n"
                "  status                  Show current merge status (default)\n"
@@ -957,7 +966,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
 
         return 1;

@@ -12,7 +12,6 @@
 #include "systemctl.h"
 
 static int normalize_filenames(char **names) {
-        char **u;
         int r;
 
         STRV_FOREACH(u, names)
@@ -24,9 +23,10 @@ static int normalize_filenames(char **names) {
                                                        "Non-absolute paths are not allowed when --root is used: %s",
                                                        *u);
 
-                        if (!strchr(*u,'/'))
+                        if (!strchr(*u, '/'))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Link argument does contain at least one directory separator: %s",
+                                                       "Link argument must contain at least one directory separator.\n"
+                                                       "If you intended to link a file in the current directory, try ./%s instead.",
                                                        *u);
 
                         r = path_make_absolute_cwd(*u, &normalized_path);
@@ -39,8 +39,7 @@ static int normalize_filenames(char **names) {
         return 0;
 }
 
-static int normalize_names(char **names, bool warn_if_path) {
-        char **u;
+static int normalize_names(char **names) {
         bool was_path = false;
 
         STRV_FOREACH(u, names) {
@@ -56,16 +55,16 @@ static int normalize_names(char **names, bool warn_if_path) {
                 was_path = true;
         }
 
-        if (warn_if_path && was_path)
+        if (was_path)
                 log_warning("Warning: Can't execute disable on the unit file path. Proceeding with the unit name.");
 
         return 0;
 }
 
-int enable_unit(int argc, char *argv[], void *userdata) {
+int verb_enable(int argc, char *argv[], void *userdata) {
         _cleanup_strv_free_ char **names = NULL;
         const char *verb = argv[0];
-        UnitFileChange *changes = NULL;
+        InstallChange *changes = NULL;
         size_t n_changes = 0;
         int carries_install_info = -1;
         bool ignore_carries_install_info = arg_quiet;
@@ -86,11 +85,13 @@ int enable_unit(int argc, char *argv[], void *userdata) {
         if (strv_isempty(names)) {
                 if (arg_no_reload || install_client_side())
                         return 0;
-                return daemon_reload(argc, argv, userdata);
+
+                r = daemon_reload(ACTION_RELOAD, /* graceful= */ false);
+                return r > 0 ? 0 : r;
         }
 
         if (streq(verb, "disable")) {
-                r = normalize_names(names, true);
+                r = normalize_names(names);
                 if (r < 0)
                         return r;
         }
@@ -115,18 +116,18 @@ int enable_unit(int argc, char *argv[], void *userdata) {
                         carries_install_info = r;
                 } else if (streq(verb, "link"))
                         r = unit_file_link(arg_scope, flags, arg_root, names, &changes, &n_changes);
-                else if (streq(verb, "preset")) {
+                else if (streq(verb, "preset"))
                         r = unit_file_preset(arg_scope, flags, arg_root, names, arg_preset_mode, &changes, &n_changes);
-                } else if (streq(verb, "mask"))
+                else if (streq(verb, "mask"))
                         r = unit_file_mask(arg_scope, flags, arg_root, names, &changes, &n_changes);
                 else if (streq(verb, "unmask"))
                         r = unit_file_unmask(arg_scope, flags, arg_root, names, &changes, &n_changes);
                 else if (streq(verb, "revert"))
                         r = unit_file_revert(arg_scope, arg_root, names, &changes, &n_changes);
                 else
-                        assert_not_reached("Unknown verb");
+                        assert_not_reached();
 
-                unit_file_dump_changes(r, verb, changes, n_changes, arg_quiet);
+                install_changes_dump(r, verb, changes, n_changes, arg_quiet);
                 if (r < 0)
                         goto finish;
                 r = 0;
@@ -139,10 +140,9 @@ int enable_unit(int argc, char *argv[], void *userdata) {
                 sd_bus *bus;
 
                 if (STR_IN_SET(verb, "mask", "unmask")) {
-                        char **name;
                         _cleanup_(lookup_paths_free) LookupPaths lp = {};
 
-                        r = lookup_paths_init(&lp, arg_scope, 0, arg_root);
+                        r = lookup_paths_init_or_warn(&lp, arg_scope, 0, arg_root);
                         if (r < 0)
                                 return r;
 
@@ -191,7 +191,7 @@ int enable_unit(int argc, char *argv[], void *userdata) {
                         method = "RevertUnitFiles";
                         send_runtime = send_force = false;
                 } else
-                        assert_not_reached("Unknown verb");
+                        assert_not_reached();
 
                 r = bus_message_new_method_call(bus, &m, bus_systemd_mgr, method);
                 if (r < 0)
@@ -234,9 +234,11 @@ int enable_unit(int argc, char *argv[], void *userdata) {
                         goto finish;
 
                 /* Try to reload if enabled */
-                if (!arg_no_reload)
-                        r = daemon_reload(argc, argv, userdata);
-                else
+                if (!arg_no_reload) {
+                        r = daemon_reload(ACTION_RELOAD, /* graceful= */ false);
+                        if (r > 0)
+                                r = 0;
+                } else
                         r = 0;
         }
 
@@ -273,12 +275,12 @@ int enable_unit(int argc, char *argv[], void *userdata) {
                                 new_args[i + 1] = basename(names[i]);
                         new_args[i + 1] = NULL;
 
-                        r = start_unit(len + 1, new_args, userdata);
+                        r = verb_start(len + 1, new_args, userdata);
                 }
         }
 
 finish:
-        unit_file_changes_free(changes, n_changes);
+        install_changes_free(changes, n_changes);
 
         return r;
 }

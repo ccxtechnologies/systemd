@@ -5,19 +5,22 @@
 #include <unistd.h>
 
 #include "sd-journal.h"
+
 #include "fileio.h"
+#include "journal-send.h"
 #include "macro.h"
 #include "memory-util.h"
+#include "tests.h"
 
-static void test_journal_print(void) {
+TEST(journal_print) {
         assert_se(sd_journal_print(LOG_INFO, "XXX") == 0);
         assert_se(sd_journal_print(LOG_INFO, "%s", "YYY") == 0);
         assert_se(sd_journal_print(LOG_INFO, "X%4094sY", "ZZZ") == 0);
-        assert_se(sd_journal_print(LOG_INFO, "X%*sY", LONG_LINE_MAX - 8 - 3, "ZZZ") == 0);
-        assert_se(sd_journal_print(LOG_INFO, "X%*sY", LONG_LINE_MAX - 8 - 2, "ZZZ") == -ENOBUFS);
+        assert_se(sd_journal_print(LOG_INFO, "X%*sY", (int) LONG_LINE_MAX - 8 - 3, "ZZZ") == 0);
+        assert_se(sd_journal_print(LOG_INFO, "X%*sY", (int) LONG_LINE_MAX - 8 - 2, "ZZZ") == -ENOBUFS);
 }
 
-static void test_journal_send(void) {
+TEST(journal_send) {
         _cleanup_free_ char *huge = NULL;
 
 #define HUGE_SIZE (4096*1024)
@@ -90,14 +93,19 @@ static void test_journal_send(void) {
         assert_se(sd_journal_sendv(graph2, 1) == 0);
         assert_se(sd_journal_sendv(message1, 1) == 0);
         assert_se(sd_journal_sendv(message2, 1) == 0);
+
+        /* The above syslog() opens a fd which is stored in libc, and the valgrind reports the fd is
+         * leaked when we do not call closelog(). */
+        closelog();
 }
 
-int main(int argc, char *argv[]) {
-        test_journal_print();
-        test_journal_send();
-
+static int outro(void) {
         /* Sleep a bit to make it easy for journald to collect metadata. */
         sleep(1);
 
-        return 0;
+        close_journal_fd();
+
+        return EXIT_SUCCESS;
 }
+
+DEFINE_TEST_MAIN_FULL(LOG_INFO, NULL, outro);

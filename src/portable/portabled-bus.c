@@ -108,13 +108,12 @@ static int property_get_profiles(
 
 static int method_get_image(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         _cleanup_free_ char *p = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         const char *name;
         Image *image;
         int r;
 
         assert(message);
-        assert(m);
 
         r = sd_bus_message_read(message, "s", &name);
         if (r < 0)
@@ -134,12 +133,11 @@ static int method_get_image(sd_bus_message *message, void *userdata, sd_bus_erro
 static int method_list_images(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_hashmap_free_ Hashmap *images = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Image *image;
         int r;
 
         assert(message);
-        assert(m);
 
         images = hashmap_new(&image_hash_ops);
         if (!images)
@@ -169,6 +167,7 @@ static int method_list_images(sd_bus_message *message, void *userdata, sd_bus_er
                 r = portable_get_state(
                                 sd_bus_message_get_bus(message),
                                 image->path,
+                                NULL,
                                 0,
                                 &state,
                                 &error_state);
@@ -225,6 +224,7 @@ static int method_get_image_metadata(sd_bus_message *message, void *userdata, sd
 }
 
 static int method_get_image_state(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        _cleanup_strv_free_ char **extension_images = NULL;
         const char *name_or_path;
         PortableState state;
         int r;
@@ -235,9 +235,28 @@ static int method_get_image_state(sd_bus_message *message, void *userdata, sd_bu
         if (r < 0)
                 return r;
 
+        if (sd_bus_message_is_method_call(message, NULL, "GetImageStateWithExtensions")) {
+                uint64_t input_flags = 0;
+
+                r = sd_bus_message_read_strv(message, &extension_images);
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_read(message, "t", &input_flags);
+                if (r < 0)
+                        return r;
+
+                /* No flags are supported by this method for now. */
+                if (input_flags != 0)
+                        return sd_bus_reply_method_errorf(message, SD_BUS_ERROR_INVALID_ARGS,
+                                                          "Invalid 'flags' parameter '%" PRIu64 "'",
+                                                          input_flags);
+        }
+
         r = portable_get_state(
                         sd_bus_message_get_bus(message),
                         name_or_path,
+                        extension_images,
                         0,
                         &state,
                         error);
@@ -255,13 +274,12 @@ static int method_detach_image(sd_bus_message *message, void *userdata, sd_bus_e
         _cleanup_strv_free_ char **extension_images = NULL;
         PortableChange *changes = NULL;
         PortableFlags flags = 0;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         size_t n_changes = 0;
         const char *name_or_path;
         int r;
 
         assert(message);
-        assert(m);
 
         /* Note that we do not redirect detaching to the image object here, because we want to allow that users can
          * detach already deleted images too, in case the user already deleted an image before properly detaching
@@ -420,11 +438,19 @@ const sd_bus_vtable manager_vtable[] = {
                                             "t", flags),
                                 SD_BUS_RESULT("s", image,
                                               "ay", os_release,
+                                              "a{say}", extensions,
                                               "a{say}", units),
                                 method_get_image_metadata,
                                 SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD_WITH_ARGS("GetImageState",
                                 SD_BUS_ARGS("s", image),
+                                SD_BUS_RESULT("s", state),
+                                method_get_image_state,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("GetImageStateWithExtensions",
+                                SD_BUS_ARGS("s", image,
+                                            "as", extensions,
+                                            "t", flags),
                                 SD_BUS_RESULT("s", state),
                                 method_get_image_state,
                                 SD_BUS_VTABLE_UNPRIVILEGED),

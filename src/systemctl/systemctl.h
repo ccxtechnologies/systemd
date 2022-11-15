@@ -32,6 +32,7 @@ enum action {
         ACTION_RUNLEVEL,
         ACTION_TELINIT,
         ACTION_CANCEL_SHUTDOWN,
+        ACTION_SHOW_SHUTDOWN,
         _ACTION_MAX,
         _ACTION_INVALID = -EINVAL,
 };
@@ -50,7 +51,7 @@ extern char **arg_properties;
 extern bool arg_all;
 extern enum dependency arg_dependency;
 extern const char *_arg_job_mode;
-extern UnitFileScope arg_scope;
+extern LookupScope arg_scope;
 extern bool arg_wait;
 extern bool arg_no_block;
 extern int arg_legend;
@@ -73,7 +74,7 @@ extern bool arg_ask_password;
 extern bool arg_runtime;
 extern UnitFilePresetMode arg_preset_mode;
 extern char **arg_wall;
-extern const char *arg_kill_who;
+extern const char *arg_kill_whom;
 extern int arg_signal;
 extern char *arg_root;
 extern usec_t arg_when;

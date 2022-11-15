@@ -397,7 +397,7 @@ static int handle_request(int out_fd, const Packet *packet, size_t length) {
                  return -ECONNRESET;
 
         default:
-                assert_not_reached("Unknown request");
+                assert_not_reached();
         }
 
         return 0;
@@ -418,7 +418,7 @@ static void* thread_worker(void *p) {
 
                 length = recv(resolve->fds[REQUEST_RECV_FD], &buf, sizeof buf, 0);
                 if (length < 0) {
-                        if (errno == EINTR)
+                        if (ERRNO_IS_TRANSIENT(errno))
                                 continue;
 
                         break;
@@ -506,9 +506,9 @@ _public_ int sd_resolve_new(sd_resolve **ret) {
                 resolve->fds[i] = fd_move_above_stdio(resolve->fds[i]);
 
         (void) fd_inc_sndbuf(resolve->fds[REQUEST_SEND_FD], QUERIES_MAX * BUFSIZE);
-        (void) fd_inc_rcvbuf(resolve->fds[REQUEST_RECV_FD], QUERIES_MAX * BUFSIZE);
+        (void) fd_increase_rxbuf(resolve->fds[REQUEST_RECV_FD], QUERIES_MAX * BUFSIZE);
         (void) fd_inc_sndbuf(resolve->fds[RESPONSE_SEND_FD], QUERIES_MAX * BUFSIZE);
-        (void) fd_inc_rcvbuf(resolve->fds[RESPONSE_RECV_FD], QUERIES_MAX * BUFSIZE);
+        (void) fd_increase_rxbuf(resolve->fds[RESPONSE_RECV_FD], QUERIES_MAX * BUFSIZE);
 
         (void) fd_nonblock(resolve->fds[RESPONSE_RECV_FD], true);
 
@@ -661,7 +661,7 @@ static int complete_query(sd_resolve *resolve, sd_resolve_query *q) {
                 break;
 
         default:
-                assert_not_reached("Cannot complete unknown query type");
+                assert_not_reached();
         }
 
         resolve->current = NULL;
@@ -847,7 +847,7 @@ _public_ int sd_resolve_process(sd_resolve *resolve) {
 
         l = recv(resolve->fds[RESPONSE_RECV_FD], &buf, sizeof buf, 0);
         if (l < 0) {
-                if (errno == EAGAIN)
+                if (ERRNO_IS_TRANSIENT(errno))
                         return 0;
 
                 return -errno;
@@ -1236,10 +1236,8 @@ _public_ int sd_resolve_query_set_floating(sd_resolve_query *q, int b) {
 }
 
 static int io_callback(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
-        sd_resolve *resolve = userdata;
+        sd_resolve *resolve = ASSERT_PTR(userdata);
         int r;
-
-        assert(resolve);
 
         r = sd_resolve_process(resolve);
         if (r < 0)
@@ -1285,11 +1283,7 @@ _public_  int sd_resolve_detach_event(sd_resolve *resolve) {
         if (!resolve->event)
                 return 0;
 
-        if (resolve->event_source) {
-                sd_event_source_set_enabled(resolve->event_source, SD_EVENT_OFF);
-                resolve->event_source = sd_event_source_unref(resolve->event_source);
-        }
-
+        resolve->event_source = sd_event_source_disable_unref(resolve->event_source);
         resolve->event = sd_event_unref(resolve->event);
         return 1;
 }

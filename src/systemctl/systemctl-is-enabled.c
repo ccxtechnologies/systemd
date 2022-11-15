@@ -8,7 +8,7 @@
 #include "systemctl.h"
 
 static int show_installation_targets_client_side(const char *name) {
-        UnitFileChange *changes = NULL;
+        InstallChange *changes = NULL;
         size_t n_changes = 0;
         UnitFileFlags flags;
         char **p;
@@ -18,12 +18,12 @@ static int show_installation_targets_client_side(const char *name) {
         flags = UNIT_FILE_DRY_RUN |
                 (arg_runtime ? UNIT_FILE_RUNTIME : 0);
 
-        r = unit_file_disable(UNIT_FILE_SYSTEM, flags, NULL, p, &changes, &n_changes);
+        r = unit_file_disable(LOOKUP_SCOPE_SYSTEM, flags, NULL, p, &changes, &n_changes);
         if (r < 0)
                 return log_error_errno(r, "Failed to get file links for %s: %m", name);
 
         for (size_t i = 0; i < n_changes; i++)
-                if (changes[i].type_or_errno == UNIT_FILE_UNLINK)
+                if (changes[i].type == INSTALL_CHANGE_UNLINK)
                         printf("  %s\n", changes[i].path);
 
         return 0;
@@ -56,10 +56,9 @@ static int show_installation_targets(sd_bus *bus, const char *name) {
         return 0;
 }
 
-int unit_is_enabled(int argc, char *argv[], void *userdata) {
+int verb_is_enabled(int argc, char *argv[], void *userdata) {
         _cleanup_strv_free_ char **names = NULL;
         bool enabled;
-        char **name;
         int r;
 
         r = mangle_names("to check", strv_skip(argv, 1), &names);

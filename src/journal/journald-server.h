@@ -10,12 +10,13 @@ typedef struct Server Server;
 
 #include "conf-parser.h"
 #include "hashmap.h"
-#include "journal-file.h"
 #include "journald-context.h"
 #include "journald-rate-limit.h"
 #include "journald-stream.h"
 #include "list.h"
+#include "managed-journal-file.h"
 #include "prioq.h"
+#include "ratelimit.h"
 #include "time-util.h"
 #include "varlink.h"
 
@@ -88,8 +89,8 @@ struct Server {
         sd_event_source *watchdog_event_source;
         sd_event_source *idle_event_source;
 
-        JournalFile *runtime_journal;
-        JournalFile *system_journal;
+        ManagedJournalFile *runtime_journal;
+        ManagedJournalFile *system_journal;
         OrderedHashmap *user_journals;
 
         uint64_t seqnum;
@@ -142,6 +143,7 @@ struct Server {
 
         uint64_t *kernel_seqnum;
         bool dev_kmsg_readable:1;
+        RateLimit kmsg_own_ratelimit;
 
         bool send_watchdog:1;
         bool sent_notify_ready:1;
@@ -177,7 +179,7 @@ struct Server {
 #define SERVER_MACHINE_ID(s) ((s)->machine_id_field + STRLEN("_MACHINE_ID="))
 
 /* Extra fields for any log messages */
-#define N_IOVEC_META_FIELDS 23
+#define N_IOVEC_META_FIELDS 24
 
 /* Extra fields for log messages that contain OBJECT_PID= (i.e. log about another process) */
 #define N_IOVEC_OBJECT_FIELDS 18
@@ -190,6 +192,9 @@ struct Server {
 
 /* kmsg: Maximum number of extra fields we'll import from udev's devices */
 #define N_IOVEC_UDEV_FIELDS 32
+
+/* audit: Maximum number of extra fields we'll import from audit messages */
+#define N_IOVEC_AUDIT_FIELDS 64
 
 void server_dispatch_message(Server *s, struct iovec *iovec, size_t n, size_t m, ClientContext *c, const struct timeval *tv, int priority, pid_t object_pid);
 void server_driver_message(Server *s, pid_t object_pid, const char *message_id, const char *format, ...) _sentinel_ _printf_(4,0);
@@ -212,7 +217,7 @@ SplitMode split_mode_from_string(const char *s) _pure_;
 int server_init(Server *s, const char *namespace);
 void server_done(Server *s);
 void server_sync(Server *s);
-int server_vacuum(Server *s, bool verbose);
+void server_vacuum(Server *s, bool verbose);
 void server_rotate(Server *s);
 int server_schedule_sync(Server *s, int priority);
 int server_flush_to_var(Server *s, bool require_flag_file);

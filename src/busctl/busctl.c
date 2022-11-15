@@ -16,10 +16,11 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-table.h"
+#include "glyph-util.h"
 #include "json.h"
-#include "locale-util.h"
 #include "log.h"
 #include "main-func.h"
+#include "os-util.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
@@ -31,6 +32,7 @@
 #include "terminal-util.h"
 #include "user-util.h"
 #include "verbs.h"
+#include "version.h"
 
 static JsonFormatFlags arg_json_format_flags = JSON_FORMAT_OFF;
 static PagerFlags arg_pager_flags = 0;
@@ -102,7 +104,7 @@ static int acquire_bus(bool set_monitor, sd_bus **ret) {
 
         if (arg_address)
                 r = sd_bus_set_address(bus, arg_address);
-        else {
+        else
                 switch (arg_transport) {
 
                 case BUS_TRANSPORT_LOCAL:
@@ -121,15 +123,15 @@ static int acquire_bus(bool set_monitor, sd_bus **ret) {
                         break;
 
                 default:
-                        assert_not_reached("Hmm, unknown transport type.");
+                        assert_not_reached();
                 }
-        }
+
         if (r < 0)
-                return bus_log_address_error(r);
+                return bus_log_address_error(r, arg_transport);
 
         r = sd_bus_start(bus);
         if (r < 0)
-                return bus_log_connect_error(r);
+                return bus_log_connect_error(r, arg_transport);
 
         *ret = TAKE_PTR(bus);
 
@@ -141,7 +143,7 @@ static int list_bus_names(int argc, char **argv, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_hashmap_free_ Hashmap *names = NULL;
         _cleanup_(table_unrefp) Table *table = NULL;
-        char **i, *k;
+        char *k;
         void *v;
         int r;
 
@@ -207,9 +209,7 @@ static int list_bus_names(int argc, char **argv, void *userdata) {
         if (r < 0)
                 return log_error_errno(r, "Failed to set alignment: %m");
 
-        r = table_set_empty_string(table, "-");
-        if (r < 0)
-                return log_error_errno(r, "Failed to set empty string: %m");
+        table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
 
         r = table_set_sort(table, (size_t) COLUMN_NAME);
         if (r < 0)
@@ -339,9 +339,7 @@ static int list_bus_names(int argc, char **argv, void *userdata) {
                         if (r < 0)
                                 log_debug_errno(r, "Failed to acquire credentials of service %s, ignoring: %m", k);
                         else {
-                                char m[SD_ID128_STRING_MAX];
-
-                                r = table_add_cell(table, NULL, TABLE_STRING, sd_id128_to_string(mid, m));
+                                r = table_add_cell(table, NULL, TABLE_ID128, &mid);
                                 if (r < 0)
                                         return table_log_add_error(r);
 
@@ -417,10 +415,8 @@ static void print_tree(char **l) {
 }
 
 static int on_path(const char *path, void *userdata) {
-        Set *paths = userdata;
+        Set *paths = ASSERT_PTR(userdata);
         int r;
-
-        assert(paths);
 
         r = set_put_strdup(&paths, path);
         if (r < 0)
@@ -466,14 +462,6 @@ static int tree_one(sd_bus *bus, const char *service) {
         if (r < 0)
                 return log_oom();
 
-        done = set_new(&string_hash_ops_free);
-        if (!done)
-                return log_oom();
-
-        failed = set_new(&string_hash_ops_free);
-        if (!failed)
-                return log_oom();
-
         for (;;) {
                 _cleanup_free_ char *p = NULL;
                 int q;
@@ -490,13 +478,13 @@ static int tree_one(sd_bus *bus, const char *service) {
                 if (q < 0 && r >= 0)
                         r = q;
 
-                q = set_consume(q < 0 ? failed : done, TAKE_PTR(p));
+                q = set_ensure_consume(q < 0 ? &failed : &done, &string_hash_ops_free, TAKE_PTR(p));
                 assert(q != 0);
                 if (q < 0)
                         return log_oom();
         }
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         l = set_get_strv(done);
         if (!l)
@@ -512,7 +500,6 @@ static int tree_one(sd_bus *bus, const char *service) {
 
 static int tree(int argc, char **argv, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        char **i;
         int r;
 
         /* Do superficial verification of arguments before even opening the bus */
@@ -536,7 +523,7 @@ static int tree(int argc, char **argv, void *userdata) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to get name list: %m");
 
-                (void) pager_open(arg_pager_flags);
+                pager_open(arg_pager_flags);
 
                 STRV_FOREACH(i, names) {
                         int q;
@@ -566,7 +553,7 @@ static int tree(int argc, char **argv, void *userdata) {
                                 printf("\n");
 
                         if (argv[2]) {
-                                (void) pager_open(arg_pager_flags);
+                                pager_open(arg_pager_flags);
                                 printf("Service %s%s%s:\n", ansi_highlight(), *i, ansi_normal());
                         }
 
@@ -718,7 +705,7 @@ static int format_cmdline(sd_bus_message *m, FILE *f, bool needs_space) {
                         break;
 
                 default:
-                        assert_not_reached("Unknown basic type.");
+                        assert_not_reached();
                 }
 
                 needs_space = true;
@@ -751,6 +738,9 @@ static void member_hash_func(const Member *m, struct siphash *state) {
         if (m->name)
                 string_hash_func(m->name, state);
 
+        if (m->signature)
+                string_hash_func(m->signature, state);
+
         if (m->interface)
                 string_hash_func(m->interface, state);
 }
@@ -771,7 +761,11 @@ static int member_compare_func(const Member *x, const Member *y) {
         if (d != 0)
                 return d;
 
-        return strcmp_ptr(x->name, y->name);
+        d = strcmp_ptr(x->name, y->name);
+        if (d != 0)
+                return d;
+
+        return strcmp_ptr(x->signature, y->signature);
 }
 
 static int member_compare_funcp(Member * const *a, Member * const *b) {
@@ -798,11 +792,10 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(Set*, member_set_free);
 
 static int on_interface(const char *interface, uint64_t flags, void *userdata) {
         _cleanup_(member_freep) Member *m = NULL;
-        Set *members = userdata;
+        Set *members = ASSERT_PTR(userdata);
         int r;
 
         assert(interface);
-        assert(members);
 
         m = new(Member, 1);
         if (!m)
@@ -818,8 +811,9 @@ static int on_interface(const char *interface, uint64_t flags, void *userdata) {
                 return log_oom();
 
         r = set_put(members, m);
-        if (r == -EEXIST)
-                return log_error_errno(r,  "Invalid introspection data: duplicate interface '%s'.", interface);
+        if (r == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
+                                       "Invalid introspection data: duplicate interface '%s'.", interface);
         if (r < 0)
                 return log_oom();
 
@@ -861,8 +855,9 @@ static int on_method(const char *interface, const char *name, const char *signat
                 return log_oom();
 
         r = set_put(members, m);
-        if (r == -EEXIST)
-                return log_error_errno(r, "Invalid introspection data: duplicate method '%s' on interface '%s'.", name, interface);
+        if (r == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
+                                       "Invalid introspection data: duplicate method '%s' on interface '%s'.", name, interface);
         if (r < 0)
                 return log_oom();
 
@@ -900,8 +895,9 @@ static int on_signal(const char *interface, const char *name, const char *signat
                 return log_oom();
 
         r = set_put(members, m);
-        if (r == -EEXIST)
-                return log_error_errno(r, "Invalid introspection data: duplicate signal '%s' on interface '%s'.", name, interface);
+        if (r == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
+                                       "Invalid introspection data: duplicate signal '%s' on interface '%s'.", name, interface);
         if (r < 0)
                 return log_oom();
 
@@ -940,8 +936,9 @@ static int on_property(const char *interface, const char *name, const char *sign
                 return log_oom();
 
         r = set_put(members, m);
-        if (r == -EEXIST)
-                return log_error_errno(r, "Invalid introspection data: duplicate property '%s' on interface '%s'.", name, interface);
+        if (r == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
+                                       "Invalid introspection data: duplicate property '%s' on interface '%s'.", name, interface);
         if (r < 0)
                 return log_oom();
 
@@ -989,7 +986,7 @@ static int introspect(int argc, char **argv, void *userdata) {
 
         if (arg_xml_interface) {
                 /* Just dump the received XML and finish */
-                (void) pager_open(arg_pager_flags);
+                pager_open(arg_pager_flags);
                 puts(xml);
                 return 0;
         }
@@ -1108,7 +1105,7 @@ static int introspect(int argc, char **argv, void *userdata) {
 
         typesafe_qsort(sorted, k, member_compare_funcp);
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         if (arg_legend)
                 printf("%-*s %-*s %-*s %-*s %s\n",
@@ -1216,7 +1213,6 @@ static int monitor(int argc, char **argv, int (*dump)(sd_bus_message *m, FILE *f
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *message = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        char **i;
         uint32_t flags = 0;
         const char *unique_name;
         bool is_monitor = false;
@@ -1339,13 +1335,20 @@ static int verb_monitor(int argc, char **argv, void *userdata) {
 }
 
 static int verb_capture(int argc, char **argv, void *userdata) {
+        _cleanup_free_ char *osname = NULL;
+        static const char info[] =
+                "busctl (systemd) " STRINGIFY(PROJECT_VERSION) " (Git " GIT_VERSION ")";
         int r;
 
         if (isatty(fileno(stdout)) > 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Refusing to write message data to console, please redirect output to a file.");
 
-        bus_pcap_header(arg_snaplen, stdout);
+        r = parse_os_release(NULL, "PRETTY_NAME", &osname);
+        if (r < 0)
+                log_full_errno(r == -ENOENT ? LOG_DEBUG : LOG_INFO, r,
+                               "Failed to read os-release file, ignoring: %m");
+        bus_pcap_header(arg_snaplen, osname, info, stdout);
 
         r = monitor(argc, argv, message_pcap);
         if (r < 0)
@@ -1368,7 +1371,7 @@ static int status(int argc, char **argv, void *userdata) {
         if (r < 0)
                 return r;
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         if (!isempty(argv[1])) {
                 r = parse_pid(argv[1], &pid);
@@ -1957,7 +1960,7 @@ static int json_transform_one(sd_bus_message *m, JsonVariant **ret) {
                 break;
 
         default:
-                assert_not_reached("Unexpected element type");
+                assert_not_reached();
         }
 
         *ret = TAKE_PTR(v);
@@ -2048,7 +2051,7 @@ static int call(int argc, char **argv, void *userdata) {
                         _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
 
                         if (arg_json_format_flags & (JSON_FORMAT_PRETTY|JSON_FORMAT_PRETTY_AUTO))
-                                (void) pager_open(arg_pager_flags);
+                                pager_open(arg_pager_flags);
 
                         r = json_transform_message(reply, &v);
                         if (r < 0)
@@ -2057,7 +2060,7 @@ static int call(int argc, char **argv, void *userdata) {
                         json_variant_dump(v, arg_json_format_flags, NULL, NULL);
 
                 } else if (arg_verbose) {
-                        (void) pager_open(arg_pager_flags);
+                        pager_open(arg_pager_flags);
 
                         r = sd_bus_message_dump(reply, stdout, 0);
                         if (r < 0)
@@ -2125,7 +2128,6 @@ static int emit_signal(int argc, char **argv, void *userdata) {
 static int get_property(int argc, char **argv, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        char **i;
         int r;
 
         r = acquire_bus(false, &bus);
@@ -2157,7 +2159,7 @@ static int get_property(int argc, char **argv, void *userdata) {
                         _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
 
                         if (arg_json_format_flags & (JSON_FORMAT_PRETTY|JSON_FORMAT_PRETTY_AUTO))
-                                (void) pager_open(arg_pager_flags);
+                                pager_open(arg_pager_flags);
 
                         r = json_transform_variant(reply, contents, &v);
                         if (r < 0)
@@ -2166,7 +2168,7 @@ static int get_property(int argc, char **argv, void *userdata) {
                         json_variant_dump(v, arg_json_format_flags, NULL, NULL);
 
                 } else if (arg_verbose) {
-                        (void) pager_open(arg_pager_flags);
+                        pager_open(arg_pager_flags);
 
                         r = sd_bus_message_dump(reply, stdout, SD_BUS_MESSAGE_DUMP_SUBTREE_ONLY);
                         if (r < 0)
@@ -2243,7 +2245,7 @@ static int help(void) {
         if (r < 0)
                 return log_oom();
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         printf("%s [OPTIONS...] COMMAND ...\n\n"
                "%sIntrospect the D-Bus IPC bus.%s\n"
@@ -2525,7 +2527,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
 
         return 1;

@@ -86,7 +86,7 @@ static bool verify_checksum(const uint8_t *buf, size_t len) {
 }
 
 /*
- * Type-independant Stuff
+ * Type-independent Stuff
  */
 
 static const char *dmi_string(const struct dmi_header *dm, uint8_t s) {
@@ -117,7 +117,7 @@ static void dmi_print_memory_size(
                 code <<= 10;
 
         if (slot_num >= 0)
-                printf("%s_%u_%s=%"PRIu64"\n", attr_prefix, slot_num, attr_suffix, code);
+                printf("%s_%i_%s=%"PRIu64"\n", attr_prefix, slot_num, attr_suffix, code);
         else
                 printf("%s_%s=%"PRIu64"\n", attr_prefix, attr_suffix, code);
 }
@@ -183,7 +183,7 @@ static void dmi_memory_device_string(
                 const struct dmi_header *h, uint8_t s) {
         char *str;
 
-        str = strdupa(dmi_string(h, s));
+        str = strdupa_safe(dmi_string(h, s));
         str = strstrip(str);
         if (!isempty(str))
                 printf("MEMORY_DEVICE_%u_%s=%s\n", slot_num, attr_suffix, str);
@@ -417,9 +417,9 @@ static void dmi_memory_device_size_detail(
                 dmi_print_memory_size("MEMORY_DEVICE", attr_suffix, slot_num, code, MEMORY_SIZE_UNIT_BYTES);
 }
 
-static void dmi_decode(const struct dmi_header *h) {
+static void dmi_decode(const struct dmi_header *h,
+                       unsigned *next_slot_num) {
         const uint8_t *data = h->data;
-        static unsigned next_slot_num = 0;
         unsigned slot_num;
 
         /*
@@ -441,15 +441,14 @@ static void dmi_decode(const struct dmi_header *h) {
                         dmi_print_memory_size("MEMORY_ARRAY", "MAX_CAPACITY", -1, DWORD(data + 0x07), MEMORY_SIZE_UNIT_KB);
                 else if (h->length >= 0x17)
                         dmi_print_memory_size("MEMORY_ARRAY", "MAX_CAPACITY", -1, QWORD(data + 0x0F), MEMORY_SIZE_UNIT_BYTES);
-                printf("MEMORY_ARRAY_NUM_DEVICES=%u\n", WORD(data + 0x0D));
 
                 break;
 
         case 17: /* 7.18 Memory Device */
-                slot_num = next_slot_num;
-                next_slot_num++;
+                slot_num = *next_slot_num;
+                *next_slot_num = slot_num + 1;
 
-                log_debug("Memory Device");
+                log_debug("Memory Device: %u", slot_num);
                 if (h->length < 0x15)
                         break;
 
@@ -525,6 +524,7 @@ static void dmi_decode(const struct dmi_header *h) {
 
 static void dmi_table_decode(const uint8_t *buf, size_t len, uint16_t num) {
         const uint8_t *data = buf;
+        unsigned next_slot_num = 0;
 
         /* 4 is the length of an SMBIOS structure header */
         for (uint16_t i = 0; (i < num || num == 0) && data + 4 <= buf + len; i++) {
@@ -539,7 +539,7 @@ static void dmi_table_decode(const uint8_t *buf, size_t len, uint16_t num) {
 
                 /* If a short entry is found (less than 4 bytes), not only it
                  * is invalid, but we cannot reliably locate the next entry.
-                 * Better stop at this point, and let the user know his/her
+                 * Better stop at this point, and let the user know their
                  * table is broken. */
                 if (h.length < 4)
                         break;
@@ -559,10 +559,12 @@ static void dmi_table_decode(const uint8_t *buf, size_t len, uint16_t num) {
                         break;
 
                 if (display)
-                        dmi_decode(&h);
+                        dmi_decode(&h, &next_slot_num);
 
                 data = next;
         }
+        if (next_slot_num > 0)
+                printf("MEMORY_ARRAY_NUM_DEVICES=%u\n", next_slot_num);
 }
 
 static int dmi_table(int64_t base, uint32_t len, uint16_t num, const char *devmem, bool no_file_offset) {
@@ -665,7 +667,7 @@ static int parse_argv(int argc, char * const *argv) {
                 case '?':
                         return -EINVAL;
                 default:
-                        assert_not_reached("Unknown option");
+                        assert_not_reached();
                 }
 
         return 1;

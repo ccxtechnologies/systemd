@@ -60,6 +60,7 @@ extern bool (*sym_fido_dev_is_fido2)(const fido_dev_t *);
 extern int (*sym_fido_dev_make_cred)(fido_dev_t *, fido_cred_t *, const char *);
 extern fido_dev_t* (*sym_fido_dev_new)(void);
 extern int (*sym_fido_dev_open)(fido_dev_t *, const char *);
+extern int (*sym_fido_dev_close)(fido_dev_t *);
 extern const char* (*sym_fido_strerr)(int);
 
 int dlopen_libfido2(void);
@@ -75,8 +76,10 @@ static inline void fido_assert_free_wrapper(fido_assert_t **p) {
 }
 
 static inline void fido_dev_free_wrapper(fido_dev_t **p) {
-        if (*p)
+        if (*p) {
+                sym_fido_dev_close(*p);
                 sym_fido_dev_free(p);
+        }
 }
 
 static inline void fido_cred_free_wrapper(fido_cred_t **p) {
@@ -106,13 +109,21 @@ int fido2_generate_hmac_hash(
                 const char *user_icon,
                 const char *askpw_icon_name,
                 Fido2EnrollFlags lock_with,
+                int cred_alg,
                 void **ret_cid, size_t *ret_cid_size,
                 void **ret_salt, size_t *ret_salt_size,
                 void **ret_secret, size_t *ret_secret_size,
                 char **ret_usedpin,
                 Fido2EnrollFlags *ret_locked_with);
 
+int parse_fido2_algorithm(const char *s, int *ret);
+#else
+static inline int parse_fido2_algorithm(const char *s, int *ret) {
+        return -EOPNOTSUPP;
+}
 #endif
 
 int fido2_list_devices(void);
 int fido2_find_device_auto(char **ret);
+
+int fido2_have_device(const char *device);

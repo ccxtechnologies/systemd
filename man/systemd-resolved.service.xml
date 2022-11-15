@@ -59,12 +59,19 @@
       <command>systemd-resolved</command>.</para></listitem>
 
       <listitem><para>Additionally, <command>systemd-resolved</command> provides a local DNS stub listener on
-      IP address 127.0.0.53 on the local loopback interface. Programs issuing DNS requests directly,
-      bypassing any local API may be directed to this stub, in order to connect them to
+      the IP addresses 127.0.0.53 and 127.0.0.54 on the local loopback interface. Programs issuing DNS
+      requests directly, bypassing any local API may be directed to this stub, in order to connect them to
       <command>systemd-resolved</command>. Note however that it is strongly recommended that local programs
       use the glibc NSS or bus APIs instead (as described above), as various network resolution concepts
       (such as link-local addressing, or LLMNR Unicode domains) cannot be mapped to the unicast DNS
-      protocol.</para></listitem>
+      protocol.</para>
+
+      <para id="proxy-stub">The DNS stub resolver on 127.0.0.53 provides the full feature set of the local
+      resolver, which includes offering LLMNR/MulticastDNS resolution. The DNS stub resolver on 127.0.0.54
+      provides a more limited resolver, that operates in "proxy" mode only, i.e. it will pass most DNS
+      messages relatively unmodified to the current upstream DNS servers and back, but not try to process the
+      messages locally, and hence does not validate DNSSEC, or offer up LLMNR/MulticastDNS. (It will
+      translate to DNS-over-TLS communication if needed however.)</para></listitem>
     </itemizedlist>
 
     <para>The DNS servers contacted are determined from the global settings in
@@ -144,7 +151,7 @@
       turn. Additionally, lookup of single-label names via unicast DNS may be enabled with the
       <varname>ResolveUnicastSingleLabel=yes</varname> setting. The details of which servers are queried and
       how the final reply is chosen are described below. Note that this means that address queries for
-      single-label names are never sent out to remote DNS servers by default, and resoulution is only
+      single-label names are never sent out to remote DNS servers by default, and resolution is only
       possible if search domains are defined.</para></listitem>
 
       <listitem><para>Multi-label names with the domain suffix <literal>.local</literal> are resolved using
@@ -275,7 +282,7 @@ search foobar.com barbar.com
       fragility in both directions: a valid global name could be obscured by a local name, and resolution of
       a relative local name could suddenly break when a new top-level domain is created, or when a new
       subdomain of a top-level domain in registered. Resolving any given name as either relative or absolute
-      avoids this ambiguity.)</para></footnote></para></listitem>
+      avoids this ambiguity.</para></footnote></para></listitem>
 
       <listitem><para>This resolver has a notion of the special <literal>.local</literal> domain used for
       MulticastDNS, and will not route queries with that suffix to unicast DNS servers unless explicitly
@@ -308,11 +315,11 @@ search foobar.com barbar.com
     <itemizedlist>
       <listitem><para><command>systemd-resolved</command> maintains the
       <filename>/run/systemd/resolve/stub-resolv.conf</filename> file for compatibility with traditional
-      Linux programs. This file may be symlinked from <filename>/etc/resolv.conf</filename>. This file lists
-      the 127.0.0.53 DNS stub (see above) as the only DNS server. It also contains a list of search domains
-      that are in use by systemd-resolved. The list of search domains is always kept up-to-date. Note that
-      <filename>/run/systemd/resolve/stub-resolv.conf</filename> should not be used directly by applications,
-      but only through a symlink from <filename>/etc/resolv.conf</filename>. This file may be symlinked from
+      Linux programs. This file lists the 127.0.0.53 DNS stub (see above) as the only DNS server. It also
+      contains a list of search domains that are in use by systemd-resolved. The list of search domains is
+      always kept up-to-date. Note that <filename>/run/systemd/resolve/stub-resolv.conf</filename> should not
+      be used directly by applications, but only through a symlink from
+      <filename>/etc/resolv.conf</filename>. This file may be symlinked from
       <filename>/etc/resolv.conf</filename> in order to connect all local clients that bypass local DNS APIs
       to <command>systemd-resolved</command> with correct search domains settings. This mode of operation is
       recommended.</para></listitem>

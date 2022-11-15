@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 [Unit]
 Description=Stop Propagation Receiver
 Wants=testsuite-57-prop-stop-two.service
@@ -6,4 +7,4 @@ StopPropagatedFrom=testsuite-57-prop-stop-two.service
 
 [Service]
 ExecStart=/bin/sleep infinity
-ExecStopPost=systemctl kill --kill-who=main -sUSR2 testsuite-57.service
+ExecStopPost=systemctl kill --kill-whom=main -sUSR2 testsuite-57.service

@@ -41,8 +41,7 @@ int manager_check_resolv_conf(const Manager *m) {
 
         /* Is it symlinked to our own uplink file? */
         if (stat(PRIVATE_STATIC_RESOLV_CONF, &own) >= 0 &&
-            st.st_dev == own.st_dev &&
-            st.st_ino == own.st_ino)
+            stat_inode_same(&st, &own))
                 return log_warning_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
                                          "DNSStubListener= is disabled, but /etc/resolv.conf is a symlink to "
                                          PRIVATE_STATIC_RESOLV_CONF " which expects DNSStubListener= to be enabled.");
@@ -51,8 +50,6 @@ int manager_check_resolv_conf(const Manager *m) {
 }
 
 static bool file_is_our_own(const struct stat *st) {
-        const char *path;
-
         assert(st);
 
         FOREACH_STRING(path,
@@ -64,8 +61,7 @@ static bool file_is_our_own(const struct stat *st) {
 
                 /* Is it symlinked to our own uplink file? */
                 if (stat(path, &own) >= 0 &&
-                    st->st_dev == own.st_dev &&
-                    st->st_ino == own.st_ino)
+                    stat_inode_same(st, &own))
                         return true;
         }
 
@@ -216,6 +212,13 @@ static void write_resolv_conf_server(DnsServer *s, FILE *f, unsigned *count) {
                 return;
         }
 
+        /* resolv.conf simply doesn't support any other ports than 53, hence there's nothing much we can
+         * do — we have to suppress these entries */
+        if (dns_server_port(s) != 53) {
+                log_debug("DNS server %s with non-standard UDP port number, suppressing from generated resolv.conf.", dns_server_string(s));
+                return;
+        }
+
         /* Check if the scope this DNS server belongs to is suitable as 'default' route for lookups; resolv.conf does
          * not have a syntax to express that, so it must not appear as a global name server to avoid routing unrelated
          * domains to it (which is a privacy violation, will most probably fail anyway, and adds unnecessary load) */
@@ -323,7 +326,7 @@ static int write_stub_resolv_conf_contents(FILE *f, OrderedSet *dns, OrderedSet 
 
 int manager_write_resolv_conf(Manager *m) {
         _cleanup_ordered_set_free_ OrderedSet *dns = NULL, *domains = NULL;
-        _cleanup_free_ char *temp_path_uplink = NULL, *temp_path_stub = NULL;
+        _cleanup_(unlink_and_freep) char *temp_path_uplink = NULL, *temp_path_stub = NULL;
         _cleanup_fclose_ FILE *f_uplink = NULL, *f_stub = NULL;
         int r;
 
@@ -335,60 +338,49 @@ int manager_write_resolv_conf(Manager *m) {
         /* Add the full list to a set, to filter out duplicates */
         r = manager_compile_dns_servers(m, &dns);
         if (r < 0)
-                return log_warning_errno(r, "Failed to compile list of DNS servers: %m");
+                return log_warning_errno(r, "Failed to compile list of DNS servers, ignoring: %m");
 
         r = manager_compile_search_domains(m, &domains, false);
         if (r < 0)
-                return log_warning_errno(r, "Failed to compile list of search domains: %m");
+                return log_warning_errno(r, "Failed to compile list of search domains, ignoring: %m");
 
         r = fopen_temporary_label(PRIVATE_UPLINK_RESOLV_CONF, PRIVATE_UPLINK_RESOLV_CONF, &f_uplink, &temp_path_uplink);
         if (r < 0)
-                return log_warning_errno(r, "Failed to open new %s for writing: %m", PRIVATE_UPLINK_RESOLV_CONF);
+                return log_warning_errno(r, "Failed to open new %s for writing, ignoring: %m", PRIVATE_UPLINK_RESOLV_CONF);
 
         (void) fchmod(fileno(f_uplink), 0644);
 
         r = write_uplink_resolv_conf_contents(f_uplink, dns, domains);
-        if (r < 0) {
-                log_error_errno(r, "Failed to write new %s: %m", PRIVATE_UPLINK_RESOLV_CONF);
-                goto fail;
-        }
+        if (r < 0)
+                return log_warning_errno(r, "Failed to write new %s, ignoring: %m", PRIVATE_UPLINK_RESOLV_CONF);
 
         if (m->dns_stub_listener_mode != DNS_STUB_LISTENER_NO) {
                 r = fopen_temporary_label(PRIVATE_STUB_RESOLV_CONF, PRIVATE_STUB_RESOLV_CONF, &f_stub, &temp_path_stub);
-                if (r < 0) {
-                        log_warning_errno(r, "Failed to open new %s for writing: %m", PRIVATE_STUB_RESOLV_CONF);
-                        goto fail;
-                }
+                if (r < 0)
+                        return log_warning_errno(r, "Failed to open new %s for writing, ignoring: %m", PRIVATE_STUB_RESOLV_CONF);
 
                 (void) fchmod(fileno(f_stub), 0644);
 
                 r = write_stub_resolv_conf_contents(f_stub, dns, domains);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to write new %s: %m", PRIVATE_STUB_RESOLV_CONF);
-                        goto fail;
-                }
+                if (r < 0)
+                        return log_warning_errno(r, "Failed to write new %s, ignoring: %m", PRIVATE_STUB_RESOLV_CONF);
 
                 r = conservative_rename(temp_path_stub, PRIVATE_STUB_RESOLV_CONF);
                 if (r < 0)
-                        log_error_errno(r, "Failed to move new %s into place: %m", PRIVATE_STUB_RESOLV_CONF);
+                        log_warning_errno(r, "Failed to move new %s into place, ignoring: %m", PRIVATE_STUB_RESOLV_CONF);
 
+                temp_path_stub = mfree(temp_path_stub); /* free the string explicitly, so that we don't unlink anymore */
         } else {
                 r = symlink_atomic_label(basename(PRIVATE_UPLINK_RESOLV_CONF), PRIVATE_STUB_RESOLV_CONF);
                 if (r < 0)
-                        log_error_errno(r, "Failed to symlink %s: %m", PRIVATE_STUB_RESOLV_CONF);
+                        log_warning_errno(r, "Failed to symlink %s, ignoring: %m", PRIVATE_STUB_RESOLV_CONF);
         }
 
         r = conservative_rename(temp_path_uplink, PRIVATE_UPLINK_RESOLV_CONF);
         if (r < 0)
-                log_error_errno(r, "Failed to move new %s into place: %m", PRIVATE_UPLINK_RESOLV_CONF);
+                log_warning_errno(r, "Failed to move new %s into place: %m", PRIVATE_UPLINK_RESOLV_CONF);
 
- fail:
-        if (r < 0) {
-                /* Something went wrong, perform cleanup... */
-                (void) unlink(temp_path_uplink);
-                (void) unlink(temp_path_stub);
-        }
-
+        temp_path_uplink = mfree(temp_path_uplink); /* free the string explicitly, so that we don't unlink anymore */
         return r;
 }
 
@@ -421,8 +413,7 @@ int resolv_conf_mode(void) {
                         continue;
                 }
 
-                if (system_st.st_dev == our_st.st_dev &&
-                    system_st.st_ino == our_st.st_ino)
+                if (stat_inode_same(&system_st, &our_st))
                         return m;
         }
 

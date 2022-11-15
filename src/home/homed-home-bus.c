@@ -21,11 +21,10 @@ static int property_get_unix_record(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
 
         assert(bus);
         assert(reply);
-        assert(h);
 
         return sd_bus_message_append(
                         reply, "(suusss)",
@@ -46,11 +45,10 @@ static int property_get_state(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
 
         assert(bus);
         assert(reply);
-        assert(h);
 
         return sd_bus_message_append(reply, "s", home_state_to_string(home_get_state(h)));
 }
@@ -125,13 +123,12 @@ static int property_get_user_record(
                 sd_bus_error *error) {
 
         _cleanup_free_ char *json = NULL;
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         bool incomplete;
         int r;
 
         assert(bus);
         assert(reply);
-        assert(h);
 
         r = bus_home_get_record_json(h, sd_bus_get_current_message(bus), &json, &incomplete);
         if (r < 0)
@@ -146,11 +143,10 @@ int bus_home_method_activate(
                 sd_bus_error *error) {
 
         _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(h);
 
         r = bus_message_read_secret(message, &secret, error);
         if (r < 0)
@@ -176,11 +172,10 @@ int bus_home_method_deactivate(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(h);
 
         r = home_deactivate(h, false, error);
         if (r < 0)
@@ -201,11 +196,10 @@ int bus_home_method_unregister(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(h);
 
         r = bus_verify_polkit_async(
                         message,
@@ -238,11 +232,10 @@ int bus_home_method_realize(
                 sd_bus_error *error) {
 
         _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(h);
 
         r = bus_message_read_secret(message, &secret, error);
         if (r < 0)
@@ -283,11 +276,10 @@ int bus_home_method_remove(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(h);
 
         r = bus_verify_polkit_async(
                         message,
@@ -324,11 +316,10 @@ int bus_home_method_fixate(
                 sd_bus_error *error) {
 
         _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(h);
 
         r = bus_message_read_secret(message, &secret, error);
         if (r < 0)
@@ -354,11 +345,10 @@ int bus_home_method_authenticate(
                 sd_bus_error *error) {
 
         _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(h);
 
         r = bus_message_read_secret(message, &secret, error);
         if (r < 0)
@@ -437,11 +427,10 @@ int bus_home_method_update(
                 sd_bus_error *error) {
 
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(h);
 
         r = bus_message_read_home_record(message, USER_RECORD_REQUIRE_REGULAR|USER_RECORD_REQUIRE_SECRET|USER_RECORD_ALLOW_PRIVILEGED|USER_RECORD_ALLOW_PER_MACHINE|USER_RECORD_ALLOW_SIGNATURE|USER_RECORD_PERMISSIVE, &hr, error);
         if (r < 0)
@@ -456,12 +445,11 @@ int bus_home_method_resize(
                 sd_bus_error *error) {
 
         _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         uint64_t sz;
         int r;
 
         assert(message);
-        assert(h);
 
         r = sd_bus_message_read(message, "t", &sz);
         if (r < 0)
@@ -485,7 +473,7 @@ int bus_home_method_resize(
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = home_resize(h, sz, secret, error);
+        r = home_resize(h, sz, secret, /* automatic= */ false, error);
         if (r < 0)
                 return r;
 
@@ -505,11 +493,10 @@ int bus_home_method_change_password(
                 sd_bus_error *error) {
 
         _cleanup_(user_record_unrefp) UserRecord *new_secret = NULL, *old_secret = NULL;
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(h);
 
         r = bus_message_read_secret(message, &new_secret, error);
         if (r < 0)
@@ -552,11 +539,10 @@ int bus_home_method_lock(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(h);
 
         r = home_lock(h, error);
         if (r < 0)
@@ -580,11 +566,10 @@ int bus_home_method_unlock(
                 sd_bus_error *error) {
 
         _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(h);
 
         r = bus_message_read_secret(message, &secret, error);
         if (r < 0)
@@ -614,10 +599,9 @@ int bus_home_method_acquire(
         _cleanup_(operation_unrefp) Operation *o = NULL;
         _cleanup_close_ int fd = -1;
         int r, please_suspend;
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
 
         assert(message);
-        assert(h);
 
         r = bus_message_read_secret(message, &secret, error);
         if (r < 0)
@@ -652,12 +636,11 @@ int bus_home_method_ref(
                 sd_bus_error *error) {
 
         _cleanup_close_ int fd = -1;
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         HomeState state;
         int please_suspend, r;
 
         assert(message);
-        assert(h);
 
         r = sd_bus_message_read(message, "b", &please_suspend);
         if (r < 0)
@@ -693,11 +676,10 @@ int bus_home_method_release(
                 sd_bus_error *error) {
 
         _cleanup_(operation_unrefp) Operation *o = NULL;
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(h);
 
         o = operation_new(OPERATION_RELEASE, message);
         if (!o)
@@ -771,6 +753,8 @@ static int bus_home_node_enumerator(
                 r = bus_home_path(h, l + k);
                 if (r < 0)
                         return r;
+
+                k++;
         }
 
         *nodes = TAKE_PTR(l);
@@ -796,76 +780,61 @@ const sd_bus_vtable home_vtable[] = {
                         property_get_user_record, 0,
                         SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION|SD_BUS_VTABLE_SENSITIVE),
 
-        SD_BUS_METHOD_WITH_NAMES("Activate",
-                                 "s",
-                                 SD_BUS_PARAM(secret),
-                                 NULL,,
-                                 bus_home_method_activate,
-                                 SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("Activate",
+                                SD_BUS_ARGS("s", secret),
+                                SD_BUS_NO_RESULT,
+                                bus_home_method_activate,
+                                SD_BUS_VTABLE_SENSITIVE),
         SD_BUS_METHOD("Deactivate", NULL, NULL, bus_home_method_deactivate, 0),
         SD_BUS_METHOD("Unregister", NULL, NULL, bus_home_method_unregister, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD_WITH_NAMES("Realize",
-                                 "s",
-                                 SD_BUS_PARAM(secret),
-                                 NULL,,
-                                 bus_home_method_realize,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("Realize",
+                                SD_BUS_ARGS("s", secret),
+                                SD_BUS_NO_RESULT,
+                                bus_home_method_realize,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
 
         SD_BUS_METHOD("Remove", NULL, NULL, bus_home_method_remove, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD_WITH_NAMES("Fixate",
-                                 "s",
-                                 SD_BUS_PARAM(secret),
-                                 NULL,,
-                                 bus_home_method_fixate,
-                                 SD_BUS_VTABLE_SENSITIVE),
-        SD_BUS_METHOD_WITH_NAMES("Authenticate",
-                                 "s",
-                                 SD_BUS_PARAM(secret),
-                                 NULL,,
-                                 bus_home_method_authenticate,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
-        SD_BUS_METHOD_WITH_NAMES("Update",
-                                 "s",
-                                 SD_BUS_PARAM(user_record),
-                                 NULL,,
-                                 bus_home_method_update,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
-        SD_BUS_METHOD_WITH_NAMES("Resize",
-                                 "ts",
-                                 SD_BUS_PARAM(size)
-                                 SD_BUS_PARAM(secret),
-                                 NULL,,
-                                 bus_home_method_resize,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
-        SD_BUS_METHOD_WITH_NAMES("ChangePassword",
-                                 "ss",
-                                 SD_BUS_PARAM(new_secret)
-                                 SD_BUS_PARAM(old_secret),
-                                 NULL,,
-                                 bus_home_method_change_password,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("Fixate",
+                                SD_BUS_ARGS("s", secret),
+                                SD_BUS_NO_RESULT,
+                                bus_home_method_fixate,
+                                SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("Authenticate",
+                                SD_BUS_ARGS("s", secret),
+                                SD_BUS_NO_RESULT,
+                                bus_home_method_authenticate,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("Update",
+                                SD_BUS_ARGS("s", user_record),
+                                SD_BUS_NO_RESULT,
+                                bus_home_method_update,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("Resize",
+                                SD_BUS_ARGS("t", size, "s", secret),
+                                SD_BUS_NO_RESULT,
+                                bus_home_method_resize,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("ChangePassword",
+                                SD_BUS_ARGS("s", new_secret, "s", old_secret),
+                                SD_BUS_NO_RESULT,
+                                bus_home_method_change_password,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
         SD_BUS_METHOD("Lock", NULL, NULL, bus_home_method_lock, 0),
-        SD_BUS_METHOD_WITH_NAMES("Unlock",
-                                 "s",
-                                 SD_BUS_PARAM(secret),
-                                 NULL,,
-                                 bus_home_method_unlock,
-                                 SD_BUS_VTABLE_SENSITIVE),
-        SD_BUS_METHOD_WITH_NAMES("Acquire",
-                                 "sb",
-                                 SD_BUS_PARAM(secret)
-                                 SD_BUS_PARAM(please_suspend),
-                                 "h",
-                                 SD_BUS_PARAM(send_fd),
-                                 bus_home_method_acquire,
-                                 SD_BUS_VTABLE_SENSITIVE),
-        SD_BUS_METHOD_WITH_NAMES("Ref",
-                                 "b",
-                                 SD_BUS_PARAM(please_suspend),
-                                 "h",
-                                 SD_BUS_PARAM(send_fd),
-                                 bus_home_method_ref,
-                                 0),
+        SD_BUS_METHOD_WITH_ARGS("Unlock",
+                                SD_BUS_ARGS("s", secret),
+                                SD_BUS_NO_RESULT,
+                                bus_home_method_unlock,
+                                SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("Acquire",
+                                SD_BUS_ARGS("s", secret, "b", please_suspend),
+                                SD_BUS_RESULT("h", send_fd),
+                                bus_home_method_acquire,
+                                SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("Ref",
+                                SD_BUS_ARGS("b", please_suspend),
+                                SD_BUS_RESULT("h", send_fd),
+                                bus_home_method_ref,
+                                0),
         SD_BUS_METHOD("Release", NULL, NULL, bus_home_method_release, 0),
         SD_BUS_VTABLE_END
 };
@@ -880,10 +849,8 @@ const BusObjectImplementation home_object = {
 
 static int on_deferred_change(sd_event_source *s, void *userdata) {
         _cleanup_free_ char *path = NULL;
-        Home *h = userdata;
+        Home *h = ASSERT_PTR(userdata);
         int r;
-
-        assert(h);
 
         h->deferred_change_event_source = sd_event_source_disable_unref(h->deferred_change_event_source);
 
@@ -938,6 +905,12 @@ int bus_home_emit_remove(Home *h) {
         assert(h);
 
         if (!h->announced)
+                return 0;
+
+        if (!h->manager)
+                return 0;
+
+        if (!h->manager->bus)
                 return 0;
 
         r = bus_home_path(h, &path);

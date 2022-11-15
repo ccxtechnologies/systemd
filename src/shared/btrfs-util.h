@@ -35,6 +35,7 @@ typedef enum BtrfsSnapshotFlags {
         BTRFS_SNAPSHOT_FALLBACK_DIRECTORY = 1 << 4, /* If the destination doesn't support subvolumes, reflink/copy instead */
         BTRFS_SNAPSHOT_FALLBACK_IMMUTABLE = 1 << 5, /* When we can't create a subvolume, use the FS_IMMUTABLE attribute for indicating read-only */
         BTRFS_SNAPSHOT_SIGINT             = 1 << 6, /* Check for SIGINT regularly, and return EINTR if seen */
+        BTRFS_SNAPSHOT_SIGTERM            = 1 << 7, /* Ditto, but for SIGTERM */
 } BtrfsSnapshotFlags;
 
 typedef enum BtrfsRemoveFlags {
@@ -51,6 +52,7 @@ int btrfs_clone_range(int infd, uint64_t in_offset, int ofd, uint64_t out_offset
 int btrfs_get_block_device_fd(int fd, dev_t *dev);
 int btrfs_get_block_device(const char *path, dev_t *dev);
 
+int btrfs_defrag_fd(int fd);
 int btrfs_defrag(const char *p);
 
 int btrfs_quota_enable_fd(int fd, bool b);

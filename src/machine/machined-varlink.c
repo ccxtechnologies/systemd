@@ -27,11 +27,11 @@ static int build_user_json(const char *user_name, uid_t uid, const char *real_na
                                        JSON_BUILD_PAIR("uid", JSON_BUILD_UNSIGNED(uid)),
                                        JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(GID_NOBODY)),
                                        JSON_BUILD_PAIR_CONDITION(!isempty(real_name), "realName", JSON_BUILD_STRING(real_name)),
-                                       JSON_BUILD_PAIR("homeDirectory", JSON_BUILD_STRING("/")),
+                                       JSON_BUILD_PAIR("homeDirectory", JSON_BUILD_CONST_STRING("/")),
                                        JSON_BUILD_PAIR("shell", JSON_BUILD_STRING(NOLOGIN)),
                                        JSON_BUILD_PAIR("locked", JSON_BUILD_BOOLEAN(true)),
-                                       JSON_BUILD_PAIR("service", JSON_BUILD_STRING("io.systemd.Machine")),
-                                       JSON_BUILD_PAIR("disposition", JSON_BUILD_STRING("container"))))));
+                                       JSON_BUILD_PAIR("service", JSON_BUILD_CONST_STRING("io.systemd.Machine")),
+                                       JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("container"))))));
 }
 
 static bool user_match_lookup_parameters(LookupParameters *p, const char *name, uid_t uid) {
@@ -150,12 +150,11 @@ static int vl_method_get_user_record(Varlink *link, JsonVariant *parameters, Var
         };
         _cleanup_free_ char *found_name = NULL, *found_real_name = NULL;
         uid_t found_uid = UID_INVALID, uid;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         const char *un;
         int r;
 
         assert(parameters);
-        assert(m);
 
         r = json_dispatch(parameters, dispatch_table, NULL, 0, &p);
         if (r < 0)
@@ -198,8 +197,8 @@ static int build_group_json(const char *group_name, gid_t gid, const char *descr
                                        JSON_BUILD_PAIR("groupName", JSON_BUILD_STRING(group_name)),
                                        JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(gid)),
                                        JSON_BUILD_PAIR_CONDITION(!isempty(description), "description", JSON_BUILD_STRING(description)),
-                                       JSON_BUILD_PAIR("service", JSON_BUILD_STRING("io.systemd.Machine")),
-                                       JSON_BUILD_PAIR("disposition", JSON_BUILD_STRING("container"))))));
+                                       JSON_BUILD_PAIR("service", JSON_BUILD_CONST_STRING("io.systemd.Machine")),
+                                       JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("container"))))));
     }
 
 static bool group_match_lookup_parameters(LookupParameters *p, const char *name, gid_t gid) {
@@ -297,7 +296,7 @@ static int group_lookup_name(Manager *m, const char *name, gid_t *ret_gid, char 
                 desc = mfree(desc);
 
         *ret_gid = converted_gid;
-        *ret_description = desc;
+        *ret_description = TAKE_PTR(desc);
         return 0;
 }
 
@@ -316,12 +315,11 @@ static int vl_method_get_group_record(Varlink *link, JsonVariant *parameters, Va
         };
         _cleanup_free_ char *found_name = NULL, *found_description = NULL;
         uid_t found_gid = GID_INVALID, gid;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         const char *gn;
         int r;
 
         assert(parameters);
-        assert(m);
 
         r = json_dispatch(parameters, dispatch_table, NULL, 0, &p);
         if (r < 0)

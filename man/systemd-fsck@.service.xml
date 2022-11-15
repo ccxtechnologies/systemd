@@ -31,15 +31,12 @@
   <refsect1>
     <title>Description</title>
 
-    <para><filename>systemd-fsck@.service</filename> and
-    <filename>systemd-fsck-root.service</filename> are services
-    responsible for file system checks. They are instantiated for each
-    device that is configured for file system checking.
-    <filename>systemd-fsck-root.service</filename> is responsible for
-    file system checks on the root file system, but only if the
-    root filesystem was not checked in the initramfs.
-    <filename>systemd-fsck@.service</filename> is used for all other
-    file systems and for the root file system in the initramfs.</para>
+    <para><filename>systemd-fsck@.service</filename> and <filename>systemd-fsck-root.service</filename> are
+    services responsible for file system checks. They are instantiated for each device that is configured for
+    file system checking.  <filename>systemd-fsck-root.service</filename> is responsible for file system
+    checks on the root file system, but only if the root filesystem was not checked in the initrd.
+    <filename>systemd-fsck@.service</filename> is used for all other file systems and for the root file
+    system in the initrd.</para>
 
     <para>These services are started at boot if
     <option>passno</option> in <filename>/etc/fstab</filename> for the
@@ -55,9 +52,18 @@
     the filesystem should actually be checked based on the time since
     last check, number of mounts, unclean unmount, etc.</para>
 
-    <para>If a file system check fails for a service without
-    <option>nofail</option>, emergency mode is activated, by isolating
-    to <filename>emergency.target</filename>.</para>
+    <para><filename>systemd-fsck-root.service</filename> will activate
+    <filename>reboot.target</filename> if <filename>/sbin/fsck</filename>
+    returns the "System should reboot" condition, or
+    <filename>emergency.target</filename> if <filename>/sbin/fsck</filename>
+    returns the "Filesystem errors left uncorrected" condition.</para>
+
+    <para><filename>systemd-fsck@.service</filename> will fail if
+    <filename>/sbin/fsck</filename> returns with either "System should reboot"
+    or "Filesystem errors left uncorrected" conditions. For filesystems
+    listed in <filename>/etc/fstab</filename> without <literal>nofail</literal>
+    or <literal>noauto</literal> options, <literal>local-fs.target</literal>
+    will then activate <filename>emergency.target</filename>.</para>
   </refsect1>
 
   <refsect1>

@@ -46,7 +46,11 @@ static const char* arg_output = NULL;
 static char *arg_key = NULL;
 static char *arg_cert = NULL;
 static char *arg_trust = NULL;
+#if HAVE_GNUTLS
 static bool arg_trust_all = false;
+#else
+static bool arg_trust_all = true;
+#endif
 
 STATIC_DESTRUCTOR_REGISTER(arg_gnutls_log, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_key, freep);
@@ -83,9 +87,9 @@ static int spawn_child(const char* child, char** argv) {
 
         /* In the child */
         if (r == 0) {
-                safe_close(fd[0]);
+                fd[0] = safe_close(fd[0]);
 
-                r = rearrange_stdio(STDIN_FILENO, fd[1], STDERR_FILENO);
+                r = rearrange_stdio(STDIN_FILENO, TAKE_FD(fd[1]), STDERR_FILENO);
                 if (r < 0) {
                         log_error_errno(r, "Failed to dup pipe to stdout: %m");
                         _exit(EXIT_FAILURE);
@@ -219,9 +223,7 @@ static int process_http_upload(
                 finished = true;
 
         for (;;) {
-                r = process_source(source,
-                                   journal_remote_server_global->compress,
-                                   journal_remote_server_global->seal);
+                r = process_source(source, journal_remote_server_global->file_flags);
                 if (r == -EAGAIN)
                         break;
                 if (r < 0) {
@@ -319,7 +321,7 @@ static mhd_result request_handler(
                         /* When serialized, an entry of maximum size might be slightly larger,
                          * so this does not correspond exactly to the limit in journald. Oh well.
                          */
-                        return mhd_respondf(connection, 0, MHD_HTTP_PAYLOAD_TOO_LARGE,
+                        return mhd_respondf(connection, 0, MHD_HTTP_CONTENT_TOO_LARGE,
                                             "Payload larger than maximum size of %u bytes", ENTRY_SIZE_MAX);
         }
 
@@ -528,11 +530,9 @@ static int dispatch_http_event(sd_event_source *event,
                                int fd,
                                uint32_t revents,
                                void *userdata) {
-        MHDDaemonWrapper *d = userdata;
+        MHDDaemonWrapper *d = ASSERT_PTR(userdata);
         int r;
         MHD_UNSIGNED_LONG_LONG timeout = ULLONG_MAX;
-
-        assert(d);
 
         r = MHD_run(d->daemon);
         if (r == MHD_NO)
@@ -594,9 +594,13 @@ static int create_remoteserver(
                 const char* trust) {
 
         int r, n, fd;
-        char **file;
 
-        r = journal_remote_server_init(s, arg_output, arg_split_mode, arg_compress, arg_seal);
+        r = journal_remote_server_init(
+                        s,
+                        arg_output,
+                        arg_split_mode,
+                        (arg_compress ? JOURNAL_COMPRESS : 0) |
+                        (arg_seal ? JOURNAL_SEAL : 0));
         if (r < 0)
                 return r;
 
@@ -662,7 +666,7 @@ static int create_remoteserver(
                         else
                                 url = strjoina(arg_url, "/entries");
                 } else
-                        url = strdupa(arg_url);
+                        url = strdupa_safe(arg_url);
 
                 log_info("Spawning curl %s...", url);
                 fd = spawn_curl(url);
@@ -673,7 +677,7 @@ static int create_remoteserver(
                 if (!hostname)
                         hostname = arg_url;
 
-                hostname = strndupa(hostname, strcspn(hostname, "/:"));
+                hostname = strndupa_safe(hostname, strcspn(hostname, "/:"));
 
                 r = journal_remote_add_source(s, fd, (char *) hostname, false);
                 if (r < 0)
@@ -852,7 +856,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argv);
 
         while ((c = getopt_long(argc, argv, "ho:", options, NULL)) >= 0)
-                switch(c) {
+                switch (c) {
 
                 case 'h':
                         return help();
@@ -932,6 +936,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_TRUST:
+#if HAVE_GNUTLS
                         if (arg_trust || arg_trust_all)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Confusing trusted CA configuration");
@@ -939,16 +944,14 @@ static int parse_argv(int argc, char *argv[]) {
                         if (streq(optarg, "all"))
                                 arg_trust_all = true;
                         else {
-#if HAVE_GNUTLS
                                 arg_trust = strdup(optarg);
                                 if (!arg_trust)
                                         return log_oom();
-#else
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Option --trust is not available.");
-#endif
                         }
-
+#else
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Option --trust is not available.");
+#endif
                         break;
 
                 case 'o':
@@ -1003,7 +1006,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unknown option code.");
+                        assert_not_reached();
                 }
 
         if (optind < argc)
@@ -1099,7 +1102,7 @@ static int load_certificates(char **key, char **cert, char **trust) {
 
 static int run(int argc, char **argv) {
         _cleanup_(journal_remote_server_destroy) RemoteServer s = {};
-        _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
+        _unused_ _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         _cleanup_(erase_and_freep) char *key = NULL;
         _cleanup_free_ char *cert = NULL, *trust = NULL;
         int r;

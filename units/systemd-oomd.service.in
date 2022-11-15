@@ -14,9 +14,12 @@ DefaultDependencies=no
 Before=multi-user.target shutdown.target
 Conflicts=shutdown.target
 ConditionControlGroupController=v2
+ConditionControlGroupController=memory
 ConditionPathExists=/proc/pressure/cpu
 ConditionPathExists=/proc/pressure/io
 ConditionPathExists=/proc/pressure/memory
+Requires=systemd-oomd.socket
+After=systemd-oomd.socket
 
 [Service]
 AmbientCapabilities=CAP_KILL CAP_DAC_OVERRIDE

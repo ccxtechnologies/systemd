@@ -19,13 +19,11 @@ static int property_get_monotonic_timers(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Timer *t = userdata;
-        TimerValue *v;
+        Timer *t = ASSERT_PTR(userdata);
         int r;
 
         assert(bus);
         assert(reply);
-        assert(t);
 
         r = sd_bus_message_open_container(reply, 'a', "(stt)");
         if (r < 0)
@@ -68,13 +66,11 @@ static int property_get_calendar_timers(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Timer *t = userdata;
-        TimerValue *v;
+        Timer *t = ASSERT_PTR(userdata);
         int r;
 
         assert(bus);
         assert(reply);
-        assert(t);
 
         r = sd_bus_message_open_container(reply, 'a', "(sst)");
         if (r < 0)
@@ -107,11 +103,10 @@ static int property_get_next_elapse_monotonic(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Timer *t = userdata;
+        Timer *t = ASSERT_PTR(userdata);
 
         assert(bus);
         assert(reply);
-        assert(t);
 
         return sd_bus_message_append(reply, "t",
                                      (uint64_t) usec_shift_clock(t->next_elapse_monotonic_or_boottime,
@@ -147,13 +142,12 @@ static int timer_add_one_monotonic_spec(
                 sd_bus_error *error) {
 
         if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
-                char ts[FORMAT_TIMESPAN_MAX];
                 TimerValue *v;
 
                 unit_write_settingf(UNIT(t), flags|UNIT_ESCAPE_SPECIFIERS, name,
                                     "%s=%s",
                                     timer_base_to_string(base),
-                                    format_timespan(ts, sizeof ts, usec, USEC_PER_MSEC));
+                                    FORMAT_TIMESPAN(usec, USEC_PER_MSEC));
 
                 v = new(TimerValue, 1);
                 if (!v)

@@ -10,6 +10,7 @@
 #include "bus-locator.h"
 #include "bus-unit-util.h"
 #include "bus-wait-for-jobs.h"
+#include "chase-symlinks.h"
 #include "def.h"
 #include "dirent-util.h"
 #include "env-file.h"
@@ -24,8 +25,8 @@
 #include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
-#include "pretty-print.h"
 #include "portable.h"
+#include "pretty-print.h"
 #include "spawn-polkit-agent.h"
 #include "string-util.h"
 #include "strv.h"
@@ -47,6 +48,7 @@ static bool arg_enable = false;
 static bool arg_now = false;
 static bool arg_no_block = false;
 static char **arg_extension_images = NULL;
+static bool arg_force = false;
 
 STATIC_DESTRUCTOR_REGISTER(arg_extension_images, strv_freep);
 
@@ -89,7 +91,6 @@ static int determine_image(const char *image, bool permit_non_existing, char **r
 }
 
 static int attach_extensions_to_message(sd_bus_message *m, char **extensions) {
-        char **p;
         int r;
 
         assert(m);
@@ -219,7 +220,7 @@ static int acquire_bus(sd_bus **bus) {
 
         r = bus_connect_transport(arg_transport, arg_host, false, bus);
         if (r < 0)
-                return bus_log_connect_error(r);
+                return bus_log_connect_error(r, arg_transport);
 
         (void) sd_bus_set_allow_interactive_authorization(*bus, arg_ask_password);
 
@@ -249,7 +250,7 @@ static int maybe_reload(sd_bus **bus) {
                 return bus_log_create_error(r);
 
         /* Reloading the daemon may take long, hence set a longer timeout here */
-        r = sd_bus_call(*bus, m, DEFAULT_TIMEOUT_USEC * 2, &error, NULL);
+        r = sd_bus_call(*bus, m, DAEMON_RELOAD_TIMEOUT_SEC, &error, NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to reload daemon: %s", bus_error_message(&error, r));
 
@@ -259,8 +260,8 @@ static int maybe_reload(sd_bus **bus) {
 static int get_image_metadata(sd_bus *bus, const char *image, char **matches, sd_bus_message **reply) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        uint64_t flags = arg_force ? PORTABLE_FORCE_SYSEXT : 0;
         const char *method;
-        uint64_t flags = 0;
         int r;
 
         assert(bus);
@@ -332,7 +333,7 @@ static int inspect_image(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         if (arg_cat) {
                 printf("%s-- OS Release: --%s\n", ansi_highlight(), ansi_normal());
@@ -343,7 +344,7 @@ static int inspect_image(int argc, char *argv[], void *userdata) {
                 _cleanup_free_ char *pretty_portable = NULL, *pretty_os = NULL;
                 _cleanup_fclose_ FILE *f = NULL;
 
-                f = fmemopen_unlocked((void*) data, sz, "re");
+                f = fmemopen_unlocked((void*) data, sz, "r");
                 if (!f)
                         return log_error_errno(errno, "Failed to open /etc/os-release buffer: %m");
 
@@ -359,6 +360,85 @@ static int inspect_image(int argc, char *argv[], void *userdata) {
                        path,
                        strna(pretty_portable),
                        strna(pretty_os));
+        }
+
+        if (!strv_isempty(arg_extension_images)) {
+                /* If we specified any extensions, we'll first get back exactly the paths (and
+                 * extension-release content) for each one of the arguments. */
+
+                r = sd_bus_message_enter_container(reply, 'a', "{say}");
+                if (r < 0)
+                        return bus_log_parse_error(r);
+
+                for (size_t i = 0; i < strv_length(arg_extension_images); ++i) {
+                        const char *name;
+
+                        r = sd_bus_message_enter_container(reply, 'e', "say");
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+                        if (r == 0)
+                                break;
+
+                        r = sd_bus_message_read(reply, "s", &name);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        r = sd_bus_message_read_array(reply, 'y', &data, &sz);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        if (arg_cat) {
+                                if (nl)
+                                        fputc('\n', stdout);
+
+                                printf("%s-- Extension Release: %s --%s\n", ansi_highlight(), name, ansi_normal());
+                                fwrite(data, sz, 1, stdout);
+                                fflush(stdout);
+                                nl = true;
+                        } else {
+                                _cleanup_free_ char *pretty_portable = NULL, *pretty_os = NULL, *sysext_level = NULL,
+                                        *id = NULL, *version_id = NULL, *sysext_scope = NULL, *portable_prefixes = NULL;
+                                _cleanup_fclose_ FILE *f = NULL;
+
+                                f = fmemopen_unlocked((void*) data, sz, "r");
+                                if (!f)
+                                        return log_error_errno(errno, "Failed to open extension-release buffer: %m");
+
+                                r = parse_env_file(f, name,
+                                                   "ID", &id,
+                                                   "VERSION_ID", &version_id,
+                                                   "SYSEXT_SCOPE", &sysext_scope,
+                                                   "SYSEXT_LEVEL", &sysext_level,
+                                                   "PORTABLE_PRETTY_NAME", &pretty_portable,
+                                                   "PORTABLE_PREFIXES", &portable_prefixes,
+                                                   "PRETTY_NAME", &pretty_os);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to parse extension release from '%s': %m", name);
+
+                                printf("Extension:\n\t%s\n"
+                                       "\tExtension Scope:\n\t\t%s\n"
+                                       "\tExtension Compatibility Level:\n\t\t%s\n"
+                                       "\tPortable Service:\n\t\t%s\n"
+                                       "\tPortable Prefixes:\n\t\t%s\n"
+                                       "\tOperating System:\n\t\t%s (%s %s)\n",
+                                       name,
+                                       strna(sysext_scope),
+                                       strna(sysext_level),
+                                       strna(pretty_portable),
+                                       strna(portable_prefixes),
+                                       strna(pretty_os),
+                                       strna(id),
+                                       strna(version_id));
+                        }
+
+                        r = sd_bus_message_exit_container(reply);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+                }
+
+                r = sd_bus_message_exit_container(reply);
+                if (r < 0)
+                        return bus_log_parse_error(r);
         }
 
         r = sd_bus_message_enter_container(reply, 'a', "{say}");
@@ -433,12 +513,12 @@ static int print_changes(sd_bus_message *m) {
                         break;
 
                 if (streq(type, "symlink"))
-                        log_info("Created symlink %s %s %s.", path, special_glyph(SPECIAL_GLYPH_ARROW), source);
+                        log_info("Created symlink %s %s %s.", path, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), source);
                 else if (streq(type, "copy")) {
                         if (isempty(source))
                                 log_info("Copied %s.", path);
                         else
-                                log_info("Copied %s %s %s.", source, special_glyph(SPECIAL_GLYPH_ARROW), path);
+                                log_info("Copied %s %s %s.", source, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), path);
                 } else if (streq(type, "unlink"))
                         log_info("Removed %s.", path);
                 else if (streq(type, "write"))
@@ -460,7 +540,7 @@ static int maybe_enable_disable(sd_bus *bus, const char *path, bool enable) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_strv_free_ char **names = NULL;
-        UnitFileChange *changes = NULL;
+        InstallChange *changes = NULL;
         const uint64_t flags = UNIT_FILE_PORTABLE | (arg_runtime ? UNIT_FILE_RUNTIME : 0);
         size_t n_changes = 0;
         int r;
@@ -500,7 +580,9 @@ static int maybe_enable_disable(sd_bus *bus, const char *path, bool enable) {
                 if (r < 0)
                         return bus_log_parse_error(r);
         }
+
         (void) bus_deserialize_and_dump_unit_file_changes(reply, arg_quiet, &changes, &n_changes);
+        install_changes_free(changes, n_changes);
 
         return 0;
 }
@@ -516,11 +598,9 @@ static int maybe_start_stop_restart(sd_bus *bus, const char *path, const char *m
         if (!arg_now)
                 return 0;
 
-        r = sd_bus_call_method(
+        r = bus_call_method(
                         bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
+                        bus_systemd_mgr,
                         method,
                         &error,
                         &reply,
@@ -695,6 +775,13 @@ static int maybe_stop_disable(sd_bus *bus, char *image, char *argv[]) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
+        /* If we specified any extensions, we'll first an array of extension-release metadata. */
+        if (!strv_isempty(arg_extension_images)) {
+                r = sd_bus_message_skip(reply, "a{say}");
+                if (r < 0)
+                        return bus_log_parse_error(r);
+        }
+
         r = sd_bus_message_enter_container(reply, 'a', "{say}");
         if (r < 0)
                 return bus_log_parse_error(r);
@@ -782,7 +869,7 @@ static int attach_reattach_image(int argc, char *argv[], const char *method) {
                 return bus_log_create_error(r);
 
         if (STR_IN_SET(method, "AttachImageWithExtensions", "ReattachImageWithExtensions")) {
-                uint64_t flags = arg_runtime ? PORTABLE_RUNTIME : 0;
+                uint64_t flags = (arg_runtime ? PORTABLE_RUNTIME : 0) | (arg_force ? PORTABLE_FORCE_ATTACH | PORTABLE_FORCE_SYSEXT : 0);
 
                 r = sd_bus_message_append(m, "st", arg_copy_mode, flags);
         } else
@@ -851,12 +938,13 @@ static int detach_image(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return r;
 
-        if (!strv_isempty(arg_extension_images)) {
-                uint64_t flags = arg_runtime ? PORTABLE_RUNTIME : 0;
+        if (strv_isempty(arg_extension_images))
+                r = sd_bus_message_append(m, "b", arg_runtime);
+        else {
+                uint64_t flags = (arg_runtime ? PORTABLE_RUNTIME : 0) | (arg_force ? PORTABLE_FORCE_ATTACH | PORTABLE_FORCE_SYSEXT : 0);
 
                 r = sd_bus_message_append(m, "t", flags);
-        } else
-                r = sd_bus_message_append(m, "b", arg_runtime);
+        }
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -1033,11 +1121,11 @@ static int set_limit(int argc, char *argv[], void *userdata) {
 }
 
 static int is_image_attached(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_free_ char *image = NULL;
-        const char *state;
+        const char *state, *method;
         int r;
 
         r = determine_image(argv[1], true, &image);
@@ -1048,9 +1136,29 @@ static int is_image_attached(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return r;
 
-        r = bus_call_method(bus, bus_portable_mgr, "GetImageState", &error, &reply, "s", image);
+        method = strv_isempty(arg_extension_images) ? "GetImageState" : "GetImageStateWithExtensions";
+
+        r = bus_message_new_method_call(bus, &m, bus_portable_mgr, method);
         if (r < 0)
-                return log_error_errno(r, "Failed to get image state: %s", bus_error_message(&error, r));
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_append(m, "s", image);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = attach_extensions_to_message(m, arg_extension_images);
+        if (r < 0)
+                return r;
+
+        if (!strv_isempty(arg_extension_images)) {
+                r = sd_bus_message_append(m, "t", 0);
+                if (r < 0)
+                        return bus_log_create_error(r);
+        }
+
+        r = sd_bus_call(bus, m, 0, &error, &reply);
+        if (r < 0)
+                return log_error_errno(r, "%s failed: %s", method, bus_error_message(&error, r));
 
         r = sd_bus_message_read(reply, "s", &state);
         if (r < 0)
@@ -1066,7 +1174,6 @@ static int dump_profiles(void) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_strv_free_ char **l = NULL;
-        char **i;
         int r;
 
         r = acquire_bus(&bus);
@@ -1092,7 +1199,7 @@ static int help(int argc, char *argv[], void *userdata) {
         _cleanup_free_ char *link = NULL;
         int r;
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         r = terminal_urlify_man("portablectl", "1", &link);
         if (r < 0)
@@ -1135,6 +1242,8 @@ static int help(int argc, char *argv[], void *userdata) {
                "                              attach/before detach\n"
                "     --no-block               Don't block waiting for attach --now to complete\n"
                "     --extension=PATH         Extend the image with an overlay\n"
+               "     --force                  Skip 'already active' check when attaching or\n"
+               "                              detaching an image (with extensions)\n"
                "\nSee the %s for details.\n",
                program_invocation_short_name,
                ansi_highlight(),
@@ -1160,6 +1269,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_NOW,
                 ARG_NO_BLOCK,
                 ARG_EXTENSION,
+                ARG_FORCE,
         };
 
         static const struct option options[] = {
@@ -1180,6 +1290,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "now",             no_argument,       NULL, ARG_NOW             },
                 { "no-block",        no_argument,       NULL, ARG_NO_BLOCK        },
                 { "extension",       required_argument, NULL, ARG_EXTENSION       },
+                { "force",           no_argument,       NULL, ARG_FORCE           },
                 {}
         };
 
@@ -1284,11 +1395,15 @@ static int parse_argv(int argc, char *argv[]) {
                                 return log_oom();
                         break;
 
+                case ARG_FORCE:
+                        arg_force = true;
+                        break;
+
                 case '?':
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
         }
 

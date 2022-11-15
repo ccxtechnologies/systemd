@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT-0
+
 # Enroll the security token in the LUKS2 volume. Replace /dev/sdXn by the
 # partition to use (e.g. /dev/sda1).
 sudo systemd-cryptenroll --fido2-device=auto /dev/sdXn

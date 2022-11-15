@@ -12,7 +12,9 @@
 #include "cryptenroll-wipe.h"
 #include "cryptenroll.h"
 #include "cryptsetup-util.h"
+#include "env-util.h"
 #include "escape.h"
+#include "fileio.h"
 #include "libfido2-util.h"
 #include "main-func.h"
 #include "memory-util.h"
@@ -24,26 +26,41 @@
 #include "string-table.h"
 #include "strv.h"
 #include "terminal-util.h"
+#include "tpm-pcr.h"
 #include "tpm2-util.h"
 
 static EnrollType arg_enroll_type = _ENROLL_TYPE_INVALID;
+static char *arg_unlock_keyfile = NULL;
 static char *arg_pkcs11_token_uri = NULL;
 static char *arg_fido2_device = NULL;
 static char *arg_tpm2_device = NULL;
 static uint32_t arg_tpm2_pcr_mask = UINT32_MAX;
+static bool arg_tpm2_pin = false;
+static char *arg_tpm2_public_key = NULL;
+static uint32_t arg_tpm2_public_key_pcr_mask = UINT32_MAX;
+static char *arg_tpm2_signature = NULL;
 static char *arg_node = NULL;
 static int *arg_wipe_slots = NULL;
 static size_t arg_n_wipe_slots = 0;
 static WipeScope arg_wipe_slots_scope = WIPE_EXPLICIT;
 static unsigned arg_wipe_slots_mask = 0; /* Bitmask of (1U << EnrollType), for wiping all slots of specific types */
 static Fido2EnrollFlags arg_fido2_lock_with = FIDO2ENROLL_PIN | FIDO2ENROLL_UP;
+#if HAVE_LIBFIDO2
+static int arg_fido2_cred_alg = COSE_ES256;
+#else
+static int arg_fido2_cred_alg = 0;
+#endif
 
 assert_cc(sizeof(arg_wipe_slots_mask) * 8 >= _ENROLL_TYPE_MAX);
 
+STATIC_DESTRUCTOR_REGISTER(arg_unlock_keyfile, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_pkcs11_token_uri, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_fido2_device, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_tpm2_device, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_tpm2_public_key, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_tpm2_signature, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_node, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_wipe_slots, freep);
 
 static bool wipe_requested(void) {
         return arg_n_wipe_slots > 0 ||
@@ -85,8 +102,12 @@ static int help(void) {
                "     --version         Show package version\n"
                "     --password        Enroll a user-supplied password\n"
                "     --recovery-key    Enroll a recovery key\n"
+               "     --unlock-key-file=PATH\n"
+               "                       Use a file to unlock the volume\n"
                "     --pkcs11-token-uri=URI\n"
                "                       Specify PKCS#11 security token URI\n"
+               "     --fido2-credential-algorithm=STRING\n"
+               "                       Specify COSE algorithm for FIDO2 credential\n"
                "     --fido2-device=PATH\n"
                "                       Enroll a FIDO2-HMAC security token\n"
                "     --fido2-with-client-pin=BOOL\n"
@@ -99,6 +120,15 @@ static int help(void) {
                "                       Enroll a TPM2 device\n"
                "     --tpm2-pcrs=PCR1+PCR2+PCR3+…\n"
                "                       Specify TPM2 PCRs to seal against\n"
+               "     --tpm2-public-key=PATH\n"
+               "                       Enroll signed TPM2 PCR policy against PEM public key\n"
+               "     --tpm2-public-key-pcrs=PCR1+PCR2+PCR3+…\n"
+               "                       Enroll signed TPM2 PCR policy for specified TPM2 PCRs\n"
+               "     --tpm2-signature=PATH\n"
+               "                       Validate public key enrollment works with JSON signature\n"
+               "                       file\n"
+               "     --tpm2-with-pin=BOOL\n"
+               "                       Whether to require entering a PIN to unlock the volume\n"
                "     --wipe-slot=SLOT1,SLOT2,…\n"
                "                       Wipe specified slots\n"
                "\nSee the %s for details.\n",
@@ -116,29 +146,41 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_VERSION = 0x100,
                 ARG_PASSWORD,
                 ARG_RECOVERY_KEY,
+                ARG_UNLOCK_KEYFILE,
                 ARG_PKCS11_TOKEN_URI,
                 ARG_FIDO2_DEVICE,
                 ARG_TPM2_DEVICE,
                 ARG_TPM2_PCRS,
+                ARG_TPM2_PUBLIC_KEY,
+                ARG_TPM2_PUBLIC_KEY_PCRS,
+                ARG_TPM2_SIGNATURE,
+                ARG_TPM2_PIN,
                 ARG_WIPE_SLOT,
                 ARG_FIDO2_WITH_PIN,
                 ARG_FIDO2_WITH_UP,
                 ARG_FIDO2_WITH_UV,
+                ARG_FIDO2_CRED_ALG,
         };
 
         static const struct option options[] = {
-                { "help",                         no_argument,       NULL, 'h'                  },
-                { "version",                      no_argument,       NULL, ARG_VERSION          },
-                { "password",                     no_argument,       NULL, ARG_PASSWORD         },
-                { "recovery-key",                 no_argument,       NULL, ARG_RECOVERY_KEY     },
-                { "pkcs11-token-uri",             required_argument, NULL, ARG_PKCS11_TOKEN_URI },
-                { "fido2-device",                 required_argument, NULL, ARG_FIDO2_DEVICE     },
-                { "fido2-with-client-pin",        required_argument, NULL, ARG_FIDO2_WITH_PIN   },
-                { "fido2-with-user-presence",     required_argument, NULL, ARG_FIDO2_WITH_UP    },
-                { "fido2-with-user-verification", required_argument, NULL, ARG_FIDO2_WITH_UV    },
-                { "tpm2-device",                  required_argument, NULL, ARG_TPM2_DEVICE      },
-                { "tpm2-pcrs",                    required_argument, NULL, ARG_TPM2_PCRS        },
-                { "wipe-slot",                    required_argument, NULL, ARG_WIPE_SLOT        },
+                { "help",                         no_argument,       NULL, 'h'                       },
+                { "version",                      no_argument,       NULL, ARG_VERSION               },
+                { "password",                     no_argument,       NULL, ARG_PASSWORD              },
+                { "recovery-key",                 no_argument,       NULL, ARG_RECOVERY_KEY          },
+                { "unlock-key-file",              required_argument, NULL, ARG_UNLOCK_KEYFILE        },
+                { "pkcs11-token-uri",             required_argument, NULL, ARG_PKCS11_TOKEN_URI      },
+                { "fido2-credential-algorithm",   required_argument, NULL, ARG_FIDO2_CRED_ALG        },
+                { "fido2-device",                 required_argument, NULL, ARG_FIDO2_DEVICE          },
+                { "fido2-with-client-pin",        required_argument, NULL, ARG_FIDO2_WITH_PIN        },
+                { "fido2-with-user-presence",     required_argument, NULL, ARG_FIDO2_WITH_UP         },
+                { "fido2-with-user-verification", required_argument, NULL, ARG_FIDO2_WITH_UV         },
+                { "tpm2-device",                  required_argument, NULL, ARG_TPM2_DEVICE           },
+                { "tpm2-pcrs",                    required_argument, NULL, ARG_TPM2_PCRS             },
+                { "tpm2-public-key",              required_argument, NULL, ARG_TPM2_PUBLIC_KEY       },
+                { "tpm2-public-key-pcrs",         required_argument, NULL, ARG_TPM2_PUBLIC_KEY_PCRS  },
+                { "tpm2-signature",               required_argument, NULL, ARG_TPM2_SIGNATURE        },
+                { "tpm2-with-pin",                required_argument, NULL, ARG_TPM2_PIN              },
+                { "wipe-slot",                    required_argument, NULL, ARG_WIPE_SLOT             },
                 {}
         };
 
@@ -206,6 +248,12 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_enroll_type = ENROLL_RECOVERY;
                         break;
 
+                case ARG_UNLOCK_KEYFILE:
+                        r = parse_path_argument(optarg, /* suppress_root= */ true, &arg_unlock_keyfile);
+                        if (r < 0)
+                                return r;
+                        break;
+
                 case ARG_PKCS11_TOKEN_URI: {
                         _cleanup_free_ char *uri = NULL;
 
@@ -233,6 +281,12 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_pkcs11_token_uri = TAKE_PTR(uri);
                         break;
                 }
+
+                case ARG_FIDO2_CRED_ALG:
+                        r = parse_fido2_algorithm(optarg, &arg_fido2_cred_alg);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse COSE algorithm: %s", optarg);
+                        break;
 
                 case ARG_FIDO2_DEVICE: {
                         _cleanup_free_ char *device = NULL;
@@ -280,25 +334,40 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                case ARG_TPM2_PCRS: {
-                        uint32_t mask;
-
-                        if (isempty(optarg)) {
-                                arg_tpm2_pcr_mask = 0;
-                                break;
-                        }
-
-                        r = tpm2_parse_pcrs(optarg, &mask);
+                case ARG_TPM2_PCRS:
+                        r = tpm2_parse_pcr_argument(optarg, &arg_tpm2_pcr_mask);
                         if (r < 0)
                                 return r;
 
-                        if (arg_tpm2_pcr_mask == UINT32_MAX)
-                                arg_tpm2_pcr_mask = mask;
-                        else
-                                arg_tpm2_pcr_mask |= mask;
+                        break;
+
+                case ARG_TPM2_PIN:
+                        r = parse_boolean_argument("--tpm2-with-pin=", optarg, &arg_tpm2_pin);
+                        if (r < 0)
+                                return r;
 
                         break;
-                }
+
+                case ARG_TPM2_PUBLIC_KEY:
+                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_tpm2_public_key);
+                        if (r < 0)
+                                return r;
+
+                        break;
+
+                case ARG_TPM2_PUBLIC_KEY_PCRS:
+                        r = tpm2_parse_pcr_argument(optarg, &arg_tpm2_public_key_pcr_mask);
+                        if (r < 0)
+                                return r;
+
+                        break;
+
+                case ARG_TPM2_SIGNATURE:
+                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_tpm2_signature);
+                        if (r < 0)
+                                return r;
+
+                        break;
 
                 case ARG_WIPE_SLOT: {
                         const char *p = optarg;
@@ -358,7 +427,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
         }
 
@@ -376,8 +445,32 @@ static int parse_argv(int argc, char *argv[]) {
 
         if (arg_tpm2_pcr_mask == UINT32_MAX)
                 arg_tpm2_pcr_mask = TPM2_PCR_MASK_DEFAULT;
+        if (arg_tpm2_public_key_pcr_mask == UINT32_MAX)
+                arg_tpm2_public_key_pcr_mask = UINT32_C(1) << TPM_PCR_INDEX_KERNEL_IMAGE;
 
         return 1;
+}
+
+static int check_for_homed(struct crypt_device *cd) {
+        int r;
+
+        assert_se(cd);
+
+        /* Politely refuse operating on homed volumes. The enrolled tokens for the user record and the LUKS2
+         * volume should not get out of sync. */
+
+        for (int token = 0; token < crypt_token_max(CRYPT_LUKS2); token ++) {
+                r = cryptsetup_get_token_as_json(cd, token, "systemd-homed", NULL);
+                if (IN_SET(r, -ENOENT, -EINVAL, -EMEDIUMTYPE))
+                        continue;
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read JSON token data off disk: %m");
+
+                return log_error_errno(SYNTHETIC_ERRNO(EHOSTDOWN),
+                                       "LUKS2 volume is managed by systemd-homed, please use homectl to enroll tokens.");
+        }
+
+        return 0;
 }
 
 static int prepare_luks(
@@ -386,8 +479,8 @@ static int prepare_luks(
                 size_t *ret_volume_key_size) {
 
         _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
+        _cleanup_(erase_and_freep) char *envpw = NULL;
         _cleanup_(erase_and_freep) void *vk = NULL;
-        char *e = NULL;
         size_t vks;
         int r;
 
@@ -404,6 +497,10 @@ static int prepare_luks(
         if (r < 0)
                 return log_error_errno(r, "Failed to load LUKS2 superblock: %m");
 
+        r = check_for_homed(cd);
+        if (r < 0)
+                return r;
+
         if (!ret_volume_key) {
                 *ret_cd = TAKE_PTR(cd);
                 return 0;
@@ -418,16 +515,21 @@ static int prepare_luks(
         if (!vk)
                 return log_oom();
 
-        e = getenv("PASSWORD");
-        if (e) {
+        if (arg_unlock_keyfile) {
                 _cleanup_(erase_and_freep) char *password = NULL;
+                size_t password_len;
 
-                password = strdup(e);
-                if (!password)
-                        return log_oom();
-
-                string_erase(e);
-                assert_se(unsetenv("PASSWORD") >= 0);
+                r = read_full_file_full(
+                                AT_FDCWD,
+                                arg_unlock_keyfile,
+                                0,
+                                SIZE_MAX,
+                                READ_FULL_FILE_SECURE|READ_FULL_FILE_WARN_WORLD_READABLE|READ_FULL_FILE_CONNECT_SOCKET,
+                                NULL,
+                                &password,
+                                &password_len);
+                if (r < 0)
+                        return log_error_errno(r, "Reading keyfile %s failed: %m", arg_unlock_keyfile);
 
                 r = crypt_volume_key_get(
                                 cd,
@@ -435,7 +537,24 @@ static int prepare_luks(
                                 vk,
                                 &vks,
                                 password,
-                                strlen(password));
+                                password_len);
+                if (r < 0)
+                        return log_error_errno(r, "Unlocking via keyfile failed: %m");
+
+                goto out;
+        }
+
+        r = getenv_steal_erase("PASSWORD", &envpw);
+        if (r < 0)
+                return log_error_errno(r, "Failed to acquire password from environment: %m");
+        if (r > 0) {
+                r = crypt_volume_key_get(
+                                cd,
+                                CRYPT_ANY_SLOT,
+                                vk,
+                                &vks,
+                                envpw,
+                                strlen(envpw));
                 if (r < 0)
                         return log_error_errno(r, "Password from environment variable $PASSWORD did not work.");
         } else {
@@ -456,7 +575,6 @@ static int prepare_luks(
 
                 for (;;) {
                         _cleanup_strv_free_erase_ char **passwords = NULL;
-                        char **p;
 
                         if (--i == 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(ENOKEY),
@@ -489,6 +607,7 @@ static int prepare_luks(
                 }
         }
 
+out:
         *ret_cd = TAKE_PTR(cd);
         *ret_volume_key = TAKE_PTR(vk);
         *ret_volume_key_size = vks;
@@ -534,11 +653,11 @@ static int run(int argc, char *argv[]) {
                 break;
 
         case ENROLL_FIDO2:
-                slot = enroll_fido2(cd, vk, vks, arg_fido2_device, arg_fido2_lock_with);
+                slot = enroll_fido2(cd, vk, vks, arg_fido2_device, arg_fido2_lock_with, arg_fido2_cred_alg);
                 break;
 
         case ENROLL_TPM2:
-                slot = enroll_tpm2(cd, vk, vks, arg_tpm2_device, arg_tpm2_pcr_mask);
+                slot = enroll_tpm2(cd, vk, vks, arg_tpm2_device, arg_tpm2_pcr_mask, arg_tpm2_public_key, arg_tpm2_public_key_pcr_mask, arg_tpm2_signature, arg_tpm2_pin);
                 break;
 
         case _ENROLL_TYPE_INVALID:

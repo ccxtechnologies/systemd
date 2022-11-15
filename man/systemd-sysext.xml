@@ -26,6 +26,7 @@
     <cmdsynopsis>
       <command>systemd-sysext</command>
       <arg choice="opt" rep="repeat">OPTIONS</arg>
+      <arg choice="plain">COMMAND</arg>
     </cmdsynopsis>
 
     <para><literallayout><filename>systemd-sysext.service</filename></literallayout></para>
@@ -46,7 +47,7 @@
     operating system tree. When one or more system extension images are activated, their
     <filename>/usr/</filename> and <filename>/opt/</filename> hierarchies are combined via
     <literal>overlayfs</literal> with the same hierarchies of the host OS, and the host
-    <filename>/usr/</filename> and <filename>/opt</filename> overmounted with it ("merging"). When they are
+    <filename>/usr/</filename> and <filename>/opt/</filename> overmounted with it ("merging"). When they are
     deactivated, the mount point is disassembled — again revealing the unmodified original host version of
     the hierarchy ("unmerging"). Merging thus makes the extension's resources suddenly appear below the
     <filename>/usr/</filename> and <filename>/opt/</filename> hierarchies as if they were included in the
@@ -64,20 +65,20 @@
 
     <para>System extensions are supposed to be purely additive, i.e. they are supposed to include only files
     that do not exist in the underlying basic OS image. However, the underlying mechanism (overlayfs) also
-    allows removing files, but it is recommended not to make use of this.</para>
+    allows overlaying or removing files, but it is recommended not to make use of this.</para>
 
     <para>System extension images may be provided in the following formats:</para>
 
     <orderedlist>
       <listitem><para>Plain directories or btrfs subvolumes containing the OS tree</para></listitem>
       <listitem><para>Disk images with a GPT disk label, following the <ulink
-      url="https://systemd.io/DISCOVERABLE_PARTITIONS">Discoverable Partition Specification</ulink></para></listitem>
+      url="https://systemd.io/DISCOVERABLE_PARTITIONS">Discoverable Partitions Specification</ulink></para></listitem>
       <listitem><para>Disk images lacking a partition table, with a naked Linux file system (e.g. squashfs or ext4)</para></listitem>
     </orderedlist>
 
     <para>These image formats are the same ones that
     <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    supports via it's <option>--directory=</option>/<option>--image=</option> switches and those that the
+    supports via its <option>--directory=</option>/<option>--image=</option> switches and those that the
     service manager supports via <option>RootDirectory=</option>/<option>RootImage=</option>. Similar to
     them they may optionally carry Verity authentication information.</para>
 
@@ -92,7 +93,7 @@
 
     <para>During boot OS extension images are activated automatically, if the
     <filename>systemd-sysext.service</filename> is enabled. Note that this service runs only after the
-    underlying file systems where system extensions are searched are mounted. This means they are not
+    underlying file systems where system extensions may be located have been mounted. This means they are not
     suitable for shipping resources that are processed by subsystems running in earliest boot. Specifically,
     OS extension images are not suitable for shipping system services or
     <citerefentry><refentrytitle>systemd-sysusers</refentrytitle><manvolnum>8</manvolnum></citerefentry>
@@ -108,17 +109,24 @@
     accessed.</para>
 
     <para>Note that there is no concept of enabling/disabling installed system extension images: all
-    installed extension images are automatically activated at boot.</para>
+    installed extension images are automatically activated at boot. However, you can place an empty directory
+    named like the extension (no <filename>.raw</filename>) in <filename>/etc/extensions/</filename> to "mask"
+    an extension with the same name in a system folder with lower precedence.</para>
 
     <para>A simple mechanism for version compatibility is enforced: a system extension image must carry a
     <filename>/usr/lib/extension-release.d/extension-release.<replaceable>$name</replaceable></filename>
     file, which must match its image name, that is compared with the host <filename>os-release</filename>
-    file: the contained <varname>ID=</varname> fields have to match, as well as the
-    <varname>SYSEXT_LEVEL=</varname> field (if defined). If the latter is not defined, the
-    <varname>VERSION_ID=</varname> field has to match instead. System extensions should not ship a
-    <filename>/usr/lib/os-release</filename> file (as that would be merged into the host
-    <filename>/usr/</filename> tree, overriding the host OS version data, which is not desirable). The
-    <filename>extension-release</filename> file follows the same format and semantics, and carries the same
+    file: the contained <varname>ID=</varname> fields have to match unless <literal>_any</literal> is set
+    for the extension. If the extension <varname>ID=</varname> is not <literal>_any</literal>, the
+    <varname>SYSEXT_LEVEL=</varname> field (if defined) has to match. If the latter is not defined, the
+    <varname>VERSION_ID=</varname> field has to match instead. If the extension defines the
+    <varname>ARCHITECTURE=</varname> field and the value is not <literal>_any</literal> it has to match the kernel's
+    architecture reported by <citerefentry><refentrytitle>uname</refentrytitle><manvolnum>2</manvolnum></citerefentry>
+    but the used architecture identifiers are the same as for <varname>ConditionArchitecture=</varname>
+    described in <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+    System extensions should not ship a <filename>/usr/lib/os-release</filename> file (as that would be merged
+    into the host <filename>/usr/</filename> tree, overriding the host OS version data, which is not desirable).
+    The <filename>extension-release</filename> file follows the same format and semantics, and carries the same
     content, as the <filename>os-release</filename> file of the OS, but it describes the resources carried
     in the extension image.</para>
   </refsect1>
@@ -127,13 +135,15 @@
     <title>Uses</title>
 
     <para>The primary use case for system images are immutable environments where debugging and development
-    tools shall optionally be made available, but not included in the immutable base OS image itself
-    (e.g. <filename>strace</filename> and <filename>gdb</filename> shall be an optionally installable
-    addition in order to make debugging/development easier). System extension images should not be
-    misunderstood as a generic software packaging framework, as no dependency scheme is available: system
-    extensions should carry all files they need themselves, except for those already shipped in the
-    underlying host system image. Typically, system extension images are built at the same time as the base
-    OS image — within the same build system.</para>
+    tools shall optionally be made available, but not included in the immutable base OS image itself (e.g.
+    <citerefentry project='man-pages'><refentrytitle>strace</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+    and
+    <citerefentry project='man-pages'><refentrytitle>gdb</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+    shall be an optionally installable addition in order to make debugging/development easier). System
+    extension images should not be misunderstood as a generic software packaging framework, as no dependency
+    scheme is available: system extensions should carry all files they need themselves, except for those
+    already shipped in the underlying host system image. Typically, system extension images are built at the
+    same time as the base OS image — within the same build system.</para>
 
     <para>Another use case for the system extension concept is temporarily overriding OS supplied resources
     with newer ones, for example to install a locally compiled development version of some low-level

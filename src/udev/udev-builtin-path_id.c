@@ -85,6 +85,13 @@ static sd_device *skip_subsystem(sd_device *dev, const char *subsys) {
         assert(dev);
         assert(subsys);
 
+        /* Unlike the function name, this drops multiple parent devices EXCEPT FOR THE LAST ONE.
+         * The last one will be dropped at the end of the loop in builtin_path_id().
+         * E.g.
+         * Input:  /sys/devices/pci0000:00/0000:00:14.0/usb1/1-1/1-1:1.0
+         * Output: /sys/devices/pci0000:00/0000:00:14.0/usb1
+         */
+
         for (parent = dev; ; ) {
                 const char *subsystem;
 
@@ -302,7 +309,6 @@ static sd_device *handle_scsi_default(sd_device *parent, char **path) {
         int host, bus, target, lun;
         const char *name, *base, *pos;
         _cleanup_closedir_ DIR *dir = NULL;
-        struct dirent *dent;
         int basenum = -1;
 
         assert(parent);
@@ -340,21 +346,21 @@ static sd_device *handle_scsi_default(sd_device *parent, char **path) {
         if (!pos)
                 return NULL;
 
-        base = strndupa(base, pos - base);
+        base = strndupa_safe(base, pos - base);
         dir = opendir(base);
         if (!dir)
                 return NULL;
 
-        FOREACH_DIRENT_ALL(dent, dir, break) {
+        FOREACH_DIRENT_ALL(de, dir, break) {
                 unsigned i;
 
-                if (dent->d_name[0] == '.')
+                if (de->d_name[0] == '.')
                         continue;
-                if (!IN_SET(dent->d_type, DT_DIR, DT_LNK))
+                if (!IN_SET(de->d_type, DT_DIR, DT_LNK))
                         continue;
-                if (!startswith(dent->d_name, "host"))
+                if (!startswith(de->d_name, "host"))
                         continue;
-                if (safe_atou_full(&dent->d_name[4], 10, &i) < 0)
+                if (safe_atou_full(&de->d_name[4], 10, &i) < 0)
                         continue;
                 /*
                  * find the smallest number; the host really needs to export its
@@ -368,7 +374,7 @@ static sd_device *handle_scsi_default(sd_device *parent, char **path) {
                 return hostdev;
         host -= basenum;
 
-        path_prepend(path, "scsi-%u:%u:%u:%u", host, bus, target, lun);
+        path_prepend(path, "scsi-%i:%i:%i:%i", host, bus, target, lun);
         return hostdev;
 }
 
@@ -378,7 +384,6 @@ static sd_device *handle_scsi_hyperv(sd_device *parent, char **path, size_t guid
         const char *guid_str;
         _cleanup_free_ char *lun = NULL;
         char guid[39];
-        size_t i, k;
 
         assert(parent);
         assert(path);
@@ -396,7 +401,8 @@ static sd_device *handle_scsi_hyperv(sd_device *parent, char **path, size_t guid
         if (strlen(guid_str) < guid_str_len || guid_str[0] != '{' || guid_str[guid_str_len-1] != '}')
                 return NULL;
 
-        for (i = 1, k = 0; i < guid_str_len-1; i++) {
+        size_t k = 0;
+        for (size_t i = 1; i < guid_str_len-1; i++) {
                 if (guid_str[i] == '-')
                         continue;
                 guid[k++] = guid_str[i];
@@ -496,6 +502,10 @@ static sd_device *handle_usb(sd_device *parent, char **path) {
                 return parent;
         port++;
 
+        /* USB host number may change across reboots (and probably even without reboot). The part after
+         * USB host number is determined by device topology and so does not change. Hence, drop the
+         * host number and always use '0' instead. */
+
         path_prepend(path, "usb-0:%s", port);
         return skip_subsystem(parent, "usb");
 }
@@ -533,19 +543,55 @@ static sd_device *handle_ap(sd_device *parent, char **path) {
         return skip_subsystem(parent, "ap");
 }
 
-static int builtin_path_id(sd_device *dev, int argc, char *argv[], bool test) {
-        sd_device *parent;
-        _cleanup_free_ char *path = NULL;
-        _cleanup_free_ char *compat_path = NULL;
-        bool supported_transport = false;
-        bool supported_parent = false;
+static int find_real_nvme_parent(sd_device *dev, sd_device **ret) {
+        _cleanup_(sd_device_unrefp) sd_device *nvme = NULL;
+        const char *sysname, *end;
+        int r;
+
+        /* If the device belongs to "nvme-subsystem" (not to be confused with "nvme"), which happens when
+         * NVMe multipathing is enabled in the kernel (/sys/module/nvme_core/parameters/multipath is Y),
+         * then the syspath is something like the following:
+         *   /sys/devices/virtual/nvme-subsystem/nvme-subsys0/nvme0n1
+         * Hence, we need to find the 'real parent' in "nvme" subsystem, e.g,
+         *   /sys/devices/pci0000:00/0000:00:1c.4/0000:3c:00.0/nvme/nvme0 */
+
+        assert(dev);
+        assert(ret);
+
+        r = sd_device_get_sysname(dev, &sysname);
+        if (r < 0)
+                return r;
+
+        /* The sysname format of nvme block device is nvme%d[c%d]n%d[p%d], e.g. nvme0n1p2 or nvme0c1n2.
+         * (Note, nvme device with 'c' can be ignored, as they are hidden. )
+         * The sysname format of nvme subsystem device is nvme%d.
+         * See nvme_alloc_ns() and nvme_init_ctrl() in drivers/nvme/host/core.c for more details. */
+        end = startswith(sysname, "nvme");
+        if (!end)
+                return -ENXIO;
+
+        end += strspn(end, DIGITS);
+        sysname = strndupa(sysname, end - sysname);
+
+        r = sd_device_new_from_subsystem_sysname(&nvme, "nvme", sysname);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(nvme);
+        return 0;
+}
+
+static int builtin_path_id(sd_device *dev, sd_netlink **rtnl, int argc, char *argv[], bool test) {
+        _cleanup_(sd_device_unrefp) sd_device *dev_other_branch = NULL;
+        _cleanup_free_ char *path = NULL, *compat_path = NULL;
+        bool supported_transport = false, supported_parent = false;
         const char *subsystem;
+        int r;
 
         assert(dev);
 
         /* walk up the chain of devices and compose path */
-        parent = dev;
-        while (parent) {
+        for (sd_device *parent = dev; parent; ) {
                 const char *subsys, *sysname;
 
                 if (sd_device_get_subsystem(parent, &subsys) < 0 ||
@@ -632,13 +678,22 @@ static int builtin_path_id(sd_device *dev, int argc, char *argv[], bool test) {
                         parent = skip_subsystem(parent, "iucv");
                         supported_transport = true;
                         supported_parent = true;
-                } else if (streq(subsys, "nvme")) {
+                } else if (STR_IN_SET(subsys, "nvme", "nvme-subsystem")) {
                         const char *nsid;
 
                         if (sd_device_get_sysattr_value(dev, "nsid", &nsid) >= 0) {
                                 path_prepend(&path, "nvme-%s", nsid);
                                 if (compat_path)
                                         path_prepend(&compat_path, "nvme-%s", nsid);
+
+                                if (streq(subsys, "nvme-subsystem")) {
+                                        r = find_real_nvme_parent(dev, &dev_other_branch);
+                                        if (r < 0)
+                                                return r;
+
+                                        parent = dev_other_branch;
+                                }
+
                                 parent = skip_subsystem(parent, "nvme");
                                 supported_parent = true;
                                 supported_transport = true;
@@ -681,14 +736,12 @@ static int builtin_path_id(sd_device *dev, int argc, char *argv[], bool test) {
 
         {
                 char tag[UDEV_NAME_SIZE];
-                size_t i;
-                const char *p;
+                size_t i = 0;
 
                 /* compose valid udev tag name */
-                for (p = path, i = 0; *p; p++) {
-                        if ((*p >= '0' && *p <= '9') ||
-                            (*p >= 'A' && *p <= 'Z') ||
-                            (*p >= 'a' && *p <= 'z') ||
+                for (const char *p = path; *p; p++) {
+                        if (ascii_isdigit(*p) ||
+                            ascii_isalpha(*p) ||
                             *p == '-') {
                                 tag[i++] = *p;
                                 continue;

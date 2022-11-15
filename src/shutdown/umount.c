@@ -15,25 +15,33 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#if HAVE_VALGRIND_MEMCHECK_H
+#include <valgrind/memcheck.h>
+#endif
+
 #include "sd-device.h"
 
 #include "alloc-util.h"
 #include "blockdev-util.h"
 #include "def.h"
 #include "device-util.h"
+#include "dirent-util.h"
 #include "escape.h"
 #include "fd-util.h"
+#include "fileio.h"
 #include "fs-util.h"
 #include "fstab-util.h"
 #include "libmount-util.h"
 #include "mount-setup.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
+#include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "signal-util.h"
 #include "string-util.h"
 #include "strv.h"
+#include "sync-util.h"
 #include "umount.h"
 #include "util.h"
 #include "virt.h"
@@ -68,16 +76,15 @@ int mount_points_list_get(const char *mountinfo, MountPoint **head) {
                 return log_error_errno(r, "Failed to parse %s: %m", mountinfo ?: "/proc/self/mountinfo");
 
         for (;;) {
+                _cleanup_free_ char *options = NULL, *remount_options = NULL;
                 struct libmnt_fs *fs;
                 const char *path, *fstype;
-                _cleanup_free_ char *options = NULL;
                 unsigned long remount_flags = 0u;
-                _cleanup_free_ char *remount_options = NULL;
-                bool try_remount_ro;
+                bool try_remount_ro, is_api_vfs;
                 _cleanup_free_ MountPoint *m = NULL;
 
                 r = mnt_table_next_fs(table, iter, &fs);
-                if (r == 1)
+                if (r == 1) /* EOF */
                         break;
                 if (r < 0)
                         return log_error_errno(r, "Failed to get next entry from %s: %m", mountinfo ?: "/proc/self/mountinfo");
@@ -88,52 +95,45 @@ int mount_points_list_get(const char *mountinfo, MountPoint **head) {
 
                 fstype = mnt_fs_get_fstype(fs);
 
-                /* Combine the generic VFS options with the FS-specific
-                 * options. Duplicates are not a problem here, because the only
-                 * options that should come up twice are typically ro/rw, which
-                 * are turned into MS_RDONLY or the inversion of it.
+                /* Combine the generic VFS options with the FS-specific options. Duplicates are not a problem
+                 * here, because the only options that should come up twice are typically ro/rw, which are
+                 * turned into MS_RDONLY or the inversion of it.
                  *
-                 * Even if there are duplicates later in mount_option_mangle()
-                 * they shouldn't hurt anyways as they override each other.
-                 */
+                 * Even if there are duplicates later in mount_option_mangle() they shouldn't hurt anyways as
+                 * they override each other. */
                 if (!strextend_with_separator(&options, ",", mnt_fs_get_vfs_options(fs)))
                         return log_oom();
                 if (!strextend_with_separator(&options, ",", mnt_fs_get_fs_options(fs)))
                         return log_oom();
 
-                /* Ignore mount points we can't unmount because they
-                 * are API or because we are keeping them open (like
-                 * /dev/console). Also, ignore all mounts below API
-                 * file systems, since they are likely virtual too,
-                 * and hence not worth spending time on. Also, in
-                 * unprivileged containers we might lack the rights to
-                 * unmount these things, hence don't bother. */
+                /* Ignore mount points we can't unmount because they are API or because we are keeping them
+                 * open (like /dev/console). Also, ignore all mounts below API file systems, since they are
+                 * likely virtual too, and hence not worth spending time on. Also, in unprivileged containers
+                 * we might lack the rights to unmount these things, hence don't bother. */
                 if (mount_point_is_api(path) ||
                     mount_point_ignore(path) ||
                     PATH_STARTSWITH_SET(path, "/dev", "/sys", "/proc"))
                         continue;
 
-                /* If we are in a container, don't attempt to
-                 * read-only mount anything as that brings no real
-                 * benefits, but might confuse the host, as we remount
-                 * the superblock here, not the bind mount.
+                is_api_vfs = fstype_is_api_vfs(fstype);
+
+                /* If we are in a container, don't attempt to read-only mount anything as that brings no real
+                 * benefits, but might confuse the host, as we remount the superblock here, not the bind
+                 * mount.
                  *
-                 * If the filesystem is a network fs, also skip the
-                 * remount. It brings no value (we cannot leave
-                 * a "dirty fs") and could hang if the network is down.
-                 * Note that umount2() is more careful and will not
-                 * hang because of the network being down. */
+                 * If the filesystem is a network fs, also skip the remount. It brings no value (we cannot
+                 * leave a "dirty fs") and could hang if the network is down.  Note that umount2() is more
+                 * careful and will not hang because of the network being down. */
                 try_remount_ro = detect_container() <= 0 &&
                                  !fstype_is_network(fstype) &&
-                                 !fstype_is_api_vfs(fstype) &&
+                                 !is_api_vfs &&
                                  !fstype_is_ro(fstype) &&
                                  !fstab_test_yes_no_option(options, "ro\0rw\0");
 
                 if (try_remount_ro) {
-                        /* mount(2) states that mount flags and options need to be exactly the same
-                         * as they were when the filesystem was mounted, except for the desired
-                         * changes. So we reconstruct both here and adjust them for the later
-                         * remount call too. */
+                        /* mount(2) states that mount flags and options need to be exactly the same as they
+                         * were when the filesystem was mounted, except for the desired changes. So we
+                         * reconstruct both here and adjust them for the later remount call too. */
 
                         r = mnt_fs_get_propagation(fs, &remount_flags);
                         if (r < 0) {
@@ -152,17 +152,25 @@ int mount_points_list_get(const char *mountinfo, MountPoint **head) {
                         remount_flags = (remount_flags|MS_REMOUNT|MS_RDONLY) & ~MS_BIND;
                 }
 
-                m = new0(MountPoint, 1);
+                m = new(MountPoint, 1);
                 if (!m)
                         return log_oom();
+
+                *m = (MountPoint) {
+                        .remount_options = remount_options,
+                        .remount_flags = remount_flags,
+                        .try_remount_ro = try_remount_ro,
+
+                        /* Unmount sysfs/procfs/… lazily, since syncing doesn't matter there, and it's OK if
+                         * something keeps an fd open to it. */
+                        .umount_lazily = is_api_vfs,
+                };
 
                 m->path = strdup(path);
                 if (!m->path)
                         return log_oom();
 
-                m->remount_options = TAKE_PTR(remount_options);
-                m->remount_flags = remount_flags;
-                m->try_remount_ro = try_remount_ro;
+                TAKE_PTR(remount_options);
 
                 LIST_PREPEND(mount_point, *head, TAKE_PTR(m));
         }
@@ -194,7 +202,7 @@ int swap_list_get(const char *swaps, MountPoint **head) {
                 const char *source;
 
                 r = mnt_table_next_fs(t, i, &fs);
-                if (r == 1)
+                if (r == 1) /* EOF */
                         break;
                 if (r < 0)
                         return log_error_errno(r, "Failed to get next entry from %s: %m", swaps ?: "/proc/swaps");
@@ -348,14 +356,30 @@ static int md_list_get(MountPoint **head) {
         if (r < 0)
                 return r;
 
+        /* Filter out partitions. */
+        r = sd_device_enumerator_add_match_property(e, "DEVTYPE", "disk");
+        if (r < 0)
+                return r;
+
         FOREACH_DEVICE(e, d) {
                 _cleanup_free_ char *p = NULL;
-                const char *dn;
+                const char *dn, *md_level;
                 MountPoint *m;
                 dev_t devnum;
 
                 if (sd_device_get_devnum(d, &devnum) < 0 ||
                     sd_device_get_devname(d, &dn) < 0)
+                        continue;
+
+                r = sd_device_get_property_value(d, "MD_LEVEL", &md_level);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to get MD_LEVEL property for %s, ignoring: %m", dn);
+                        continue;
+                }
+
+                /* MD "containers" are a special type of MD devices, used for external metadata.  Since it
+                 * doesn't provide RAID functionality in itself we don't need to stop it. */
+                if (streq(md_level, "container"))
                         continue;
 
                 p = strdup(dn);
@@ -409,6 +433,10 @@ static int delete_loopback(const char *device) {
                         return -EBUSY; /* propagate original error */
                 }
 
+#if HAVE_VALGRIND_MEMCHECK_H
+                VALGRIND_MAKE_MEM_DEFINED(&info, sizeof(info));
+#endif
+
                 if (FLAGS_SET(info.lo_flags, LO_FLAGS_AUTOCLEAR)) /* someone else already set LO_FLAGS_AUTOCLEAR for us? fine by us */
                         return -EBUSY; /* propagate original error */
 
@@ -433,6 +461,10 @@ static int delete_loopback(const char *device) {
 
                 return 1;
         }
+
+#if HAVE_VALGRIND_MEMCHECK_H
+        VALGRIND_MAKE_MEM_DEFINED(&info, sizeof(info));
+#endif
 
         /* Linux makes LOOP_CLR_FD succeed whenever LO_FLAGS_AUTOCLEAR is set without actually doing
          * anything. Very confusing. Let's hence not claim we did anything in this case. */
@@ -460,7 +492,7 @@ static int delete_dm(MountPoint *m) {
         if (r < 0)
                 log_debug_errno(r, "Failed to sync DM block device %s, ignoring: %m", m->path);
 
-        if (ioctl(fd, DM_DEV_REMOVE, &(struct dm_ioctl) {
+        return RET_NERRNO(ioctl(fd, DM_DEV_REMOVE, &(struct dm_ioctl) {
                 .version = {
                         DM_VERSION_MAJOR,
                         DM_VERSION_MINOR,
@@ -468,10 +500,7 @@ static int delete_dm(MountPoint *m) {
                 },
                 .data_size = sizeof(struct dm_ioctl),
                 .dev = m->devnum,
-        }) < 0)
-                return -errno;
-
-        return 0;
+        }));
 }
 
 static int delete_md(MountPoint *m) {
@@ -488,10 +517,7 @@ static int delete_md(MountPoint *m) {
         if (fsync(fd) < 0)
                 log_debug_errno(errno, "Failed to sync MD block device %s, ignoring: %m", m->path);
 
-        if (ioctl(fd, STOP_ARRAY, NULL) < 0)
-                return -errno;
-
-        return 0;
+        return RET_NERRNO(ioctl(fd, STOP_ARRAY, NULL));
 }
 
 static bool nonunmountable_path(const char *path) {
@@ -502,7 +528,73 @@ static bool nonunmountable_path(const char *path) {
                 || path_startswith(path, "/run/initramfs");
 }
 
-static int remount_with_timeout(MountPoint *m, int umount_log_level) {
+static void log_umount_blockers(const char *mnt) {
+        _cleanup_free_ char *blockers = NULL;
+        int r;
+
+        _cleanup_closedir_ DIR *dir = opendir("/proc");
+        if (!dir)
+                return (void) log_warning_errno(errno, "Failed to open /proc/: %m");
+
+        FOREACH_DIRENT_ALL(de, dir, break) {
+                if (!IN_SET(de->d_type, DT_DIR, DT_UNKNOWN))
+                        continue;
+
+                pid_t pid;
+                if (parse_pid(de->d_name, &pid) < 0)
+                        continue;
+
+                _cleanup_free_ char *fdp = path_join(de->d_name, "fd");
+                if (!fdp)
+                        return (void) log_oom();
+
+                _cleanup_closedir_ DIR *fd_dir = xopendirat(dirfd(dir), fdp, 0);
+                if (!fd_dir) {
+                        if (errno != ENOENT) /* process gone by now? */
+                                log_debug_errno(errno, "Failed to open /proc/%s/, ignoring: %m",fdp);
+                        continue;
+                }
+
+                bool culprit = false;
+                FOREACH_DIRENT(fd_de, fd_dir, break) {
+                        _cleanup_free_ char *open_file = NULL;
+
+                        r = readlinkat_malloc(dirfd(fd_dir), fd_de->d_name, &open_file);
+                        if (r < 0) {
+                                if (r != -ENOENT) /* fd closed by now */
+                                        log_debug_errno(r, "Failed to read link /proc/%s/%s, ignoring: %m", fdp, fd_de->d_name);
+                                continue;
+                        }
+
+                        if (path_startswith(open_file, mnt)) {
+                                culprit = true;
+                                break;
+                        }
+                }
+
+                if (!culprit)
+                        continue;
+
+                _cleanup_free_ char *comm = NULL;
+                r = get_process_comm(pid, &comm);
+                if (r < 0) {
+                        if (r != -ESRCH) /* process gone by now */
+                                log_debug_errno(r, "Failed to read process name of PID " PID_FMT ": %m", pid);
+                        continue;
+                }
+
+                if (!strextend_with_separator(&blockers, ", ", comm))
+                        return (void) log_oom();
+
+                if (!strextend(&blockers, "(", de->d_name, ")"))
+                        return (void) log_oom();
+        }
+
+        if (blockers)
+                log_warning("Unmounting '%s' blocked by: %s", mnt, blockers);
+}
+
+static int remount_with_timeout(MountPoint *m, bool last_try) {
         pid_t pid;
         int r;
 
@@ -516,12 +608,15 @@ static int remount_with_timeout(MountPoint *m, int umount_log_level) {
         if (r < 0)
                 return r;
         if (r == 0) {
-                log_info("Remounting '%s' read-only in with options '%s'.", m->path, m->remount_options);
+                log_info("Remounting '%s' read-only with options '%s'.", m->path, strempty(m->remount_options));
 
                 /* Start the mount operation here in the child */
                 r = mount(NULL, m->path, NULL, m->remount_flags, m->remount_options);
                 if (r < 0)
-                        log_full_errno(umount_log_level, errno, "Failed to remount '%s' read-only: %m", m->path);
+                        log_full_errno(last_try ? LOG_ERR : LOG_INFO,
+                                       errno,
+                                       "Failed to remount '%s' read-only: %m",
+                                       m->path);
 
                 _exit(r < 0 ? EXIT_FAILURE : EXIT_SUCCESS);
         }
@@ -538,7 +633,7 @@ static int remount_with_timeout(MountPoint *m, int umount_log_level) {
         return r;
 }
 
-static int umount_with_timeout(MountPoint *m, int umount_log_level) {
+static int umount_with_timeout(MountPoint *m, bool last_try) {
         pid_t pid;
         int r;
 
@@ -554,16 +649,20 @@ static int umount_with_timeout(MountPoint *m, int umount_log_level) {
         if (r == 0) {
                 log_info("Unmounting '%s'.", m->path);
 
-                /* Start the mount operation here in the child Using MNT_FORCE
-                 * causes some filesystems (e.g. FUSE and NFS and other network
-                 * filesystems) to abort any pending requests and return -EIO
-                 * rather than blocking indefinitely. If the filesysten is
-                 * "busy", this may allow processes to die, thus making the
-                 * filesystem less busy so the unmount might succeed (rather
-                 * than return EBUSY). */
-                r = umount2(m->path, MNT_FORCE);
-                if (r < 0)
-                        log_full_errno(umount_log_level, errno, "Failed to unmount %s: %m", m->path);
+                /* Start the mount operation here in the child Using MNT_FORCE causes some filesystems
+                 * (e.g. FUSE and NFS and other network filesystems) to abort any pending requests and return
+                 * -EIO rather than blocking indefinitely. If the filesysten is "busy", this may allow
+                 * processes to die, thus making the filesystem less busy so the unmount might succeed
+                 * (rather than return EBUSY). */
+                r = RET_NERRNO(umount2(m->path,
+                                       UMOUNT_NOFOLLOW | /* Don't follow symlinks: this should never happen unless our mount list was wrong */
+                                       (m->umount_lazily ? MNT_DETACH : MNT_FORCE)));
+                if (r < 0) {
+                        log_full_errno(last_try ? LOG_ERR : LOG_INFO, r, "Failed to unmount %s: %m", m->path);
+
+                        if (r == -EBUSY && last_try)
+                                log_umount_blockers(m->path);
+                }
 
                 _exit(r < 0 ? EXIT_FAILURE : EXIT_SUCCESS);
         }
@@ -582,8 +681,7 @@ static int umount_with_timeout(MountPoint *m, int umount_log_level) {
 
 /* This includes remounting readonly, which changes the kernel mount options.  Therefore the list passed to
  * this function is invalidated, and should not be reused. */
-static int mount_points_list_umount(MountPoint **head, bool *changed, int umount_log_level) {
-        MountPoint *m;
+static int mount_points_list_umount(MountPoint **head, bool *changed, bool last_try) {
         int n_failed = 0;
 
         assert(head);
@@ -603,7 +701,7 @@ static int mount_points_list_umount(MountPoint **head, bool *changed, int umount
                          *
                          * Since the remount can hang in the instance of remote filesystems, we remount
                          * asynchronously and skip the subsequent umount if it fails. */
-                        if (remount_with_timeout(m, umount_log_level) < 0) {
+                        if (remount_with_timeout(m, last_try) < 0) {
                                 /* Remount failed, but try unmounting anyway,
                                  * unless this is a mount point we want to skip. */
                                 if (nonunmountable_path(m->path)) {
@@ -619,7 +717,7 @@ static int mount_points_list_umount(MountPoint **head, bool *changed, int umount
                         continue;
 
                 /* Trying to umount */
-                if (umount_with_timeout(m, umount_log_level) < 0)
+                if (umount_with_timeout(m, last_try) < 0)
                         n_failed++;
                 else
                         *changed = true;
@@ -629,13 +727,12 @@ static int mount_points_list_umount(MountPoint **head, bool *changed, int umount
 }
 
 static int swap_points_list_off(MountPoint **head, bool *changed) {
-        MountPoint *m, *n;
         int n_failed = 0;
 
         assert(head);
         assert(changed);
 
-        LIST_FOREACH_SAFE(mount_point, m, n, *head) {
+        LIST_FOREACH(mount_point, m, *head) {
                 log_info("Deactivating swap %s.", m->path);
                 if (swapoff(m->path) < 0) {
                         log_warning_errno(errno, "Could not deactivate swap %s: %m", m->path);
@@ -650,8 +747,7 @@ static int swap_points_list_off(MountPoint **head, bool *changed) {
         return n_failed;
 }
 
-static int loopback_points_list_detach(MountPoint **head, bool *changed, int umount_log_level) {
-        MountPoint *m, *n;
+static int loopback_points_list_detach(MountPoint **head, bool *changed, bool last_try) {
         int n_failed = 0, r;
         dev_t rootdev = 0;
 
@@ -660,7 +756,7 @@ static int loopback_points_list_detach(MountPoint **head, bool *changed, int umo
 
         (void) get_block_device("/", &rootdev);
 
-        LIST_FOREACH_SAFE(mount_point, m, n, *head) {
+        LIST_FOREACH(mount_point, m, *head) {
                 if (major(rootdev) != 0 && rootdev == m->devnum) {
                         n_failed++;
                         continue;
@@ -669,7 +765,7 @@ static int loopback_points_list_detach(MountPoint **head, bool *changed, int umo
                 log_info("Detaching loopback %s.", m->path);
                 r = delete_loopback(m->path);
                 if (r < 0) {
-                        log_full_errno(umount_log_level, r, "Could not detach loopback %s: %m", m->path);
+                        log_full_errno(last_try ? LOG_ERR : LOG_INFO, r, "Could not detach loopback %s: %m", m->path);
                         n_failed++;
                         continue;
                 }
@@ -682,8 +778,7 @@ static int loopback_points_list_detach(MountPoint **head, bool *changed, int umo
         return n_failed;
 }
 
-static int dm_points_list_detach(MountPoint **head, bool *changed, int umount_log_level) {
-        MountPoint *m, *n;
+static int dm_points_list_detach(MountPoint **head, bool *changed, bool last_try) {
         int n_failed = 0, r;
         dev_t rootdev = 0;
 
@@ -692,7 +787,7 @@ static int dm_points_list_detach(MountPoint **head, bool *changed, int umount_lo
 
         (void) get_block_device("/", &rootdev);
 
-        LIST_FOREACH_SAFE(mount_point, m, n, *head) {
+        LIST_FOREACH(mount_point, m, *head) {
                 if (major(rootdev) != 0 && rootdev == m->devnum) {
                         n_failed ++;
                         continue;
@@ -701,7 +796,7 @@ static int dm_points_list_detach(MountPoint **head, bool *changed, int umount_lo
                 log_info("Detaching DM %s (%u:%u).", m->path, major(m->devnum), minor(m->devnum));
                 r = delete_dm(m);
                 if (r < 0) {
-                        log_full_errno(umount_log_level, r, "Could not detach DM %s: %m", m->path);
+                        log_full_errno(last_try ? LOG_ERR : LOG_INFO, r, "Could not detach DM %s: %m", m->path);
                         n_failed++;
                         continue;
                 }
@@ -713,8 +808,7 @@ static int dm_points_list_detach(MountPoint **head, bool *changed, int umount_lo
         return n_failed;
 }
 
-static int md_points_list_detach(MountPoint **head, bool *changed, int umount_log_level) {
-        MountPoint *m, *n;
+static int md_points_list_detach(MountPoint **head, bool *changed, bool last_try) {
         int n_failed = 0, r;
         dev_t rootdev = 0;
 
@@ -723,7 +817,7 @@ static int md_points_list_detach(MountPoint **head, bool *changed, int umount_lo
 
         (void) get_block_device("/", &rootdev);
 
-        LIST_FOREACH_SAFE(mount_point, m, n, *head) {
+        LIST_FOREACH(mount_point, m, *head) {
                 if (major(rootdev) != 0 && rootdev == m->devnum) {
                         n_failed ++;
                         continue;
@@ -732,7 +826,7 @@ static int md_points_list_detach(MountPoint **head, bool *changed, int umount_lo
                 log_info("Stopping MD %s (%u:%u).", m->path, major(m->devnum), minor(m->devnum));
                 r = delete_md(m);
                 if (r < 0) {
-                        log_full_errno(umount_log_level, r, "Could not stop MD %s: %m", m->path);
+                        log_full_errno(last_try ? LOG_ERR : LOG_INFO, r, "Could not stop MD %s: %m", m->path);
                         n_failed++;
                         continue;
                 }
@@ -744,7 +838,7 @@ static int md_points_list_detach(MountPoint **head, bool *changed, int umount_lo
         return n_failed;
 }
 
-static int umount_all_once(bool *changed, int umount_log_level) {
+static int umount_all_once(bool *changed, bool last_try) {
         _cleanup_(mount_points_list_free) LIST_HEAD(MountPoint, mp_list_head);
         int r;
 
@@ -755,22 +849,21 @@ static int umount_all_once(bool *changed, int umount_log_level) {
         if (r < 0)
                 return r;
 
-        return mount_points_list_umount(&mp_list_head, changed, umount_log_level);
+        return mount_points_list_umount(&mp_list_head, changed, last_try);
 }
 
-int umount_all(bool *changed, int umount_log_level) {
+int umount_all(bool *changed, bool last_try) {
         bool umount_changed;
         int r;
 
         assert(changed);
 
-        /* Retry umount, until nothing can be umounted anymore. Mounts are
-         * processed in order, newest first. The retries are needed when
-         * an old mount has been moved, to a path inside a newer mount. */
+        /* Retry umount, until nothing can be umounted anymore. Mounts are processed in order, newest
+         * first. The retries are needed when an old mount has been moved, to a path inside a newer mount. */
         do {
                 umount_changed = false;
 
-                r = umount_all_once(&umount_changed, umount_log_level);
+                r = umount_all_once(&umount_changed, last_try);
                 if (umount_changed)
                         *changed = true;
         } while (umount_changed);
@@ -793,7 +886,7 @@ int swapoff_all(bool *changed) {
         return swap_points_list_off(&swap_list_head, changed);
 }
 
-int loopback_detach_all(bool *changed, int umount_log_level) {
+int loopback_detach_all(bool *changed, bool last_try) {
         _cleanup_(mount_points_list_free) LIST_HEAD(MountPoint, loopback_list_head);
         int r;
 
@@ -805,10 +898,10 @@ int loopback_detach_all(bool *changed, int umount_log_level) {
         if (r < 0)
                 return r;
 
-        return loopback_points_list_detach(&loopback_list_head, changed, umount_log_level);
+        return loopback_points_list_detach(&loopback_list_head, changed, last_try);
 }
 
-int dm_detach_all(bool *changed, int umount_log_level) {
+int dm_detach_all(bool *changed, bool last_try) {
         _cleanup_(mount_points_list_free) LIST_HEAD(MountPoint, dm_list_head);
         int r;
 
@@ -820,10 +913,10 @@ int dm_detach_all(bool *changed, int umount_log_level) {
         if (r < 0)
                 return r;
 
-        return dm_points_list_detach(&dm_list_head, changed, umount_log_level);
+        return dm_points_list_detach(&dm_list_head, changed, last_try);
 }
 
-int md_detach_all(bool *changed, int umount_log_level) {
+int md_detach_all(bool *changed, bool last_try) {
         _cleanup_(mount_points_list_free) LIST_HEAD(MountPoint, md_list_head);
         int r;
 
@@ -835,5 +928,5 @@ int md_detach_all(bool *changed, int umount_log_level) {
         if (r < 0)
                 return r;
 
-        return md_points_list_detach(&md_list_head, changed, umount_log_level);
+        return md_points_list_detach(&md_list_head, changed, last_try);
 }

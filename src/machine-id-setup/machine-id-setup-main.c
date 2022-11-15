@@ -110,7 +110,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
 
         if (optind < argc)
@@ -125,9 +125,7 @@ static int parse_argv(int argc, char *argv[]) {
 
 static int run(int argc, char *argv[]) {
         _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
-        _cleanup_(decrypted_image_unrefp) DecryptedImage *decrypted_image = NULL;
         _cleanup_(umount_and_rmdir_and_freep) char *unlink_dir = NULL;
-        char buf[SD_ID128_STRING_MAX];
         sd_id128_t id;
         int r;
 
@@ -149,8 +147,7 @@ static int run(int argc, char *argv[]) {
                                 DISSECT_IMAGE_FSCK |
                                 DISSECT_IMAGE_GROWFS,
                                 &unlink_dir,
-                                &loop_device,
-                                &decrypted_image);
+                                &loop_device);
                 if (r < 0)
                         return r;
 
@@ -177,7 +174,7 @@ static int run(int argc, char *argv[]) {
         }
 
         if (arg_print)
-                puts(sd_id128_to_string(id, buf));
+                puts(SD_ID128_TO_STRING(id));
 
         return 0;
 }

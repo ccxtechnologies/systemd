@@ -2,12 +2,6 @@
 
 #include <sys/sendfile.h>
 
-/* When we include libgen.h because we need dirname() we immediately
- * undefine basename() since libgen.h defines it as a macro to the POSIX
- * version which is really broken. We prefer GNU basename(). */
-#include <libgen.h>
-#undef basename
-
 #include "sd-daemon.h"
 
 #include "alloc-util.h"
@@ -223,7 +217,7 @@ static int raw_export_process(RawExport *e) {
 finish:
         if (r >= 0) {
                 (void) copy_times(e->input_fd, e->output_fd, COPY_CRTIME);
-                (void) copy_xattr(e->input_fd, e->output_fd);
+                (void) copy_xattr(e->input_fd, e->output_fd, 0);
         }
 
         if (e->on_finished)

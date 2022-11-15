@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT-0
+
 # Destroy any old key on the Yubikey (careful!)
 ykman piv reset
 
