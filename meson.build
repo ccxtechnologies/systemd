@@ -389,6 +389,9 @@ possible_cc_flags = [
         '-fstack-protector',
         '-fstack-protector-strong',
         '--param=ssp-buffer-size=4',
+
+        # Disable -Wformat-overflow for gcc 13
+        '-Wno-format-overflow',
 ]
 
 # --as-needed and --no-undefined are provided by meson by default,
