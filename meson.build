@@ -650,7 +650,9 @@ foreach ident : [
         ['open_tree',         '''#include <sys/mount.h>'''],
         ['fsopen',            '''#include <sys/mount.h>'''],
         ['fsconfig',          '''#include <sys/mount.h>'''],
+        ['fsmount',           '''#include <sys/mount.h>'''],
         ['getdents64',        '''#include <dirent.h>'''],
+]
 
         have = cc.has_function(ident[0], prefix : ident[1], args : '-D_GNU_SOURCE')
         conf.set10('HAVE_' + ident[0].to_upper(), have)
