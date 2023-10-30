@@ -1100,27 +1100,6 @@ static int mount_bind_sysfs(const MountEntry *m) {
         return 1;
 }
 
-static bool mount_option_supported(const char *fstype, const char *key, const char *value) {
-        _cleanup_close_ int fd = -1;
-        int r;
-
-        /* This function assumes support by default. Only if the fsconfig() call fails with -EINVAL/-EOPNOTSUPP
-         * will it report that the option/value is not supported. */
-
-        fd = fsopen(fstype, FSOPEN_CLOEXEC);
-        if (fd < 0) {
-                if (errno != ENOSYS)
-                        log_debug_errno(errno, "Failed to open superblock context for '%s': %m", fstype);
-                return true; /* If fsopen() fails for whatever reason, assume the value is supported. */
-        }
-
-        r = fsconfig(fd, FSCONFIG_SET_STRING, key, value, 0);
-        if (r < 0 && !IN_SET(errno, EINVAL, EOPNOTSUPP, ENOSYS))
-                log_debug_errno(errno, "Failed to set '%s=%s' on '%s' superblock context: %m", key, value, fstype);
-
-        return r >= 0 || !IN_SET(errno, EINVAL, EOPNOTSUPP);
-}
-
 static int mount_procfs(const MountEntry *m, const NamespaceInfo *ns_info) {
         _cleanup_free_ char *opts = NULL;
         const char *entry_path;
