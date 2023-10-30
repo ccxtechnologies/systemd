@@ -88,18 +88,25 @@ NSPAWN_ARGUMENTS='...'
     Specify additional arguments for systemd-nspawn
 
 QEMU_TIMEOUT=infinity
-    Set a timeout for tests under qemu (defaults to infinity)
+    Set a timeout for tests under qemu (defaults to 1800 sec)
 
 NSPAWN_TIMEOUT=infinity
-    Set a timeout for tests under systemd-nspawn (defaults to infinity)
+    Set a timeout for tests under systemd-nspawn (defaults to 1800 sec)
 
 INTERACTIVE_DEBUG=1
     Configure the machine to be more *user-friendly* for interactive debuggung
     (e.g. by setting a usable default terminal, suppressing the shutdown after
     the test, etc.)
 
+TEST_MATCH_SUBTEST=subtest
+    If the test makes use of `run_subtests` use this variable to provide
+    a POSIX extended regex to run only subtests matching the expression
+
+TEST_MATCH_TESTCASE=testcase
+    Same as $TEST_MATCH_SUBTEST but for subtests that make use of `run_testcases`
+
 The kernel and initrd can be specified with $KERNEL_BIN and $INITRD. (Fedora's
-or Debian's default kernel path and initrd are used by default)
+or Debian's default kernel path and initrd are used by default.)
 
 A script will try to find your qemu binary. If you want to specify a different
 one with $QEMU_BIN.
@@ -107,12 +114,12 @@ one with $QEMU_BIN.
 Debugging the qemu image
 ========================
 
-If you want to log in the testsuite virtual machine, you can specify additional
-kernel command line parameter with $KERNEL_APPEND and then log in as root.
+If you want to log in the testsuite virtual machine, use INTERACTIVE_DEBUG=1
+and log in as root:
 
-$ sudo make -C test/TEST-01-BASIC KERNEL_APPEND="systemd.unit=multi-user.target" run
+$ sudo make -C test/TEST-01-BASIC INTERACTIVE_DEBUG=1 run
 
-Root password is empty.
+The root password is empty.
 
 Ubuntu CI
 =========
@@ -171,7 +178,7 @@ Manually running a part of the Ubuntu CI test suite
 
 In some situations one may want/need to run one of the tests run by Ubuntu CI
 locally for debugging purposes. For this, you need a machine (or a VM) with
-the same Ubuntu release as is used by Ubuntu CI (Focal ATTOW).
+the same Ubuntu release as is used by Ubuntu CI (Jammy ATTOW).
 
 First of all, clone the Debian systemd repository and sync it with the code of
 the PR (set by the $UPSTREAM_PULL_REQUEST env variable) you'd like to debug:
@@ -186,18 +193,16 @@ Now install necessary build & test dependencies:
 ## PPA with some newer Ubuntu packages required by upstream systemd
 # add-apt-repository -y ppa:upstream-systemd-ci/systemd-ci
 # apt build-dep -y systemd
-# apt install -y autopkgtest debhelper genisoimage git qemu-system-x86 \
-                 libzstd-dev libfdisk-dev libtss2-dev libfido2-dev libssl-dev \
-                 python3-jinja2 zstd
+# apt install -y autopkgtest debhelper genisoimage git qemu-system-x86
 
 Build systemd deb packages with debug info:
 
-# DEB_BUILD_OPTIONS="nocheck nostrip" dpkg-buildpackage -us -uc
+# TEST_UPSTREAM=1 DEB_BUILD_OPTIONS="nocheck nostrip" dpkg-buildpackage -us -uc
 # cd ..
 
 Prepare a testbed image for autopkgtest (tweak the release as necessary):
 
-# autopkgtest-buildvm-ubuntu-cloud -v -a amd64 -r focal
+# autopkgtest-buildvm-ubuntu-cloud --ram-size 1024 -v -a amd64 -r jammy
 
 And finally run the autopkgtest itself:
 
@@ -205,7 +210,7 @@ And finally run the autopkgtest itself:
               --timeout-factor=3 \
               --test-name=boot-and-services \
               --shell-fail \
-              -- autopkgtest-virt-qemu autopkgtest-focal-amd64.img
+              -- autopkgtest-virt-qemu --ram-size 2048 autopkgtest-jammy-amd64.img
 
 where --test-name= is the name of the test you want to run/debug. The
 --shell-fail option will pause the execution in case the test fails and shows
@@ -264,3 +269,39 @@ More about query suites here: https://codeql.github.com/docs/codeql-cli/creating
 The results are then located in the `results.csv` file as a comma separated
 values list (obviously), which is the most human-friendly output format the
 CodeQL utility provides (so far).
+
+Code coverage
+=============
+
+We have a daily cron job in CentOS CI which runs all unit and integration tests,
+collects coverage using gcov/lcov, and uploads the report to Coveralls[0]. In
+order to collect the most accurate coverage information, some measures have
+to be taken regarding sandboxing, namely:
+
+ - ProtectSystem= and ProtectHome= need to be turned off
+ - the $BUILD_DIR with necessary .gcno files needs to be present in the image
+   and needs to be writable by all processes
+
+The first point is relatively easy to handle and is handled automagically by
+our test "framework" by creating necessary dropins.
+
+Making the $BUILD_DIR accessible to _everything_ is slightly more complicated.
+First, and foremost, the $BUILD_DIR has a POSIX ACL that makes it writable
+to everyone. However, this is not enough in some cases, like for services
+that use DynamicUser=yes, since that implies ProtectSystem=strict that can't
+be turned off. A solution to this is to use ReadWritePaths=$BUILD_DIR, which
+works for the majority of cases, but can't be turned on globally, since
+ReadWritePaths= creates its own mount namespace which might break some
+services. Hence, the ReadWritePaths=$BUILD_DIR is enabled for all services
+with the `test-` prefix (i.e. test-foo.service or test-foo-bar.service), both
+in the system and the user managers.
+
+So, if you're considering writing an integration test that makes use
+of DynamicUser=yes, or other sandboxing stuff that implies it, please prefix
+the test unit (be it a static one or a transient one created via systemd-run),
+with `test-`, unless the test unit needs to be able to install mount points
+in the main mount namespace - in that case use IGNORE_MISSING_COVERAGE=yes
+in the test definition (i.e. TEST-*-NAME/test.sh), which will skip the post-test
+check for missing coverage for the respective test.
+
+[0] https://coveralls.io/github/systemd/systemd

@@ -27,7 +27,7 @@ void pull_job_close_disk_fd(PullJob *j) {
         if (j->close_disk_fd)
                 safe_close(j->disk_fd);
 
-        j->disk_fd = -1;
+        j->disk_fd = -EBADF;
 }
 
 PullJob* pull_job_unref(PullJob *j) {
@@ -124,8 +124,8 @@ static int pull_job_restart(PullJob *j, const char *new_url) {
 
 void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
         PullJob *j = NULL;
+        char *scheme = NULL;
         CURLcode code;
-        long protocol;
         int r;
 
         if (curl_easy_getinfo(curl, CURLINFO_PRIVATE, (char **)&j) != CURLE_OK)
@@ -139,13 +139,13 @@ void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
                 goto finish;
         }
 
-        code = curl_easy_getinfo(curl, CURLINFO_PROTOCOL, &protocol);
-        if (code != CURLE_OK) {
-                r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve response code: %s", curl_easy_strerror(code));
+        code = curl_easy_getinfo(curl, CURLINFO_SCHEME, &scheme);
+        if (code != CURLE_OK || !scheme) {
+                r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve URL scheme.");
                 goto finish;
         }
 
-        if (IN_SET(protocol, CURLPROTO_HTTP, CURLPROTO_HTTPS)) {
+        if (STRCASE_IN_SET(scheme, "HTTP", "HTTPS")) {
                 long status;
 
                 code = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
@@ -250,8 +250,8 @@ void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
                         if (j->offset == UINT64_MAX) {
 
                                 if (j->written_compressed > 0) {
-                                        /* Make sure the file size is right, in case the file was sparse and we just seeked
-                                         * for the last part */
+                                        /* Make sure the file size is right, in case the file was sparse and
+                                         * we just moved to the last part. */
                                         if (ftruncate(j->disk_fd, j->written_uncompressed) < 0) {
                                                 r = log_error_errno(errno, "Failed to truncate file: %m");
                                                 goto finish;
@@ -692,7 +692,7 @@ int pull_job_new(
 
         *j = (PullJob) {
                 .state = PULL_JOB_INIT,
-                .disk_fd = -1,
+                .disk_fd = -EBADF,
                 .close_disk_fd = true,
                 .userdata = userdata,
                 .glue = glue,

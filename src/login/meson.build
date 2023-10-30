@@ -2,7 +2,6 @@
 
 systemd_logind_sources = files(
         'logind.c',
-        'logind.h',
 )
 
 logind_gperf_c = custom_target(
@@ -13,34 +12,20 @@ logind_gperf_c = custom_target(
 
 liblogind_core_sources = files(
         'logind-action.c',
-        'logind-action.h',
         'logind-brightness.c',
-        'logind-brightness.h',
         'logind-button.c',
-        'logind-button.h',
         'logind-core.c',
         'logind-dbus.c',
-        'logind-dbus.h',
         'logind-device.c',
-        'logind-device.h',
         'logind-inhibit.c',
-        'logind-inhibit.h',
         'logind-polkit.c',
-        'logind-polkit.h',
         'logind-seat-dbus.c',
-        'logind-seat-dbus.h',
         'logind-seat.c',
-        'logind-seat.h',
         'logind-session-dbus.c',
-        'logind-session-dbus.h',
         'logind-session-device.c',
-        'logind-session-device.h',
         'logind-session.c',
-        'logind-session.h',
         'logind-user-dbus.c',
-        'logind-user-dbus.h',
         'logind-user.c',
-        'logind-user.h',
         'logind-utmp.c',
 )
 
@@ -50,12 +35,12 @@ liblogind_core = static_library(
         'logind-core',
         liblogind_core_sources,
         include_directories : includes,
-        dependencies : libacl,
+        dependencies : [libacl,
+                        userspace],
         build_by_default : false)
 
 loginctl_sources = files(
         'loginctl.c',
-        'sysfs-show.h',
         'sysfs-show.c',
 )
 
@@ -93,17 +78,25 @@ endif
 
 ############################################################
 
+simple_tests += files(
+        'test-login-shared.c'
+)
+
 tests += [
-        [files('test-login-shared.c')],
-
-        [files('test-inhibit.c'),
-         [], [], [], '', 'manual'],
-
-        [files('test-login-tables.c'),
-         [liblogind_core,
-          libshared],
-         [threads]],
-
-        [files('test-session-properties.c'),
-         [], [], [], '', 'manual'],
+        {
+                'sources' : files('test-inhibit.c'),
+                'type' : 'manual',
+        },
+        {
+                'sources' : files('test-login-tables.c'),
+                'link_with' : [
+                        liblogind_core,
+                        libshared,
+                ],
+                'dependencies' : threads,
+        },
+        {
+                'sources' : files('test-session-properties.c'),
+                'type' : 'manual',
+        },
 ]

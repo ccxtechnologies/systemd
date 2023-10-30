@@ -6,12 +6,14 @@
 
 #include "alloc-util.h"
 #include "blockdev-util.h"
-#include "chase-symlinks.h"
+#include "chase.h"
 #include "device-util.h"
+#include "devnum-util.h"
 #include "dirent-util.h"
 #include "env-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "find-esp.h"
 #include "glyph-util.h"
 #include "gpt.h"
 #include "hexdecoct.h"
@@ -71,7 +73,7 @@ static int resource_load_from_directory(
                 Resource *rr,
                 mode_t m) {
 
-        _cleanup_(closedirp) DIR *d = NULL;
+        _cleanup_closedir_ DIR *d = NULL;
         int r;
 
         assert(rr);
@@ -194,7 +196,7 @@ static int resource_load_from_blockdev(Resource *rr) {
                         continue;
 
                 /* Check if partition type matches */
-                if (rr->partition_type_set && !sd_id128_equal(pinfo.type, rr->partition_type))
+                if (rr->partition_type_set && !sd_id128_equal(pinfo.type, rr->partition_type.uuid))
                         continue;
 
                 /* A label of "_empty" means "not used so far" for us */
@@ -241,7 +243,7 @@ static int download_manifest(
                 size_t *ret_size) {
 
         _cleanup_free_ char *buffer = NULL, *suffixed_url = NULL;
-        _cleanup_(close_pairp) int pfd[2] = { -1, -1 };
+        _cleanup_close_pair_ int pfd[2] = PIPE_EBADF;
         _cleanup_fclose_ FILE *manifest = NULL;
         size_t size = 0;
         pid_t pid;
@@ -263,7 +265,11 @@ static int download_manifest(
         log_info("%s Acquiring manifest file %s%s", special_glyph(SPECIAL_GLYPH_DOWNLOAD),
                  suffixed_url, special_glyph(SPECIAL_GLYPH_ELLIPSIS));
 
-        r = safe_fork("(sd-pull)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG, &pid);
+        r = safe_fork_full("(sd-pull)",
+                           (int[]) { -EBADF, pfd[1], STDERR_FILENO },
+                           NULL, 0,
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_REARRANGE_STDIO|FORK_LOG,
+                           &pid);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -279,15 +285,6 @@ static int download_manifest(
                         NULL
                 };
 
-                pfd[0] = safe_close(pfd[0]);
-
-                r = rearrange_stdio(-1, pfd[1], STDERR_FILENO);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to rearrange stdin/stdout: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
-                (void) unsetenv("NOTIFY_SOCKET");
                 execv(pull_binary_path(), (char *const*) cmdline);
                 log_error_errno(errno, "Failed to execute %s tool: %m", pull_binary_path());
                 _exit(EXIT_FAILURE);
@@ -524,11 +521,21 @@ int resource_resolve_path(
 
         assert(rr);
 
-        if (rr->path_auto) {
+        if (IN_SET(rr->path_relative_to, PATH_RELATIVE_TO_ESP, PATH_RELATIVE_TO_XBOOTLDR, PATH_RELATIVE_TO_BOOT) &&
+            !IN_SET(rr->type, RESOURCE_REGULAR_FILE, RESOURCE_DIRECTORY))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Paths relative to %s are only allowed for regular-file or directory resources.",
+                                       path_relative_to_to_string(rr->path_relative_to));
 
-                /* NB: we don't actually check the backing device of the root fs "/", but of "/usr", in order
-                 * to support environments where the root fs is a tmpfs, and the OS itself placed exclusively
-                 * in /usr/. */
+        if (rr->path_auto) {
+                struct stat orig_root_stats;
+
+                /* NB: If the root mount has been replaced by some form of volatile file system (overlayfs),
+                 * the original root block device node is symlinked in /run/systemd/volatile-root. Let's
+                 * follow that link here. If that doesn't exist, we check the backing device of "/usr". We
+                 * don't actually check the backing device of the root fs "/", in order to support
+                 * environments where the root fs is a tmpfs, and the OS itself placed exclusively in
+                 * /usr/. */
 
                 if (rr->type != RESOURCE_PARTITION)
                         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
@@ -546,14 +553,23 @@ int resource_resolve_path(
                         return log_error_errno(SYNTHETIC_ERRNO(EPERM),
                                                "Block device is not allowed when using --root= mode.");
 
-                r = get_block_device_harder("/usr/", &d);
+                r = stat("/run/systemd/volatile-root", &orig_root_stats);
+                if (r < 0) {
+                        if (errno == ENOENT) /* volatile-root not found */
+                                r = get_block_device_harder("/usr/", &d);
+                        else
+                                return log_error_errno(r, "Failed to stat /run/systemd/volatile-root: %m");
+                } else if (!S_ISBLK(orig_root_stats.st_mode)) /* symlink was present but not block device */
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOTBLK), "/run/systemd/volatile-root is not linked to a block device.");
+                else /* symlink was present and a block device */
+                        d = orig_root_stats.st_rdev;
 
         } else if (rr->type == RESOURCE_PARTITION) {
-                _cleanup_close_ int fd = -1, real_fd = -1;
+                _cleanup_close_ int fd = -EBADF, real_fd = -EBADF;
                 _cleanup_free_ char *resolved = NULL;
                 struct stat st;
 
-                r = chase_symlinks(rr->path, root, CHASE_PREFIX_ROOT, &resolved, &fd);
+                r = chase(rr->path, root, CHASE_PREFIX_ROOT, &resolved, &fd);
                 if (r < 0)
                         return log_error_errno(r, "Failed to resolve '%s': %m", rr->path);
 
@@ -586,12 +602,31 @@ int resource_resolve_path(
 
                 r = get_block_device_harder_fd(fd, &d);
 
-        } else if (RESOURCE_IS_FILESYSTEM(rr->type) && root) {
-                _cleanup_free_ char *resolved = NULL;
+        } else if (RESOURCE_IS_FILESYSTEM(rr->type)) {
+                _cleanup_free_ char *resolved = NULL, *relative_to = NULL;
+                ChaseFlags chase_flags = CHASE_PREFIX_ROOT;
 
-                r = chase_symlinks(rr->path, root, CHASE_PREFIX_ROOT, &resolved, NULL);
+                if (rr->path_relative_to == PATH_RELATIVE_TO_ROOT) {
+                        relative_to = strdup(empty_to_root(root));
+                        if (!relative_to)
+                                return log_oom();
+                } else { /* boot, esp, or xbootldr */
+                        r = 0;
+                        if (IN_SET(rr->path_relative_to, PATH_RELATIVE_TO_BOOT, PATH_RELATIVE_TO_XBOOTLDR))
+                                r = find_xbootldr_and_warn(root, NULL, /* unprivileged_mode= */ -1, &relative_to, NULL, NULL);
+                        if (r == -ENOKEY || rr->path_relative_to == PATH_RELATIVE_TO_ESP)
+                                r = find_esp_and_warn(root, NULL, -1, &relative_to, NULL, NULL, NULL, NULL, NULL);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to resolve $BOOT: %m");
+                        log_debug("Resolved $BOOT to '%s'", relative_to);
+
+                        /* Since this partition is read from EFI, there should be no symlinks */
+                        chase_flags |= CHASE_PROHIBIT_SYMLINKS;
+                }
+
+                r = chase(rr->path, relative_to, chase_flags, &resolved, NULL);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to resolve '%s': %m", rr->path);
+                        return log_error_errno(r, "Failed to resolve '%s' (relative to '%s'): %m", rr->path, relative_to);
 
                 free_and_replace(rr->path, resolved);
                 return 0;
@@ -632,3 +667,12 @@ static const char *resource_type_table[_RESOURCE_TYPE_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP(resource_type, ResourceType);
+
+static const char *path_relative_to_table[_PATH_RELATIVE_TO_MAX] = {
+        [PATH_RELATIVE_TO_ROOT]     = "root",
+        [PATH_RELATIVE_TO_ESP]      = "esp",
+        [PATH_RELATIVE_TO_XBOOTLDR] = "xbootldr",
+        [PATH_RELATIVE_TO_BOOT]     = "boot",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(path_relative_to, PathRelativeTo);

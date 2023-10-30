@@ -16,7 +16,6 @@
 #include "stat-util.h"
 #include "string-util.h"
 #include "tmpfile-util.h"
-#include "util.h"
 
 #define COPY_BUFFER_SIZE (16*1024)
 
@@ -85,8 +84,8 @@ int raw_export_new(
                 return -ENOMEM;
 
         *e = (RawExport) {
-                .output_fd = -1,
-                .input_fd = -1,
+                .output_fd = -EBADF,
+                .input_fd = -EBADF,
                 .on_finished = on_finished,
                 .userdata = userdata,
                 .last_percent = UINT_MAX,
@@ -139,7 +138,7 @@ static int raw_export_process(RawExport *e) {
                  * reflink source to destination directly. Let's see
                  * if this works. */
 
-                r = btrfs_reflink(e->input_fd, e->output_fd);
+                r = reflink(e->input_fd, e->output_fd);
                 if (r >= 0) {
                         r = 0;
                         goto finish;
@@ -217,7 +216,7 @@ static int raw_export_process(RawExport *e) {
 finish:
         if (r >= 0) {
                 (void) copy_times(e->input_fd, e->output_fd, COPY_CRTIME);
-                (void) copy_xattr(e->input_fd, e->output_fd, 0);
+                (void) copy_xattr(e->input_fd, NULL, e->output_fd, NULL, 0);
         }
 
         if (e->on_finished)
@@ -258,7 +257,7 @@ static int reflink_snapshot(int fd, const char *path) {
                 (void) unlink(t);
         }
 
-        r = btrfs_reflink(fd, new_fd);
+        r = reflink(fd, new_fd);
         if (r < 0) {
                 safe_close(new_fd);
                 return r;
@@ -268,7 +267,7 @@ static int reflink_snapshot(int fd, const char *path) {
 }
 
 int raw_export_start(RawExport *e, const char *path, int fd, ImportCompressType compress) {
-        _cleanup_close_ int sfd = -1, tfd = -1;
+        _cleanup_close_ int sfd = -EBADF, tfd = -EBADF;
         int r;
 
         assert(e);

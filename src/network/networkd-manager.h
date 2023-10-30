@@ -13,6 +13,7 @@
 #include "hashmap.h"
 #include "networkd-link.h"
 #include "networkd-network.h"
+#include "networkd-sysctl.h"
 #include "ordered-set.h"
 #include "set.h"
 #include "time-util.h"
@@ -29,6 +30,7 @@ struct Manager {
         int ethtool_fd;
 
         KeepConfiguration keep_configuration;
+        IPv6PrivacyExtensions ipv6_privacy_extensions;
 
         bool test_mode;
         bool enumerating;
@@ -38,6 +40,7 @@ struct Manager {
         bool manage_foreign_rules;
 
         Set *dirty_links;
+        Set *new_wlan_ifindices;
 
         char *state_file;
         LinkOperationalState operational_state;
@@ -114,5 +117,7 @@ int manager_enumerate(Manager *m);
 
 int manager_set_hostname(Manager *m, const char *hostname);
 int manager_set_timezone(Manager *m, const char *timezone);
+
+int manager_reload(Manager *m);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_free);

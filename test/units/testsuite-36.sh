@@ -3,6 +3,7 @@
 set -eux
 set -o pipefail
 
+# shellcheck disable=SC2317
 at_exit() {
     # shellcheck disable=SC2181
     if [[ $? -ne 0 ]]; then
@@ -348,6 +349,4 @@ systemctl daemon-reload
 
 systemd-analyze log-level info
 
-echo OK >/testok
-
-exit 0
+touch /testok

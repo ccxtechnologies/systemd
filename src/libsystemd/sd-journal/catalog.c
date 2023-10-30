@@ -145,7 +145,9 @@ static int finish_item(
                 char *payload, size_t payload_size) {
 
         _cleanup_free_ CatalogItem *i = NULL;
-        _cleanup_free_ char *prev = NULL, *combined = NULL;
+        _cleanup_free_ char *combined = NULL;
+        char *prev;
+        int r;
 
         assert(h);
         assert(payload);
@@ -168,19 +170,24 @@ static int finish_item(
                 if (!combined)
                         return log_oom();
 
-                if (ordered_hashmap_update(h, i, combined) < 0)
-                        return log_oom();
-                combined = NULL;
+                r = ordered_hashmap_update(h, i, combined);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to update catalog item: %m");
+
+                TAKE_PTR(combined);
+                free(prev);
         } else {
                 /* A new item */
                 combined = memdup(payload, payload_size + 1);
                 if (!combined)
                         return log_oom();
 
-                if (ordered_hashmap_put(h, i, combined) < 0)
-                        return log_oom();
-                i = NULL;
-                combined = NULL;
+                r = ordered_hashmap_put(h, i, combined);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to insert catalog item: %m");
+
+                TAKE_PTR(i);
+                TAKE_PTR(combined);
         }
 
         return 0;
@@ -477,7 +484,7 @@ int catalog_update(const char* database, const char* root, const char* const* di
 
         n = 0;
         ORDERED_HASHMAP_FOREACH_KEY(payload, i, h) {
-                log_debug("Found " SD_ID128_FORMAT_STR ", language %s",
+                log_trace("Found " SD_ID128_FORMAT_STR ", language %s",
                           SD_ID128_FORMAT_VAL(i->id),
                           isempty(i->language) ? "C" : i->language);
 
@@ -504,7 +511,7 @@ int catalog_update(const char* database, const char* root, const char* const* di
 }
 
 static int open_mmap(const char *database, int *_fd, struct stat *_st, void **_p) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         const CatalogHeader *h;
         struct stat st;
         void *p;
@@ -601,7 +608,7 @@ static const char *find_id(void *p, sd_id128_t id) {
 }
 
 int catalog_get(const char* database, sd_id128_t id, char **_text) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         void *p = NULL;
         struct stat st = {};
         char *text = NULL;
@@ -668,7 +675,7 @@ static void dump_catalog_entry(FILE *f, sd_id128_t id, const char *s, bool oneli
 }
 
 int catalog_list(FILE *f, const char *database, bool oneline) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         void *p = NULL;
         struct stat st;
         const CatalogHeader *h;

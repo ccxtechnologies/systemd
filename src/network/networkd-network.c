@@ -42,7 +42,6 @@
 #include "string-util.h"
 #include "strv.h"
 #include "tclass.h"
-#include "util.h"
 
 /* Let's assume that anything above this number is a user misconfiguration. */
 #define MAX_NTP_SERVERS 128U
@@ -396,6 +395,7 @@ int network_load_one(Manager *manager, OrderedHashmap **networks, const char *fi
                 .dhcp_use_ntp = true,
                 .dhcp_routes_to_ntp = true,
                 .dhcp_use_sip = true,
+                .dhcp_use_captive_portal = true,
                 .dhcp_use_dns = true,
                 .dhcp_routes_to_dns = true,
                 .dhcp_use_hostname = true,
@@ -414,9 +414,11 @@ int network_load_one(Manager *manager, OrderedHashmap **networks, const char *fi
                 .dhcp6_use_dns = true,
                 .dhcp6_use_hostname = true,
                 .dhcp6_use_ntp = true,
+                .dhcp6_use_captive_portal = true,
                 .dhcp6_use_rapid_commit = true,
                 .dhcp6_duid.type = _DUID_TYPE_INVALID,
                 .dhcp6_client_start_mode = _DHCP6_CLIENT_START_MODE_INVALID,
+                .dhcp6_send_release = true,
 
                 .dhcp_pd = -1,
                 .dhcp_pd_announce = true,
@@ -467,7 +469,7 @@ int network_load_one(Manager *manager, OrderedHashmap **networks, const char *fi
 
                 .ipv4_accept_local = -1,
                 .ipv4_route_localnet = -1,
-                .ipv6_privacy_extensions = IPV6_PRIVACY_EXTENSIONS_NO,
+                .ipv6_privacy_extensions = _IPV6_PRIVACY_EXTENSIONS_INVALID,
                 .ipv6_dad_transmits = -1,
                 .ipv6_hop_limit = -1,
                 .ipv6_proxy_ndp = -1,
@@ -476,12 +478,15 @@ int network_load_one(Manager *manager, OrderedHashmap **networks, const char *fi
                 .ipv6_accept_ra = -1,
                 .ipv6_accept_ra_use_dns = true,
                 .ipv6_accept_ra_use_gateway = true,
+                .ipv6_accept_ra_use_captive_portal = true,
                 .ipv6_accept_ra_use_route_prefix = true,
                 .ipv6_accept_ra_use_autonomous_prefix = true,
                 .ipv6_accept_ra_use_onlink_prefix = true,
                 .ipv6_accept_ra_use_mtu = true,
                 .ipv6_accept_ra_route_table = RT_TABLE_MAIN,
-                .ipv6_accept_ra_route_metric = DHCP_ROUTE_METRIC,
+                .ipv6_accept_ra_route_metric_high = IPV6RA_ROUTE_METRIC_HIGH,
+                .ipv6_accept_ra_route_metric_medium = IPV6RA_ROUTE_METRIC_MEDIUM,
+                .ipv6_accept_ra_route_metric_low = IPV6RA_ROUTE_METRIC_LOW,
                 .ipv6_accept_ra_start_dhcp6_client = IPV6_ACCEPT_RA_START_DHCP6_CLIENT_YES,
 
                 .can_termination = -1,
@@ -491,7 +496,7 @@ int network_load_one(Manager *manager, OrderedHashmap **networks, const char *fi
         };
 
         r = config_parse_many(
-                        STRV_MAKE_CONST(filename), NETWORK_DIRS, dropin_dirname,
+                        STRV_MAKE_CONST(filename), NETWORK_DIRS, dropin_dirname, /* root = */ NULL,
                         "Match\0"
                         "Link\0"
                         "SR-IOV\0"
@@ -551,7 +556,7 @@ int network_load_one(Manager *manager, OrderedHashmap **networks, const char *fi
                         CONFIG_PARSE_WARN,
                         network,
                         &network->stats_by_path,
-                        NULL);
+                        &network->dropins);
         if (r < 0)
                 return r; /* config_parse_many() logs internally. */
 
@@ -669,6 +674,7 @@ static Network *network_free(Network *network) {
         free(network->name);
         free(network->filename);
         free(network->description);
+        strv_free(network->dropins);
         hashmap_free(network->stats_by_path);
 
         /* conditions */

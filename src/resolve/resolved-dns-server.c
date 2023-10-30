@@ -195,19 +195,19 @@ void dns_server_move_back_and_unmark(DnsServer *s) {
 
         case DNS_SERVER_LINK:
                 assert(s->link);
-                LIST_FIND_TAIL(servers, s, tail);
+                tail = LIST_FIND_TAIL(servers, s);
                 LIST_REMOVE(servers, s->link->dns_servers, s);
                 LIST_INSERT_AFTER(servers, s->link->dns_servers, tail, s);
                 break;
 
         case DNS_SERVER_SYSTEM:
-                LIST_FIND_TAIL(servers, s, tail);
+                tail = LIST_FIND_TAIL(servers, s);
                 LIST_REMOVE(servers, s->manager->dns_servers, s);
                 LIST_INSERT_AFTER(servers, s->manager->dns_servers, tail, s);
                 break;
 
         case DNS_SERVER_FALLBACK:
-                LIST_FIND_TAIL(servers, s, tail);
+                tail = LIST_FIND_TAIL(servers, s);
                 LIST_REMOVE(servers, s->manager->fallback_dns_servers, s);
                 LIST_INSERT_AFTER(servers, s->manager->fallback_dns_servers, tail, s);
                 break;
@@ -542,7 +542,7 @@ DnsServerFeatureLevel dns_server_possible_feature_level(DnsServer *s) {
                            DNS_SERVER_FEATURE_LEVEL_IS_UDP(s->possible_feature_level) &&
                            ((s->possible_feature_level != DNS_SERVER_FEATURE_LEVEL_DO) || dns_server_get_dnssec_mode(s) != DNSSEC_YES)) {
 
-                        /* We lost too many UDP packets in a row, and are on an UDP feature level. If the
+                        /* We lost too many UDP packets in a row, and are on a UDP feature level. If the
                          * packets are lost, maybe the server cannot parse them, hence downgrading sounds
                          * like a good idea. We might downgrade all the way down to TCP this way.
                          *
@@ -647,6 +647,11 @@ int dns_server_adjust_opt(DnsServer *server, DnsPacket *packet, DnsServerFeature
 
 int dns_server_ifindex(const DnsServer *s) {
         assert(s);
+
+        /* For loopback addresses, go via the loopback interface, regardless which interface this is linked
+         * to. */
+        if (in_addr_is_localhost(s->family, &s->address))
+                return LOOPBACK_IFINDEX;
 
         /* The link ifindex always takes precedence */
         if (s->link)

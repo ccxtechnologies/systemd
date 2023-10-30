@@ -21,6 +21,7 @@ bpf	357
 brk	45
 cachectl
 cacheflush
+cachestat	451
 capget	184
 capset	185
 chdir	12
@@ -427,6 +428,7 @@ renameat2	353
 request_key	287
 restart_syscall	0
 riscv_flush_icache
+riscv_hwprobe
 rmdir	40
 rseq	386
 rt_sigaction	174

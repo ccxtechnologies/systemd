@@ -19,6 +19,7 @@
 #include "macro.h"
 #include "path-util.h"
 #include "process-util.h"
+#include "random-util.h"
 #include "resolved-dns-packet.h"
 #include "resolved-dns-question.h"
 #include "resolved-dns-rr.h"
@@ -107,7 +108,7 @@ static void server_handle(int fd) {
 }
 
 static void *tcp_dns_server(void *p) {
-        _cleanup_close_ int bindfd = -1, acceptfd = -1;
+        _cleanup_close_ int bindfd = -EBADF, acceptfd = -EBADF;
 
         assert_se((bindfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) >= 0);
         assert_se(setsockopt(bindfd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) >= 0);
@@ -125,7 +126,7 @@ static void *tcp_dns_server(void *p) {
 static void *tls_dns_server(void *p) {
         pid_t openssl_pid;
         int r;
-        _cleanup_close_ int fd_server = -1, fd_tls = -1;
+        _cleanup_close_ int fd_server = -EBADF, fd_tls = -EBADF;
         _cleanup_free_ char *cert_path = NULL, *key_path = NULL;
         _cleanup_free_ char *bind_str = NULL;
 
@@ -147,16 +148,14 @@ static void *tls_dns_server(void *p) {
                 fd_tls = fd[1];
         }
 
-        r = safe_fork_full("(test-resolved-stream-tls-openssl)", (int[]) { fd_server, fd_tls }, 2,
-                FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_LOG|FORK_REOPEN_LOG, &openssl_pid);
+        r = safe_fork_full("(test-resolved-stream-tls-openssl)",
+                           (int[]) { fd_tls, fd_tls, STDOUT_FILENO },
+                           NULL, 0,
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_REARRANGE_STDIO|FORK_LOG|FORK_REOPEN_LOG,
+                           &openssl_pid);
         assert_se(r >= 0);
         if (r == 0) {
                 /* Child */
-                assert_se(dup2(fd_tls, STDIN_FILENO) >= 0);
-                assert_se(dup2(fd_tls, STDOUT_FILENO) >= 0);
-                close(TAKE_FD(fd_server));
-                close(TAKE_FD(fd_tls));
-
                 execlp("openssl", "openssl", "s_server", "-accept", bind_str,
                        "-key", key_path, "-cert", cert_path,
                        "-quiet", "-naccept", "1", NULL);
@@ -213,7 +212,7 @@ static void test_dns_stream(bool tls) {
         Manager manager = {};
          _cleanup_(dns_stream_unrefp) DnsStream *stream = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
-        _cleanup_close_ int clientfd = -1;
+        _cleanup_close_ int clientfd = -EBADF;
         int r;
 
         void *(*server_entrypoint)(void *);
@@ -251,7 +250,7 @@ static void test_dns_stream(bool tls) {
                 r = connect(clientfd, &server_address.sa, SOCKADDR_LEN(server_address));
                 if (r >= 0)
                         break;
-                usleep(EVENT_TIMEOUT_USEC / 100);
+                usleep_safe(EVENT_TIMEOUT_USEC / 100);
         }
         assert_se(r >= 0);
 
@@ -331,7 +330,7 @@ static void test_dns_stream(bool tls) {
 }
 
 static void try_isolate_network(void) {
-        _cleanup_close_ int socket_fd = -1;
+        _cleanup_close_ int socket_fd = -EBADF;
         int r;
 
         /* First test if CLONE_NEWUSER/CLONE_NEWNET can actually work for us, i.e. we can open the namespaces
@@ -376,7 +375,7 @@ static void try_isolate_network(void) {
 int main(int argc, char **argv) {
         server_address = (union sockaddr_union) {
                 .in.sin_family = AF_INET,
-                .in.sin_port = htobe16(12345),
+                .in.sin_port = htobe16(random_u64_range(UINT16_MAX - 1024) + 1024),
                 .in.sin_addr.s_addr = htobe32(INADDR_LOOPBACK)
         };
 

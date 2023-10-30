@@ -183,6 +183,7 @@ static int dhcp4_request_route(Route *in, Link *link) {
 
         assert(route);
         assert(link);
+        assert(link->network);
         assert(link->dhcp_lease);
 
         r = sd_dhcp_lease_get_server_identifier(link->dhcp_lease, &server);
@@ -200,6 +201,8 @@ static int dhcp4_request_route(Route *in, Link *link) {
                 route->table = link_get_dhcp4_route_table(link);
         if (route->mtu == 0)
                 route->mtu = link->network->dhcp_route_mtu;
+        if (route->quickack < 0)
+                route->quickack = link->network->dhcp_quickack;
 
         if (route_get(NULL, link, route, &existing) < 0) /* This is a new route. */
                 link->dhcp4_configured = false;
@@ -275,7 +278,8 @@ static int dhcp4_request_route_to_gateway(Link *link, const struct in_addr *gw) 
 static int dhcp4_request_route_auto(
                 Route *in,
                 Link *link,
-                const struct in_addr *gw) {
+                const struct in_addr *gw,
+                bool force_use_gw) {
 
         _cleanup_(route_freep) Route *route = in;
         struct in_addr address, netmask, prefix;
@@ -320,7 +324,8 @@ static int dhcp4_request_route_auto(
                 route->gw = IN_ADDR_NULL;
                 route->prefsrc.in = address;
 
-        } else if (route->dst_prefixlen >= prefixlen &&
+        } else if (!force_use_gw &&
+                   route->dst_prefixlen >= prefixlen &&
                    (route->dst.in.s_addr & netmask.s_addr) == prefix.s_addr) {
                 if (in4_addr_is_set(gw))
                         log_link_debug(link, "DHCP: requested route destination "IPV4_ADDRESS_FMT_STR"/%u is in the assigned network "
@@ -334,15 +339,18 @@ static int dhcp4_request_route_auto(
                 route->gw = IN_ADDR_NULL;
                 route->prefsrc.in = address;
 
-        } else {
-                if (in4_addr_is_null(gw)) {
-                        log_link_debug(link, "DHCP: requested route destination "IPV4_ADDRESS_FMT_STR"/%u is not in the assigned network "
-                                       IPV4_ADDRESS_FMT_STR"/%u, but no gateway is specified, ignoring.",
-                                       IPV4_ADDRESS_FMT_VAL(route->dst.in), route->dst_prefixlen,
-                                       IPV4_ADDRESS_FMT_VAL(prefix), prefixlen);
-                        return 0;
-                }
+        } else if (in4_addr_is_null(gw)) {
+                log_link_debug(link, "DHCP: requested route destination "IPV4_ADDRESS_FMT_STR"/%u is not in the assigned network "
+                               IPV4_ADDRESS_FMT_STR"/%u, but no gateway is specified, using 'link' scope.",
+                               IPV4_ADDRESS_FMT_VAL(route->dst.in), route->dst_prefixlen,
+                               IPV4_ADDRESS_FMT_VAL(prefix), prefixlen);
 
+                route->scope = RT_SCOPE_LINK;
+                route->gw_family = AF_UNSPEC;
+                route->gw = IN_ADDR_NULL;
+                route->prefsrc.in = address;
+
+        } else {
                 r = dhcp4_request_route_to_gateway(link, gw);
                 if (r < 0)
                         return r;
@@ -467,7 +475,9 @@ static int dhcp4_request_static_routes(Link *link, struct in_addr *ret_default_g
                     in4_addr_is_null(&default_gw))
                         default_gw = gw;
 
-                r = dhcp4_request_route_auto(TAKE_PTR(route), link, &gw);
+                /* Do not ignore the gateway given by the classless route option even if the destination is
+                 * in the same network. See issue #28280. */
+                r = dhcp4_request_route_auto(TAKE_PTR(route), link, &gw, /* force_use_gw = */ n_classless_routes > 0);
                 if (r < 0)
                         return r;
         }
@@ -603,7 +613,7 @@ static int dhcp4_request_routes_to_servers(
                 route->dst.in = servers[i];
                 route->dst_prefixlen = 32;
 
-                r = dhcp4_request_route_auto(TAKE_PTR(route), link, gw);
+                r = dhcp4_request_route_auto(TAKE_PTR(route), link, gw, /* force_use_gw = */ false);
                 if (r < 0)
                         return r;
         }
@@ -1357,6 +1367,10 @@ static int dhcp4_configure(Link *link) {
         if (r < 0)
                 return log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to attach event to DHCPv4 client: %m");
 
+        r = sd_dhcp_client_attach_device(link->dhcp_client, link->dev);
+        if (r < 0)
+                return log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to attach device: %m");
+
         r = sd_dhcp_client_set_mac(link->dhcp_client,
                                    link->hw_addr.bytes,
                                    link->bcast_addr.length > 0 ? link->bcast_addr.bytes : NULL,
@@ -1415,6 +1429,11 @@ static int dhcp4_configure(Link *link) {
                         r = sd_dhcp_client_set_request_option(link->dhcp_client, SD_DHCP_OPTION_SIP_SERVER);
                         if (r < 0)
                                 return log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to set request flag for SIP server: %m");
+                }
+                if (link->network->dhcp_use_captive_portal) {
+                        r = sd_dhcp_client_set_request_option(link->dhcp_client, SD_DHCP_OPTION_DHCP_CAPTIVE_PORTAL);
+                        if (r < 0)
+                                return log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to set request flag for captive portal: %m");
                 }
 
                 if (link->network->dhcp_use_timezone) {
@@ -1493,6 +1512,12 @@ static int dhcp4_configure(Link *link) {
                 r = sd_dhcp_client_set_service_type(link->dhcp_client, link->network->dhcp_ip_service_type);
                 if (r < 0)
                         return log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to set IP service type: %m");
+        }
+
+        if (link->network->dhcp_socket_priority_set) {
+                r = sd_dhcp_client_set_socket_priority(link->dhcp_client, link->network->dhcp_socket_priority);
+                if (r < 0)
+                        return log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to set socket priority: %m");
         }
 
         if (link->network->dhcp_fallback_lease_lifetime > 0) {
@@ -1693,6 +1718,42 @@ int config_parse_dhcp_ip_service_type(
         else
                 log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "Failed to parse %s=, ignoring assignment: %s", lvalue, rvalue);
+
+        return 0;
+}
+
+int config_parse_dhcp_socket_priority(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        Network *network = ASSERT_PTR(data);
+        int a, r;
+
+        assert(lvalue);
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                network->dhcp_socket_priority_set = false;
+                return 0;
+        }
+
+        r = safe_atoi(rvalue, &a);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to parse socket priority, ignoring: %s", rvalue);
+                return 0;
+        }
+
+        network->dhcp_socket_priority_set = true;
+        network->dhcp_socket_priority = a;
 
         return 0;
 }

@@ -75,6 +75,9 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
+        /* Resetting to 0 forces the invocation of an internal initialization routine of getopt_long()
+         * that checks for GNU extensions in optstring ('-' or '+' at the beginning). */
+        optind = 0;
         while ((c = getopt_long(argc, argv, arg_print ? "hVd:b:t:p" : "+hVd:b:t:p", options, NULL)) >= 0)
 
                 switch (c) {
@@ -176,7 +179,7 @@ static int lock_device(
                 dev_t devno,
                 usec_t deadline) {
 
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         struct stat st;
         int r;
 
@@ -284,7 +287,7 @@ static int lock_device(
 }
 
 int lock_main(int argc, char *argv[], void *userdata) {
-        _cleanup_(fdset_freep) FDSet *fds = NULL;
+        _cleanup_fdset_free_ FDSet *fds = NULL;
         _cleanup_free_ dev_t *devnos = NULL;
         size_t n_devnos = 0;
         usec_t deadline;
@@ -313,7 +316,7 @@ int lock_main(int argc, char *argv[], void *userdata) {
         if (!fds)
                 return log_oom();
 
-        if (IN_SET(arg_timeout_usec, 0, USEC_INFINITY))
+        if (!timestamp_is_set(arg_timeout_usec))
                 deadline = arg_timeout_usec;
         else
                 deadline = usec_add(now(CLOCK_MONOTONIC), arg_timeout_usec);
@@ -328,17 +331,15 @@ int lock_main(int argc, char *argv[], void *userdata) {
                 if (arg_print)
                         printf("%s\n", node);
                 else {
-                        _cleanup_close_ int fd = -1;
+                        _cleanup_close_ int fd = -EBADF;
 
                         fd = lock_device(node, devnos[i], deadline);
                         if (fd < 0)
                                 return fd;
 
-                        r = fdset_put(fds, fd);
+                        r = fdset_consume(fds, TAKE_FD(fd));
                         if (r < 0)
                                 return log_oom();
-
-                        TAKE_FD(fd);
                 }
         }
 

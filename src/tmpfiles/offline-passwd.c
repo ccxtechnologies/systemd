@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "chase-symlinks.h"
+#include "chase.h"
 #include "fd-util.h"
 #include "offline-passwd.h"
 #include "path-util.h"
@@ -10,26 +10,32 @@ DEFINE_PRIVATE_HASH_OPS_WITH_KEY_DESTRUCTOR(uid_gid_hash_ops, char, string_hash_
 
 static int open_passwd_file(const char *root, const char *fname, FILE **ret_file) {
         _cleanup_free_ char *p = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
+        _cleanup_fclose_ FILE *f = NULL;
 
-        fd = chase_symlinks_and_open(fname, root, CHASE_PREFIX_ROOT, O_RDONLY|O_CLOEXEC, &p);
+        fd = chase_and_open(fname, root, CHASE_PREFIX_ROOT, O_RDONLY|O_CLOEXEC, &p);
         if (fd < 0)
                 return fd;
 
-        FILE *f = fdopen(fd, "r");
+        f = fdopen(fd, "r");
         if (!f)
                 return -errno;
 
         TAKE_FD(fd);
 
-        log_debug("Reading %s entries from %s...", basename(fname), p);
+        if (DEBUG_LOGGING) {
+                _cleanup_free_ char *bn = NULL;
 
-        *ret_file = f;
+                (void) path_extract_filename(fname, &bn);
+                log_debug("Reading %s entries from %s...", strna(bn), p);
+        }
+
+        *ret_file = TAKE_PTR(f);
         return 0;
 }
 
 static int populate_uid_cache(const char *root, Hashmap **ret) {
-        _cleanup_(hashmap_freep) Hashmap *cache = NULL;
+        _cleanup_hashmap_free_ Hashmap *cache = NULL;
         int r;
 
         cache = hashmap_new(&uid_gid_hash_ops);
@@ -57,7 +63,7 @@ static int populate_uid_cache(const char *root, Hashmap **ret) {
                                 return -ENOMEM;
 
                         r = hashmap_put(cache, n, UID_TO_PTR(pw->pw_uid));
-                        if (IN_SET(r, 0 -EEXIST))
+                        if (IN_SET(r, 0, -EEXIST))
                                 continue;
                         if (r < 0)
                                 return r;
@@ -70,7 +76,7 @@ static int populate_uid_cache(const char *root, Hashmap **ret) {
 }
 
 static int populate_gid_cache(const char *root, Hashmap **ret) {
-        _cleanup_(hashmap_freep) Hashmap *cache = NULL;
+        _cleanup_hashmap_free_ Hashmap *cache = NULL;
         int r;
 
         cache = hashmap_new(&uid_gid_hash_ops);

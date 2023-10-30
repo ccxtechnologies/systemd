@@ -14,6 +14,7 @@
 #include "sd-dhcp-client.h"
 
 #include "alloc-util.h"
+#include "device-util.h"
 #include "dhcp-identifier.h"
 #include "dhcp-internal.h"
 #include "dhcp-lease-internal.h"
@@ -77,8 +78,12 @@ struct sd_dhcp_client {
         sd_event *event;
         int event_priority;
         sd_event_source *timeout_resend;
+
         int ifindex;
         char *ifname;
+
+        sd_device *dev;
+
         int fd;
         uint16_t port;
         union sockaddr_union link;
@@ -116,8 +121,10 @@ struct sd_dhcp_client {
         sd_dhcp_lease *lease;
         usec_t start_delay;
         int ip_service_type;
+        int socket_priority;
+        bool socket_priority_set;
 
-        /* Ignore ifindex when generating iaid. See dhcp_identifier_set_iaid(). */
+        /* Ignore machine-ID when generating DUID. See dhcp_identifier_set_duid_en(). */
         bool test_mode;
 };
 
@@ -188,35 +195,33 @@ int sd_dhcp_client_id_to_string(const void *data, size_t len, char **ret) {
                         r = asprintf(&t, "DATA");
                 break;
         case 1:
-                if (len != sizeof_field(sd_dhcp_client_id, eth))
-                        return -EINVAL;
-
-                r = asprintf(&t, "%02x:%02x:%02x:%02x:%02x:%02x",
-                             client_id->eth.haddr[0],
-                             client_id->eth.haddr[1],
-                             client_id->eth.haddr[2],
-                             client_id->eth.haddr[3],
-                             client_id->eth.haddr[4],
-                             client_id->eth.haddr[5]);
+                if (len == sizeof_field(sd_dhcp_client_id, eth))
+                        r = asprintf(&t, "%02x:%02x:%02x:%02x:%02x:%02x",
+                                     client_id->eth.haddr[0],
+                                     client_id->eth.haddr[1],
+                                     client_id->eth.haddr[2],
+                                     client_id->eth.haddr[3],
+                                     client_id->eth.haddr[4],
+                                     client_id->eth.haddr[5]);
+                else
+                        r = asprintf(&t, "ETHER");
                 break;
         case 2 ... 254:
                 r = asprintf(&t, "ARP/LL");
                 break;
         case 255:
-                if (len < 6)
-                        return -EINVAL;
-
-                uint32_t iaid = be32toh(client_id->ns.iaid);
-                uint16_t duid_type = be16toh(client_id->ns.duid.type);
-                if (dhcp_validate_duid_len(duid_type, len - 6, true) < 0)
-                        return -EINVAL;
-
-                r = asprintf(&t, "IAID:0x%x/DUID", iaid);
+                if (len < sizeof(uint32_t))
+                        r = asprintf(&t, "IAID/DUID");
+                else {
+                        uint32_t iaid = be32toh(client_id->ns.iaid);
+                        /* TODO: check and stringify DUID */
+                        r = asprintf(&t, "IAID:0x%x/DUID", iaid);
+                }
                 break;
         }
-
         if (r < 0)
                 return -ENOMEM;
+
         *ret = TAKE_PTR(t);
         return 0;
 }
@@ -334,24 +339,31 @@ int sd_dhcp_client_set_mac(
 
 int sd_dhcp_client_get_client_id(
                 sd_dhcp_client *client,
-                uint8_t *type,
-                const uint8_t **data,
-                size_t *data_len) {
+                uint8_t *ret_type,
+                const uint8_t **ret_data,
+                size_t *ret_data_len) {
 
         assert_return(client, -EINVAL);
-        assert_return(type, -EINVAL);
-        assert_return(data, -EINVAL);
-        assert_return(data_len, -EINVAL);
 
-        if (client->client_id_len) {
-                *type = client->client_id.type;
-                *data = client->client_id.raw.data;
-                *data_len = client->client_id_len - sizeof(client->client_id.type);
-        } else {
-                *type = 0;
-                *data = NULL;
-                *data_len = 0;
+        if (client->client_id_len > 0) {
+                if (client->client_id_len <= offsetof(sd_dhcp_client_id, raw.data))
+                        return -EINVAL;
+
+                if (ret_type)
+                        *ret_type = client->client_id.type;
+                if (ret_data)
+                        *ret_data = client->client_id.raw.data;
+                if (ret_data_len)
+                        *ret_data_len = client->client_id_len - offsetof(sd_dhcp_client_id, raw.data);
+                return 1;
         }
+
+        if (ret_type)
+                *ret_type = 0;
+        if (ret_data)
+                *ret_data = NULL;
+        if (ret_data_len)
+                *ret_data_len = 0;
 
         return 0;
 }
@@ -420,9 +432,8 @@ static int dhcp_client_set_iaid_duid_internal(
                 if (iaid_set)
                         client->client_id.ns.iaid = htobe32(iaid);
                 else {
-                        r = dhcp_identifier_set_iaid(client->ifindex, &client->hw_addr,
+                        r = dhcp_identifier_set_iaid(client->dev, &client->hw_addr,
                                                      /* legacy_unstable_byteorder = */ true,
-                                                     /* use_mac = */ client->test_mode,
                                                      &client->client_id.ns.iaid);
                         if (r < 0)
                                 return log_dhcp_client_errno(client, r, "Failed to set IAID: %m");
@@ -643,6 +654,16 @@ int sd_dhcp_client_set_service_type(sd_dhcp_client *client, int type) {
         return 0;
 }
 
+int sd_dhcp_client_set_socket_priority(sd_dhcp_client *client, int socket_priority) {
+        assert_return(client, -EINVAL);
+        assert_return(!sd_dhcp_client_is_running(client), -EBUSY);
+
+        client->socket_priority_set = true;
+        client->socket_priority = socket_priority;
+
+        return 0;
+}
+
 int sd_dhcp_client_set_fallback_lease_lifetime(sd_dhcp_client *client, uint32_t fallback_lease_lifetime) {
         assert_return(client, -EINVAL);
         assert_return(!sd_dhcp_client_is_running(client), -EBUSY);
@@ -776,7 +797,7 @@ static int client_message_init(
 
         /* seconds between sending first and last DISCOVER
          * must always be strictly positive to deal with broken servers */
-        secs = ((time_now - client->start_time) / USEC_PER_SEC) ? : 1;
+        secs = ((time_now - client->start_time) / USEC_PER_SEC) ?: 1;
         packet->dhcp.secs = htobe16(secs);
 
         /* RFC2131 section 4.1
@@ -799,9 +820,8 @@ static int client_message_init(
 
                 client->client_id.type = 255;
 
-                r = dhcp_identifier_set_iaid(client->ifindex, &client->hw_addr,
+                r = dhcp_identifier_set_iaid(client->dev, &client->hw_addr,
                                              /* legacy_unstable_byteorder = */ true,
-                                             /* use_mac = */ client->test_mode,
                                              &client->client_id.ns.iaid);
                 if (r < 0)
                         return r;
@@ -815,14 +835,12 @@ static int client_message_init(
 
         /* Some DHCP servers will refuse to issue an DHCP lease if the Client
            Identifier option is not set */
-        if (client->client_id_len) {
-                r = dhcp_option_append(&packet->dhcp, optlen, &optoffset, 0,
-                                       SD_DHCP_OPTION_CLIENT_IDENTIFIER,
-                                       client->client_id_len,
-                                       &client->client_id);
-                if (r < 0)
-                        return r;
-        }
+        r = dhcp_option_append(&packet->dhcp, optlen, &optoffset, 0,
+                               SD_DHCP_OPTION_CLIENT_IDENTIFIER,
+                               client->client_id_len,
+                               &client->client_id);
+        if (r < 0)
+                return r;
 
         /* RFC2131 section 3.5:
            in its initial DHCPDISCOVER or DHCPREQUEST message, a
@@ -1378,7 +1396,8 @@ static int client_start_delayed(sd_dhcp_client *client) {
 
         r = dhcp_network_bind_raw_socket(client->ifindex, &client->link, client->xid,
                                          &client->hw_addr, &client->bcast_addr,
-                                         client->arp_type, client->port);
+                                         client->arp_type, client->port,
+                                         client->socket_priority_set, client->socket_priority);
         if (r < 0) {
                 client_stop(client, r);
                 return r;
@@ -1426,7 +1445,8 @@ static int client_timeout_t2(sd_event_source *s, uint64_t usec, void *userdata) 
 
         r = dhcp_network_bind_raw_socket(client->ifindex, &client->link, client->xid,
                                          &client->hw_addr, &client->bcast_addr,
-                                         client->arp_type, client->port);
+                                         client->arp_type, client->port,
+                                         client->socket_priority_set, client->socket_priority);
         if (r < 0) {
                 client_stop(client, r);
                 return 0;
@@ -1457,7 +1477,7 @@ static int client_handle_offer(sd_dhcp_client *client, DHCPMessage *offer, size_
         if (r < 0)
                 return r;
 
-        if (client->client_id_len) {
+        if (client->client_id_len > 0) {
                 r = dhcp_lease_set_client_id(lease,
                                              (uint8_t *) &client->client_id,
                                              client->client_id_len);
@@ -1551,7 +1571,7 @@ static int client_handle_ack(sd_dhcp_client *client, DHCPMessage *ack, size_t le
         if (r < 0)
                 return r;
 
-        if (client->client_id_len) {
+        if (client->client_id_len > 0) {
                 r = dhcp_lease_set_client_id(lease,
                                              (uint8_t *) &client->client_id,
                                              client->client_id_len);
@@ -1966,7 +1986,7 @@ static int client_receive_message_raw(
 
         cmsg = cmsg_find(&msg, SOL_PACKET, PACKET_AUXDATA, CMSG_LEN(sizeof(struct tpacket_auxdata)));
         if (cmsg) {
-                struct tpacket_auxdata *aux = (struct tpacket_auxdata*) CMSG_DATA(cmsg);
+                struct tpacket_auxdata *aux = CMSG_TYPED_DATA(cmsg, struct tpacket_auxdata);
                 checksum = !(aux->tp_status & TP_STATUS_CSUMNOTREADY);
         }
 
@@ -2153,6 +2173,12 @@ sd_event *sd_dhcp_client_get_event(sd_dhcp_client *client) {
         return client->event;
 }
 
+int sd_dhcp_client_attach_device(sd_dhcp_client *client, sd_device *dev) {
+        assert_return(client, -EINVAL);
+
+        return device_unref_and_replace(client->dev, dev);
+}
+
 static sd_dhcp_client *dhcp_client_free(sd_dhcp_client *client) {
         if (!client)
                 return NULL;
@@ -2167,6 +2193,8 @@ static sd_dhcp_client *dhcp_client_free(sd_dhcp_client *client) {
         client->timeout_expire = sd_event_source_unref(client->timeout_expire);
 
         sd_dhcp_client_detach_event(client);
+
+        sd_device_unref(client->dev);
 
         set_free(client->req_opts);
         free(client->hostname);
@@ -2196,7 +2224,7 @@ int sd_dhcp_client_new(sd_dhcp_client **ret, int anonymize) {
                 .n_ref = 1,
                 .state = DHCP_STATE_INIT,
                 .ifindex = -1,
-                .fd = -1,
+                .fd = -EBADF,
                 .mtu = DHCP_MIN_PACKET_SIZE,
                 .port = DHCP_PORT_CLIENT,
                 .anonymize = !!anonymize,

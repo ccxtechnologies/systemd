@@ -31,7 +31,7 @@ static int netlink_new(sd_netlink **ret) {
 
         *nl = (sd_netlink) {
                 .n_ref = 1,
-                .fd = -1,
+                .fd = -EBADF,
                 .sockaddr.nl.nl_family = AF_NETLINK,
                 .original_pid = getpid_cached(),
                 .protocol = -1,
@@ -45,13 +45,13 @@ static int netlink_new(sd_netlink **ret) {
                  * while the socket sticks around we might get confused by replies from earlier runs coming
                  * in late — which is pretty likely if we'd start our sequence numbers always from 1. Hence,
                  * let's start with a value based on the system clock. This should make collisions much less
-                 * likely (though still theoretically possible). We use a 32 bit µs counter starting at boot
+                 * likely (though still theoretically possible). We use a 32 bit μs counter starting at boot
                  * for this (and explicitly exclude the zero, see above). This counter will wrap around after
                  * a bit more than 1h, but that's hopefully OK as the kernel shouldn't take that long to
                  * reply to our requests.
                  *
                  * We only pick the initial start value this way. For each message we simply increase the
-                 * sequence number by 1. This means we could enqueue 1 netlink message per µs without risking
+                 * sequence number by 1. This means we could enqueue 1 netlink message per μs without risking
                  * collisions, which should be OK.
                  *
                  * Note this means the serials will be in the range 1…UINT32_MAX here.
@@ -60,10 +60,6 @@ static int netlink_new(sd_netlink **ret) {
                  * somehow, to avoid all this, but I couldn't come up with a nice way to do this) */
                 .serial = (uint32_t) (now(CLOCK_MONOTONIC) % UINT32_MAX) + 1,
         };
-
-        /* We guarantee that the read buffer has at least space for a message header */
-        if (!greedy_realloc((void**) &nl->rbuffer, sizeof(struct nlmsghdr), sizeof(uint8_t)))
-                return -ENOMEM;
 
         *ret = TAKE_PTR(nl);
         return 0;
@@ -97,7 +93,7 @@ int sd_netlink_open_fd(sd_netlink **ret, int fd) {
 
         r = socket_bind(nl);
         if (r < 0) {
-                nl->fd = -1; /* on failure, the caller remains owner of the fd, hence don't close it here */
+                nl->fd = -EBADF; /* on failure, the caller remains owner of the fd, hence don't close it here */
                 nl->protocol = -1;
                 return r;
         }
@@ -120,18 +116,12 @@ int sd_netlink_increase_rxbuf(sd_netlink *nl, size_t size) {
 
 static sd_netlink *netlink_free(sd_netlink *nl) {
         sd_netlink_slot *s;
-        unsigned i;
 
         assert(nl);
 
-        for (i = 0; i < nl->rqueue_size; i++)
-                sd_netlink_message_unref(nl->rqueue[i]);
-        free(nl->rqueue);
-
-        for (i = 0; i < nl->rqueue_partial_size; i++)
-                sd_netlink_message_unref(nl->rqueue_partial[i]);
-        free(nl->rqueue_partial);
-
+        ordered_set_free(nl->rqueue);
+        hashmap_free(nl->rqueue_by_serial);
+        hashmap_free(nl->rqueue_partial_by_serial);
         free(nl->rbuffer);
 
         while ((s = nl->slots)) {
@@ -179,57 +169,28 @@ int sd_netlink_send(
         return 1;
 }
 
-int netlink_rqueue_make_room(sd_netlink *nl) {
-        assert(nl);
-
-        if (nl->rqueue_size >= NETLINK_RQUEUE_MAX)
-                return log_debug_errno(SYNTHETIC_ERRNO(ENOBUFS),
-                                       "sd-netlink: exhausted the read queue size (%d)",
-                                       NETLINK_RQUEUE_MAX);
-
-        if (!GREEDY_REALLOC(nl->rqueue, nl->rqueue_size + 1))
-                return -ENOMEM;
-
-        return 0;
-}
-
-int netlink_rqueue_partial_make_room(sd_netlink *nl) {
-        assert(nl);
-
-        if (nl->rqueue_partial_size >= NETLINK_RQUEUE_MAX)
-                return log_debug_errno(SYNTHETIC_ERRNO(ENOBUFS),
-                                       "sd-netlink: exhausted the partial read queue size (%d)",
-                                       NETLINK_RQUEUE_MAX);
-
-        if (!GREEDY_REALLOC(nl->rqueue_partial, nl->rqueue_partial_size + 1))
-                return -ENOMEM;
-
-        return 0;
-}
-
-static int dispatch_rqueue(sd_netlink *nl, sd_netlink_message **message) {
+static int dispatch_rqueue(sd_netlink *nl, sd_netlink_message **ret) {
+        sd_netlink_message *m;
         int r;
 
         assert(nl);
-        assert(message);
+        assert(ret);
 
-        if (nl->rqueue_size <= 0) {
+        if (ordered_set_size(nl->rqueue) <= 0) {
                 /* Try to read a new message */
                 r = socket_read_message(nl);
-                if (r == -ENOBUFS) { /* FIXME: ignore buffer overruns for now */
+                if (r == -ENOBUFS) /* FIXME: ignore buffer overruns for now */
                         log_debug_errno(r, "sd-netlink: Got ENOBUFS from netlink socket, ignoring.");
-                        return 1;
-                }
-                if (r <= 0)
+                else if (r < 0)
                         return r;
         }
 
         /* Dispatch a queued message */
-        *message = nl->rqueue[0];
-        nl->rqueue_size--;
-        memmove(nl->rqueue, nl->rqueue + 1, sizeof(sd_netlink_message*) * nl->rqueue_size);
-
-        return 1;
+        m = ordered_set_steal_first(nl->rqueue);
+        if (m)
+                sd_netlink_message_unref(hashmap_remove_value(nl->rqueue_by_serial, UINT32_TO_PTR(message_get_serial(m)), m));
+        *ret = m;
+        return !!m;
 }
 
 static int process_timeout(sd_netlink *nl) {
@@ -464,13 +425,18 @@ static int netlink_poll(sd_netlink *nl, bool need_more, usec_t timeout_usec) {
 }
 
 int sd_netlink_wait(sd_netlink *nl, uint64_t timeout_usec) {
+        int r;
+
         assert_return(nl, -EINVAL);
         assert_return(!netlink_pid_changed(nl), -ECHILD);
 
-        if (nl->rqueue_size > 0)
+        if (ordered_set_size(nl->rqueue) > 0)
                 return 0;
 
-        return netlink_poll(nl, false, timeout_usec);
+        r = netlink_poll(nl, false, timeout_usec);
+        if (r < 0 && ERRNO_IS_TRANSIENT(r)) /* Convert EINTR to "something happened" and give user a chance to run some code before calling back into us */
+                return 1;
+        return r;
 }
 
 static int timeout_compare(const void *a, const void *b) {
@@ -565,39 +531,32 @@ int sd_netlink_read(
         timeout = calc_elapse(usec);
 
         for (;;) {
+                _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
                 usec_t left;
 
-                for (unsigned i = 0; i < nl->rqueue_size; i++) {
-                        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *incoming = NULL;
-                        uint32_t received_serial;
+                m = hashmap_remove(nl->rqueue_by_serial, UINT32_TO_PTR(serial));
+                if (m) {
                         uint16_t type;
 
-                        received_serial = message_get_serial(nl->rqueue[i]);
-                        if (received_serial != serial)
-                                continue;
-
-                        incoming = nl->rqueue[i];
-
                         /* found a match, remove from rqueue and return it */
-                        memmove(nl->rqueue + i, nl->rqueue + i + 1,
-                                sizeof(sd_netlink_message*) * (nl->rqueue_size - i - 1));
-                        nl->rqueue_size--;
+                        sd_netlink_message_unref(ordered_set_remove(nl->rqueue, m));
 
-                        r = sd_netlink_message_get_errno(incoming);
+                        r = sd_netlink_message_get_errno(m);
                         if (r < 0)
                                 return r;
 
-                        r = sd_netlink_message_get_type(incoming, &type);
+                        r = sd_netlink_message_get_type(m, &type);
                         if (r < 0)
                                 return r;
 
                         if (type == NLMSG_DONE) {
-                                *ret = NULL;
+                                if (ret)
+                                        *ret = NULL;
                                 return 0;
                         }
 
                         if (ret)
-                                *ret = TAKE_PTR(incoming);
+                                *ret = TAKE_PTR(m);
                         return 1;
                 }
 
@@ -651,7 +610,7 @@ int sd_netlink_get_events(sd_netlink *nl) {
         assert_return(nl, -EINVAL);
         assert_return(!netlink_pid_changed(nl), -ECHILD);
 
-        return nl->rqueue_size == 0 ? POLLIN : 0;
+        return ordered_set_size(nl->rqueue) == 0 ? POLLIN : 0;
 }
 
 int sd_netlink_get_timeout(sd_netlink *nl, uint64_t *timeout_usec) {
@@ -661,7 +620,7 @@ int sd_netlink_get_timeout(sd_netlink *nl, uint64_t *timeout_usec) {
         assert_return(timeout_usec, -EINVAL);
         assert_return(!netlink_pid_changed(nl), -ECHILD);
 
-        if (nl->rqueue_size > 0) {
+        if (ordered_set_size(nl->rqueue) > 0) {
                 *timeout_usec = 0;
                 return 1;
         }
@@ -673,7 +632,6 @@ int sd_netlink_get_timeout(sd_netlink *nl, uint64_t *timeout_usec) {
         }
 
         *timeout_usec = c->timeout;
-
         return 1;
 }
 

@@ -796,3 +796,35 @@ global:
 
         sd_hwdb_new_from_path;
 } LIBSYSTEMD_251;
+
+LIBSYSTEMD_253 {
+global:
+        sd_bus_emit_signal_to;
+        sd_bus_emit_signal_tov;
+        sd_bus_message_new_signal_to;
+        sd_pidfd_get_cgroup;
+        sd_pidfd_get_machine_name;
+        sd_pidfd_get_owner_uid;
+        sd_pidfd_get_session;
+        sd_pidfd_get_slice;
+        sd_pidfd_get_unit;
+        sd_pidfd_get_user_slice;
+        sd_pidfd_get_user_unit;
+} LIBSYSTEMD_252;
+
+LIBSYSTEMD_254 {
+global:
+        sd_journal_get_seqnum;
+        sd_session_get_username;
+        sd_session_get_start_time;
+        sd_uid_get_login_time;
+        sd_pid_notifyf_with_fds;
+        sd_event_add_memory_pressure;
+        sd_event_source_set_memory_pressure_type;
+        sd_event_source_set_memory_pressure_period;
+        sd_event_trim_memory;
+        sd_pid_notify_barrier;
+        sd_event_source_leave_ratelimit;
+        sd_journal_step_one;
+        sd_session_get_leader;
+} LIBSYSTEMD_253;

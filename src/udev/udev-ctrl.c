@@ -18,7 +18,6 @@
 #include "socket-util.h"
 #include "strxcpyx.h"
 #include "udev-ctrl.h"
-#include "util.h"
 
 /* wire protocol magic must match */
 #define UDEV_CTRL_MAGIC                                0xdead1dea
@@ -47,7 +46,7 @@ struct UdevCtrl {
 };
 
 int udev_ctrl_new_from_fd(UdevCtrl **ret, int fd) {
-        _cleanup_close_ int sock = -1;
+        _cleanup_close_ int sock = -EBADF;
         UdevCtrl *uctrl;
 
         assert(ret);
@@ -65,7 +64,7 @@ int udev_ctrl_new_from_fd(UdevCtrl **ret, int fd) {
         *uctrl = (UdevCtrl) {
                 .n_ref = 1,
                 .sock = fd >= 0 ? fd : TAKE_FD(sock),
-                .sock_connect = -1,
+                .sock_connect = -EBADF,
                 .bound = fd >= 0,
         };
 
@@ -162,7 +161,6 @@ static int udev_ctrl_connection_event_handler(sd_event_source *s, int fd, uint32
                 .msg_control = &control,
                 .msg_controllen = sizeof(control),
         };
-        struct cmsghdr *cmsg;
         struct ucred *cred;
         ssize_t size;
 
@@ -186,14 +184,11 @@ static int udev_ctrl_connection_event_handler(sd_event_source *s, int fd, uint32
 
         cmsg_close_all(&smsg);
 
-        cmsg = CMSG_FIRSTHDR(&smsg);
-
-        if (!cmsg || cmsg->cmsg_type != SCM_CREDENTIALS) {
+        cred = CMSG_FIND_DATA(&smsg, SOL_SOCKET, SCM_CREDENTIALS, struct ucred);
+        if (!cred) {
                 log_error("No sender credentials received, ignoring message");
                 return 0;
         }
-
-        cred = (struct ucred *) CMSG_DATA(cmsg);
 
         if (cred->uid != 0) {
                 log_error("Invalid sender uid "UID_FMT", ignoring message", cred->uid);
@@ -218,7 +213,7 @@ static int udev_ctrl_connection_event_handler(sd_event_source *s, int fd, uint32
 
 static int udev_ctrl_event_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
         UdevCtrl *uctrl = ASSERT_PTR(userdata);
-        _cleanup_close_ int sock = -1;
+        _cleanup_close_ int sock = -EBADF;
         struct ucred ucred;
         int r;
 

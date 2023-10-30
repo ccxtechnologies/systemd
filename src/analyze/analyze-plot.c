@@ -5,6 +5,8 @@
 #include "analyze-time-data.h"
 #include "bus-error.h"
 #include "bus-map-properties.h"
+#include "format-table.h"
+#include "os-util.h"
 #include "sort-util.h"
 #include "version.h"
 
@@ -37,7 +39,7 @@ typedef struct HostInfo {
         char *architecture;
 } HostInfo;
 
-static HostInfo* free_host_info(HostInfo *hi) {
+static HostInfo *free_host_info(HostInfo *hi) {
         if (!hi)
                 return NULL;
 
@@ -78,8 +80,8 @@ static int acquire_host_info(sd_bus *bus, HostInfo **hi) {
         if (!host)
                 return log_oom();
 
-        if (arg_scope != LOOKUP_SCOPE_SYSTEM) {
-                r = bus_connect_transport(arg_transport, arg_host, false, &system_bus);
+        if (arg_runtime_scope != RUNTIME_SCOPE_SYSTEM) {
+                r = bus_connect_transport(arg_transport, arg_host, RUNTIME_SCOPE_SYSTEM, &system_bus);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to connect to system bus, ignoring: %m");
                         goto manager;
@@ -156,15 +158,14 @@ static void svg_graph_box(double height, double begin, double end) {
                             SCALE_Y * height);
         }
 }
-
 static int plot_unit_times(UnitTimes *u, double width, int y) {
         bool b;
 
         if (!u->name)
                 return 0;
 
-        svg_bar("activating",   u->activating, u->activated, y);
-        svg_bar("active",       u->activated, u->deactivating, y);
+        svg_bar("activating", u->activating, u->activated, y);
+        svg_bar("active", u->activated, u->deactivating, y);
         svg_bar("deactivating", u->deactivating, u->deactivated, y);
 
         /* place the text on the left if we have passed the half of the svg width */
@@ -178,40 +179,26 @@ static int plot_unit_times(UnitTimes *u, double width, int y) {
         return 1;
 }
 
-int verb_plot(int argc, char *argv[], void *userdata) {
-        _cleanup_(free_host_infop) HostInfo *host = NULL;
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_(unit_times_free_arrayp) UnitTimes *times = NULL;
-        _cleanup_free_ char *pretty_times = NULL;
-        bool use_full_bus = arg_scope == LOOKUP_SCOPE_SYSTEM;
-        BootTimes *boot;
+static void limit_times_to_boot(const BootTimes *boot, UnitTimes *u) {
+        if (u->deactivated > u->activating && u->deactivated <= boot->finish_time && u->activated == 0
+            && u->deactivating == 0)
+                u->activated = u->deactivating = u->deactivated;
+        if (u->activated < u->activating || u->activated > boot->finish_time)
+                u->activated = boot->finish_time;
+        if (u->deactivating < u->activated || u->deactivating > boot->finish_time)
+                u->deactivating = boot->finish_time;
+        if (u->deactivated < u->deactivating || u->deactivated > boot->finish_time)
+                u->deactivated = boot->finish_time;
+}
+
+static int produce_plot_as_svg(
+                UnitTimes *times,
+                const HostInfo *host,
+                const BootTimes *boot,
+                const char *pretty_times) {
+        int m = 1, y = 0;
         UnitTimes *u;
-        int n, m = 1, y = 0, r;
         double width;
-
-        r = acquire_bus(&bus, &use_full_bus);
-        if (r < 0)
-                return bus_log_connect_error(r, arg_transport);
-
-        n = acquire_boot_times(bus, &boot);
-        if (n < 0)
-                return n;
-
-        n = pretty_boot_time(bus, &pretty_times);
-        if (n < 0)
-                return n;
-
-        if (use_full_bus || arg_scope != LOOKUP_SCOPE_SYSTEM) {
-                n = acquire_host_info(bus, &host);
-                if (n < 0)
-                        return n;
-        }
-
-        n = acquire_time_data(bus, &times);
-        if (n <= 0)
-                return n;
-
-        typesafe_qsort(times, n, compare_unit_start);
 
         width = SCALE_X * (boot->firmware_time + boot->finish_time);
         if (width < 800.0)
@@ -219,14 +206,14 @@ int verb_plot(int argc, char *argv[], void *userdata) {
 
         if (boot->firmware_time > boot->loader_time)
                 m++;
-        if (boot->loader_time > 0) {
+        if (timestamp_is_set(boot->loader_time)) {
                 m++;
                 if (width < 1000.0)
                         width = 1000.0;
         }
-        if (boot->initrd_time > 0)
+        if (timestamp_is_set(boot->initrd_time))
                 m++;
-        if (boot->kernel_done_time > 0)
+        if (timestamp_is_set(boot->kernel_done_time))
                 m++;
 
         for (u = times; u->has_data; u++) {
@@ -245,16 +232,8 @@ int verb_plot(int argc, char *argv[], void *userdata) {
                 if (text_width > text_start && text_width + text_start > width)
                         width = text_width + text_start;
 
-                if (u->deactivated > u->activating &&
-                    u->deactivated <= boot->finish_time &&
-                    u->activated == 0 && u->deactivating == 0)
-                        u->activated = u->deactivating = u->deactivated;
-                if (u->activated < u->activating || u->activated > boot->finish_time)
-                        u->activated = boot->finish_time;
-                if (u->deactivating < u->activated || u->deactivating > boot->finish_time)
-                        u->deactivating = boot->finish_time;
-                if (u->deactivated < u->deactivating || u->deactivated > boot->finish_time)
-                        u->deactivated = boot->finish_time;
+                limit_times_to_boot(boot, u);
+
                 m++;
         }
 
@@ -305,7 +284,7 @@ int verb_plot(int argc, char *argv[], void *userdata) {
         svg("<text x=\"20\" y=\"50\">%s</text>", pretty_times);
         if (host)
                 svg("<text x=\"20\" y=\"30\">%s %s (%s %s %s) %s %s</text>",
-                    isempty(host->os_pretty_name) ? "Linux" : host->os_pretty_name,
+                    os_release_pretty_name(host->os_pretty_name, NULL),
                     strempty(host->hostname),
                     strempty(host->kernel_name),
                     strempty(host->kernel_release),
@@ -316,22 +295,22 @@ int verb_plot(int argc, char *argv[], void *userdata) {
         svg("<g transform=\"translate(%.3f,100)\">\n", 20.0 + (SCALE_X * boot->firmware_time));
         svg_graph_box(m, -(double) boot->firmware_time, boot->finish_time);
 
-        if (boot->firmware_time > 0) {
+        if (timestamp_is_set(boot->firmware_time)) {
                 svg_bar("firmware", -(double) boot->firmware_time, -(double) boot->loader_time, y);
                 svg_text(true, -(double) boot->firmware_time, y, "firmware");
                 y++;
         }
-        if (boot->loader_time > 0) {
+        if (timestamp_is_set(boot->loader_time)) {
                 svg_bar("loader", -(double) boot->loader_time, 0, y);
                 svg_text(true, -(double) boot->loader_time, y, "loader");
                 y++;
         }
-        if (boot->kernel_done_time > 0) {
+        if (timestamp_is_set(boot->kernel_done_time)) {
                 svg_bar("kernel", 0, boot->kernel_done_time, y);
                 svg_text(true, 0, y, "kernel");
                 y++;
         }
-        if (boot->initrd_time > 0) {
+        if (timestamp_is_set(boot->initrd_time)) {
                 svg_bar("initrd", boot->initrd_time, boot->userspace_time, y);
                 if (boot->initrd_security_start_time < boot->initrd_security_finish_time)
                         svg_bar("security", boot->initrd_security_start_time, boot->initrd_security_finish_time, y);
@@ -351,7 +330,7 @@ int verb_plot(int argc, char *argv[], void *userdata) {
         }
 
         svg_bar("active", boot->userspace_time, boot->finish_time, y);
-        if (boot->security_start_time > 0)
+        if (timestamp_is_set(boot->security_start_time))
                 svg_bar("security", boot->security_start_time, boot->security_finish_time, y);
         svg_bar("generators", boot->generators_start_time, boot->generators_finish_time, y);
         svg_bar("unitsload", boot->unitsload_start_time, boot->unitsload_finish_time, y);
@@ -375,7 +354,7 @@ int verb_plot(int argc, char *argv[], void *userdata) {
         svg_bar("deactivating", 0, 300000, y);
         svg_text(true, 400000, y, "Deactivating");
         y++;
-        if (boot->security_start_time > 0) {
+        if (timestamp_is_set(boot->security_start_time)) {
                 svg_bar("security", 0, 300000, y);
                 svg_text(true, 400000, y, "Setting up security module");
                 y++;
@@ -390,6 +369,102 @@ int verb_plot(int argc, char *argv[], void *userdata) {
         svg("</g>\n\n");
 
         svg("</svg>\n");
+
+        return 0;
+}
+
+static int show_table(Table *table, const char *word) {
+        int r;
+
+        assert(table);
+        assert(word);
+
+        if (table_get_rows(table) > 1) {
+                table_set_header(table, arg_legend);
+
+                if (!FLAGS_SET(arg_json_format_flags, JSON_FORMAT_OFF))
+                        r = table_print_json(table, NULL, arg_json_format_flags | JSON_FORMAT_COLOR_AUTO);
+                else
+                        r = table_print(table, NULL);
+                if (r < 0)
+                        return table_log_print_error(r);
+        }
+
+        if (arg_legend) {
+                if (table_get_rows(table) > 1)
+                        printf("\n%zu %s listed.\n", table_get_rows(table) - 1, word);
+                else
+                        printf("No %s.\n", word);
+        }
+
+        return 0;
+}
+
+static int produce_plot_as_text(UnitTimes *times, const BootTimes *boot) {
+        _cleanup_(table_unrefp) Table *table = NULL;
+        int r;
+
+        table = table_new("name", "activated", "activating", "time", "deactivated", "deactivating");
+        if (!table)
+                return log_oom();
+
+        for (; times->has_data; times++) {
+                limit_times_to_boot(boot, times);
+
+                r = table_add_many(
+                                table,
+                                TABLE_STRING, times->name,
+                                TABLE_TIMESPAN_MSEC, times->activated,
+                                TABLE_TIMESPAN_MSEC, times->activating,
+                                TABLE_TIMESPAN_MSEC, times->time,
+                                TABLE_TIMESPAN_MSEC, times->deactivated,
+                                TABLE_TIMESPAN_MSEC, times->deactivating);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
+        return show_table(table, "Units");
+}
+
+int verb_plot(int argc, char *argv[], void *userdata) {
+        _cleanup_(free_host_infop) HostInfo *host = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(unit_times_free_arrayp) UnitTimes *times = NULL;
+        _cleanup_free_ char *pretty_times = NULL;
+        bool use_full_bus = arg_runtime_scope == RUNTIME_SCOPE_SYSTEM;
+        BootTimes *boot;
+        int n, r;
+
+        r = acquire_bus(&bus, &use_full_bus);
+        if (r < 0)
+                return bus_log_connect_error(r, arg_transport);
+
+        n = acquire_boot_times(bus, /* require_finished = */ true, &boot);
+        if (n < 0)
+                return n;
+
+        n = pretty_boot_time(bus, &pretty_times);
+        if (n < 0)
+                return n;
+
+        if (use_full_bus || arg_runtime_scope != RUNTIME_SCOPE_SYSTEM) {
+                n = acquire_host_info(bus, &host);
+                if (n < 0)
+                        return n;
+        }
+
+        n = acquire_time_data(bus, /* require_finished = */ true, &times);
+        if (n <= 0)
+                return n;
+
+        typesafe_qsort(times, n, compare_unit_start);
+
+        if (!FLAGS_SET(arg_json_format_flags, JSON_FORMAT_OFF) || arg_table)
+                r = produce_plot_as_text(times, boot);
+        else
+                r = produce_plot_as_svg(times, host, boot, pretty_times);
+        if (r < 0)
+                return r;
 
         return EXIT_SUCCESS;
 }

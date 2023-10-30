@@ -22,7 +22,7 @@
         "e  \\\n"                               \
         "f  \n"                                 \
         "g=g\\ \n"                              \
-        "h= ąęół\\ śćńźżµ \n"                   \
+        "h= ąęół\\ śćńźżμ \n"                   \
         "i=i\\"
 
 #define env_file_2                              \
@@ -31,9 +31,10 @@
 #define env_file_3 \
         "#SPAMD_ARGS=\"-d --socketpath=/var/lib/bulwark/spamd \\\n" \
         "#--nouser-config                                     \\\n" \
-        "normal=line                                          \\\n" \
+        "normal1=line\\\n"                                           \
+        "111\n"                                                     \
         ";normal=ignored                                      \\\n" \
-        "normal_ignored                                       \\\n" \
+        "normal2=line222\n"                                          \
         "normal ignored                                       \\\n"
 
 #define env_file_4                              \
@@ -58,7 +59,6 @@
         "d= \" \\n\\t\\$\\`\\\\\n"              \
         "\"   \n"
 
-
 TEST(load_env_file_1) {
         _cleanup_(unlink_tempfilep) char name[] = "/tmp/test-load-env-file.XXXXXX";
         assert_se(write_tmpfile(name, env_file_1) == 0);
@@ -69,7 +69,7 @@ TEST(load_env_file_1) {
         assert_se(streq(data[1], "b=bc"));
         assert_se(streq(data[2], "d=de  f"));
         assert_se(streq(data[3], "g=g "));
-        assert_se(streq(data[4], "h=ąęół śćńźżµ"));
+        assert_se(streq(data[4], "h=ąęół śćńźżμ"));
         assert_se(streq(data[5], "i=i"));
         assert_se(data[6] == NULL);
 }
@@ -90,7 +90,9 @@ TEST(load_env_file_3) {
 
         _cleanup_strv_free_ char **data = NULL;
         assert_se(load_env_file(NULL, name, &data) == 0);
-        assert_se(data == NULL);
+        assert_se(streq(data[0], "normal1=line111"));
+        assert_se(streq(data[1], "normal2=line222"));
+        assert_se(data[2] == NULL);
 }
 
 TEST(load_env_file_4) {
@@ -127,6 +129,25 @@ TEST(load_env_file_6) {
         assert_se(streq(data[2], "c= \\n\\t\\$\\`\\\\\n"));
         assert_se(streq(data[3], "d= \\n\\t$`\\\n"));
         assert_se(data[4] == NULL);
+}
+
+TEST(load_env_file_invalid_utf8) {
+        /* Test out a couple of assignments where the key/value has an invalid
+         * UTF-8 character ("noncharacter")
+         *
+         * See: https://en.wikipedia.org/wiki/Universal_Character_Set_characters#Non-characters
+         */
+        FOREACH_STRING(s,
+                       "fo\ufffeo=bar",
+                       "foo=b\uffffar",
+                       "baz=hello world\ufffe") {
+                _cleanup_(unlink_tempfilep) char name[] = "/tmp/test-load-env-file.XXXXXX";
+                assert_se(write_tmpfile(name, s) == 0);
+
+                _cleanup_strv_free_ char **data = NULL;
+                assert_se(load_env_file(NULL, name, &data) == -EINVAL);
+                assert_se(!data);
+        }
 }
 
 TEST(write_and_load_env_file) {

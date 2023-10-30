@@ -60,11 +60,11 @@ int home_setup_cifs(
         STRV_FOREACH(pw, h->password) {
                 _cleanup_(unlink_and_freep) char *p = NULL;
                 _cleanup_free_ char *options = NULL;
-                _cleanup_(fclosep) FILE *f = NULL;
+                _cleanup_fclose_ FILE *f = NULL;
                 pid_t mount_pid;
                 int exit_status;
 
-                r = fopen_temporary(NULL, &f, &p);
+                r = fopen_temporary_child(NULL, &f, &p);
                 if (r < 0)
                         return log_error_errno(r, "Failed to create temporary credentials file: %m");
 

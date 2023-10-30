@@ -7,7 +7,6 @@
 
 #include "hash-funcs.h"
 #include "macro.h"
-#include "util.h"
 
 /*
  * A hash table implementation. As a minor optimization a NULL hashmap object
@@ -399,6 +398,17 @@ static inline char** ordered_hashmap_get_strv(OrderedHashmap *h) {
         return _hashmap_get_strv(HASHMAP_BASE(h));
 }
 
+int _hashmap_dump_sorted(HashmapBase *h, void ***ret, size_t *ret_n);
+static inline int hashmap_dump_sorted(Hashmap *h, void ***ret, size_t *ret_n) {
+        return _hashmap_dump_sorted(HASHMAP_BASE(h), ret, ret_n);
+}
+static inline int ordered_hashmap_dump_sorted(OrderedHashmap *h, void ***ret, size_t *ret_n) {
+        return _hashmap_dump_sorted(HASHMAP_BASE(h), ret, ret_n);
+}
+static inline int set_dump_sorted(Set *h, void ***ret, size_t *ret_n) {
+        return _hashmap_dump_sorted(HASHMAP_BASE(h), ret, ret_n);
+}
+
 /*
  * Hashmaps are iterated in unpredictable order.
  * OrderedHashmaps are an exception to this. They are iterated in the order
@@ -444,3 +454,5 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(OrderedHashmap*, ordered_hashmap_free_free_free);
 DEFINE_TRIVIAL_CLEANUP_FUNC(IteratedCache*, iterated_cache_free);
 
 #define _cleanup_iterated_cache_free_ _cleanup_(iterated_cache_freep)
+
+void hashmap_trim_pools(void);

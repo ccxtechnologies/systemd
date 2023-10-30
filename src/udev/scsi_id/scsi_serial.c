@@ -161,7 +161,7 @@ static int scsi_dump_sense(struct scsi_id_device *dev_scsi,
          * Figure out and print the sense key, asc and ascq.
          *
          * If you want to suppress these for a particular drive model, add
-         * a black list entry in the scsi_id config file.
+         * a deny list entry in the scsi_id config file.
          *
          * XXX We probably need to: lookup the sense/asc/ascq in a retry
          * table, and if found return 1 (after dumping the sense, asc, and
@@ -786,7 +786,7 @@ out:
 int scsi_get_serial(struct scsi_id_device *dev_scsi, const char *devname,
                     int page_code, int len) {
         unsigned char page0[SCSI_INQ_BUFF_LEN];
-        int fd = -1;
+        int fd = -EBADF;
         int cnt;
         int ind;
         int retval;

@@ -17,6 +17,7 @@
 #include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
+#include "bus-locator.h"
 #include "bus-util.h"
 #include "device-util.h"
 #include "fd-util.h"
@@ -27,12 +28,10 @@
 #include "path-util.h"
 #include "proc-cmdline.h"
 #include "process-util.h"
-#include "rlimit-util.h"
 #include "signal-util.h"
 #include "socket-util.h"
 #include "special.h"
 #include "stdio-util.h"
-#include "util.h"
 
 static bool arg_skip = false;
 static bool arg_force = false;
@@ -55,14 +54,7 @@ static void start_target(const char *target, const char *mode) {
         log_info("Requesting %s/start/%s", target, mode);
 
         /* Start this unit only if we can replace basic.target with it */
-        r = sd_bus_call_method(bus,
-                               "org.freedesktop.systemd1",
-                               "/org/freedesktop/systemd1",
-                               "org.freedesktop.systemd1.Manager",
-                               "StartUnitReplace",
-                               &error,
-                               NULL,
-                               "sss", "basic.target", target, mode);
+        r = bus_call_method(bus, bus_systemd_mgr, "StartUnitReplace", &error, NULL, "sss", "basic.target", target, mode);
 
         /* Don't print a warning if we aren't called during startup */
         if (r < 0 && !sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_JOB))
@@ -226,7 +218,7 @@ static int process_progress(int fd, FILE* console) {
 }
 
 static int fsck_progress_socket(void) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         int r;
 
         fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -242,7 +234,7 @@ static int fsck_progress_socket(void) {
 }
 
 static int run(int argc, char *argv[]) {
-        _cleanup_close_pair_ int progress_pipe[2] = { -1, -1 };
+        _cleanup_close_pair_ int progress_pipe[2] = PIPE_EBADF;
         _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
         _cleanup_free_ char *dpath = NULL;
         _cleanup_fclose_ FILE *console = NULL;
@@ -347,7 +339,7 @@ static int run(int argc, char *argv[]) {
             pipe(progress_pipe) < 0)
                 return log_error_errno(errno, "pipe(): %m");
 
-        r = safe_fork("(fsck)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG, &pid);
+        r = safe_fork("(fsck)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE, &pid);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -373,7 +365,7 @@ static int run(int argc, char *argv[]) {
                 } else
                         dash_c[0] = 0;
 
-                cmdline[i++] = "/sbin/fsck";
+                cmdline[i++] = "fsck";
                 cmdline[i++] =  arg_repair;
                 cmdline[i++] = "-T";
 
@@ -396,9 +388,7 @@ static int run(int argc, char *argv[]) {
                 cmdline[i++] = device;
                 cmdline[i++] = NULL;
 
-                (void) rlimit_nofile_safe();
-
-                execv(cmdline[0], (char**) cmdline);
+                execvp(cmdline[0], (char**) cmdline);
                 _exit(FSCK_OPERATIONAL_ERROR);
         }
 

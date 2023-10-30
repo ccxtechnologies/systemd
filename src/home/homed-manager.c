@@ -18,6 +18,7 @@
 #include "bus-log-control-api.h"
 #include "bus-polkit.h"
 #include "clean-ipc.h"
+#include "common-signal.h"
 #include "conf-files.h"
 #include "device-util.h"
 #include "dirent-util.h"
@@ -222,6 +223,15 @@ int manager_new(Manager **ret) {
                 return r;
 
         r = sd_event_add_signal(m->event, NULL, SIGTERM, NULL, NULL);
+        if (r < 0)
+                return r;
+
+        r = sd_event_add_memory_pressure(m->event, NULL, NULL, NULL);
+        if (r < 0)
+                log_full_errno(ERRNO_IS_NOT_SUPPORTED(r) || ERRNO_IS_PRIVILEGE(r) || (r == -EHOSTDOWN) ? LOG_DEBUG : LOG_WARNING, r,
+                               "Failed to allocate memory pressure watch, ignoring: %m");
+
+        r = sd_event_add_signal(m->event, NULL, SIGRTMIN+18, sigrtmin18_handler, NULL);
         if (r < 0)
                 return r;
 
@@ -860,7 +870,7 @@ static int manager_assess_image(
 
         if (S_ISDIR(st.st_mode)) {
                 _cleanup_free_ char *n = NULL, *user_name = NULL, *realm = NULL;
-                _cleanup_close_ int fd = -1;
+                _cleanup_close_ int fd = -EBADF;
                 UserStorage storage;
 
                 if (!directory_suffix)
@@ -1022,9 +1032,9 @@ static int manager_bind_varlink(Manager *m) {
                 return log_error_errno(r, "Failed to attach varlink connection to event loop: %m");
 
         assert(!m->userdb_service);
-        m->userdb_service = strdup(basename(socket_path));
-        if (!m->userdb_service)
-                return log_oom();
+        r = path_extract_filename(socket_path, &m->userdb_service);
+        if (r < 0)
+                return log_error_errno(r, "Failed to extra filename from socket path '%s': %m", socket_path);
 
         /* Avoid recursion */
         if (setenv("SYSTEMD_BYPASS_USERDB", m->userdb_service, 1) < 0)
@@ -1041,7 +1051,7 @@ static ssize_t read_datagram(
 
         CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct ucred)) + CMSG_SPACE(sizeof(int))) control;
         _cleanup_free_ void *buffer = NULL;
-        _cleanup_close_ int passed_fd = -1;
+        _cleanup_close_ int passed_fd = -EBADF;
         struct ucred *sender = NULL;
         struct cmsghdr *cmsg;
         struct msghdr mh;
@@ -1086,7 +1096,7 @@ static ssize_t read_datagram(
                     cmsg->cmsg_type == SCM_CREDENTIALS &&
                     cmsg->cmsg_len == CMSG_LEN(sizeof(struct ucred))) {
                         assert(!sender);
-                        sender = (struct ucred*) CMSG_DATA(cmsg);
+                        sender = CMSG_TYPED_DATA(cmsg, struct ucred);
                 }
 
                 if (cmsg->cmsg_level == SOL_SOCKET &&
@@ -1098,7 +1108,7 @@ static ssize_t read_datagram(
                         }
 
                         assert(passed_fd < 0);
-                        passed_fd = *(int*) CMSG_DATA(cmsg);
+                        passed_fd = *CMSG_TYPED_DATA(cmsg, int);
                 }
         }
 
@@ -1119,7 +1129,7 @@ static ssize_t read_datagram(
 static int on_notify_socket(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
         _cleanup_strv_free_ char **l = NULL;
         _cleanup_free_ void *datagram = NULL;
-        _cleanup_close_ int passed_fd = -1;
+        _cleanup_close_ int passed_fd = -EBADF;
         struct ucred sender = UCRED_INVALID;
         Manager *m = ASSERT_PTR(userdata);
         ssize_t n;
@@ -1154,7 +1164,7 @@ static int on_notify_socket(sd_event_source *s, int fd, uint32_t revents, void *
 }
 
 static int manager_listen_notify(Manager *m) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         union sockaddr_union sa = {
                 .un.sun_family = AF_UNIX,
                 .un.sun_path = "/run/systemd/home/notify",
@@ -1327,7 +1337,6 @@ static int manager_watch_devices(Manager *m) {
 
 static int manager_enumerate_devices(Manager *m) {
         _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
-        sd_device *d;
         int r;
 
         assert(m);
@@ -1347,7 +1356,7 @@ static int manager_enumerate_devices(Manager *m) {
 }
 
 static int manager_load_key_pair(Manager *m) {
-        _cleanup_(fclosep) FILE *f = NULL;
+        _cleanup_fclose_ FILE *f = NULL;
         struct stat st;
         int r;
 
@@ -1446,9 +1455,10 @@ static int manager_generate_key_pair(Manager *m) {
                 return log_error_errno(errno, "Failed to move public key file into place: %m");
         temp_public = mfree(temp_public);
 
-        if (rename(temp_private, "/var/lib/systemd/home/local.private") < 0) {
-                (void) unlink_noerrno("/var/lib/systemd/home/local.public"); /* try to remove the file we already created */
-                return log_error_errno(errno, "Failed to move private key file into place: %m");
+        r = RET_NERRNO(rename(temp_private, "/var/lib/systemd/home/local.private"));
+        if (r < 0) {
+                (void) unlink("/var/lib/systemd/home/local.public"); /* try to remove the file we already created */
+                return log_error_errno(r, "Failed to move private key file into place: %m");
         }
         temp_private = mfree(temp_private);
 
@@ -1505,7 +1515,11 @@ static int manager_load_public_key_one(Manager *m, const char *path) {
 
         assert(m);
 
-        if (streq(basename(path), "local.public")) /* we already loaded the private key, which includes the public one */
+        r = path_extract_filename(path, &fn);
+        if (r < 0)
+                return log_error_errno(r, "Failed to extract filename of path '%s': %m", path);
+
+        if (streq(fn, "local.public")) /* we already loaded the private key, which includes the public one */
                 return 0;
 
         f = fopen(path, "re");
@@ -1533,10 +1547,6 @@ static int manager_load_public_key_one(Manager *m, const char *path) {
         pkey = PEM_read_PUBKEY(f, &pkey, NULL, NULL);
         if (!pkey)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to parse public key file %s.", path);
-
-        fn = strdup(basename(path));
-        if (!fn)
-                return log_oom();
 
         r = hashmap_put(m->public_keys, fn, pkey);
         if (r < 0)
@@ -1616,7 +1626,7 @@ void manager_revalidate_image(Manager *m, Home *h) {
         assert(h);
 
         /* Frees an automatically discovered image, if it's synthetic and its image disappeared. Unmounts any
-         * image if it's mounted but it's image vanished. */
+         * image if it's mounted but its image vanished. */
 
         if (h->current_operation || !ordered_set_isempty(h->pending_operations))
                 return;

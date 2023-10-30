@@ -6,7 +6,8 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "chase-symlinks.h"
+#include "build.h"
+#include "chase.h"
 #include "dirent-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
@@ -74,11 +75,11 @@ static int equivalent(const char *a, const char *b) {
         _cleanup_free_ char *x = NULL, *y = NULL;
         int r;
 
-        r = chase_symlinks(a, NULL, CHASE_TRAIL_SLASH, &x, NULL);
+        r = chase(a, NULL, CHASE_TRAIL_SLASH, &x, NULL);
         if (r < 0)
                 return r;
 
-        r = chase_symlinks(b, NULL, CHASE_TRAIL_SLASH, &y, NULL);
+        r = chase(b, NULL, CHASE_TRAIL_SLASH, &y, NULL);
         if (r < 0)
                 return r;
 
@@ -370,13 +371,12 @@ static int enumerate_dir(
 static int should_skip_path(const char *prefix, const char *suffix) {
 #if HAVE_SPLIT_USR
         _cleanup_free_ char *target = NULL, *dirname = NULL;
-        const char *p;
 
         dirname = path_join(prefix, suffix);
         if (!dirname)
                 return -ENOMEM;
 
-        if (chase_symlinks(dirname, NULL, 0, &target, NULL) < 0)
+        if (chase(dirname, NULL, 0, &target, NULL) < 0)
                 return false;
 
         NULSTR_FOREACH(p, prefixes) {
@@ -399,7 +399,6 @@ static int should_skip_path(const char *prefix, const char *suffix) {
 }
 
 static int process_suffix(const char *suffix, const char *onlyprefix) {
-        const char *p;
         char *f, *key;
         OrderedHashmap *top, *bottom, *drops, *h;
         int r = 0, k, n_found = 0;
@@ -476,7 +475,6 @@ finish:
 }
 
 static int process_suffixes(const char *onlyprefix) {
-        const char *n;
         int n_found = 0, r;
 
         NULSTR_FOREACH(n, suffixes) {
@@ -491,8 +489,6 @@ static int process_suffixes(const char *onlyprefix) {
 }
 
 static int process_suffix_chop(const char *arg) {
-        const char *p;
-
         assert(arg);
 
         if (!path_is_absolute(arg))

@@ -67,6 +67,7 @@ typedef struct JournalFile {
         int open_flags;
         bool close_fd:1;
         bool archive:1;
+        bool strict_order:1;
 
         direction_t last_direction;
         LocationType location_type;
@@ -120,11 +121,21 @@ typedef struct JournalFile {
         void *fsprg_seed;
         size_t fsprg_seed_size;
 #endif
+
+        /* When we insert this file into the per-boot priority queue 'newest_by_boot_id' in sd_journal, then by these keys */
+        sd_id128_t newest_boot_id;
+        sd_id128_t newest_machine_id;
+        uint64_t newest_monotonic_usec;
+        uint64_t newest_realtime_usec;
+        unsigned newest_boot_id_prioq_idx;
+        usec_t newest_mtime;
 } JournalFile;
 
 typedef enum JournalFileFlags {
-        JOURNAL_COMPRESS = 1 << 0,
-        JOURNAL_SEAL     = 1 << 1,
+        JOURNAL_COMPRESS        = 1 << 0,
+        JOURNAL_SEAL            = 1 << 1,
+        JOURNAL_STRICT_ORDER    = 1 << 2,
+        _JOURNAL_FILE_FLAGS_MAX = JOURNAL_COMPRESS|JOURNAL_SEAL|JOURNAL_STRICT_ORDER,
 } JournalFileFlags;
 
 typedef struct {
@@ -176,6 +187,9 @@ static inline bool VALID_EPOCH(uint64_t u) {
 
 #define JOURNAL_HEADER_SEALED(h) \
         FLAGS_SET(le32toh((h)->compatible_flags), HEADER_COMPATIBLE_SEALED)
+
+#define JOURNAL_HEADER_TAIL_ENTRY_BOOT_ID(h) \
+        FLAGS_SET(le32toh((h)->compatible_flags), HEADER_COMPATIBLE_TAIL_ENTRY_BOOT_ID)
 
 #define JOURNAL_HEADER_COMPRESSED_XZ(h) \
         FLAGS_SET(le32toh((h)->incompatible_flags), HEADER_INCOMPATIBLE_COMPRESSED_XZ)
@@ -254,8 +268,10 @@ int journal_file_append_entry(
                 JournalFile *f,
                 const dual_timestamp *ts,
                 const sd_id128_t *boot_id,
-                const struct iovec iovec[], unsigned n_iovec,
-                uint64_t *seqno,
+                const struct iovec iovec[],
+                size_t n_iovec,
+                uint64_t *seqnum,
+                sd_id128_t *seqnum_id,
                 Object **ret_object,
                 uint64_t *ret_offset);
 
@@ -267,7 +283,6 @@ int journal_file_find_field_object_with_hash(JournalFile *f, const void *field, 
 
 void journal_file_reset_location(JournalFile *f);
 void journal_file_save_location(JournalFile *f, Object *o, uint64_t offset);
-int journal_file_compare_locations(JournalFile *af, JournalFile *bf);
 int journal_file_next_entry(JournalFile *f, uint64_t p, direction_t direction, Object **ret_object, uint64_t *ret_offset);
 
 int journal_file_next_entry_for_data(JournalFile *f, Object *d, direction_t direction, Object **ret_object, uint64_t *ret_offset);
@@ -282,12 +297,13 @@ int journal_file_move_to_entry_by_seqnum_for_data(JournalFile *f, Object *d, uin
 int journal_file_move_to_entry_by_realtime_for_data(JournalFile *f, Object *d, uint64_t realtime, direction_t direction, Object **ret_object, uint64_t *ret_offset);
 int journal_file_move_to_entry_by_monotonic_for_data(JournalFile *f, Object *d, sd_id128_t boot_id, uint64_t monotonic, direction_t direction, Object **ret_object, uint64_t *ret_offset);
 
-int journal_file_copy_entry(JournalFile *from, JournalFile *to, Object *o, uint64_t p);
+int journal_file_copy_entry(JournalFile *from, JournalFile *to, Object *o, uint64_t p, uint64_t *seqnum, sd_id128_t *seqnum_id);
 
 void journal_file_dump(JournalFile *f);
 void journal_file_print_header(JournalFile *f);
 
 int journal_file_archive(JournalFile *f, char **ret_previous_path);
+int journal_file_parse_uid_from_filename(const char *path, uid_t *uid);
 JournalFile* journal_initiate_close(JournalFile *f, Set *deferred_closes);
 
 int journal_file_dispose(int dir_fd, const char *fname);
@@ -305,10 +321,16 @@ bool journal_file_rotate_suggested(JournalFile *f, usec_t max_file_usec, int log
 int journal_file_map_data_hash_table(JournalFile *f);
 int journal_file_map_field_hash_table(JournalFile *f);
 
-static inline bool JOURNAL_FILE_COMPRESS(JournalFile *f) {
+static inline Compression JOURNAL_FILE_COMPRESSION(JournalFile *f) {
         assert(f);
-        return JOURNAL_HEADER_COMPRESSED_XZ(f->header) || JOURNAL_HEADER_COMPRESSED_LZ4(f->header) ||
-                        JOURNAL_HEADER_COMPRESSED_ZSTD(f->header);
+
+        if (JOURNAL_HEADER_COMPRESSED_XZ(f->header))
+                return COMPRESSION_XZ;
+        if (JOURNAL_HEADER_COMPRESSED_LZ4(f->header))
+                return COMPRESSION_LZ4;
+        if (JOURNAL_HEADER_COMPRESSED_ZSTD(f->header))
+                return COMPRESSION_ZSTD;
+        return COMPRESSION_NONE;
 }
 
 uint64_t journal_file_hash_data(JournalFile *f, const void *data, size_t sz);

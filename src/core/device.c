@@ -6,7 +6,7 @@
 #include "sd-messages.h"
 
 #include "alloc-util.h"
-#include "bus-error.h"
+#include "bus-common-errors.h"
 #include "dbus-device.h"
 #include "dbus-unit.h"
 #include "device-private.h"
@@ -55,23 +55,30 @@ static int device_by_path(Manager *m, const char *path, Unit **ret) {
 
 static void device_unset_sysfs(Device *d) {
         Hashmap *devices;
-        Device *first;
 
         assert(d);
 
         if (!d->sysfs)
                 return;
 
-        /* Remove this unit from the chain of devices which share the
-         * same sysfs path. */
-        devices = UNIT(d)->manager->devices_by_sysfs;
-        first = hashmap_get(devices, d->sysfs);
-        LIST_REMOVE(same_sysfs, first, d);
+        /* Remove this unit from the chain of devices which share the same sysfs path. */
 
-        if (first)
-                hashmap_remove_and_replace(devices, d->sysfs, first->sysfs, first);
+        devices = UNIT(d)->manager->devices_by_sysfs;
+
+        if (d->same_sysfs_prev)
+                /* If this is not the first unit, then simply remove this unit. */
+                d->same_sysfs_prev->same_sysfs_next = d->same_sysfs_next;
+        else if (d->same_sysfs_next)
+                /* If this is the first unit, replace with the next unit. */
+                assert_se(hashmap_replace(devices, d->same_sysfs_next->sysfs, d->same_sysfs_next) >= 0);
         else
+                /* Otherwise, remove the entry. */
                 hashmap_remove(devices, d->sysfs);
+
+        if (d->same_sysfs_next)
+                d->same_sysfs_next->same_sysfs_prev = d->same_sysfs_prev;
+
+        d->same_sysfs_prev = d->same_sysfs_next = NULL;
 
         d->sysfs = mfree(d->sysfs);
 }
@@ -135,6 +142,7 @@ static void device_done(Unit *u) {
         assert(d);
 
         device_unset_sysfs(d);
+        d->deserialized_sysfs = mfree(d->deserialized_sysfs);
         d->wants_property = strv_free(d->wants_property);
         d->path = mfree(d->path);
 }
@@ -174,7 +182,7 @@ static void device_set_state(Device *d, DeviceState state) {
         if (state != old_state)
                 log_unit_debug(UNIT(d), "Changed %s -> %s", device_state_to_string(old_state), device_state_to_string(state));
 
-        unit_notify(UNIT(d), state_translation_table[old_state], state_translation_table[state], 0);
+        unit_notify(UNIT(d), state_translation_table[old_state], state_translation_table[state], /* reload_success = */ true);
 }
 
 static void device_found_changed(Device *d, DeviceFound previous, DeviceFound now) {
@@ -267,7 +275,7 @@ static int device_coldplug(Unit *u) {
          * 1. MANAGER_IS_RUNNING() == false
          * 2. enumerate devices: manager_enumerate() -> device_enumerate()
          *    Device.enumerated_found is set.
-         * 3. deserialize devices: manager_deserialize() -> device_deserialize()
+         * 3. deserialize devices: manager_deserialize() -> device_deserialize_item()
          *    Device.deserialize_state and Device.deserialized_found are set.
          * 4. coldplug devices: manager_coldplug() -> device_coldplug()
          *    deserialized properties are copied to the main properties.
@@ -282,23 +290,41 @@ static int device_coldplug(Unit *u) {
          *
          * - On switch-root, the udev database may be cleared, except for devices with sticky bit, i.e.
          *   OPTIONS="db_persist". Hence, almost no devices are enumerated in the step 2. However, in
-         *   general, we have several serialized devices. So, DEVICE_FOUND_UDEV bit in the deserialized_found
-         *   must be ignored, as udev rules in initrd and the main system are often different. If the
-         *   deserialized state is DEVICE_PLUGGED, we need to downgrade it to DEVICE_TENTATIVE. Unlike the
-         *   other starting mode, MANAGER_IS_SWITCHING_ROOT() is true when device_coldplug() and
-         *   device_catchup() are called.  Hence, let's conditionalize the operations by using the
-         *   flag. After switch-root, systemd-udevd will (re-)process all devices, and the Device.found and
-         *   Device.state will be adjusted.
+         *   general, we have several serialized devices. So, DEVICE_FOUND_UDEV bit in the
+         *   Device.deserialized_found must be ignored, as udev rules in initrd and the main system are often
+         *   different. If the deserialized state is DEVICE_PLUGGED, we need to downgrade it to
+         *   DEVICE_TENTATIVE. Unlike the other starting mode, MANAGER_IS_SWITCHING_ROOT() is true when
+         *   device_coldplug() and device_catchup() are called. Hence, let's conditionalize the operations by
+         *   using the flag. After switch-root, systemd-udevd will (re-)process all devices, and the
+         *   Device.found and Device.state will be adjusted.
          *
-         * - On reload or reexecute, we can trust enumerated_found, deserialized_found, and deserialized_state.
-         *   Of course, deserialized parameters may be outdated, but the unit state can be adjusted later by
-         *   device_catchup() or uevents. */
+         * - On reload or reexecute, we can trust Device.enumerated_found, Device.deserialized_found, and
+         *   Device.deserialized_state. Of course, deserialized parameters may be outdated, but the unit
+         *   state can be adjusted later by device_catchup() or uevents. */
 
         if (MANAGER_IS_SWITCHING_ROOT(m) &&
             !FLAGS_SET(d->enumerated_found, DEVICE_FOUND_UDEV)) {
-                found &= ~DEVICE_FOUND_UDEV; /* ignore DEVICE_FOUND_UDEV bit */
+
+                /* The device has not been enumerated. On switching-root, such situation is natural. See the
+                 * above comment. To prevent problematic state transition active → dead → active, let's
+                 * drop the DEVICE_FOUND_UDEV flag and downgrade state to DEVICE_TENTATIVE(activating). See
+                 * issue #12953 and #23208. */
+                found &= ~DEVICE_FOUND_UDEV;
                 if (state == DEVICE_PLUGGED)
-                        state = DEVICE_TENTATIVE; /* downgrade state */
+                        state = DEVICE_TENTATIVE;
+
+                /* Also check the validity of the device syspath. Without this check, if the device was
+                 * removed while switching root, it would never go to inactive state, as both Device.found
+                 * and Device.enumerated_found do not have the DEVICE_FOUND_UDEV flag, so device_catchup() in
+                 * device_update_found_one() does nothing in most cases. See issue #25106. Note that the
+                 * syspath field is only serialized when systemd is sufficiently new and the device has been
+                 * already processed by udevd. */
+                if (d->deserialized_sysfs) {
+                        _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
+
+                        if (sd_device_new_from_syspath(&dev, d->deserialized_sysfs) < 0)
+                                state = DEVICE_DEAD;
+                }
         }
 
         if (d->found == found && d->state == state)
@@ -387,6 +413,9 @@ static int device_serialize(Unit *u, FILE *f, FDSet *fds) {
         assert(f);
         assert(fds);
 
+        if (d->sysfs)
+                (void) serialize_item(f, "sysfs", d->sysfs);
+
         if (d->path)
                 (void) serialize_item(f, "path", d->path);
 
@@ -408,7 +437,14 @@ static int device_deserialize_item(Unit *u, const char *key, const char *value, 
         assert(value);
         assert(fds);
 
-        if (streq(key, "path")) {
+        if (streq(key, "sysfs")) {
+                if (!d->deserialized_sysfs) {
+                        d->deserialized_sysfs = strdup(value);
+                        if (!d->deserialized_sysfs)
+                                log_oom_debug();
+                }
+
+        } else if (streq(key, "path")) {
                 if (!d->path) {
                         d->path = strdup(value);
                         if (!d->path)
@@ -583,7 +619,8 @@ static int device_add_udev_wants(Unit *u, sd_device *dev) {
 
                         r = manager_add_job_by_name(u->manager, JOB_START, *i, JOB_FAIL, NULL, &error, NULL);
                         if (r < 0)
-                                log_unit_warning_errno(u, r, "Failed to enqueue SYSTEMD_WANTS= job, ignoring: %s", bus_error_message(&error, r));
+                                log_unit_full_errno(u, sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_UNIT) ? LOG_DEBUG : LOG_WARNING, r,
+                                                    "Failed to enqueue %s job, ignoring: %s", property, bus_error_message(&error, r));
                 }
 
         return strv_free_and_replace(d->wants_property, added);
@@ -655,7 +692,7 @@ static int device_setup_unit(Manager *m, sd_device *dev, const char *path, bool 
                  * serialize the sysfs path across reloads/reexecs. Hence, when coming back from a reload/restart we
                  * might have the state valid, but not the sysfs path. Also, there is another possibility; when multiple
                  * devices have the same devlink (e.g. /dev/disk/by-uuid/xxxx), adding/updating/removing one of the
-                 * device causes syspath change. Hence, let's always update sysfs path.*/
+                 * device causes syspath change. Hence, let's always update sysfs path. */
 
                 /* Let's remove all dependencies generated due to udev properties. We'll re-add whatever is configured
                  * now below. */
@@ -763,7 +800,7 @@ static int device_setup_devlink_unit_one(Manager *m, const char *devlink, Set **
 
 static int device_setup_extra_units(Manager *m, sd_device *dev, Set **ready_units, Set **not_ready_units) {
         _cleanup_strv_free_ char **aliases = NULL;
-        const char *devlink, *syspath, *devname = NULL;
+        const char *syspath, *devname = NULL;
         Device *l;
         int r;
 
@@ -863,7 +900,7 @@ static int device_setup_units(Manager *m, sd_device *dev, Set **ready_units, Set
 
         /* First, process the main (that is, points to the syspath) and (real, not symlink) devnode units. */
         if (device_for_action(dev, SD_DEVICE_REMOVE))
-                /* If the device is removed, the main and devnode units units will be removed by
+                /* If the device is removed, the main and devnode units will be removed by
                  * device_update_found_by_sysfs() in device_dispatch_io(). Hence, it is not necessary to
                  * store them to not_ready_units, and we have nothing to do here.
                  *
@@ -980,7 +1017,6 @@ static void device_shutdown(Manager *m) {
 
 static void device_enumerate(Manager *m) {
         _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
-        sd_device *dev;
         int r;
 
         assert(m);
@@ -1095,18 +1131,39 @@ static int device_dispatch_io(sd_device_monitor *monitor, sd_device *dev, void *
 
         r = sd_device_get_syspath(dev, &sysfs);
         if (r < 0) {
-                log_device_error_errno(dev, r, "Failed to get device syspath, ignoring: %m");
+                log_device_warning_errno(dev, r, "Failed to get device syspath, ignoring: %m");
                 return 0;
         }
 
         r = sd_device_get_action(dev, &action);
         if (r < 0) {
-                log_device_error_errno(dev, r, "Failed to get udev action, ignoring: %m");
+                log_device_warning_errno(dev, r, "Failed to get udev action, ignoring: %m");
                 return 0;
         }
 
+        log_device_debug(dev, "Got '%s' action on syspath '%s'.", device_action_to_string(action), sysfs);
+
         if (action == SD_DEVICE_MOVE)
                 device_remove_old_on_move(m, dev);
+
+        /* When udevd failed to process the device, SYSTEMD_ALIAS or any other properties may contain invalid
+         * values. Let's refuse to handle the uevent. */
+        if (sd_device_get_property_value(dev, "UDEV_WORKER_FAILED", NULL) >= 0) {
+                int v;
+
+                if (device_get_property_int(dev, "UDEV_WORKER_ERRNO", &v) >= 0)
+                        log_device_warning_errno(dev, v, "systemd-udevd failed to process the device, ignoring: %m");
+                else if (device_get_property_int(dev, "UDEV_WORKER_EXIT_STATUS", &v) >= 0)
+                        log_device_warning(dev, "systemd-udevd failed to process the device with exit status %i, ignoring.", v);
+                else if (device_get_property_int(dev, "UDEV_WORKER_SIGNAL", &v) >= 0) {
+                        const char *s;
+                        (void) sd_device_get_property_value(dev, "UDEV_WORKER_SIGNAL_NAME", &s);
+                        log_device_warning(dev, "systemd-udevd failed to process the device with signal %i(%s), ignoring.", v, strna(s));
+                } else
+                        log_device_warning(dev, "systemd-udevd failed to process the device with unknown result, ignoring.");
+
+                return 0;
+        }
 
         /* A change event can signal that a device is becoming ready, in particular if the device is using
          * the SYSTEMD_READY logic in udev so we need to reach the else block of the following if, even for

@@ -2,17 +2,14 @@
 
 sources = files(
         'timesyncd-conf.c',
-        'timesyncd-conf.h',
         'timesyncd-manager.c',
-        'timesyncd-manager.h',
-        'timesyncd-ntp-message.h',
         'timesyncd-server.c',
-        'timesyncd-server.h')
+)
 
 systemd_timesyncd_sources = files(
         'timesyncd.c',
         'timesyncd-bus.c',
-        'timesyncd-bus.h')
+)
 
 sources += custom_target(
         'timesyncd-gperf.c',
@@ -32,6 +29,7 @@ libtimesyncd_core = static_library(
         'timesyncd-core',
         sources,
         include_directories : includes,
+        dependencies : userspace,
         link_with : timesyncd_link_with,
         build_by_default : false)
 
@@ -57,8 +55,12 @@ endif
 ############################################################
 
 tests += [
-        [files('test-timesync.c'),
-         [libtimesyncd_core,
-          libshared],
-         [libm]],
+        {
+                'sources' : files('test-timesync.c'),
+                'link_with' : [
+                        libshared,
+                        libtimesyncd_core,
+                ],
+                'dependencies' : libm,
+        },
 ]

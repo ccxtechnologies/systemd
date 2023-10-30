@@ -3,11 +3,12 @@
 #include <getopt.h>
 #include <unistd.h>
 
+#include "build.h"
 #include "bus-error.h"
 #include "bus-locator.h"
-#include "chase-symlinks.h"
+#include "chase.h"
 #include "conf-files.h"
-#include "def.h"
+#include "constants.h"
 #include "dirent-util.h"
 #include "dissect-image.h"
 #include "fd-util.h"
@@ -45,11 +46,13 @@ static char *arg_image = NULL;
 static bool arg_reboot = false;
 static char *arg_component = NULL;
 static int arg_verify = -1;
+static ImagePolicy *arg_image_policy = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_definitions, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_component, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_image_policy, image_policy_freep);
 
 typedef struct Context {
         Transfer **transfers;
@@ -858,7 +861,7 @@ static int process_image(
                 LoopDevice **ret_loop_device) {
 
         _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
-        _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
+        _cleanup_(umount_and_freep) char *mounted_dir = NULL;
         int r;
 
         assert(ret_mounted_dir);
@@ -871,6 +874,7 @@ static int process_image(
 
         r = mount_image_privately_interactively(
                         arg_image,
+                        arg_image_policy,
                         (ro ? DISSECT_IMAGE_READ_ONLY : 0) |
                         DISSECT_IMAGE_FSCK |
                         DISSECT_IMAGE_MKDIR |
@@ -880,6 +884,7 @@ static int process_image(
                         DISSECT_IMAGE_GENERIC_ROOT |
                         DISSECT_IMAGE_REQUIRE_ROOT,
                         &mounted_dir,
+                        /* ret_dir_fd= */ NULL,
                         &loop_device);
         if (r < 0)
                 return r;
@@ -1020,7 +1025,7 @@ static int verb_pending_or_reboot(int argc, char **argv, void *userdata) {
 
         if (arg_image || arg_root)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "The --root=/--image switches may not be combined with the '%s' operation.", argv[0]);
+                                       "The --root=/--image= switches may not be combined with the '%s' operation.", argv[0]);
 
         r = context_make_offline(&context, NULL);
         if (r < 0)
@@ -1088,7 +1093,7 @@ static int component_name_valid(const char *c) {
 static int verb_components(int argc, char **argv, void *userdata) {
         _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
         _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
-        _cleanup_(set_freep) Set *names = NULL;
+        _cleanup_set_free_ Set *names = NULL;
         _cleanup_free_ char **z = NULL; /* We use simple free() rather than strv_free() here, since set_free() will free the strings for us */
         char **l = CONF_PATHS_STRV("");
         bool has_default_component = false;
@@ -1104,7 +1109,7 @@ static int verb_components(int argc, char **argv, void *userdata) {
                 _cleanup_closedir_ DIR *d = NULL;
                 _cleanup_free_ char *p = NULL;
 
-                r = chase_symlinks_and_opendir(*i, arg_root, CHASE_PREFIX_ROOT, &p, &d);
+                r = chase_and_opendir(*i, arg_root, CHASE_PREFIX_ROOT, &p, &d);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)
@@ -1183,7 +1188,7 @@ static int verb_help(int argc, char **argv, void *userdata) {
         _cleanup_free_ char *link = NULL;
         int r;
 
-        r = terminal_urlify_man("systemd-sysupdate", "1", &link);
+        r = terminal_urlify_man("systemd-sysupdate", "8", &link);
         if (r < 0)
                 return log_oom();
 
@@ -1203,8 +1208,10 @@ static int verb_help(int argc, char **argv, void *userdata) {
                "\n%3$sOptions:%4$s\n"
                "  -C --component=NAME     Select component to update\n"
                "     --definitions=DIR    Find transfer definitions in specified directory\n"
-               "     --root=PATH          Operate relative to root path\n"
-               "     --image=PATH         Operate relative to image file\n"
+               "     --root=PATH          Operate on an alternate filesystem root\n"
+               "     --image=PATH         Operate on disk image as filesystem root\n"
+               "     --image-policy=POLICY\n"
+               "                          Specify disk image dissection policy\n"
                "  -m --instances-max=INT  How many instances to maintain\n"
                "     --sync=BOOL          Controls whether to sync data to disk\n"
                "     --verify=BOOL        Force signature verification on or off\n"
@@ -1234,6 +1241,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_JSON,
                 ARG_ROOT,
                 ARG_IMAGE,
+                ARG_IMAGE_POLICY,
                 ARG_REBOOT,
                 ARG_VERIFY,
         };
@@ -1249,6 +1257,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "json",              required_argument, NULL, ARG_JSON              },
                 { "root",              required_argument, NULL, ARG_ROOT              },
                 { "image",             required_argument, NULL, ARG_IMAGE             },
+                { "image-policy",      required_argument, NULL, ARG_IMAGE_POLICY      },
                 { "reboot",            no_argument,       NULL, ARG_REBOOT            },
                 { "component",         required_argument, NULL, 'C'                   },
                 { "verify",            required_argument, NULL, ARG_VERIFY            },
@@ -1312,6 +1321,12 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_IMAGE:
                         r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_image);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                case ARG_IMAGE_POLICY:
+                        r = parse_image_policy_argument(optarg, &arg_image_policy);
                         if (r < 0)
                                 return r;
                         break;

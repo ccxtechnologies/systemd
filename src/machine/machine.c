@@ -17,6 +17,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
+#include "fs-util.h"
 #include "hashmap.h"
 #include "machine-dbus.h"
 #include "machine.h"
@@ -32,14 +33,17 @@
 #include "tmpfile-util.h"
 #include "unit-name.h"
 #include "user-util.h"
-#include "util.h"
 
-Machine* machine_new(Manager *manager, MachineClass class, const char *name) {
-        Machine *m;
+DEFINE_TRIVIAL_CLEANUP_FUNC(Machine*, machine_free);
+
+int machine_new(Manager *manager, MachineClass class, const char *name, Machine **ret) {
+        _cleanup_(machine_freep) Machine *m = NULL;
+        int r;
 
         assert(manager);
         assert(class < _MACHINE_CLASS_MAX);
         assert(name);
+        assert(ret);
 
         /* Passing class == _MACHINE_CLASS_INVALID here is fine. It
          * means as much as "we don't know yet", and that we'll figure
@@ -47,31 +51,28 @@ Machine* machine_new(Manager *manager, MachineClass class, const char *name) {
 
         m = new0(Machine, 1);
         if (!m)
-                return NULL;
+                return -ENOMEM;
 
         m->name = strdup(name);
         if (!m->name)
-                goto fail;
+                return -ENOMEM;
 
         if (class != MACHINE_HOST) {
                 m->state_file = path_join("/run/systemd/machines", m->name);
                 if (!m->state_file)
-                        goto fail;
+                        return -ENOMEM;
         }
 
         m->class = class;
 
-        if (hashmap_put(manager->machines, m->name, m) < 0)
-                goto fail;
+        r = hashmap_put(manager->machines, m->name, m);
+        if (r < 0)
+                return r;
 
         m->manager = manager;
 
-        return m;
-
-fail:
-        free(m->state_file);
-        free(m->name);
-        return mfree(m);
+        *ret = TAKE_PTR(m);
+        return 0;
 }
 
 Machine* machine_free(Machine *m) {
@@ -107,7 +108,7 @@ Machine* machine_free(Machine *m) {
 }
 
 int machine_save(Machine *m) {
-        _cleanup_free_ char *temp_path = NULL;
+        _cleanup_(unlink_and_freep) char *temp_path = NULL;
         _cleanup_fclose_ FILE *f = NULL;
         int r;
 
@@ -211,6 +212,8 @@ int machine_save(Machine *m) {
                 goto fail;
         }
 
+        temp_path = mfree(temp_path);
+
         if (m->unit) {
                 char *sl;
 
@@ -225,9 +228,6 @@ int machine_save(Machine *m) {
 
 fail:
         (void) unlink(m->state_file);
-
-        if (temp_path)
-                (void) unlink(temp_path);
 
         return log_error_errno(r, "Failed to save machine data %s: %m", m->state_file);
 }

@@ -3,6 +3,7 @@
 #include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-get-properties.h"
+#include "bus-locator.h"
 #include "bus-log-control-api.h"
 #include "bus-message-util.h"
 #include "bus-polkit.h"
@@ -159,7 +160,7 @@ static int reply_query_state(DnsQuery *q) {
         case DNS_TRANSACTION_NOT_FOUND:
                 /* We return this as NXDOMAIN. This is only generated when a host doesn't implement LLMNR/TCP, and we
                  * thus quickly know that we cannot resolve an in-addr.arpa or ip6.arpa address. */
-                return reply_method_errorf(q, _BUS_ERROR_DNS "NXDOMAIN", "'%s' not found", dns_query_string(q));
+                return reply_method_errorf(q, BUS_ERROR_DNS_NXDOMAIN, "'%s' not found", dns_query_string(q));
 
         case DNS_TRANSACTION_NO_SOURCE:
                 return reply_method_errorf(q, BUS_ERROR_NO_SOURCE, "All suitable resolution sources turned off");
@@ -176,7 +177,7 @@ static int reply_query_state(DnsQuery *q) {
                         return 0;
 
                 if (q->answer_rcode == DNS_RCODE_NXDOMAIN)
-                        sd_bus_error_setf(&error, _BUS_ERROR_DNS "NXDOMAIN", "'%s' not found", dns_query_string(q));
+                        sd_bus_error_setf(&error, BUS_ERROR_DNS_NXDOMAIN, "Name '%s' not found", dns_query_string(q));
                 else {
                         const char *rc, *n;
 
@@ -359,6 +360,7 @@ static int validate_and_mangle_flags(
                        SD_RESOLVED_NO_ZONE|
                        SD_RESOLVED_NO_TRUST_ANCHOR|
                        SD_RESOLVED_NO_NETWORK|
+                       SD_RESOLVED_NO_STALE|
                        ok))
                 return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid flags parameter");
 
@@ -1371,7 +1373,11 @@ static int bus_method_resolve_service(sd_bus_message *message, void *userdata, s
         return 1;
 }
 
-int bus_dns_server_append(sd_bus_message *reply, DnsServer *s, bool with_ifindex, bool extended) {
+int bus_dns_server_append(
+                sd_bus_message *reply,
+                DnsServer *s,
+                bool with_ifindex, /* include "ifindex" field */
+                bool extended) {   /* also include port number and server name */
         int r;
 
         assert(reply);
@@ -1390,7 +1396,11 @@ int bus_dns_server_append(sd_bus_message *reply, DnsServer *s, bool with_ifindex
                 }
         }
 
-        r = sd_bus_message_open_container(reply, 'r', with_ifindex ? (extended ? "iiayqs" : "iiay") : (extended ? "iayqs" : "iay"));
+        r = sd_bus_message_open_container(
+                        reply,
+                        'r',
+                        with_ifindex ? (extended ? "iiayqs" : "iiay") :
+                                       (extended ? "iayqs" : "iay"));
         if (r < 0)
                 return r;
 
@@ -1666,34 +1676,6 @@ static int bus_property_get_dnssec_statistics(
                                      (uint64_t) m->n_dnssec_verdict[DNSSEC_INSECURE],
                                      (uint64_t) m->n_dnssec_verdict[DNSSEC_BOGUS],
                                      (uint64_t) m->n_dnssec_verdict[DNSSEC_INDETERMINATE]);
-}
-
-static int bus_property_get_ntas(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *reply,
-                void *userdata,
-                sd_bus_error *error) {
-
-        Manager *m = ASSERT_PTR(userdata);
-        const char *domain;
-        int r;
-
-        assert(reply);
-
-        r = sd_bus_message_open_container(reply, 'a', "s");
-        if (r < 0)
-                return r;
-
-        SET_FOREACH(domain, m->trust_anchor.negative_by_name) {
-                r = sd_bus_message_append(reply, "s", domain);
-                if (r < 0)
-                        return r;
-        }
-
-        return sd_bus_message_close_container(reply);
 }
 
 static BUS_DEFINE_PROPERTY_GET_ENUM(bus_property_get_dns_stub_listener_mode, dns_stub_listener_mode, DnsStubListenerMode);
@@ -2093,7 +2075,7 @@ static const sd_bus_vtable resolve_vtable[] = {
         SD_BUS_PROPERTY("DNSSEC", "s", bus_property_get_dnssec_mode, 0, 0),
         SD_BUS_PROPERTY("DNSSECStatistics", "(tttt)", bus_property_get_dnssec_statistics, 0, 0),
         SD_BUS_PROPERTY("DNSSECSupported", "b", bus_property_get_dnssec_supported, 0, 0),
-        SD_BUS_PROPERTY("DNSSECNegativeTrustAnchors", "as", bus_property_get_ntas, 0, 0),
+        SD_BUS_PROPERTY("DNSSECNegativeTrustAnchors", "as", bus_property_get_string_set, offsetof(Manager, trust_anchor.negative_by_name), 0),
         SD_BUS_PROPERTY("DNSStubListener", "s", bus_property_get_dns_stub_listener_mode, offsetof(Manager, dns_stub_listener_mode), 0),
         SD_BUS_PROPERTY("ResolvConfMode", "s", bus_property_get_resolv_conf_mode, 0, 0),
 
@@ -2274,12 +2256,10 @@ int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to attach bus to event loop: %m");
 
-        r = sd_bus_match_signal_async(
+        r = bus_match_signal_async(
                         m->bus,
                         NULL,
-                        "org.freedesktop.login1",
-                        "/org/freedesktop/login1",
-                        "org.freedesktop.login1.Manager",
+                        bus_login_mgr,
                         "PrepareForSleep",
                         match_prepare_for_sleep,
                         NULL,

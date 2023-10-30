@@ -15,6 +15,7 @@
 
 #include "alloc-util.h"
 #include "bus-polkit.h"
+#include "common-signal.h"
 #include "dns-domain.h"
 #include "event-util.h"
 #include "fd-util.h"
@@ -22,6 +23,7 @@
 #include "fs-util.h"
 #include "list.h"
 #include "log.h"
+#include "logarithm.h"
 #include "network-util.h"
 #include "ratelimit.h"
 #include "resolve-private.h"
@@ -32,7 +34,6 @@
 #include "timesyncd-conf.h"
 #include "timesyncd-manager.h"
 #include "user-util.h"
-#include "util.h"
 
 #ifndef ADJ_SETOFFSET
 #define ADJ_SETOFFSET                   0x0100  /* add 'time' to current time */
@@ -78,7 +79,7 @@ static double ts_to_d(const struct timespec *ts) {
 }
 
 static uint32_t graceful_add_offset_1900_1970(time_t t) {
-        /* Adds OFFSET_1900_1970 to t and returns it as 32bit value. This is handles overflows
+        /* Adds OFFSET_1900_1970 to t and returns it as 32-bit value. This is handles overflows
          * gracefully in a deterministic and well-defined way by cutting off the top bits. */
         uint64_t a = (uint64_t) t + OFFSET_1900_1970;
         return (uint32_t) (a & UINT64_C(0xFFFFFFFF));
@@ -119,8 +120,10 @@ static int manager_send_request(Manager *m) {
         m->event_timeout = sd_event_source_unref(m->event_timeout);
 
         r = manager_listen_setup(m);
-        if (r < 0)
-                return log_warning_errno(r, "Failed to set up connection socket: %m");
+        if (r < 0) {
+                log_warning_errno(r, "Failed to set up connection socket: %m");
+                return manager_connect(m);
+        }
 
         /*
          * Set transmit timestamp, remember it; the server will send that back
@@ -408,7 +411,7 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                 .msg_name = &server_addr,
                 .msg_namelen = sizeof(server_addr),
         };
-        struct timespec *recv_time = NULL;
+        struct timespec *recv_time;
         triple_timestamp dts;
         ssize_t len;
         double origin, receive, trans, dest, delay, offset, root_distance;
@@ -443,7 +446,7 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                 return 0;
         }
 
-        recv_time = CMSG_FIND_DATA(&msghdr, SOL_SOCKET, SCM_TIMESTAMPNS, struct timespec);
+        recv_time = CMSG_FIND_AND_COPY_DATA(&msghdr, SOL_SOCKET, SCM_TIMESTAMPNS, struct timespec);
         if (!recv_time)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Packet timestamp missing.");
 
@@ -619,7 +622,7 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                            "MESSAGE_ID=" SD_MESSAGE_TIME_SYNC_STR,
                            "MONOTONIC_USEC=" USEC_FMT, dts.monotonic,
                            "REALTIME_USEC=" USEC_FMT, dts.realtime,
-                           "BOOTIME_USEC=" USEC_FMT, dts.boottime);
+                           "BOOTTIME_USEC=" USEC_FMT, dts.boottime);
         }
 
         r = manager_arm_timer(m, m->poll_interval_usec);
@@ -752,7 +755,7 @@ static int manager_resolve_handler(sd_resolve_query *q, int ret, const struct ad
                 assert(ai->ai_addrlen >= offsetof(struct sockaddr, sa_data));
 
                 if (!IN_SET(ai->ai_addr->sa_family, AF_INET, AF_INET6)) {
-                        log_warning("Unsuitable address protocol for %s", m->current_server_name->string);
+                        log_debug("Ignoring unsuitable address protocol for %s.", m->current_server_name->string);
                         continue;
                 }
 
@@ -806,11 +809,6 @@ int manager_connect(Manager *m) {
         if (m->current_server_address && m->current_server_address->addresses_next)
                 manager_set_server_address(m, m->current_server_address->addresses_next);
         else {
-                static const struct addrinfo hints = {
-                        .ai_flags = AI_NUMERICSERV|AI_ADDRCONFIG,
-                        .ai_socktype = SOCK_DGRAM,
-                };
-
                 /* Hmm, we are through all addresses, let's look for the next host instead */
                 if (m->current_server_name && m->current_server_name->names_next)
                         manager_set_server_name(m, m->current_server_name->names_next);
@@ -877,6 +875,12 @@ int manager_connect(Manager *m) {
                 server_name_flush_addresses(m->current_server_name);
 
                 log_debug("Resolving %s...", m->current_server_name->string);
+
+                struct addrinfo hints = {
+                        .ai_flags = AI_NUMERICSERV|AI_ADDRCONFIG,
+                        .ai_socktype = SOCK_DGRAM,
+                        .ai_family = socket_ipv6_is_supported() ? AF_UNSPEC : AF_INET,
+                };
 
                 r = resolve_getaddrinfo(m->resolve, &m->resolve_query, m->current_server_name->string, "123", &hints, manager_resolve_handler, NULL, m);
                 if (r < 0)
@@ -969,10 +973,10 @@ static int manager_network_read_link_servers(Manager *m) {
         assert(m);
 
         r = sd_network_get_ntp(&ntp);
-        if (r < 0) {
+        if (r < 0 && r != -ENODATA) {
                 if (r == -ENOMEM)
                         log_oom();
-                else if (r != -ENODATA)
+                else
                         log_debug_errno(r, "Failed to get link NTP servers: %m");
                 goto clear;
         }
@@ -1110,9 +1114,9 @@ int manager_new(Manager **ret) {
 
                 .connection_retry_usec = DEFAULT_CONNECTION_RETRY_USEC,
 
-                .server_socket = -1,
+                .server_socket = -EBADF,
 
-                .ratelimit = (RateLimit) {
+                .ratelimit = (const RateLimit) {
                         RATELIMIT_INTERVAL_USEC,
                         RATELIMIT_BURST
                 },
@@ -1126,6 +1130,11 @@ int manager_new(Manager **ret) {
 
         (void) sd_event_add_signal(m->event, NULL, SIGTERM, NULL,  NULL);
         (void) sd_event_add_signal(m->event, NULL, SIGINT, NULL, NULL);
+        (void) sd_event_add_signal(m->event, NULL, SIGRTMIN+18, sigrtmin18_handler, NULL);
+
+        r = sd_event_add_memory_pressure(m->event, NULL, NULL, NULL);
+        if (r < 0)
+                log_debug_errno(r, "Failed allocate memory pressure event source, ignoring: %m");
 
         (void) sd_event_set_watchdog(m->event, true);
 

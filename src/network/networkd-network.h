@@ -65,6 +65,7 @@ struct Network {
 
         char *name;
         char *filename;
+        char **dropins;
         Hashmap *stats_by_path;
         char *description;
 
@@ -130,6 +131,8 @@ struct Network {
         uint16_t dhcp_client_port;
         int dhcp_critical;
         int dhcp_ip_service_type;
+        int dhcp_socket_priority;
+        bool dhcp_socket_priority_set;
         bool dhcp_anonymize;
         bool dhcp_send_hostname;
         int dhcp_broadcast;
@@ -140,9 +143,11 @@ struct Network {
         bool dhcp_use_ntp_set;
         bool dhcp_routes_to_ntp;
         bool dhcp_use_sip;
+        bool dhcp_use_captive_portal;
         bool dhcp_use_mtu;
         bool dhcp_use_routes;
         int dhcp_use_gateway;
+        bool dhcp_quickack;
         bool dhcp_use_timezone;
         bool dhcp_use_hostname;
         bool dhcp_use_6rd;
@@ -165,6 +170,7 @@ struct Network {
         bool dhcp6_use_hostname;
         bool dhcp6_use_ntp;
         bool dhcp6_use_ntp_set;
+        bool dhcp6_use_captive_portal;
         bool dhcp6_use_rapid_commit;
         DHCPUseDomains dhcp6_use_domains;
         bool dhcp6_use_domains_set;
@@ -182,6 +188,7 @@ struct Network {
         OrderedHashmap *dhcp6_client_send_vendor_options;
         Set *dhcp6_request_options;
         char *dhcp6_netlabel;
+        bool dhcp6_send_release;
 
         /* DHCP Server Support */
         bool dhcp_server;
@@ -309,13 +316,17 @@ struct Network {
         bool ipv6_accept_ra_use_autonomous_prefix;
         bool ipv6_accept_ra_use_onlink_prefix;
         bool ipv6_accept_ra_use_mtu;
+        bool ipv6_accept_ra_quickack;
+        bool ipv6_accept_ra_use_captive_portal;
         bool active_slave;
         bool primary_slave;
         DHCPUseDomains ipv6_accept_ra_use_domains;
         IPv6AcceptRAStartDHCP6Client ipv6_accept_ra_start_dhcp6_client;
         uint32_t ipv6_accept_ra_route_table;
         bool ipv6_accept_ra_route_table_set;
-        uint32_t ipv6_accept_ra_route_metric;
+        uint32_t ipv6_accept_ra_route_metric_high;
+        uint32_t ipv6_accept_ra_route_metric_medium;
+        uint32_t ipv6_accept_ra_route_metric_low;
         bool ipv6_accept_ra_route_metric_set;
         Set *ndisc_deny_listed_router;
         Set *ndisc_allow_listed_router;

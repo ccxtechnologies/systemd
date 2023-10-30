@@ -36,6 +36,10 @@ usb:v0FD9p0060*
 usb:v0FD9p0063*
  ID_AV_PRODUCTION_CONTROLLER=1
 
+# Stream Deck Mini (gen 2)
+usb:v0FD9p0090*
+ ID_AV_PRODUCTION_CONTROLLER=1
+
 # Stream Deck XL
 usb:v0FD9p006C*
  ID_AV_PRODUCTION_CONTROLLER=1
@@ -50,6 +54,10 @@ usb:v0FD9p006D*
 
 # Stream Deck MK.2
 usb:v0FD9p0080*
+ ID_AV_PRODUCTION_CONTROLLER=1
+
+# Stream Deck Pedal
+usb:v0FD9p0086*
  ID_AV_PRODUCTION_CONTROLLER=1
 
 #############################

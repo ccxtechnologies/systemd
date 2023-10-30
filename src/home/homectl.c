@@ -5,9 +5,12 @@
 #include "sd-bus.h"
 
 #include "ask-password-api.h"
+#include "build.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
 #include "bus-locator.h"
+#include "cap-list.h"
+#include "capability-util.h"
 #include "cgroup-util.h"
 #include "dns-domain.h"
 #include "env-util.h"
@@ -27,20 +30,20 @@
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
+#include "password-quality-util.h"
 #include "path-util.h"
 #include "percent-util.h"
 #include "pkcs11-util.h"
 #include "pretty-print.h"
 #include "process-util.h"
-#include "pwquality-util.h"
 #include "rlimit-util.h"
 #include "spawn-polkit-agent.h"
 #include "terminal-util.h"
 #include "uid-alloc-range.h"
-#include "user-record-pwquality.h"
+#include "user-record.h"
+#include "user-record-password-quality.h"
 #include "user-record-show.h"
 #include "user-record-util.h"
-#include "user-record.h"
 #include "user-util.h"
 #include "verbs.h"
 
@@ -75,6 +78,8 @@ static enum {
         EXPORT_FORMAT_STRIPPED,      /* strip "state" + "binding", but leave signature in place */
         EXPORT_FORMAT_MINIMAL,       /* also strip signature */
 } arg_export_format = EXPORT_FORMAT_FULL;
+static uint64_t arg_capability_bounding_set = UINT64_MAX;
+static uint64_t arg_capability_ambient_set = UINT64_MAX;
 
 STATIC_DESTRUCTOR_REGISTER(arg_identity_extra, json_variant_unrefp);
 STATIC_DESTRUCTOR_REGISTER(arg_identity_extra_this_machine, json_variant_unrefp);
@@ -108,7 +113,7 @@ static int acquire_bus(sd_bus **bus) {
         if (*bus)
                 return 0;
 
-        r = bus_connect_transport(arg_transport, arg_host, false, bus);
+        r = bus_connect_transport(arg_transport, arg_host, RUNTIME_SCOPE_SYSTEM, bus);
         if (r < 0)
                 return bus_log_connect_error(r, arg_transport);
 
@@ -205,7 +210,7 @@ static int acquire_existing_password(
                 bool emphasize_current,
                 AskPasswordFlags flags) {
 
-        _cleanup_(strv_free_erasep) char **password = NULL;
+        _cleanup_strv_free_erase_ char **password = NULL;
         _cleanup_(erase_and_freep) char *envpw = NULL;
         _cleanup_free_ char *question = NULL;
         int r;
@@ -266,7 +271,7 @@ static int acquire_recovery_key(
                 UserRecord *hr,
                 AskPasswordFlags flags) {
 
-        _cleanup_(strv_free_erasep) char **recovery_key = NULL;
+        _cleanup_strv_free_erase_ char **recovery_key = NULL;
         _cleanup_(erase_and_freep) char *envpw = NULL;
         _cleanup_free_ char *question = NULL;
         int r;
@@ -324,7 +329,7 @@ static int acquire_token_pin(
                 UserRecord *hr,
                 AskPasswordFlags flags) {
 
-        _cleanup_(strv_free_erasep) char **pin = NULL;
+        _cleanup_strv_free_erase_ char **pin = NULL;
         _cleanup_(erase_and_freep) char *envpin = NULL;
         _cleanup_free_ char *question = NULL;
         int r;
@@ -694,7 +699,7 @@ static char **mangle_user_list(char **list, char ***ret_allocated) {
 
 static int inspect_home(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_(strv_freep) char **mangled_list = NULL;
+        _cleanup_strv_free_ char **mangled_list = NULL;
         int r, ret = 0;
         char **items;
 
@@ -778,7 +783,7 @@ static int inspect_home(int argc, char *argv[], void *userdata) {
 
 static int authenticate_home(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_(strv_freep) char **mangled_list = NULL;
+        _cleanup_strv_free_ char **mangled_list = NULL;
         int r, ret = 0;
         char **items;
 
@@ -1182,7 +1187,7 @@ static int acquire_new_password(
                 (void) suggest_passwords();
 
         for (;;) {
-                _cleanup_(strv_free_erasep) char **first = NULL, **second = NULL;
+                _cleanup_strv_free_erase_ char **first = NULL, **second = NULL;
                 _cleanup_free_ char *question = NULL;
 
                 if (--i == 0)
@@ -1318,7 +1323,7 @@ static int create_home(int argc, char *argv[], void *userdata) {
 
                 /* If password quality enforcement is disabled, let's at least warn client side */
 
-                r = user_record_quality_check_password(hr, hr, &error);
+                r = user_record_check_password_quality(hr, hr, &error);
                 if (r < 0)
                         log_warning_errno(r, "Specified password does not pass quality checks (%s), proceeding anyway.", bus_error_message(&error, r));
         }
@@ -1797,26 +1802,6 @@ static int parse_disk_size(const char *t, uint64_t *ret) {
         return 0;
 }
 
-static int parse_sector_size(const char *t, uint64_t *ret) {
-        int r;
-
-        assert(t);
-        assert(ret);
-
-        uint64_t ss;
-
-        r = safe_atou64(t, &ss);
-        if (r < 0)
-                return log_error_errno(r, "Failed to parse sector size parameter %s", t);
-        if (ss < 512 || ss > 4096) /* Allow up to 4K due to dm-crypt support and 4K alignment by the homed LUKS backend */
-                return log_error_errno(SYNTHETIC_ERRNO(ERANGE), "Sector size not between 512 and 4096: %s", t);
-        if (!ISPOWEROF2(ss))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Sector size not power of 2: %s", t);
-
-        *ret = ss;
-        return 0;
-}
-
 static int resize_home(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
@@ -1963,7 +1948,7 @@ static int with_home(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
-        _cleanup_close_ int acquired_fd = -1;
+        _cleanup_close_ int acquired_fd = -EBADF;
         _cleanup_strv_free_ char **cmdline  = NULL;
         const char *home;
         int r, ret;
@@ -2229,6 +2214,10 @@ static int help(int argc, char *argv[], void *userdata) {
                "  -d --home-dir=PATH           Home directory\n"
                "  -u --uid=UID                 Numeric UID for user\n"
                "  -G --member-of=GROUP         Add user to group\n"
+               "     --capability-bounding-set=CAPS\n"
+               "                               Bounding POSIX capability set\n"
+               "     --capability-ambient-set=CAPS\n"
+               "                               Ambient POSIX capability set\n"
                "     --skel=PATH               Skeleton directory to use\n"
                "     --shell=PATH              Shell for account\n"
                "     --setenv=VARIABLE[=VALUE] Set an environment variable at log-in\n"
@@ -2391,6 +2380,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_IO_WEIGHT,
                 ARG_LUKS_PBKDF_TYPE,
                 ARG_LUKS_PBKDF_HASH_ALGORITHM,
+                ARG_LUKS_PBKDF_FORCE_ITERATIONS,
                 ARG_LUKS_PBKDF_TIME_COST,
                 ARG_LUKS_PBKDF_MEMORY_COST,
                 ARG_LUKS_PBKDF_PARALLEL_THREADS,
@@ -2420,6 +2410,8 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_AUTO_RESIZE_MODE,
                 ARG_REBALANCE_WEIGHT,
                 ARG_FIDO2_CRED_ALG,
+                ARG_CAPABILITY_BOUNDING_SET,
+                ARG_CAPABILITY_AMBIENT_SET,
         };
 
         static const struct option options[] = {
@@ -2472,6 +2464,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "luks-volume-key-size",        required_argument, NULL, ARG_LUKS_VOLUME_KEY_SIZE        },
                 { "luks-pbkdf-type",             required_argument, NULL, ARG_LUKS_PBKDF_TYPE             },
                 { "luks-pbkdf-hash-algorithm",   required_argument, NULL, ARG_LUKS_PBKDF_HASH_ALGORITHM   },
+                { "luks-pbkdf-force-iterations", required_argument, NULL, ARG_LUKS_PBKDF_FORCE_ITERATIONS },
                 { "luks-pbkdf-time-cost",        required_argument, NULL, ARG_LUKS_PBKDF_TIME_COST        },
                 { "luks-pbkdf-memory-cost",      required_argument, NULL, ARG_LUKS_PBKDF_MEMORY_COST      },
                 { "luks-pbkdf-parallel-threads", required_argument, NULL, ARG_LUKS_PBKDF_PARALLEL_THREADS },
@@ -2509,6 +2502,8 @@ static int parse_argv(int argc, char *argv[]) {
                 { "luks-extra-mount-options",    required_argument, NULL, ARG_LUKS_EXTRA_MOUNT_OPTIONS    },
                 { "auto-resize-mode",            required_argument, NULL, ARG_AUTO_RESIZE_MODE            },
                 { "rebalance-weight",            required_argument, NULL, ARG_REBALANCE_WEIGHT            },
+                { "capability-bounding-set",     required_argument, NULL, ARG_CAPABILITY_BOUNDING_SET     },
+                { "capability-ambient-set",      required_argument, NULL, ARG_CAPABILITY_AMBIENT_SET      },
                 {}
         };
 
@@ -3092,10 +3087,12 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_LUKS_VOLUME_KEY_SIZE:
+                case ARG_LUKS_PBKDF_FORCE_ITERATIONS:
                 case ARG_LUKS_PBKDF_PARALLEL_THREADS:
                 case ARG_RATE_LIMIT_BURST: {
                         const char *field =
                                        c == ARG_LUKS_VOLUME_KEY_SIZE ? "luksVolumeKeySize" :
+                                c == ARG_LUKS_PBKDF_FORCE_ITERATIONS ? "luksPbkdfForceIterations" :
                                 c == ARG_LUKS_PBKDF_PARALLEL_THREADS ? "luksPbkdfParallelThreads" :
                                            c == ARG_RATE_LIMIT_BURST ? "rateLimitBurst" : NULL;
                         unsigned n;
@@ -3165,7 +3162,7 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_SSH_AUTHORIZED_KEYS: {
                         _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
-                        _cleanup_(strv_freep) char **l = NULL, **add = NULL;
+                        _cleanup_strv_free_ char **l = NULL, **add = NULL;
 
                         if (isempty(optarg)) {
                                 r = drop_from_identity("sshAuthorizedKeys");
@@ -3579,38 +3576,29 @@ static int parse_argv(int argc, char *argv[]) {
                         strv_uniq(arg_fido2_device);
                         break;
 
-                case ARG_FIDO2_WITH_PIN: {
-                        bool lock_with_pin;
-
-                        r = parse_boolean_argument("--fido2-with-client-pin=", optarg, &lock_with_pin);
+                case ARG_FIDO2_WITH_PIN:
+                        r = parse_boolean_argument("--fido2-with-client-pin=", optarg, NULL);
                         if (r < 0)
                                 return r;
 
-                        SET_FLAG(arg_fido2_lock_with, FIDO2ENROLL_PIN, lock_with_pin);
+                        SET_FLAG(arg_fido2_lock_with, FIDO2ENROLL_PIN, r);
                         break;
-                }
 
-                case ARG_FIDO2_WITH_UP: {
-                        bool lock_with_up;
-
-                        r = parse_boolean_argument("--fido2-with-user-presence=", optarg, &lock_with_up);
+                case ARG_FIDO2_WITH_UP:
+                        r = parse_boolean_argument("--fido2-with-user-presence=", optarg, NULL);
                         if (r < 0)
                                 return r;
 
-                        SET_FLAG(arg_fido2_lock_with, FIDO2ENROLL_UP, lock_with_up);
+                        SET_FLAG(arg_fido2_lock_with, FIDO2ENROLL_UP, r);
                         break;
-                }
 
-                case ARG_FIDO2_WITH_UV: {
-                        bool lock_with_uv;
-
-                        r = parse_boolean_argument("--fido2-with-user-verification=", optarg, &lock_with_uv);
+                case ARG_FIDO2_WITH_UV:
+                        r = parse_boolean_argument("--fido2-with-user-verification=", optarg, NULL);
                         if (r < 0)
                                 return r;
 
-                        SET_FLAG(arg_fido2_lock_with, FIDO2ENROLL_UV, lock_with_uv);
+                        SET_FLAG(arg_fido2_lock_with, FIDO2ENROLL_UV, r);
                         break;
-                }
 
                 case ARG_RECOVERY_KEY:
                         r = parse_boolean(optarg);
@@ -3653,6 +3641,7 @@ static int parse_argv(int argc, char *argv[]) {
                                 r = drop_from_identity("rebalanceWeight");
                                 if (r < 0)
                                         return r;
+                                break;
                         }
 
                         if (streq(optarg, "off"))
@@ -3729,15 +3718,14 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_DROP_CACHES: {
-                        bool drop_caches;
-
                         if (isempty(optarg)) {
                                 r = drop_from_identity("dropCaches");
                                 if (r < 0)
                                         return r;
+                                break;
                         }
 
-                        r = parse_boolean_argument("--drop-caches=", optarg, &drop_caches);
+                        r = parse_boolean_argument("--drop-caches=", optarg, NULL);
                         if (r < 0)
                                 return r;
 
@@ -3745,6 +3733,61 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to set drop caches field: %m");
 
+                        break;
+                }
+
+                case ARG_CAPABILITY_AMBIENT_SET:
+                case ARG_CAPABILITY_BOUNDING_SET: {
+                        _cleanup_strv_free_ char **l = NULL;
+                        bool subtract = false;
+                        uint64_t parsed, *which, updated;
+                        const char *p, *field;
+
+                        if (c == ARG_CAPABILITY_AMBIENT_SET) {
+                                which = &arg_capability_ambient_set;
+                                field = "capabilityAmbientSet";
+                        } else {
+                                assert(c == ARG_CAPABILITY_BOUNDING_SET);
+                                which = &arg_capability_bounding_set;
+                                field = "capabilityBoundingSet";
+                        }
+
+                        if (isempty(optarg)) {
+                                r = drop_from_identity(field);
+                                if (r < 0)
+                                        return r;
+
+                                *which = UINT64_MAX;
+                                break;
+                        }
+
+                        p = optarg;
+                        if (*p == '~') {
+                                subtract = true;
+                                p++;
+                        }
+
+                        r = capability_set_from_string(p, &parsed);
+                        if (r == 0)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid capabilities in capability string '%s'.", p);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse capability string '%s': %m", p);
+
+                        if (*which == UINT64_MAX)
+                                updated = subtract ? all_capabilities() & ~parsed : parsed;
+                        else if (subtract)
+                                updated = *which & ~parsed;
+                        else
+                                updated = *which | parsed;
+
+                        if (capability_set_to_strv(updated, &l) < 0)
+                                return log_oom();
+
+                        r = json_variant_set_field_strv(&arg_identity_extra, field, l);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to set %s field: %m", field);
+
+                        *which = updated;
                         break;
                 }
 

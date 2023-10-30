@@ -364,14 +364,14 @@ static int bus_socket_set_transient_property(
                         return r;
 
                 while ((r = sd_bus_message_read(message, "(ss)", &t, &a)) > 0) {
-                        _cleanup_free_ SocketPort *p = NULL;
+                        _cleanup_(socket_port_freep) SocketPort *p = NULL;
 
                         p = new(SocketPort, 1);
                         if (!p)
                                 return log_oom();
 
                         *p = (SocketPort) {
-                                .fd = -1,
+                                .fd = -EBADF,
                                 .socket = s,
                         };
 
@@ -380,7 +380,7 @@ static int bus_socket_set_transient_property(
                                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Unknown Socket type: %s", t);
 
                         if (p->type != SOCKET_SOCKET) {
-                                if (!path_is_valid(a))
+                                if (!path_is_absolute(a) || !path_is_valid(a))
                                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid socket path: %s", a);
 
                                 p->path = strdup(a);

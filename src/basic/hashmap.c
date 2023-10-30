@@ -5,10 +5,14 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
+#if HAVE_VALGRIND_VALGRIND_H
+#  include <valgrind/valgrind.h>
+#endif
 
 #include "alloc-util.h"
 #include "fileio.h"
 #include "hashmap.h"
+#include "logarithm.h"
 #include "macro.h"
 #include "memory-util.h"
 #include "mempool.h"
@@ -17,6 +21,7 @@
 #include "random-util.h"
 #include "set.h"
 #include "siphash24.h"
+#include "sort-util.h"
 #include "string-util.h"
 #include "strv.h"
 
@@ -170,9 +175,9 @@ struct _packed_ indirect_storage {
 };
 
 struct direct_storage {
-        /* This gives us 39 bytes on 64bit, or 35 bytes on 32bit.
-         * That's room for 4 set_entries + 4 DIB bytes + 3 unused bytes on 64bit,
-         *              or 7 set_entries + 7 DIB bytes + 0 unused bytes on 32bit. */
+        /* This gives us 39 bytes on 64-bit, or 35 bytes on 32-bit.
+         * That's room for 4 set_entries + 4 DIB bytes + 3 unused bytes on 64-bit,
+         *              or 7 set_entries + 7 DIB bytes + 0 unused bytes on 32-bit. */
         uint8_t storage[sizeof(struct indirect_storage)];
 };
 
@@ -273,29 +278,32 @@ static _used_ const struct hashmap_type_info hashmap_type_info[_HASHMAP_TYPE_MAX
         },
 };
 
-#if VALGRIND
-_destructor_ static void cleanup_pools(void) {
-        _cleanup_free_ char *t = NULL;
+void hashmap_trim_pools(void) {
         int r;
 
-        /* Be nice to valgrind */
+        /* The pool is only allocated by the main thread, but the memory can be passed to other
+         * threads. Let's clean up if we are the main thread and no other threads are live. */
 
-        /* The pool is only allocated by the main thread, but the memory can
-         * be passed to other threads. Let's clean up if we are the main thread
-         * and no other threads are live. */
-        /* We build our own is_main_thread() here, which doesn't use C11
-         * TLS based caching of the result. That's because valgrind apparently
-         * doesn't like malloc() (which C11 TLS internally uses) to be called
-         * from a GCC destructors. */
+        /* We build our own is_main_thread() here, which doesn't use C11 TLS based caching of the
+         * result. That's because valgrind apparently doesn't like TLS to be used from a GCC destructor. */
         if (getpid() != gettid())
-                return;
+                return (void) log_debug("Not cleaning up memory pools, not in main thread.");
 
-        r = get_proc_field("/proc/self/status", "Threads", WHITESPACE, &t);
-        if (r < 0 || !streq(t, "1"))
-                return;
+        r = get_process_threads(0);
+        if (r < 0)
+                return (void) log_debug_errno(r, "Failed to determine number of threads, not cleaning up memory pools: %m");
+        if (r != 1)
+                return (void) log_debug("Not cleaning up memory pools, running in multi-threaded process.");
 
-        mempool_drop(&hashmap_pool);
-        mempool_drop(&ordered_hashmap_pool);
+        mempool_trim(&hashmap_pool);
+        mempool_trim(&ordered_hashmap_pool);
+}
+
+#if HAVE_VALGRIND_VALGRIND_H
+_destructor_ static void cleanup_pools(void) {
+        /* Be nice to valgrind */
+        if (RUNNING_ON_VALGRIND)
+                hashmap_trim_pools();
 }
 #endif
 
@@ -372,8 +380,9 @@ static void get_hash_key(uint8_t hash_key[HASH_KEY_SIZE], bool reuse_is_ok) {
 }
 
 static struct hashmap_base_entry* bucket_at(HashmapBase *h, unsigned idx) {
-        return (struct hashmap_base_entry*)
-                ((uint8_t*) storage_ptr(h) + idx * hashmap_type_info[h->type].entry_size);
+        return CAST_ALIGN_PTR(
+                        struct hashmap_base_entry,
+                        (uint8_t *) storage_ptr(h) + idx * hashmap_type_info[h->type].entry_size);
 }
 
 static struct plain_hashmap_entry* plain_bucket_at(Hashmap *h, unsigned idx) {
@@ -772,7 +781,7 @@ static struct HashmapBase* hashmap_base_new(const struct hash_ops *hash_ops, enu
         HashmapBase *h;
         const struct hashmap_type_info *hi = &hashmap_type_info[type];
 
-        bool use_pool = mempool_enabled && mempool_enabled();
+        bool use_pool = mempool_enabled && mempool_enabled();  /* mempool_enabled is a weak symbol */
 
         h = use_pool ? mempool_alloc0_tile(hi->mempool) : malloc0(hi->head_size);
         if (!h)
@@ -1751,7 +1760,7 @@ HashmapBase* _hashmap_copy(HashmapBase *h  HASHMAP_DEBUG_PARAMS) {
         }
 
         if (r < 0)
-                return _hashmap_free(copy, false, false);
+                return _hashmap_free(copy, NULL, NULL);
 
         return copy;
 }
@@ -2097,4 +2106,52 @@ bool set_fnmatch(Set *include_patterns, Set *exclude_patterns, const char *needl
                 return true;
 
         return set_fnmatch_one(include_patterns, needle);
+}
+
+static int hashmap_entry_compare(
+                struct hashmap_base_entry * const *a,
+                struct hashmap_base_entry * const *b,
+                compare_func_t compare) {
+
+        assert(a && *a);
+        assert(b && *b);
+        assert(compare);
+
+        return compare((*a)->key, (*b)->key);
+}
+
+int _hashmap_dump_sorted(HashmapBase *h, void ***ret, size_t *ret_n) {
+        _cleanup_free_ struct hashmap_base_entry **entries = NULL;
+        Iterator iter;
+        unsigned idx;
+        size_t n = 0;
+
+        assert(ret);
+
+        if (_hashmap_size(h) == 0) {
+                *ret = NULL;
+                if (ret_n)
+                        *ret_n = 0;
+                return 0;
+        }
+
+        entries = new(struct hashmap_base_entry*, _hashmap_size(h));
+        if (!entries)
+                return -ENOMEM;
+
+        HASHMAP_FOREACH_IDX(idx, h, iter)
+                entries[n++] = bucket_at(h, idx);
+
+        assert(n == _hashmap_size(h));
+
+        typesafe_qsort_r(entries, n, hashmap_entry_compare, h->hash_ops->compare);
+
+        /* Reuse the array. */
+        FOREACH_ARRAY(e, entries, n)
+                *e = entry_value(h, *e);
+
+        *ret = (void**) TAKE_PTR(entries);
+        if (ret_n)
+                *ret_n = n;
+        return 0;
 }

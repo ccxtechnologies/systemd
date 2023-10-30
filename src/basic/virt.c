@@ -16,6 +16,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "macro.h"
+#include "missing_threads.h"
 #include "process-util.h"
 #include "stat-util.h"
 #include "string-table.h"
@@ -50,6 +51,8 @@ static Virtualization detect_vm_cpuid(void) {
                 { "QNXQVMBSQG",   VIRTUALIZATION_QNX       },
                 /* https://projectacrn.org */
                 { "ACRNACRNACRN", VIRTUALIZATION_ACRN      },
+                /* https://www.lockheedmartin.com/en-us/products/Hardened-Security-for-Intel-Processors.html */
+                { "SRESRESRESRE", VIRTUALIZATION_SRE       },
         };
 
         uint32_t eax, ebx, ecx, edx;
@@ -100,6 +103,7 @@ static Virtualization detect_vm_device_tree(void) {
         r = read_one_line_file("/proc/device-tree/hypervisor/compatible", &hvtype);
         if (r == -ENOENT) {
                 _cleanup_closedir_ DIR *dir = NULL;
+                _cleanup_free_ char *compat = NULL;
 
                 if (access("/proc/device-tree/ibm,partition-name", F_OK) == 0 &&
                     access("/proc/device-tree/hmc-managed?", F_OK) == 0 &&
@@ -120,6 +124,14 @@ static Virtualization detect_vm_device_tree(void) {
                                 log_debug("Virtualization QEMU: \"fw-cfg\" present in /proc/device-tree/%s", de->d_name);
                                 return VIRTUALIZATION_QEMU;
                         }
+
+                r = read_one_line_file("/proc/device-tree/compatible", &compat);
+                if (r < 0 && r != -ENOENT)
+                        return r;
+                if (r >= 0 && streq(compat, "qemu,pseries")) {
+                        log_debug("Virtualization %s found in /proc/device-tree/compatible", compat);
+                        return VIRTUALIZATION_QEMU;
+                }
 
                 log_debug("No virtualization found in /proc/device-tree/*");
                 return VIRTUALIZATION_NONE;
@@ -197,7 +209,7 @@ static Virtualization detect_vm_dmi_vendor(void) {
 }
 
 static int detect_vm_smbios(void) {
-        /* The SMBIOS BIOS Charateristics Extension Byte 2 (Section 2.1.2.2 of
+        /* The SMBIOS BIOS Characteristics Extension Byte 2 (Section 2.1.2.2 of
          * https://www.dmtf.org/sites/default/files/standards/documents/DSP0134_3.4.0.pdf), specifies that
          * the 4th bit being set indicates a VM. The BIOS Characteristics table is exposed via the kernel in
          * /sys/firmware/dmi/entries/0-0. Note that in the general case, this bit being unset should not
@@ -252,6 +264,7 @@ static Virtualization detect_vm_dmi(void) {
                          * so we fallback to using the product name which is less restricted
                          * to distinguish metal systems from virtualized instances */
                         _cleanup_free_ char *s = NULL;
+                        const char *e;
 
                         r = read_full_virtual_file("/sys/class/dmi/id/product_name", &s, NULL);
                         /* In EC2, virtualized is much more common than metal, so if for some reason
@@ -261,8 +274,9 @@ static Virtualization detect_vm_dmi(void) {
                                                 " assuming virtualized: %m");
                                 return VIRTUALIZATION_AMAZON;
                         }
-                        if (endswith(truncate_nl(s), ".metal")) {
-                                log_debug("DMI product name ends with '.metal', assuming no virtualization");
+                        e = strstrafter(truncate_nl(s), ".metal");
+                        if (e && IN_SET(*e, 0, '-')) {
+                                log_debug("DMI product name has '.metal', assuming no virtualization");
                                 return VIRTUALIZATION_NONE;
                         } else
                                 return VIRTUALIZATION_AMAZON;
@@ -478,8 +492,6 @@ Virtualization detect_vm(void) {
                         return xen_dom0;
                 if (xen_dom0 == 0)
                         goto finish;
-
-                v = VIRTUALIZATION_NONE;
         } else if (v != VIRTUALIZATION_NONE)
                 assert_not_reached();
 
@@ -776,7 +788,7 @@ translate_name:
                 /* Some images hardcode container=oci, but OCI is not a specific container manager.
                  * Try to detect one based on well-known files. */
                 v = detect_container_files();
-                if (v != VIRTUALIZATION_NONE)
+                if (v == VIRTUALIZATION_NONE)
                         v = VIRTUALIZATION_CONTAINER_OTHER;
                 goto finish;
         }
@@ -867,10 +879,26 @@ int running_in_userns(void) {
 int running_in_chroot(void) {
         int r;
 
+        /* If we're PID1, /proc may not be mounted (and most likely we're not in a chroot). But PID1 will
+         * mount /proc, so all other programs can assume that if /proc is *not* available, we're in some
+         * chroot. */
+
         if (getenv_bool("SYSTEMD_IGNORE_CHROOT") > 0)
                 return 0;
 
-        r = files_same("/proc/1/root", "/", 0);
+        if (getpid_cached() == 1)
+                return false;  /* We're PID 1, we can't be in a chroot. */
+
+        r = inode_same("/proc/1/root", "/", 0);
+        if (r == -ENOENT) {
+                r = proc_mounted();
+                if (r == 0) {
+                        log_debug("/proc is not mounted, assuming we're in a chroot.");
+                        return 1;
+                }
+                if (r > 0)  /* If we have fake /proc/, we can't do the check properly. */
+                        return -ENOSYS;
+        }
         if (r < 0)
                 return r;
 
@@ -1020,6 +1048,7 @@ static const char *const virtualization_table[_VIRTUALIZATION_MAX] = {
         [VIRTUALIZATION_ACRN]            = "acrn",
         [VIRTUALIZATION_POWERVM]         = "powervm",
         [VIRTUALIZATION_APPLE]           = "apple",
+        [VIRTUALIZATION_SRE]             = "sre",
         [VIRTUALIZATION_VM_OTHER]        = "vm-other",
 
         [VIRTUALIZATION_SYSTEMD_NSPAWN]  = "systemd-nspawn",

@@ -3,6 +3,7 @@
 #include "af-list.h"
 #include "alloc-util.h"
 #include "bus-error.h"
+#include "bus-locator.h"
 #include "bus-unit-util.h"
 #include "bus-util.h"
 #include "cap-list.h"
@@ -29,6 +30,7 @@
 #include "mountpoint-util.h"
 #include "nsflags.h"
 #include "numa-util.h"
+#include "open-file.h"
 #include "parse-helpers.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -131,7 +133,7 @@ DEFINE_BUS_APPEND_PARSE_PTR("t", uint64_t, uint64_t, cg_blkio_weight_parse);
 DEFINE_BUS_APPEND_PARSE_PTR("t", uint64_t, uint64_t, cg_cpu_shares_parse);
 DEFINE_BUS_APPEND_PARSE_PTR("t", uint64_t, uint64_t, cg_weight_parse);
 DEFINE_BUS_APPEND_PARSE_PTR("t", uint64_t, uint64_t, cg_cpu_weight_parse);
-DEFINE_BUS_APPEND_PARSE_PTR("t", uint64_t, unsigned long, mount_propagation_flags_from_string);
+DEFINE_BUS_APPEND_PARSE_PTR("t", uint64_t, unsigned long, mount_propagation_flag_from_string);
 DEFINE_BUS_APPEND_PARSE_PTR("t", uint64_t, uint64_t, safe_atou64);
 DEFINE_BUS_APPEND_PARSE_PTR("u", uint32_t, mode_t, parse_mode);
 DEFINE_BUS_APPEND_PARSE_PTR("u", uint32_t, unsigned, safe_atou);
@@ -410,6 +412,23 @@ static int bus_append_exec_command(sd_bus_message *m, const char *field, const c
         return 1;
 }
 
+static int bus_append_open_file(sd_bus_message *m, const char *field, const char *eq) {
+        _cleanup_(open_file_freep) OpenFile *of = NULL;
+        int r;
+
+        assert(m);
+
+        r = open_file_parse(eq, &of);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse OpenFile= setting: %m");
+
+        r = sd_bus_message_append(m, "(sv)", field, "a(sst)", (size_t) 1, of->path, of->fdname, of->flags);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        return 1;
+}
+
 static int bus_append_ip_address_access(sd_bus_message *m, int family, const union in_addr_union *prefix, unsigned char prefixlen) {
         int r;
 
@@ -442,7 +461,9 @@ static int bus_append_cgroup_property(sd_bus_message *m, const char *field, cons
                               "Slice",
                               "ManagedOOMSwap",
                               "ManagedOOMMemoryPressure",
-                              "ManagedOOMPreference"))
+                              "ManagedOOMPreference",
+                              "MemoryPressureWatch",
+                              "DelegateSubgroup"))
                 return bus_append_string(m, field, eq);
 
         if (STR_IN_SET(field, "ManagedOOMMemoryPressureLimit")) {
@@ -523,6 +544,7 @@ static int bus_append_cgroup_property(sd_bus_message *m, const char *field, cons
                               "MemoryHigh",
                               "MemoryMax",
                               "MemorySwapMax",
+                              "MemoryZSwapMax",
                               "MemoryLimit",
                               "TasksMax")) {
 
@@ -894,6 +916,9 @@ static int bus_append_cgroup_property(sd_bus_message *m, const char *field, cons
                 return 1;
         }
 
+        if (streq(field, "MemoryPressureThresholdSec"))
+                return bus_append_parse_sec_rename(m, field, eq);
+
         return 0;
 }
 
@@ -936,7 +961,10 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                               "ProcSubset",
                               "NetworkNamespacePath",
                               "IPCNamespacePath",
-                              "LogNamespace"))
+                              "LogNamespace",
+                              "RootImagePolicy",
+                              "MountImagePolicy",
+                              "ExtensionImagePolicy"))
                 return bus_append_string(m, field, eq);
 
         if (STR_IN_SET(field, "IgnoreSIGPIPE",
@@ -964,7 +992,9 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                               "CPUSchedulingResetOnFork",
                               "LockPersonality",
                               "ProtectHostname",
-                              "RestrictSUIDSGID"))
+                              "MemoryKSM",
+                              "RestrictSUIDSGID",
+                              "RootEphemeral"))
                 return bus_append_parse_boolean(m, field, eq);
 
         if (STR_IN_SET(field, "ReadWriteDirectories",
@@ -1034,7 +1064,7 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                 return bus_append_safe_atou(m, field, eq);
 
         if (streq(field, "MountFlags"))
-                return bus_append_mount_propagation_flags_from_string(m, field, eq);
+                return bus_append_mount_propagation_flag_from_string(m, field, eq);
 
         if (STR_IN_SET(field, "Environment",
                               "UnsetEnvironment",
@@ -1181,6 +1211,17 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                 return 1;
         }
 
+        if (streq(field, "ImportCredential")) {
+                if (isempty(eq))
+                        r = sd_bus_message_append(m, "(sv)", field, "as", 0);
+                else
+                        r = sd_bus_message_append(m, "(sv)", field, "as", 1, eq);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                return 1;
+        }
+
         if (streq(field, "LogExtraFields")) {
                 r = sd_bus_message_open_container(m, 'r', "sv");
                 if (r < 0)
@@ -1211,6 +1252,16 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                         return bus_log_create_error(r);
 
                 r = sd_bus_message_close_container(m);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                return 1;
+        }
+
+        if (streq(field, "LogFilterPatterns")) {
+                r = sd_bus_message_append(m, "(sv)", "LogFilterPatterns", "a(bs)", 1,
+                                          eq[0] != '~',
+                                          eq[0] != '~' ? eq : eq + 1);
                 if (r < 0)
                         return bus_log_create_error(r);
 
@@ -2065,7 +2116,8 @@ static int bus_append_kill_property(sd_bus_message *m, const char *field, const 
         if (STR_IN_SET(field, "KillSignal",
                               "RestartKillSignal",
                               "FinalKillSignal",
-                              "WatchdogSignal"))
+                              "WatchdogSignal",
+                              "ReloadSignal"))
                 return bus_append_signal_from_string(m, field, eq);
 
         return 0;
@@ -2142,6 +2194,9 @@ static int bus_append_scope_property(sd_bus_message *m, const char *field, const
         if (STR_IN_SET(field, "User", "Group"))
                 return bus_append_string(m, field, eq);
 
+        if (streq(field, "OOMPolicy"))
+                return bus_append_string(m, field, eq);
+
         return 0;
 }
 
@@ -2152,13 +2207,15 @@ static int bus_append_service_property(sd_bus_message *m, const char *field, con
                               "Type",
                               "ExitType",
                               "Restart",
+                              "RestartMode",
                               "BusName",
                               "NotifyAccess",
                               "USBFunctionDescriptors",
                               "USBFunctionStrings",
                               "OOMPolicy",
                               "TimeoutStartFailureMode",
-                              "TimeoutStopFailureMode"))
+                              "TimeoutStopFailureMode",
+                              "FileDescriptorStorePreserve"))
                 return bus_append_string(m, field, eq);
 
         if (STR_IN_SET(field, "PermissionsStartOnly",
@@ -2168,6 +2225,7 @@ static int bus_append_service_property(sd_bus_message *m, const char *field, con
                 return bus_append_parse_boolean(m, field, eq);
 
         if (STR_IN_SET(field, "RestartSec",
+                              "RestartMaxDelaySec",
                               "TimeoutStartSec",
                               "TimeoutStopSec",
                               "TimeoutAbortSec",
@@ -2184,7 +2242,8 @@ static int bus_append_service_property(sd_bus_message *m, const char *field, con
                 return bus_append_parse_sec_rename(m, "TimeoutStopSec", eq);
         }
 
-        if (streq(field, "FileDescriptorStoreMax"))
+        if (STR_IN_SET(field, "FileDescriptorStoreMax",
+                              "RestartSteps"))
                 return bus_append_safe_atou(m, field, eq);
 
         if (STR_IN_SET(field, "ExecCondition",
@@ -2285,6 +2344,9 @@ static int bus_append_service_property(sd_bus_message *m, const char *field, con
 
                 return 1;
         }
+
+        if (streq(field, "OpenFile"))
+                return bus_append_open_file(m, field, eq);
 
         return 0;
 }
@@ -2668,14 +2730,13 @@ int bus_append_unit_property_assignment_many(sd_bus_message *m, UnitType t, char
         return 0;
 }
 
-int bus_deserialize_and_dump_unit_file_changes(sd_bus_message *m, bool quiet, InstallChange **changes, size_t *n_changes) {
+int bus_deserialize_and_dump_unit_file_changes(sd_bus_message *m, bool quiet) {
         const char *type, *path, *source;
+        InstallChange *changes = NULL;
+        size_t n_changes = 0;
         int r;
 
-        /* changes is dereferenced when calling install_changes_dump() later,
-         * so we have to make sure this is not NULL. */
-        assert(changes);
-        assert(n_changes);
+        CLEANUP_ARRAY(changes, n_changes, install_changes_free);
 
         r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "(sss)");
         if (r < 0)
@@ -2693,7 +2754,7 @@ int bus_deserialize_and_dump_unit_file_changes(sd_bus_message *m, bool quiet, In
                         continue;
                 }
 
-                r = install_changes_add(changes, n_changes, t, path, source);
+                r = install_changes_add(&changes, &n_changes, t, path, source);
                 if (r < 0)
                         return r;
         }
@@ -2704,7 +2765,8 @@ int bus_deserialize_and_dump_unit_file_changes(sd_bus_message *m, bool quiet, In
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        install_changes_dump(0, NULL, *changes, *n_changes, quiet);
+        install_changes_dump(0, NULL, changes, n_changes, quiet);
+
         return 0;
 }
 
@@ -2717,7 +2779,7 @@ int unit_load_state(sd_bus *bus, const char *name, char **load_state) {
         if (!path)
                 return log_oom();
 
-        /* This function warns on it's own, because otherwise it'd be awkward to pass
+        /* This function warns on its own, because otherwise it'd be awkward to pass
          * the dbus error message around. */
 
         r = sd_bus_get_property_string(
@@ -2749,4 +2811,23 @@ int unit_info_compare(const UnitInfo *a, const UnitInfo *b) {
 
         /* Third, order by name */
         return strcasecmp(a->id, b->id);
+}
+
+int bus_service_manager_reload(sd_bus *bus) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        int r;
+
+        assert(bus);
+
+        r = bus_message_new_method_call(bus, &m, bus_systemd_mgr, "Reload");
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        /* Reloading the daemon may take long, hence set a longer timeout here */
+        r = sd_bus_call(bus, m, DAEMON_RELOAD_TIMEOUT_SEC, &error, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to reload service manager: %s", bus_error_message(&error, r));
+
+        return 0;
 }

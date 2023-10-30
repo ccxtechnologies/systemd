@@ -15,8 +15,8 @@ systemd-cgtop --cpu=percentage
 systemd-cgtop --cpu=time
 systemd-cgtop -P
 systemd-cgtop -k
-# FIXME: https://github.com/systemd/systemd/issues/25248
-#systemd-cgtop --recursive=no
+systemd-cgtop --recursive=no -P
+systemd-cgtop --recursive=no -k
 systemd-cgtop --depth=0
 systemd-cgtop --depth=100
 

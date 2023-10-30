@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: LGPL-2.1-or-later
+# shellcheck disable=SC2016
 set -eux
 set -o pipefail
 
+# shellcheck source=test/units/util.sh
+. "$(dirname "$0")"/util.sh
+
 at_exit() {
     if [[ -v UNIT_NAME && -e "/usr/lib/systemd/system/$UNIT_NAME" ]]; then
-        rm -fv "/usr/lib/systemd/system/$UNIT_NAME"
+        rm -fvr "/usr/lib/systemd/system/$UNIT_NAME" "/etc/systemd/system/$UNIT_NAME.d" "+4"
     fi
+
+    rm -f /etc/init.d/issue-24990
+    return 0
 }
 
 trap at_exit EXIT
@@ -14,7 +21,7 @@ trap at_exit EXIT
 # Create a simple unit file for testing
 # Note: the service file is created under /usr on purpose to test
 #       the 'revert' verb as well
-UNIT_NAME="systemctl-test-$RANDOM.service"
+export UNIT_NAME="systemctl-test-$RANDOM.service"
 cat >"/usr/lib/systemd/system/$UNIT_NAME" <<\EOF
 [Unit]
 Description=systemctl test
@@ -38,7 +45,19 @@ EOF
 mkdir /run/systemd/system-preset/
 echo "disable $UNIT_NAME" >/run/systemd/system-preset/99-systemd-test.preset
 
-systemctl daemon-reload
+EDITOR='true' script -ec 'systemctl edit "$UNIT_NAME"' /dev/null
+[ ! -e "/etc/systemd/system/$UNIT_NAME.d/override.conf" ]
+
+printf '%s\n' '[Service]' 'ExecStart=' 'ExecStart=sleep 10d' >"+4"
+EDITOR='mv' script -ec 'systemctl edit "$UNIT_NAME"' /dev/null
+printf '%s\n' '[Service]' 'ExecStart=' 'ExecStart=sleep 10d' | cmp - "/etc/systemd/system/$UNIT_NAME.d/override.conf"
+
+printf '%b'   '[Service]\n' 'ExecStart=\n' 'ExecStart=sleep 10d' >"+4"
+EDITOR='mv' script -ec 'systemctl edit "$UNIT_NAME"' /dev/null
+printf '%s\n' '[Service]'   'ExecStart='   'ExecStart=sleep 10d' | cmp - "/etc/systemd/system/$UNIT_NAME.d/override.conf"
+
+# Double free when editing a template unit (#26483)
+EDITOR='true' script -ec 'systemctl edit user@0' /dev/null
 
 # Argument help
 systemctl --state help
@@ -71,13 +90,34 @@ systemctl list-sockets --legend=no -a "*journal*"
 systemctl list-sockets --show-types
 systemctl list-sockets --state=listening
 systemctl list-timers -a -l
-systemctl list-unit-files
-systemctl list-unit-files "*journal*"
 systemctl list-jobs
 systemctl list-jobs --after
 systemctl list-jobs --before
 systemctl list-jobs --after --before
 systemctl list-jobs "*"
+systemctl list-dependencies sysinit.target --type=socket,mount
+systemctl list-dependencies multi-user.target --state=active
+systemctl list-dependencies sysinit.target --state=mounted --all
+systemctl list-paths
+systemctl list-paths --legend=no -a "systemd*"
+
+test_list_unit_files() {
+    systemctl list-unit-files "$@"
+    systemctl list-unit-files "$@" "*journal*"
+}
+
+test_list_unit_files
+test_list_unit_files --root=/
+
+# is-* verbs
+# Should return 4 for a missing unit file
+assert_rc 4 systemctl --quiet is-active not-found.service
+assert_rc 4 systemctl --quiet is-failed not-found.service
+assert_rc 4 systemctl --quiet is-enabled not-found.service
+# is-active: return 3 when the unit exists but inactive
+assert_rc 3 systemctl --quiet is-active "$UNIT_NAME"
+# is-enabled: return 1 when the unit exists but disabled
+assert_rc 1 systemctl --quiet is-enabled "$UNIT_NAME"
 
 # Basic service management
 systemctl start --show-transaction "$UNIT_NAME"
@@ -96,45 +136,55 @@ systemctl stop "$UNIT_NAME"
 (! systemctl is-active "$UNIT_NAME")
 
 # enable/disable/preset
-(! systemctl is-enabled "$UNIT_NAME")
-systemctl enable "$UNIT_NAME"
-systemctl is-enabled -l "$UNIT_NAME"
-# We created a preset file for this unit above with a "disable" policy
-systemctl preset "$UNIT_NAME"
-(! systemctl is-enabled "$UNIT_NAME")
-systemctl reenable "$UNIT_NAME"
-systemctl is-enabled "$UNIT_NAME"
-systemctl preset --preset-mode=enable-only "$UNIT_NAME"
-systemctl is-enabled "$UNIT_NAME"
-systemctl preset --preset-mode=disable-only "$UNIT_NAME"
-(! systemctl is-enabled "$UNIT_NAME")
-systemctl enable --runtime "$UNIT_NAME"
-[[ -e "/run/systemd/system/multi-user.target.wants/$UNIT_NAME" ]]
-systemctl is-enabled "$UNIT_NAME"
-systemctl disable "$UNIT_NAME"
-# The unit should be still enabled, as we didn't use the --runtime switch
-systemctl is-enabled "$UNIT_NAME"
-systemctl disable --runtime "$UNIT_NAME"
-(! systemctl is-enabled "$UNIT_NAME")
+test_enable_disable_preset() {
+    (! systemctl is-enabled "$@" "$UNIT_NAME")
+    systemctl enable "$@" "$UNIT_NAME"
+    systemctl is-enabled "$@" -l "$UNIT_NAME"
+    # We created a preset file for this unit above with a "disable" policy
+    systemctl preset "$@" "$UNIT_NAME"
+    (! systemctl is-enabled "$@" "$UNIT_NAME")
+    systemctl reenable "$@" "$UNIT_NAME"
+    systemctl is-enabled "$@" "$UNIT_NAME"
+    systemctl preset "$@" --preset-mode=enable-only "$UNIT_NAME"
+    systemctl is-enabled "$@" "$UNIT_NAME"
+    systemctl preset "$@" --preset-mode=disable-only "$UNIT_NAME"
+    (! systemctl is-enabled "$@" "$UNIT_NAME")
+    systemctl enable "$@" --runtime "$UNIT_NAME"
+    [[ -e "/run/systemd/system/multi-user.target.wants/$UNIT_NAME" ]]
+    systemctl is-enabled "$@" "$UNIT_NAME"
+    systemctl disable "$@" "$UNIT_NAME"
+    # The unit should be still enabled, as we didn't use the --runtime switch
+    systemctl is-enabled "$@" "$UNIT_NAME"
+    systemctl disable "$@" --runtime "$UNIT_NAME"
+    (! systemctl is-enabled "$@" "$UNIT_NAME")
+}
+
+test_enable_disable_preset
+test_enable_disable_preset --root=/
 
 # mask/unmask/revert
-systemctl disable "$UNIT_NAME"
-[[ "$(systemctl is-enabled "$UNIT_NAME")" == disabled ]]
-systemctl mask "$UNIT_NAME"
-[[ "$(systemctl is-enabled "$UNIT_NAME")" == masked ]]
-systemctl unmask "$UNIT_NAME"
-[[ "$(systemctl is-enabled "$UNIT_NAME")" == disabled ]]
-systemctl mask "$UNIT_NAME"
-[[ "$(systemctl is-enabled "$UNIT_NAME")" == masked ]]
-systemctl revert "$UNIT_NAME"
-[[ "$(systemctl is-enabled "$UNIT_NAME")" == disabled ]]
-systemctl mask --runtime "$UNIT_NAME"
-[[ "$(systemctl is-enabled "$UNIT_NAME")" == masked-runtime ]]
-# This should be a no-op without the --runtime switch
-systemctl unmask "$UNIT_NAME"
-[[ "$(systemctl is-enabled "$UNIT_NAME")" == masked-runtime ]]
-systemctl unmask --runtime "$UNIT_NAME"
-[[ "$(systemctl is-enabled "$UNIT_NAME")" == disabled ]]
+test_mask_unmask_revert() {
+    systemctl disable "$@" "$UNIT_NAME"
+    [[ "$(systemctl is-enabled "$@" "$UNIT_NAME")" == disabled ]]
+    systemctl mask "$@" "$UNIT_NAME"
+    [[ "$(systemctl is-enabled "$@" "$UNIT_NAME")" == masked ]]
+    systemctl unmask "$@" "$UNIT_NAME"
+    [[ "$(systemctl is-enabled "$@" "$UNIT_NAME")" == disabled ]]
+    systemctl mask "$@" "$UNIT_NAME"
+    [[ "$(systemctl is-enabled "$@" "$UNIT_NAME")" == masked ]]
+    systemctl revert "$@" "$UNIT_NAME"
+    [[ "$(systemctl is-enabled "$@" "$UNIT_NAME")" == disabled ]]
+    systemctl mask "$@" --runtime "$UNIT_NAME"
+    [[ "$(systemctl is-enabled "$@" "$UNIT_NAME")" == masked-runtime ]]
+    # This should be a no-op without the --runtime switch
+    systemctl unmask "$@" "$UNIT_NAME"
+    [[ "$(systemctl is-enabled "$@" "$UNIT_NAME")" == masked-runtime ]]
+    systemctl unmask "$@" --runtime "$UNIT_NAME"
+    [[ "$(systemctl is-enabled "$@" "$UNIT_NAME")" == disabled ]]
+}
+
+test_mask_unmask_revert
+test_mask_unmask_revert --root=/
 
 # add-wants/add-requires
 (! systemctl show -P Wants "$UNIT_NAME" | grep "systemd-journald.service")
@@ -193,11 +243,16 @@ for value in pretty us µs utc us+utc µs+utc; do
 done
 
 # set-default/get-default
-target="$(systemctl get-default)"
-systemctl set-default emergency.target
-[[ "$(systemctl get-default)" == emergency.target ]]
-systemctl set-default "$target"
-[[ "$(systemctl get-default)" == "$target" ]]
+test_get_set_default() {
+    target="$(systemctl get-default "$@")"
+    systemctl set-default "$@" emergency.target
+    [[ "$(systemctl get-default "$@")" == emergency.target ]]
+    systemctl set-default "$@" "$target"
+    [[ "$(systemctl get-default "$@")" == "$target" ]]
+}
+
+test_get_set_default
+test_get_set_default --root=/
 
 # show/status
 systemctl show --property ""
@@ -211,6 +266,7 @@ systemctl status "systemd-*.timer"
 systemctl status "systemd-journald*.socket"
 systemctl status "sys-devices-*-ttyS0.device"
 systemctl status -- -.mount
+systemctl status 1
 
 # --marked
 systemctl restart "$UNIT_NAME"
@@ -284,6 +340,124 @@ systemctl unset-environment IMPORT_THIS IMPORT_THIS_TOO
 (! systemctl show-environment | grep "^IMPORT_THIS=")
 (! systemctl show-environment | grep "^IMPORT_THIS_TOO=")
 
-echo OK >/testok
+# test for sysv-generator (issue #24990)
+if [[ -x /usr/lib/systemd/system-generators/systemd-sysv-generator ]]; then
+    # This is configurable via -Dsysvinit-path=, but we can't get the value
+    # at runtime, so let's just support the two most common paths for now.
+    [[ -d /etc/rc.d/init.d ]] && SYSVINIT_PATH="/etc/rc.d/init.d" || SYSVINIT_PATH="/etc/init.d"
 
-exit 0
+    # invalid dependency
+    cat >"${SYSVINIT_PATH:?}/issue-24990" <<\EOF
+#!/bin/bash
+
+### BEGIN INIT INFO
+# Provides:test1 test2
+# Required-Start:test1 $remote_fs $network
+# Required-Stop:test1 $remote_fs $network
+# Description:Test
+# Short-Description: Test
+### END INIT INFO
+
+case "$1" in
+    start)
+        echo "Starting issue-24990.service"
+        sleep 1000 &
+        ;;
+    stop)
+        echo "Stopping issue-24990.service"
+        sleep 10 &
+        ;;
+    *)
+        echo "Usage: service test {start|stop|restart|status}"
+        ;;
+esac
+EOF
+
+    chmod +x "$SYSVINIT_PATH/issue-24990"
+    systemctl daemon-reload
+    [[ -L /run/systemd/generator.late/test1.service ]]
+    [[ -L /run/systemd/generator.late/test2.service ]]
+    assert_eq "$(readlink -f /run/systemd/generator.late/test1.service)" "/run/systemd/generator.late/issue-24990.service"
+    assert_eq "$(readlink -f /run/systemd/generator.late/test2.service)" "/run/systemd/generator.late/issue-24990.service"
+    output=$(systemctl cat issue-24990)
+    assert_in "SourcePath=$SYSVINIT_PATH/issue-24990" "$output"
+    assert_in "Description=LSB: Test" "$output"
+    assert_in "After=test1.service" "$output"
+    assert_in "After=remote-fs.target" "$output"
+    assert_in "After=network-online.target" "$output"
+    assert_in "Wants=network-online.target" "$output"
+    assert_in "ExecStart=$SYSVINIT_PATH/issue-24990 start" "$output"
+    assert_in "ExecStop=$SYSVINIT_PATH/issue-24990 stop" "$output"
+    systemctl status issue-24990 || :
+    systemctl show issue-24990
+    assert_not_in "issue-24990.service" "$(systemctl show --property=After --value)"
+    assert_not_in "issue-24990.service" "$(systemctl show --property=Before --value)"
+
+    if ! systemctl is-active network-online.target; then
+        systemctl start network-online.target
+    fi
+
+    systemctl restart issue-24990
+    systemctl stop issue-24990
+
+    # valid dependency
+    cat >"$SYSVINIT_PATH/issue-24990" <<\EOF
+#!/bin/bash
+
+### BEGIN INIT INFO
+# Provides:test1 test2
+# Required-Start:$remote_fs
+# Required-Stop:$remote_fs
+# Description:Test
+# Short-Description: Test
+### END INIT INFO
+
+case "$1" in
+    start)
+        echo "Starting issue-24990.service"
+        sleep 1000 &
+        ;;
+    stop)
+        echo "Stopping issue-24990.service"
+        sleep 10 &
+        ;;
+    *)
+        echo "Usage: service test {start|stop|restart|status}"
+        ;;
+esac
+EOF
+
+    chmod +x "$SYSVINIT_PATH/issue-24990"
+    systemctl daemon-reload
+    [[ -L /run/systemd/generator.late/test1.service ]]
+    [[ -L /run/systemd/generator.late/test2.service ]]
+    assert_eq "$(readlink -f /run/systemd/generator.late/test1.service)" "/run/systemd/generator.late/issue-24990.service"
+    assert_eq "$(readlink -f /run/systemd/generator.late/test2.service)" "/run/systemd/generator.late/issue-24990.service"
+    output=$(systemctl cat issue-24990)
+    assert_in "SourcePath=$SYSVINIT_PATH/issue-24990" "$output"
+    assert_in "Description=LSB: Test" "$output"
+    assert_in "After=remote-fs.target" "$output"
+    assert_in "ExecStart=$SYSVINIT_PATH/issue-24990 start" "$output"
+    assert_in "ExecStop=$SYSVINIT_PATH/issue-24990 stop" "$output"
+    systemctl status issue-24990 || :
+    systemctl show issue-24990
+    assert_not_in "issue-24990.service" "$(systemctl show --property=After --value)"
+    assert_not_in "issue-24990.service" "$(systemctl show --property=Before --value)"
+
+    systemctl restart issue-24990
+    systemctl stop issue-24990
+fi
+
+# %J in WantedBy= causes ABRT (#26467)
+cat >/run/systemd/system/test-WantedBy.service <<EOF
+[Service]
+ExecStart=true
+
+[Install]
+WantedBy=user-%i@%J.service
+EOF
+systemctl daemon-reload
+systemctl enable --now test-WantedBy.service || :
+systemctl daemon-reload
+
+touch /testok

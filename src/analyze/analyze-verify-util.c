@@ -36,12 +36,9 @@ static void log_syntax_callback(const char *unit, int level, void *userdata) {
 }
 
 int verify_prepare_filename(const char *filename, char **ret) {
-        int r;
-        const char *name;
-        _cleanup_free_ char *abspath = NULL;
-        _cleanup_free_ char *dir = NULL;
-        _cleanup_free_ char *with_instance = NULL;
+        _cleanup_free_ char *abspath = NULL, *name = NULL, *dir = NULL, *with_instance = NULL;
         char *c;
+        int r;
 
         assert(filename);
         assert(ret);
@@ -50,7 +47,10 @@ int verify_prepare_filename(const char *filename, char **ret) {
         if (r < 0)
                 return r;
 
-        name = basename(abspath);
+        r = path_extract_filename(abspath, &name);
+        if (r < 0)
+                return r;
+
         if (!unit_name_is_valid(name, UNIT_NAME_ANY))
                 return -EINVAL;
 
@@ -248,7 +248,14 @@ static void set_destroy_ignore_pointer_max(Set** s) {
         set_free_free(*s);
 }
 
-int verify_units(char **filenames, LookupScope scope, bool check_man, bool run_generators, RecursiveErrors recursive_errors, const char *root) {
+int verify_units(
+                char **filenames,
+                RuntimeScope scope,
+                bool check_man,
+                bool run_generators,
+                RecursiveErrors recursive_errors,
+                const char *root) {
+
         const ManagerTestRunFlags flags =
                 MANAGER_TEST_RUN_MINIMAL |
                 MANAGER_TEST_RUN_ENV_GENERATORS |

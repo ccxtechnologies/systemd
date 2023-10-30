@@ -18,7 +18,7 @@
 
 int talk_initctl(char rl) {
 #if HAVE_SYSV_COMPAT
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         const char *path;
         int r;
 
@@ -113,10 +113,11 @@ int enable_sysv_units(const char *verb, char **args) {
 #if HAVE_SYSV_COMPAT
         _cleanup_(lookup_paths_free) LookupPaths paths = {};
         unsigned f = 0;
+        SysVUnitEnableState enable_state = SYSV_UNIT_NOT_FOUND;
 
         /* Processes all SysV units, and reshuffles the array so that afterwards only the native units remain */
 
-        if (arg_scope != LOOKUP_SCOPE_SYSTEM)
+        if (arg_runtime_scope != RUNTIME_SCOPE_SYSTEM)
                 return 0;
 
         if (getenv_bool("SYSTEMCTL_SKIP_SYSV") > 0)
@@ -128,7 +129,7 @@ int enable_sysv_units(const char *verb, char **args) {
                         "is-enabled"))
                 return 0;
 
-        r = lookup_paths_init_or_warn(&paths, arg_scope, LOOKUP_PATHS_EXCLUDE_GENERATED, arg_root);
+        r = lookup_paths_init_or_warn(&paths, arg_runtime_scope, LOOKUP_PATHS_EXCLUDE_GENERATED, arg_root);
         if (r < 0)
                 return r;
 
@@ -158,7 +159,7 @@ int enable_sysv_units(const char *verb, char **args) {
                 if (path_is_absolute(name))
                         continue;
 
-                j = unit_file_exists(arg_scope, &paths, name);
+                j = unit_file_exists(arg_runtime_scope, &paths, name);
                 if (j < 0 && !IN_SET(j, -ELOOP, -ERFKILL, -EADDRNOTAVAIL))
                         return log_error_errno(j, "Failed to look up unit file state: %m");
                 found_native = j != 0;
@@ -226,10 +227,12 @@ int enable_sysv_units(const char *verb, char **args) {
                         if (j == EXIT_SUCCESS) {
                                 if (!arg_quiet)
                                         puts("enabled");
-                                r = 1;
+                                enable_state = SYSV_UNIT_ENABLED;
                         } else {
                                 if (!arg_quiet)
                                         puts("disabled");
+                                if (enable_state != SYSV_UNIT_ENABLED)
+                                        enable_state = SYSV_UNIT_DISABLED;
                         }
 
                 } else if (j != EXIT_SUCCESS)
@@ -245,6 +248,8 @@ int enable_sysv_units(const char *verb, char **args) {
                 strv_remove(args + f, name);
         }
 
+        if (streq(verb, "is-enabled"))
+                return enable_state;
 #endif
         return r;
 }

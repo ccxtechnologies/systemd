@@ -141,7 +141,7 @@ int manager_llmnr_ipv4_udp_fd(Manager *m) {
                 .in.sin_family = AF_INET,
                 .in.sin_port = htobe16(LLMNR_PORT),
         };
-        _cleanup_close_ int s = -1;
+        _cleanup_close_ int s = -EBADF;
         int r;
 
         assert(m);
@@ -211,7 +211,7 @@ int manager_llmnr_ipv6_udp_fd(Manager *m) {
                 .in6.sin6_family = AF_INET6,
                 .in6.sin6_port = htobe16(LLMNR_PORT),
         };
-        _cleanup_close_ int s = -1;
+        _cleanup_close_ int s = -EBADF;
         int r;
 
         assert(m);
@@ -344,7 +344,7 @@ int manager_llmnr_ipv4_tcp_fd(Manager *m) {
                 .in.sin_family = AF_INET,
                 .in.sin_port = htobe16(LLMNR_PORT),
         };
-        _cleanup_close_ int s = -1;
+        _cleanup_close_ int s = -EBADF;
         int r;
 
         assert(m);
@@ -392,7 +392,7 @@ int manager_llmnr_ipv4_tcp_fd(Manager *m) {
                         return log_error_errno(r, "LLMNR-IPv4(TCP): Failed to set SO_REUSEADDR: %m");
         }
 
-        r = listen(s, SOMAXCONN);
+        r = listen(s, SOMAXCONN_DELUXE);
         if (r < 0)
                 return log_error_errno(errno, "LLMNR-IPv4(TCP): Failed to listen the stream: %m");
 
@@ -410,7 +410,7 @@ int manager_llmnr_ipv6_tcp_fd(Manager *m) {
                 .in6.sin6_family = AF_INET6,
                 .in6.sin6_port = htobe16(LLMNR_PORT),
         };
-        _cleanup_close_ int s = -1;
+        _cleanup_close_ int s = -EBADF;
         int r;
 
         assert(m);
@@ -457,7 +457,7 @@ int manager_llmnr_ipv6_tcp_fd(Manager *m) {
                         return log_error_errno(r, "LLMNR-IPv6(TCP): Failed to set SO_REUSEADDR: %m");
         }
 
-        r = listen(s, SOMAXCONN);
+        r = listen(s, SOMAXCONN_DELUXE);
         if (r < 0)
                 return log_error_errno(errno, "LLMNR-IPv6(TCP): Failed to listen the stream: %m");
 

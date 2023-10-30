@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "sd-id128.h"
+
 #include "alloc-util.h"
 #include "all-units.h"
 #include "glob-util.h"
@@ -22,7 +24,6 @@
 #include "unit-printf.h"
 #include "unit.h"
 #include "user-util.h"
-#include "util.h"
 
 static char *runtime_dir = NULL;
 
@@ -241,11 +242,13 @@ TEST_RET(unit_printf, .sd_booted = true) {
                 *user, *group, *uid, *gid, *home, *shell,
                 *tmp_dir, *var_tmp_dir;
         _cleanup_(manager_freep) Manager *m = NULL;
+        _cleanup_close_ int fd = -EBADF;
         Unit *u;
         int r;
 
         _cleanup_(unlink_tempfilep) char filename[] = "/tmp/test-unit_printf.XXXXXX";
-        assert_se(mkostemp_safe(filename) >= 0);
+        fd = mkostemp_safe(filename);
+        assert_se(fd >= 0);
 
         /* Using the specifier functions is admittedly a bit circular, but we don't want to reimplement the
          * logic a second time. We're at least testing that the hookup works. */
@@ -262,7 +265,7 @@ TEST_RET(unit_printf, .sd_booted = true) {
         assert_se(short_hostname);
         assert_se(specifier_pretty_hostname('q', NULL, NULL, NULL, &pretty_hostname) == 0);
         assert_se(pretty_hostname);
-        if (access("/etc/machine-id", F_OK) >= 0) {
+        if (sd_id128_get_machine(NULL) >= 0) {
                 assert_se(specifier_machine_id('m', NULL, NULL, NULL, &machine_id) >= 0);
                 assert_se(machine_id);
         }
@@ -281,7 +284,7 @@ TEST_RET(unit_printf, .sd_booted = true) {
         assert_se(specifier_var_tmp_dir('V', NULL, NULL, NULL, &var_tmp_dir) >= 0);
         assert_se(var_tmp_dir);
 
-        r = manager_new(LOOKUP_SCOPE_USER, MANAGER_TEST_RUN_MINIMAL, &m);
+        r = manager_new(RUNTIME_SCOPE_USER, MANAGER_TEST_RUN_MINIMAL, &m);
         if (manager_errno_skip_test(r))
                 return log_tests_skipped_errno(r, "manager_new");
         assert_se(r == 0);
@@ -580,7 +583,7 @@ TEST(unit_name_to_instance) {
 }
 
 TEST(unit_name_escape) {
-        _cleanup_free_ char *r;
+        _cleanup_free_ char *r = NULL;
 
         r = unit_name_escape("ab+-c.a/bc@foo.service");
         assert_se(r);

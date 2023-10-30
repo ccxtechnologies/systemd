@@ -9,9 +9,10 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include "build.h"
 #include "conf-files.h"
+#include "constants.h"
 #include "creds-util.h"
-#include "def.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -442,7 +443,7 @@ static int parse_argv(int argc, char *argv[]) {
 }
 
 static int run(int argc, char *argv[]) {
-        _cleanup_(ordered_hashmap_freep) OrderedHashmap *sysctl_options = NULL;
+        _cleanup_ordered_hashmap_free_ OrderedHashmap *sysctl_options = NULL;
         int r, k;
 
         r = parse_argv(argc, argv);

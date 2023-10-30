@@ -14,6 +14,8 @@
 #include "sd-resolve.h"
 
 #include "alloc-util.h"
+#include "build.h"
+#include "daemon-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "log.h"
@@ -25,7 +27,6 @@
 #include "set.h"
 #include "socket-util.h"
 #include "string-util.h"
-#include "util.h"
 
 #define BUFFER_SIZE (256 * 1024)
 
@@ -234,15 +235,15 @@ static int traffic_cb(sd_event_source *s, int fd, uint32_t revents, void *userda
                 goto quit;
 
         /* EOF on both sides? */
-        if (c->server_fd == -1 && c->client_fd == -1)
+        if (c->server_fd < 0 && c->client_fd < 0)
                 goto quit;
 
         /* Server closed, and all data written to client? */
-        if (c->server_fd == -1 && c->server_to_client_buffer_full <= 0)
+        if (c->server_fd < 0 && c->server_to_client_buffer_full <= 0)
                 goto quit;
 
         /* Client closed, and all data written to server? */
-        if (c->client_fd == -1 && c->client_to_server_buffer_full <= 0)
+        if (c->client_fd < 0 && c->client_to_server_buffer_full <= 0)
                 goto quit;
 
         r = connection_enable_event_sources(c);
@@ -486,9 +487,9 @@ static int add_connection_socket(Context *context, int fd) {
         *c = (Connection) {
                .context = context,
                .server_fd = fd,
-               .client_fd = -1,
-               .server_to_client_buffer = {-1, -1},
-               .client_to_server_buffer = {-1, -1},
+               .client_fd = -EBADF,
+               .server_to_client_buffer = PIPE_EBADF,
+               .client_to_server_buffer = PIPE_EBADF,
         };
 
         r = set_ensure_put(&context->connections, NULL, c);
@@ -504,7 +505,7 @@ static int add_connection_socket(Context *context, int fd) {
 static int accept_cb(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
         _cleanup_free_ char *peer = NULL;
         Context *context = ASSERT_PTR(userdata);
-        int nfd = -1, r;
+        int nfd = -EBADF, r;
 
         assert(s);
         assert(fd >= 0);
@@ -672,6 +673,7 @@ static int parse_argv(int argc, char *argv[]) {
 
 static int run(int argc, char *argv[]) {
         _cleanup_(context_clear) Context context = {};
+        _unused_ _cleanup_(notify_on_cleanup) const char *notify_stop = NULL;
         int r, n, fd;
 
         log_parse_environment();
@@ -709,6 +711,7 @@ static int run(int argc, char *argv[]) {
                         return r;
         }
 
+        notify_stop = notify_start(NOTIFY_READY, NOTIFY_STOPPING);
         r = sd_event_loop(context.event);
         if (r < 0)
                 return log_error_errno(r, "Failed to run event loop: %m");

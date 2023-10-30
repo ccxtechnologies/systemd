@@ -15,19 +15,19 @@ ConditionCapability=CAP_SYS_ADMIN
 ConditionDirectoryNotEmpty=|/etc/extensions
 ConditionDirectoryNotEmpty=|/run/extensions
 ConditionDirectoryNotEmpty=|/var/lib/extensions
-ConditionDirectoryNotEmpty=|/usr/local/lib/extensions
-ConditionDirectoryNotEmpty=|/usr/lib/extensions
+ConditionDirectoryNotEmpty=|/.extra/sysext
 
 DefaultDependencies=no
 After=local-fs.target
-Before=sysinit.target systemd-tmpfiles.service
+Before=sysinit.target systemd-tmpfiles-setup.service
 Conflicts=shutdown.target initrd-switch-root.target
 Before=shutdown.target initrd-switch-root.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=systemd-sysext merge
+ExecStart=systemd-sysext refresh
+ExecReload=systemd-sysext refresh
 ExecStop=systemd-sysext unmerge
 
 [Install]

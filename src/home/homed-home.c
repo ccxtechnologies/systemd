@@ -11,6 +11,7 @@
 #include "blockdev-util.h"
 #include "btrfs-util.h"
 #include "bus-common-errors.h"
+#include "bus-locator.h"
 #include "data-fd-util.h"
 #include "env-util.h"
 #include "errno-list.h"
@@ -23,12 +24,13 @@
 #include "home-util.h"
 #include "homed-home-bus.h"
 #include "homed-home.h"
+#include "memfd-util.h"
 #include "missing_magic.h"
+#include "missing_mman.h"
 #include "missing_syscall.h"
 #include "mkdir.h"
 #include "path-util.h"
 #include "process-util.h"
-#include "pwquality-util.h"
 #include "quota-util.h"
 #include "resize-fs.h"
 #include "set.h"
@@ -37,7 +39,7 @@
 #include "string-table.h"
 #include "strv.h"
 #include "uid-alloc-range.h"
-#include "user-record-pwquality.h"
+#include "user-record-password-quality.h"
 #include "user-record-sign.h"
 #include "user-record-util.h"
 #include "user-record.h"
@@ -135,11 +137,11 @@ int home_new(Manager *m, UserRecord *hr, const char *sysfs, Home **ret) {
                 .user_name = TAKE_PTR(nm),
                 .uid = hr->uid,
                 .state = _HOME_STATE_INVALID,
-                .worker_stdout_fd = -1,
+                .worker_stdout_fd = -EBADF,
                 .sysfs = TAKE_PTR(ns),
                 .signed_locally = -1,
-                .pin_fd = -1,
-                .luks_lock_fd = -1,
+                .pin_fd = -EBADF,
+                .luks_lock_fd = -EBADF,
         };
 
         r = hashmap_put(m->homes_by_name, home->user_name, home);
@@ -1137,7 +1139,7 @@ static int home_on_worker_process(sd_event_source *s, const siginfo_t *si, void 
 static int home_start_work(Home *h, const char *verb, UserRecord *hr, UserRecord *secret) {
         _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
         _cleanup_(erase_and_freep) char *formatted = NULL;
-        _cleanup_close_ int stdin_fd = -1, stdout_fd = -1;
+        _cleanup_close_ int stdin_fd = -EBADF, stdout_fd = -EBADF;
         pid_t pid = 0;
         int r;
 
@@ -1175,13 +1177,14 @@ static int home_start_work(Home *h, const char *verb, UserRecord *hr, UserRecord
 
         log_debug("Sending to worker: %s", formatted);
 
-        stdout_fd = memfd_create("homework-stdout", MFD_CLOEXEC);
+        stdout_fd = memfd_create_wrapper("homework-stdout", MFD_CLOEXEC | MFD_NOEXEC_SEAL);
         if (stdout_fd < 0)
-                return -errno;
+                return stdout_fd;
 
         r = safe_fork_full("(sd-homework)",
-                           (int[]) { stdin_fd, stdout_fd }, 2,
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_LOG|FORK_REOPEN_LOG, &pid);
+                           (int[]) { stdin_fd, stdout_fd, STDERR_FILENO },
+                           NULL, 0,
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_REARRANGE_STDIO|FORK_LOG|FORK_REOPEN_LOG, &pid);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -1225,13 +1228,6 @@ static int home_start_work(Home *h, const char *verb, UserRecord *hr, UserRecord
                 r = setenv_systemd_exec_pid(true);
                 if (r < 0)
                         log_warning_errno(r, "Failed to update $SYSTEMD_EXEC_PID, ignoring: %m");
-
-                r = rearrange_stdio(TAKE_FD(stdin_fd), TAKE_FD(stdout_fd), STDERR_FILENO); /* fds are invalidated by rearrange_stdio() even on failure */
-                if (r < 0) {
-                        log_error_errno(r, "Failed to rearrange stdin/stdout/stderr: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
 
                 /* Allow overriding the homework path via an environment variable, to make debugging
                  * easier. */
@@ -1496,7 +1492,7 @@ int home_create(Home *h, UserRecord *secret, sd_bus_error *error) {
                 if (IN_SET(t, USER_TEST_MAYBE, USER_TEST_UNDEFINED))
                         break; /* And if the image path test isn't conclusive, let's also go on */
 
-                if (IN_SET(t, -EBADFD, -ENOTDIR))
+                if (IN_SET(t, -EBADF, -ENOTDIR))
                         return sd_bus_error_setf(error, BUS_ERROR_HOME_EXISTS, "Selected home image of user %s already exists or has wrong inode type.", h->user_name);
 
                 return sd_bus_error_setf(error, BUS_ERROR_HOME_EXISTS, "Selected home image of user %s already exists.", h->user_name);
@@ -1516,7 +1512,7 @@ int home_create(Home *h, UserRecord *secret, sd_bus_error *error) {
         if (h->record->enforce_password_policy == false)
                 log_debug("Password quality check turned off for account, skipping.");
         else {
-                r = user_record_quality_check_password(h->record, secret, error);
+                r = user_record_check_password_quality(h->record, secret, error);
                 if (r < 0)
                         return r;
         }
@@ -1891,7 +1887,7 @@ int home_passwd(Home *h,
         if (c->enforce_password_policy == false)
                 log_debug("Password quality check turned off for account, skipping.");
         else {
-                r = user_record_quality_check_password(c, merged_secret, error);
+                r = user_record_check_password_quality(c, merged_secret, error);
                 if (r < 0)
                         return r;
         }
@@ -2121,15 +2117,7 @@ int home_killall(Home *h) {
         if (asprintf(&unit, "user-" UID_FMT ".slice", h->uid) < 0)
                 return log_oom();
 
-        r = sd_bus_call_method(
-                        h->manager->bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "KillUnit",
-                        &error,
-                        NULL,
-                        "ssi", unit, "all", SIGKILL);
+        r = bus_call_method(h->manager->bus, bus_systemd_mgr, "KillUnit", &error, NULL, "ssi", unit, "all", SIGKILL);
         if (r < 0)
                 log_full_errno(sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_UNIT) ? LOG_DEBUG : LOG_WARNING,
                                r, "Failed to kill login processes of user, ignoring: %s", bus_error_message(&error, r));
@@ -2242,7 +2230,7 @@ static int home_get_disk_status_luks(
          * that case the image is pre-allocated and thus appears all used from the host PoV but is not used
          * up at all yet from the user's PoV.
          *
-         * That said, we use use the stat() reported loopback file size as upper boundary: our footprint can
+         * That said, we use the stat() reported loopback file size as upper boundary: our footprint can
          * never be larger than what we take up on the lowest layers. */
 
         if (disk_size != UINT64_MAX && disk_size > disk_free) {
@@ -2630,7 +2618,7 @@ static int on_home_ref_eof(sd_event_source *s, int fd, uint32_t revents, void *u
 }
 
 int home_create_fifo(Home *h, bool please_suspend) {
-        _cleanup_close_ int ret_fd = -1;
+        _cleanup_close_ int ret_fd = -EBADF;
         sd_event_source **ss;
         const char *fn, *suffix;
         int r;
@@ -2648,7 +2636,7 @@ int home_create_fifo(Home *h, bool please_suspend) {
         fn = strjoina("/run/systemd/home/", h->user_name, suffix);
 
         if (!*ss) {
-                _cleanup_close_ int ref_fd = -1;
+                _cleanup_close_ int ref_fd = -EBADF;
 
                 (void) mkdir("/run/systemd/home/", 0755);
                 if (mkfifo(fn, 0600) < 0 && errno != EEXIST)
@@ -2692,8 +2680,6 @@ static int home_dispatch_acquire(Home *h, Operation *o) {
         assert(o);
         assert(o->type == OPERATION_ACQUIRE);
 
-        assert(!h->current_operation);
-
         switch (home_get_state(h)) {
 
         case HOME_UNFIXATED:
@@ -2728,6 +2714,8 @@ static int home_dispatch_acquire(Home *h, Operation *o) {
                  * pending. */
                 return 0;
         }
+
+        assert(!h->current_operation);
 
         r = home_ratelimit(h, &error);
         if (r >= 0)

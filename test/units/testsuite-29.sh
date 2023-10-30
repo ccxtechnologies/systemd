@@ -28,13 +28,11 @@ if [[ -v ASAN_OPTIONS || -v UBSAN_OPTIONS ]]; then
     # With the trusted profile DynamicUser is disabled, so the storage is not in private/
     STATE_DIRECTORY=/var/lib/
 fi
-# Bump the timeout if we're running with plain QEMU
-[[ "$(systemd-detect-virt -v)" == "qemu" ]] && TIMEOUT=60 || TIMEOUT=30
 
 systemd-dissect --no-pager /usr/share/minimal_0.raw | grep -q '✓ portable service'
 systemd-dissect --no-pager /usr/share/minimal_1.raw | grep -q '✓ portable service'
-systemd-dissect --no-pager /usr/share/app0.raw | grep -q '✓ extension for portable service'
-systemd-dissect --no-pager /usr/share/app1.raw | grep -q '✓ extension for portable service'
+systemd-dissect --no-pager /usr/share/app0.raw | grep -q '✓ sysext extension for portable service'
+systemd-dissect --no-pager /usr/share/app1.raw | grep -q '✓ sysext extension for portable service'
 
 export SYSTEMD_LOG_LEVEL=debug
 mkdir -p /run/systemd/system/systemd-portabled.service.d/
@@ -49,9 +47,7 @@ systemctl is-active minimal-app0.service
 systemctl is-active minimal-app0-foo.service
 systemctl is-active minimal-app0-bar.service && exit 1
 
-# Running with sanitizers may freeze the invoked service. See issue #24147.
-# Let's set timeout to improve performance.
-timeout "$TIMEOUT" portablectl "${ARGS[@]}" reattach --now --runtime /usr/share/minimal_1.raw minimal-app0
+portablectl "${ARGS[@]}" reattach --now --runtime /usr/share/minimal_1.raw minimal-app0
 
 systemctl is-active minimal-app0.service
 systemctl is-active minimal-app0-bar.service
@@ -76,7 +72,7 @@ systemctl is-active minimal-app0.service
 systemctl is-active minimal-app0-foo.service
 systemctl is-active minimal-app0-bar.service && exit 1
 
-timeout "$TIMEOUT" portablectl "${ARGS[@]}" reattach --now --enable --runtime /tmp/minimal_1 minimal-app0
+portablectl "${ARGS[@]}" reattach --now --enable --runtime /tmp/minimal_1 minimal-app0
 
 systemctl is-active minimal-app0.service
 systemctl is-active minimal-app0-bar.service
@@ -96,11 +92,19 @@ systemctl is-active app0.service
 status="$(portablectl is-attached --extension app0 minimal_0)"
 [[ "${status}" == "running-runtime" ]]
 
-timeout "$TIMEOUT" portablectl "${ARGS[@]}" reattach --now --runtime --extension /usr/share/app0.raw /usr/share/minimal_1.raw app0
+grep -q -F "LogExtraFields=PORTABLE_ROOT=minimal_0.raw" /run/systemd/system.attached/app0.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_EXTENSION=app0.raw" /run/systemd/system.attached/app0.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_EXTENSION_NAME_AND_VERSION=app" /run/systemd/system.attached/app0.service.d/20-portable.conf
+
+portablectl "${ARGS[@]}" reattach --now --runtime --extension /usr/share/app0.raw /usr/share/minimal_1.raw app0
 
 systemctl is-active app0.service
 status="$(portablectl is-attached --extension app0 minimal_1)"
 [[ "${status}" == "running-runtime" ]]
+
+grep -q -F "LogExtraFields=PORTABLE_ROOT=minimal_1.raw" /run/systemd/system.attached/app0.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_EXTENSION=app0.raw" /run/systemd/system.attached/app0.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_EXTENSION_NAME_AND_VERSION=app" /run/systemd/system.attached/app0.service.d/20-portable.conf
 
 portablectl detach --now --runtime --extension /usr/share/app0.raw /usr/share/minimal_1.raw app0
 
@@ -112,13 +116,13 @@ status="$(portablectl is-attached --extension app1 minimal_0)"
 
 # Ensure that adding or removing a version to the image doesn't break reattaching
 cp /usr/share/app1.raw /tmp/app1_2.raw
-timeout "$TIMEOUT" portablectl "${ARGS[@]}" reattach --now --runtime --extension /tmp/app1_2.raw /usr/share/minimal_1.raw app1
+portablectl "${ARGS[@]}" reattach --now --runtime --extension /tmp/app1_2.raw /usr/share/minimal_1.raw app1
 
 systemctl is-active app1.service
 status="$(portablectl is-attached --extension app1_2 minimal_1)"
 [[ "${status}" == "running-runtime" ]]
 
-timeout "$TIMEOUT" portablectl "${ARGS[@]}" reattach --now --runtime --extension /usr/share/app1.raw /usr/share/minimal_1.raw app1
+portablectl "${ARGS[@]}" reattach --now --runtime --extension /usr/share/app1.raw /usr/share/minimal_1.raw app1
 
 systemctl is-active app1.service
 status="$(portablectl is-attached --extension app1 minimal_1)"
@@ -163,7 +167,7 @@ mount /usr/share/minimal_0.raw /tmp/rootdir
 # Fix up os-release to drop the valid PORTABLE_SERVICES field (because we are
 # bypassing the sysext logic in portabled here it will otherwise not see the
 # extensions additional valid prefix)
-grep -v "^PORTABLE_PREFIXES=" /tmp/rootdir/etc/os-release > /tmp/os-release-fix/etc/os-release
+grep -v "^PORTABLE_PREFIXES=" /tmp/rootdir/etc/os-release >/tmp/os-release-fix/etc/os-release
 
 mount -t overlay overlay -o lowerdir=/tmp/os-release-fix:/tmp/app1:/tmp/rootdir /tmp/overlay
 
@@ -189,6 +193,20 @@ portablectl inspect --cat --extension app0 --extension app1 rootdir app0 app1 | 
 portablectl inspect --cat --extension app0 --extension app1 rootdir app0 app1 | grep -q -f /tmp/app1/usr/lib/systemd/system/app1.service
 portablectl inspect --cat --extension app0 --extension app1 rootdir app0 app1 | grep -q -f /tmp/app0/usr/lib/systemd/system/app0.service
 
+grep -q -F "LogExtraFields=PORTABLE=app0" /run/systemd/system.attached/app0.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_ROOT=rootdir" /run/systemd/system.attached/app0.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_EXTENSION=app0" /run/systemd/system.attached/app0.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_EXTENSION_NAME_AND_VERSION=app" /run/systemd/system.attached/app0.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_EXTENSION=app1" /run/systemd/system.attached/app0.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_EXTENSION_NAME_AND_VERSION=app_1" /run/systemd/system.attached/app0.service.d/20-portable.conf
+
+grep -q -F "LogExtraFields=PORTABLE=app1" /run/systemd/system.attached/app1.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_ROOT=rootdir" /run/systemd/system.attached/app1.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_EXTENSION=app0" /run/systemd/system.attached/app1.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_EXTENSION_NAME_AND_VERSION=app" /run/systemd/system.attached/app1.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_EXTENSION=app1" /run/systemd/system.attached/app1.service.d/20-portable.conf
+grep -q -F "LogExtraFields=PORTABLE_EXTENSION_NAME_AND_VERSION=app_1" /run/systemd/system.attached/app1.service.d/20-portable.conf
+
 portablectl detach --now --runtime --extension /tmp/app0 --extension /tmp/app1 /tmp/rootdir app0 app1
 
 # Attempt to disable the app unit during detaching. Requires --copy=symlink to reproduce.
@@ -213,6 +231,4 @@ touch /tmp/emptyext/usr/lib/extension-release.d/extension-release.emptyext
 res="$(! portablectl attach --extension /tmp/emptyext /tmp/emptyroot 2> >(grep "Remote peer disconnected"))"
 test -z "${res}"
 
-echo OK >/testok
-
-exit 0
+touch /testok

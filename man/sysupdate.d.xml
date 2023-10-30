@@ -71,7 +71,7 @@
       <listitem><para>A file <literal>https://download.example.com/foobarOS_47.root.xz</literal> should be
       downloaded, decompressed and written to a previously unused partition with GPT partition type UUID
       4f68bce3-e8cd-4db1-96e7-fbcaf984b709 for x86-64, as per <ulink
-      url="https://systemd.io/DISCOVERABLE_PARTITIONS">Discoverable Partitions
+      url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable Partitions
       Specification</ulink>.</para></listitem>
 
       <listitem><para>Similarly, a file <literal>https://download.example.com/foobarOS_47.verity.xz</literal>
@@ -80,9 +80,9 @@
       for x86-64 root file systems).</para></listitem>
 
       <listitem><para>Finally, a file <literal>https://download.example.com/foobarOS_47.efi.xz</literal> (a
-      unified kernel, as per <ulink url="https://systemd.io/BOOT_LOADER_SPECIFICATION">Boot Loader
-      Specification</ulink> Type #2) should be downloaded, decompressed and written to the ESP file system,
-      i.e. to <filename>EFI/Linux/foobarOS_47.efi</filename> in the ESP.</para></listitem>
+      unified kernel, as per <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader
+      Specification</ulink> Type #2) should be downloaded, decompressed and written to the $BOOT file system,
+      i.e. to <filename>EFI/Linux/foobarOS_47.efi</filename> in the ESP or XBOOTLDR partition.</para></listitem>
     </orderedlist>
 
     <para>The version-independent generalization of this would be (using the special marker
@@ -98,7 +98,7 @@
       set to <literal>foobarOS_@v_verity</literal>.</para></listitem>
 
       <listitem><para>A transfer of a file <literal>https://download.example.com/foobarOS_@v.efi.xz</literal>
-      → a local file <filename>/efi/EFI/Linux/foobarOS_@v.efi</filename>.</para></listitem>
+      → a local file <filename>$BOOT/EFI/Linux/foobarOS_@v.efi</filename>.</para></listitem>
     </orderedlist>
 
     <para>An update can only complete if the relevant URLs provide their resources for the same version,
@@ -355,27 +355,27 @@
             <entry><literal>@a</literal></entry>
             <entry>GPT partition flag NoAuto</entry>
             <entry>Either <literal>0</literal> or <literal>1</literal></entry>
-            <entry>Controls NoAuto bit of the GPT partition flags, as per <ulink url="https://systemd.io/DISCOVERABLE_PARTITIONS">Discoverable Partitions Specification</ulink>; only relevant if target resource type chosen as <constant>partition</constant></entry>
+            <entry>Controls NoAuto bit of the GPT partition flags, as per <ulink url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable Partitions Specification</ulink>; only relevant if target resource type chosen as <constant>partition</constant></entry>
           </row>
 
           <row>
             <entry><literal>@g</literal></entry>
             <entry>GPT partition flag GrowFileSystem</entry>
             <entry>Either <literal>0</literal> or <literal>1</literal></entry>
-            <entry>Controls GrowFileSystem bit of the GPT partition flags, as per <ulink url="https://systemd.io/DISCOVERABLE_PARTITIONS">Discoverable Partitions Specification</ulink>; only relevant if target resource type chosen as <constant>partition</constant></entry>
+            <entry>Controls GrowFileSystem bit of the GPT partition flags, as per <ulink url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable Partitions Specification</ulink>; only relevant if target resource type chosen as <constant>partition</constant></entry>
           </row>
 
           <row>
             <entry><literal>@r</literal></entry>
             <entry>Read-only flag</entry>
             <entry>Either <literal>0</literal> or <literal>1</literal></entry>
-            <entry>Controls ReadOnly bit of the GPT partition flags, as per <ulink url="https://systemd.io/DISCOVERABLE_PARTITIONS">Discoverable Partitions Specification</ulink> and other output read-only flags, see <varname>ReadOnly=</varname> below</entry>
+            <entry>Controls ReadOnly bit of the GPT partition flags, as per <ulink url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable Partitions Specification</ulink> and other output read-only flags, see <varname>ReadOnly=</varname> below</entry>
           </row>
 
           <row>
             <entry><literal>@t</literal></entry>
             <entry>File modification time</entry>
-            <entry>Formatted decimal integer, µs since UNIX epoch Jan 1st 1970</entry>
+            <entry>Formatted decimal integer, μs since UNIX epoch Jan 1st 1970</entry>
             <entry>Only relevant if target resource type chosen as <constant>regular-file</constant></entry>
           </row>
 
@@ -432,7 +432,7 @@
   <refsect1>
     <title>[Transfer] Section Options</title>
 
-    <para>This section defines general properties of this transfer:</para>
+    <para>This section defines general properties of this transfer.</para>
 
     <variablelist>
       <varlistentry>
@@ -485,7 +485,7 @@
   <refsect1>
     <title>[Source] Section Options</title>
 
-    <para>This section defines properties of the transfer source:</para>
+    <para>This section defines properties of the transfer source.</para>
 
     <variablelist>
       <varlistentry>
@@ -497,7 +497,7 @@
         <constant>subvolume</constant>. For details about the resource types, see above. This option is
         mandatory.</para>
 
-        <para>Note that only some combinations of source and target resource types are supported, see
+        <para>Note that only certain combinations of source and target resource types are supported, see
         above.</para></listitem>
       </varlistentry>
     </variablelist>
@@ -535,7 +535,7 @@
   <refsect1>
     <title>[Target] Section Options</title>
 
-    <para>This section defines properties of the transfer target:</para>
+    <para>This section defines properties of the transfer target.</para>
 
     <variablelist>
       <varlistentry>
@@ -546,7 +546,8 @@
         <constant>subvolume</constant>. For details about the resource types, see above. This option is
         mandatory.</para>
 
-        <para>Note that only some combinations of source and target resource types are supported, see above.</para></listitem>
+        <para>Note that only certain combinations of source and target resource types are supported, see
+        above.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -566,6 +567,23 @@
         a special partition label <literal>_empty</literal> is used to indicate empty partitions. To
         automatically generate suitable partitions on first boot, use a tool such as
         <citerefentry><refentrytitle>systemd-repart</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>PathRelativeTo=</varname></term>
+
+        <listitem><para>Specifies what partition <varname>Path=</varname> should be relative to. Takes one of
+        <constant>root</constant>, <constant>esp</constant>, <constant>xbootldr</constant>, or <constant>boot</constant>.
+        If unspecified, defaults to <constant>root</constant>.</para>
+
+        <para>If set to <constant>boot</constant>, the specified <varname>Path=</varname> will be resolved
+        relative to the mount point of the $BOOT partition (i.e. the ESP or XBOOTLDR), as defined by the
+        <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader
+        Specification</ulink>.</para>
+
+        <para>The values <constant>esp</constant>, <constant>xbootldr</constant>, and
+        <constant>boot</constant> are only supported when <varname>Type=</varname> is set to
+        <constant>regular-file</constant> or <constant>directory</constant>.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -610,7 +628,7 @@
         overall <varname>PartitionFlags=</varname> flags setting and the individual flag settings
         <varname>PartitionNoAuto=</varname> and <varname>PartitionGrowFileSystem=</varname> are used (or the
         wildcards for them), then the latter override the former, i.e. the individual flag bit overrides the
-        overall flags value. See <ulink url="https://systemd.io/DISCOVERABLE_PARTITIONS">Discoverable
+        overall flags value. See <ulink url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable
         Partitions Specification</ulink> for details about these flags.</para>
 
         <para>Note that these settings are not used for matching, they only have effect on newly written
@@ -622,10 +640,10 @@
 
         <listitem><para>Controls whether to mark the resulting file, subvolume or partition read-only. If the
         target type is <constant>partition</constant> this controls the ReadOnly partition flag, as per
-        <ulink url="https://systemd.io/DISCOVERABLE_PARTITIONS">Discoverable Partitions
+        <ulink url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable Partitions
         Specification</ulink>, similar to the <varname>PartitionNoAuto=</varname> and
         <varname>PartitionGrowFileSystem=</varname> flags described above. If the target type is
-        <constant>regular-file</constant>, the writable bit is removed from the access mode. If the the
+        <constant>regular-file</constant>, the writable bit is removed from the access mode. If the
         target type is <constant>subvolume</constant>, the subvolume will be marked read-only as a
         whole. Finally, if the target <varname>Type=</varname> is selected as <constant>directory</constant>,
         the "immutable" file attribute is set, see <citerefentry
@@ -675,7 +693,7 @@
 
         <para>If the target <varname>Type=</varname> is selected as <constant>partition</constant>, the number
         of concurrent versions to keep is additionally restricted by the number of partition slots of the
-        right type in the partition table. i.e. if there are only 2 partition slots for the selected
+        right type in the partition table. I.e. if there are only 2 partition slots for the selected
         partition type, setting this value larger than 2 is without effect, since no more than 2 concurrent
         versions could be stored in the image anyway.</para></listitem>
       </varlistentry>
@@ -819,7 +837,8 @@ MatchPattern=foobarOS_@v.efi.xz
 
 [Target]
 Type=regular-file
-Path=/efi/EFI/Linux
+Path=/EFI/Linux
+PathRelativeTo=boot
 MatchPattern=foobarOS_@v+@l-@d.efi \
              foobarOS_@v+@l.efi \
              foobarOS_@v.efi
@@ -828,12 +847,12 @@ TriesLeft=3
 TriesDone=0
 InstancesMax=2</programlisting></para>
 
-        <para>The above installs a unified kernel image into the ESP (which is mounted to
-        <filename>/efi/</filename>), as per <ulink url="https://systemd.io/BOOT_LOADER_SPECIFICATION">Boot
-        Loader Specification</ulink> Type #2. This defines three possible patterns for the names of the
-        kernel images, as per <ulink url="https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT">Automatic Boot
-        Assessment</ulink>, and ensures when installing new kernels, they are set up with 3 tries left. No
-        more than two parallel kernels are kept.</para>
+        <para>The above installs a unified kernel image into the $BOOT partition, as per
+        <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader
+        Specification</ulink> Type #2. This defines three possible patterns for the names of the kernel
+        images, as per <ulink url="https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT">Automatic Boot Assessment</ulink>,
+        and ensures when installing new kernels, they are set up with 3 tries left. No more than two parallel
+        kernels are kept.</para>
 
         <para>With this setup the web server would serve the following files, for a hypothetical version 7 of
         the OS:</para>

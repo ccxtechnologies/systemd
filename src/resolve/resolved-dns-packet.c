@@ -14,7 +14,6 @@
 #include "strv.h"
 #include "unaligned.h"
 #include "utf8.h"
-#include "util.h"
 
 #define EDNS0_OPT_DO (1<<15)
 
@@ -912,9 +911,9 @@ int dns_packet_append_rr(DnsPacket *p, const DnsResourceRecord *rr, const DnsAns
                 if (r < 0)
                         goto fail;
 
-                /* RFC 2782 states "Unless and until permitted by future standards
-                 * action, name compression is not to be used for this field." */
-                r = dns_packet_append_name(p, rr->srv.name, false, true, NULL);
+                /* RFC 2782 states "Unless and until permitted by future standards action, name compression
+                 * is not to be used for this field." Hence we turn off compression here. */
+                r = dns_packet_append_name(p, rr->srv.name, /* allow_compression= */ false, /* canonical_candidate= */ true, NULL);
                 break;
 
         case DNS_TYPE_PTR:
@@ -1372,13 +1371,13 @@ int dns_packet_read_uint32(DnsPacket *p, uint32_t *ret, size_t *start) {
 }
 
 int dns_packet_read_string(DnsPacket *p, char **ret, size_t *start) {
-        assert(p);
-
         _cleanup_(rewind_dns_packet) DnsPacketRewinder rewinder = REWINDER_INIT(p);
+        _cleanup_free_ char *t = NULL;
         const void *d;
-        char *t;
         uint8_t c;
         int r;
+
+        assert(p);
 
         r = dns_packet_read_uint8(p, &c, NULL);
         if (r < 0)
@@ -1388,19 +1387,14 @@ int dns_packet_read_string(DnsPacket *p, char **ret, size_t *start) {
         if (r < 0)
                 return r;
 
-        if (memchr(d, 0, c))
+        r = make_cstring(d, c, MAKE_CSTRING_REFUSE_TRAILING_NUL, &t);
+        if (r < 0)
+                return r;
+
+        if (!utf8_is_valid(t))
                 return -EBADMSG;
 
-        t = memdup_suffix0(d, c);
-        if (!t)
-                return -ENOMEM;
-
-        if (!utf8_is_valid(t)) {
-                free(t);
-                return -EBADMSG;
-        }
-
-        *ret = t;
+        *ret = TAKE_PTR(t);
 
         if (start)
                 *start = rewinder.saved_rindex;
@@ -1734,7 +1728,13 @@ int dns_packet_read_rr(
                 r = dns_packet_read_uint16(p, &rr->srv.port, NULL);
                 if (r < 0)
                         return r;
-                r = dns_packet_read_name(p, &rr->srv.name, true, NULL);
+
+                /* RFC 2782 states "Unless and until permitted by future standards action, name compression
+                 * is not to be used for this field." Nonetheless, we support it here, in the interest of
+                 * increasing compatibility with implementations that do not implement this correctly. After
+                 * all we didn't do this right once upon a time ourselves (see
+                 * https://github.com/systemd/systemd/issues/9793). */
+                r = dns_packet_read_name(p, &rr->srv.name, /* allow_compression= */ true, NULL);
                 break;
 
         case DNS_TYPE_PTR:

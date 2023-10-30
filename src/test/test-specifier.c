@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-id128.h"
+
 #include "alloc-util.h"
 #include "log.h"
 #include "specifier.h"
@@ -47,7 +49,7 @@ TEST(specifier_escape_strv) {
 static const Specifier specifier_table[] = {
         COMMON_SYSTEM_SPECIFIERS,
 
-        COMMON_CREDS_SPECIFIERS(LOOKUP_SCOPE_USER),
+        COMMON_CREDS_SPECIFIERS(RUNTIME_SCOPE_USER),
         { 'h', specifier_user_home,       NULL },
 
         COMMON_TMP_SPECIFIERS,
@@ -104,7 +106,7 @@ TEST(specifier_real_path) {
         puts(strnull(w));
 
         /* /dev/initctl should normally be a symlink to /run/initctl */
-        if (files_same("/dev/initctl", "/run/initctl", 0) > 0)
+        if (inode_same("/dev/initctl", "/run/initctl", 0) > 0)
                 assert_se(streq(w, "p=/dev/initctl y=/run/initctl Y=/run w=/dev/tty W=/dev"));
 }
 
@@ -136,8 +138,33 @@ TEST(specifiers) {
                 xsprintf(spec, "%%%c", s->specifier);
 
                 r = specifier_printf(spec, SIZE_MAX, specifier_table, NULL, NULL, &resolved);
-                if (s->specifier == 'm' && IN_SET(r, -ENOENT, -ENOMEDIUM)) /* machine-id might be missing in build chroots */
+                if (s->specifier == 'm' && IN_SET(r, -EUNATCH, -ENOMEDIUM, -ENOPKG)) /* machine-id might be missing in build chroots */
                         continue;
+                assert_se(r >= 0);
+
+                log_info("%%%c → %s", s->specifier, resolved);
+        }
+}
+
+/* Bunch of specifiers that are not part of the common lists */
+TEST(specifiers_assorted) {
+        const sd_id128_t id = SD_ID128_ALLF;
+        const uint64_t llu = UINT64_MAX;
+        const Specifier table[] = {
+                /* Used in src/partition/repart.c */
+                { 'a', specifier_uuid,      &id },
+                { 'b', specifier_uint64,    &llu },
+                {}
+        };
+
+        for (const Specifier *s = table; s->specifier; s++) {
+                char spec[3];
+                _cleanup_free_ char *resolved = NULL;
+                int r;
+
+                xsprintf(spec, "%%%c", s->specifier);
+
+                r = specifier_printf(spec, SIZE_MAX, table, NULL, NULL, &resolved);
                 assert_se(r >= 0);
 
                 log_info("%%%c → %s", s->specifier, resolved);

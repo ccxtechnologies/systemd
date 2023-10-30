@@ -9,6 +9,7 @@
 
 #include "af-list.h"
 #include "alloc-util.h"
+#include "build.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
 #include "bus-locator.h"
@@ -32,6 +33,7 @@
 #include "pretty-print.h"
 #include "process-util.h"
 #include "resolvconf-compat.h"
+#include "resolve-util.h"
 #include "resolvectl.h"
 #include "resolved-def.h"
 #include "resolved-dns-packet.h"
@@ -230,6 +232,13 @@ static void print_ifindex_comment(int printed_so_far, int ifindex) {
                ansi_grey(), ifname, ansi_normal());
 }
 
+static int resolve_host_error(const char *name, int r, const sd_bus_error *error) {
+        if (sd_bus_error_has_name(error, BUS_ERROR_DNS_NXDOMAIN))
+                return log_error_errno(r, "%s: %s", name, bus_error_message(error, r));
+
+        return log_error_errno(r, "%s: resolve call failed: %s", name, bus_error_message(error, r));
+}
+
 static int resolve_host(sd_bus *bus, const char *name) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *req = NULL, *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -255,7 +264,7 @@ static int resolve_host(sd_bus *bus, const char *name) {
 
         r = sd_bus_call(bus, req, SD_RESOLVED_QUERY_TIMEOUT_USEC, &error, &reply);
         if (r < 0)
-                return log_error_errno(r, "%s: resolve call failed: %s", name, bus_error_message(&error, r));
+                return resolve_host_error(name, r, &error);
 
         ts = now(CLOCK_MONOTONIC) - ts;
 
@@ -478,7 +487,11 @@ static bool single_label_nonsynthetic(const char *name) {
         if (!dns_name_is_single_label(name))
                 return false;
 
-        if (is_localhost(name) || is_gateway_hostname(name))
+        if (is_localhost(name) ||
+            is_gateway_hostname(name) ||
+            is_outbound_hostname(name) ||
+            is_dns_stub_hostname(name) ||
+            is_dns_proxy_stub_hostname(name))
                 return false;
 
         r = resolve_system_hostname(NULL, &first_label);
@@ -1113,49 +1126,49 @@ static int show_statistics(int argc, char **argv, void *userdata) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        table = table_new("key", "value");
+        table = table_new_vertical();
         if (!table)
                 return log_oom();
-
-        table_set_header(table, false);
 
         r = table_add_many(table,
                            TABLE_STRING, "Transactions",
                            TABLE_SET_COLOR, ansi_highlight(),
+                           TABLE_SET_ALIGN_PERCENT, 0,
                            TABLE_EMPTY,
-                           TABLE_STRING, "Current Transactions:",
+                           TABLE_FIELD, "Current Transactions",
                            TABLE_SET_ALIGN_PERCENT, 100,
                            TABLE_UINT64, n_current_transactions,
-                           TABLE_STRING, "Total Transactions:",
+                           TABLE_SET_ALIGN_PERCENT, 100,
+                           TABLE_FIELD, "Total Transactions",
                            TABLE_UINT64, n_total_transactions,
                            TABLE_EMPTY, TABLE_EMPTY,
                            TABLE_STRING, "Cache",
                            TABLE_SET_COLOR, ansi_highlight(),
                            TABLE_SET_ALIGN_PERCENT, 0,
                            TABLE_EMPTY,
-                           TABLE_STRING, "Current Cache Size:",
+                           TABLE_FIELD, "Current Cache Size",
                            TABLE_SET_ALIGN_PERCENT, 100,
                            TABLE_UINT64, cache_size,
-                           TABLE_STRING, "Cache Hits:",
+                           TABLE_FIELD, "Cache Hits",
                            TABLE_UINT64, n_cache_hit,
-                           TABLE_STRING, "Cache Misses:",
+                           TABLE_FIELD, "Cache Misses",
                            TABLE_UINT64, n_cache_miss,
                            TABLE_EMPTY, TABLE_EMPTY,
                            TABLE_STRING, "DNSSEC Verdicts",
                            TABLE_SET_COLOR, ansi_highlight(),
                            TABLE_SET_ALIGN_PERCENT, 0,
                            TABLE_EMPTY,
-                           TABLE_STRING, "Secure:",
+                           TABLE_FIELD, "Secure",
                            TABLE_SET_ALIGN_PERCENT, 100,
                            TABLE_UINT64, n_dnssec_secure,
-                           TABLE_STRING, "Insecure:",
+                           TABLE_FIELD, "Insecure",
                            TABLE_UINT64, n_dnssec_insecure,
-                           TABLE_STRING, "Bogus:",
+                           TABLE_FIELD, "Bogus",
                            TABLE_UINT64, n_dnssec_bogus,
-                           TABLE_STRING, "Indeterminate:",
+                           TABLE_FIELD, "Indeterminate",
                            TABLE_UINT64, n_dnssec_indeterminate);
         if (r < 0)
-                table_log_add_error(r);
+                return table_log_add_error(r);
 
         r = table_print(table, NULL);
         if (r < 0)
@@ -1200,18 +1213,29 @@ static int reset_server_features(int argc, char **argv, void *userdata) {
         return 0;
 }
 
-static int read_dns_server_one(sd_bus_message *m, bool with_ifindex, bool extended, char **ret) {
+static int read_dns_server_one(
+                sd_bus_message *m,
+                bool with_ifindex,  /* read "ifindex" reply that also carries an interface index */
+                bool extended,      /* read "extended" reply, i.e. with port number and server name */
+                bool only_global,   /* suppress entries with an (non-loopback) ifindex set (i.e. which are specific to some interface) */
+                char **ret) {
+
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_free_ char *pretty = NULL;
-        int ifindex, family, r, k;
         union in_addr_union a;
         const char *name = NULL;
+        int32_t ifindex = 0;
+        int family, r, k;
         uint16_t port = 0;
 
         assert(m);
         assert(ret);
 
-        r = sd_bus_message_enter_container(m, 'r', with_ifindex ? (extended ? "iiayqs" : "iiay") : (extended ? "iayqs" : "iay"));
+        r = sd_bus_message_enter_container(
+                        m,
+                        'r',
+                        with_ifindex ? (extended ? "iiayqs" : "iiay") :
+                                       (extended ? "iayqs" : "iay"));
         if (r <= 0)
                 return r;
 
@@ -1245,8 +1269,8 @@ static int read_dns_server_one(sd_bus_message *m, bool with_ifindex, bool extend
                 return 1;
         }
 
-        if (with_ifindex && ifindex != 0) {
-                /* only show the global ones here */
+        if (only_global && ifindex > 0 && ifindex != LOOPBACK_IFINDEX) {
+                /* This one has an (non-loopback) ifindex set, and we were told to suppress those. Hence do so. */
                 *ret = NULL;
                 return 1;
         }
@@ -1256,7 +1280,6 @@ static int read_dns_server_one(sd_bus_message *m, bool with_ifindex, bool extend
                 return r;
 
         *ret = TAKE_PTR(pretty);
-
         return 1;
 }
 
@@ -1275,7 +1298,7 @@ static int map_link_dns_servers_internal(sd_bus *bus, const char *member, sd_bus
         for (;;) {
                 _cleanup_free_ char *pretty = NULL;
 
-                r = read_dns_server_one(m, false, extended, &pretty);
+                r = read_dns_server_one(m, /* with_ifindex= */ false, extended, /* only_global= */ false, &pretty);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -1308,14 +1331,14 @@ static int map_link_current_dns_server(sd_bus *bus, const char *member, sd_bus_m
         assert(m);
         assert(userdata);
 
-        return read_dns_server_one(m, false, false, userdata);
+        return read_dns_server_one(m, /* with_ifindex= */ false, /* extended= */ false, /* only_global= */ false, userdata);
 }
 
 static int map_link_current_dns_server_ex(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *error, void *userdata) {
         assert(m);
         assert(userdata);
 
-        return read_dns_server_one(m, false, true, userdata);
+        return read_dns_server_one(m, /* with_ifindex= */ false, /* extended= */ true, /* only_global= */ false, userdata);
 }
 
 static int read_domain_one(sd_bus_message *m, bool with_ifindex, char **ret) {
@@ -1475,14 +1498,14 @@ static void global_info_clear(GlobalInfo *p) {
         strv_free(p->ntas);
 }
 
-static int dump_list(Table *table, const char *prefix, char * const *l) {
+static int dump_list(Table *table, const char *field, char * const *l) {
         int r;
 
         if (strv_isempty(l))
                 return 0;
 
         r = table_add_many(table,
-                           TABLE_STRING, prefix,
+                           TABLE_FIELD, field,
                            TABLE_STRV_WRAPPED, l);
         if (r < 0)
                 return table_log_add_error(r);
@@ -1654,15 +1677,13 @@ static int status_ifindex(sd_bus *bus, int ifindex, const char *name, StatusMode
         printf("%sLink %i (%s)%s\n",
                ansi_highlight(), ifindex, name, ansi_normal());
 
-        table = table_new("key", "value");
+        table = table_new_vertical();
         if (!table)
                 return log_oom();
 
-        table_set_header(table, false);
-
         r = table_add_many(table,
-                           TABLE_STRING, "Current Scopes:",
-                           TABLE_SET_ALIGN_PERCENT, 100);
+                           TABLE_FIELD, "Current Scopes",
+                           TABLE_SET_MINIMUM_WIDTH, 19);
         if (r < 0)
                 return table_log_add_error(r);
 
@@ -1694,24 +1715,24 @@ static int status_ifindex(sd_bus *bus, int ifindex, const char *name, StatusMode
                 return log_oom();
 
         r = table_add_many(table,
-                           TABLE_STRING,       "Protocols:",
+                           TABLE_FIELD,       "Protocols",
                            TABLE_STRV_WRAPPED, pstatus);
         if (r < 0)
                 return table_log_add_error(r);
 
         if (link_info.current_dns) {
                 r = table_add_many(table,
-                                   TABLE_STRING, "Current DNS Server:",
+                                   TABLE_FIELD, "Current DNS Server",
                                    TABLE_STRING, link_info.current_dns_ex ?: link_info.current_dns);
                 if (r < 0)
                         return table_log_add_error(r);
         }
 
-        r = dump_list(table, "DNS Servers:", link_info.dns_ex ?: link_info.dns);
+        r = dump_list(table, "DNS Servers", link_info.dns_ex ?: link_info.dns);
         if (r < 0)
                 return r;
 
-        r = dump_list(table, "DNS Domain:", link_info.domains);
+        r = dump_list(table, "DNS Domain", link_info.domains);
         if (r < 0)
                 return r;
 
@@ -1725,7 +1746,14 @@ static int status_ifindex(sd_bus *bus, int ifindex, const char *name, StatusMode
         return 0;
 }
 
-static int map_global_dns_servers_internal(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *error, void *userdata, bool extended) {
+static int map_global_dns_servers_internal(
+                sd_bus *bus,
+                const char *member,
+                sd_bus_message *m,
+                sd_bus_error *error,
+                void *userdata,
+                bool extended) {
+
         char ***l = ASSERT_PTR(userdata);
         int r;
 
@@ -1740,7 +1768,7 @@ static int map_global_dns_servers_internal(sd_bus *bus, const char *member, sd_b
         for (;;) {
                 _cleanup_free_ char *pretty = NULL;
 
-                r = read_dns_server_one(m, true, extended, &pretty);
+                r = read_dns_server_one(m, /* with_ifindex= */ true, extended, /* only_global= */ true, &pretty);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -1762,25 +1790,19 @@ static int map_global_dns_servers_internal(sd_bus *bus, const char *member, sd_b
 }
 
 static int map_global_dns_servers(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *error, void *userdata) {
-        return map_global_dns_servers_internal(bus, member, m, error, userdata, false);
+        return map_global_dns_servers_internal(bus, member, m, error, userdata, /* extended= */ false);
 }
 
 static int map_global_dns_servers_ex(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *error, void *userdata) {
-        return map_global_dns_servers_internal(bus, member, m, error, userdata, true);
+        return map_global_dns_servers_internal(bus, member, m, error, userdata, /* extended= */ true);
 }
 
 static int map_global_current_dns_server(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *error, void *userdata) {
-        assert(m);
-        assert(userdata);
-
-        return read_dns_server_one(m, true, false, userdata);
+        return read_dns_server_one(m, /* with_ifindex= */ true, /* extended= */ false, /* only_global= */ true, userdata);
 }
 
 static int map_global_current_dns_server_ex(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *error, void *userdata) {
-        assert(m);
-        assert(userdata);
-
-        return read_dns_server_one(m, true, true, userdata);
+        return read_dns_server_one(m, /* with_ifindex= */ true, /* extended= */ true, /* only_global= */ true, userdata);
 }
 
 static int map_global_domains(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *error, void *userdata) {
@@ -1900,26 +1922,24 @@ static int status_global(sd_bus *bus, StatusMode mode, bool *empty_line) {
 
         printf("%sGlobal%s\n", ansi_highlight(), ansi_normal());
 
-        table = table_new("key", "value");
+        table = table_new_vertical();
         if (!table)
                 return log_oom();
-
-        table_set_header(table, false);
 
         _cleanup_strv_free_ char **pstatus = global_protocol_status(&global_info);
         if (!pstatus)
                 return log_oom();
 
         r = table_add_many(table,
-                           TABLE_STRING,            "Protocols:",
-                           TABLE_SET_ALIGN_PERCENT, 100,
+                           TABLE_FIELD,            "Protocols",
+                           TABLE_SET_MINIMUM_WIDTH, 19,
                            TABLE_STRV_WRAPPED,      pstatus);
         if (r < 0)
                 return table_log_add_error(r);
 
         if (global_info.resolv_conf_mode) {
                 r = table_add_many(table,
-                                   TABLE_STRING, "resolv.conf mode:",
+                                   TABLE_FIELD, "resolv.conf mode",
                                    TABLE_STRING, global_info.resolv_conf_mode);
                 if (r < 0)
                         return table_log_add_error(r);
@@ -1927,21 +1947,21 @@ static int status_global(sd_bus *bus, StatusMode mode, bool *empty_line) {
 
         if (global_info.current_dns) {
                 r = table_add_many(table,
-                                   TABLE_STRING, "Current DNS Server:",
+                                   TABLE_FIELD, "Current DNS Server",
                                    TABLE_STRING, global_info.current_dns_ex ?: global_info.current_dns);
                 if (r < 0)
                         return table_log_add_error(r);
         }
 
-        r = dump_list(table, "DNS Servers:", global_info.dns_ex ?: global_info.dns);
+        r = dump_list(table, "DNS Servers", global_info.dns_ex ?: global_info.dns);
         if (r < 0)
                 return r;
 
-        r = dump_list(table, "Fallback DNS Servers:", global_info.fallback_dns_ex ?: global_info.fallback_dns);
+        r = dump_list(table, "Fallback DNS Servers", global_info.fallback_dns_ex ?: global_info.fallback_dns);
         if (r < 0)
                 return r;
 
-        r = dump_list(table, "DNS Domain:", global_info.domains);
+        r = dump_list(table, "DNS Domain", global_info.domains);
         if (r < 0)
                 return r;
 
@@ -2276,6 +2296,8 @@ static int verb_default_route(int argc, char **argv, void *userdata) {
 
 static int verb_llmnr(int argc, char **argv, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_free_ char *global_llmnr_support_str = NULL;
+        ResolveSupport global_llmnr_support, llmnr_support;
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
@@ -2290,6 +2312,22 @@ static int verb_llmnr(int argc, char **argv, void *userdata) {
 
         if (argc < 3)
                 return status_ifindex(bus, arg_ifindex, NULL, STATUS_LLMNR, NULL);
+
+        llmnr_support = resolve_support_from_string(argv[2]);
+        if (llmnr_support < 0)
+                return log_error_errno(llmnr_support, "Invalid LLMNR setting: %s", argv[2]);
+
+        r = bus_get_property_string(bus, bus_resolve_mgr, "LLMNR", &error, &global_llmnr_support_str);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get the global LLMNR support state: %s", bus_error_message(&error, r));
+
+        global_llmnr_support = resolve_support_from_string(global_llmnr_support_str);
+        if (global_llmnr_support < 0)
+                return log_error_errno(global_llmnr_support, "Received invalid global LLMNR setting: %s", global_llmnr_support_str);
+
+        if (global_llmnr_support < llmnr_support)
+                log_warning("Setting LLMNR support level \"%s\" for \"%s\", but the global support level is \"%s\".",
+                            argv[2], arg_ifname, global_llmnr_support_str);
 
         r = bus_call_method(bus, bus_resolve_mgr, "SetLinkLLMNR", &error, NULL, "is", arg_ifindex, argv[2]);
         if (r < 0 && sd_bus_error_has_name(&error, BUS_ERROR_LINK_BUSY)) {
@@ -2310,6 +2348,8 @@ static int verb_llmnr(int argc, char **argv, void *userdata) {
 
 static int verb_mdns(int argc, char **argv, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_free_ char *global_mdns_support_str = NULL;
+        ResolveSupport global_mdns_support, mdns_support;
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
@@ -2324,6 +2364,22 @@ static int verb_mdns(int argc, char **argv, void *userdata) {
 
         if (argc < 3)
                 return status_ifindex(bus, arg_ifindex, NULL, STATUS_MDNS, NULL);
+
+        mdns_support = resolve_support_from_string(argv[2]);
+        if (mdns_support < 0)
+                return log_error_errno(mdns_support, "Invalid mDNS setting: %s", argv[2]);
+
+        r = bus_get_property_string(bus, bus_resolve_mgr, "MulticastDNS", &error, &global_mdns_support_str);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get the global mDNS support state: %s", bus_error_message(&error, r));
+
+        global_mdns_support = resolve_support_from_string(global_mdns_support_str);
+        if (global_mdns_support < 0)
+                return log_error_errno(global_mdns_support, "Received invalid global mDNS setting: %s", global_mdns_support_str);
+
+        if (global_mdns_support < mdns_support)
+                log_warning("Setting mDNS support level \"%s\" for \"%s\", but the global support level is \"%s\".",
+                            argv[2], arg_ifname, global_mdns_support_str);
 
         r = bus_call_method(bus, bus_resolve_mgr, "SetLinkMulticastDNS", &error, NULL, "is", arg_ifindex, argv[2]);
         if (r < 0 && sd_bus_error_has_name(&error, BUS_ERROR_LINK_BUSY)) {
@@ -2530,34 +2586,6 @@ static int verb_log_level(int argc, char *argv[], void *userdata) {
         return verb_log_control_common(bus, "org.freedesktop.resolve1", argv[0], argc == 2 ? argv[1] : NULL);
 }
 
-static int monitor_rkey_from_json(JsonVariant *v, DnsResourceKey **ret_key) {
-        _cleanup_(dns_resource_key_unrefp) DnsResourceKey *key = NULL;
-        uint16_t type = 0, class = 0;
-        const char *name = NULL;
-        int r;
-
-        JsonDispatch dispatch_table[] = {
-                { "class", JSON_VARIANT_INTEGER, json_dispatch_uint16,       PTR_TO_SIZE(&class), JSON_MANDATORY },
-                { "type",  JSON_VARIANT_INTEGER, json_dispatch_uint16,       PTR_TO_SIZE(&type),  JSON_MANDATORY },
-                { "name",  JSON_VARIANT_STRING,  json_dispatch_const_string, PTR_TO_SIZE(&name),  JSON_MANDATORY },
-                {}
-        };
-
-        assert(v);
-        assert(ret_key);
-
-        r = json_dispatch(v, dispatch_table, NULL, 0, NULL);
-        if (r < 0)
-                return r;
-
-        key = dns_resource_key_new(class, type, name);
-        if (!key)
-                return -ENOMEM;
-
-        *ret_key = TAKE_PTR(key);
-        return 0;
-}
-
 static int print_question(char prefix, const char *color, JsonVariant *question) {
         JsonVariant *q = NULL;
         int r;
@@ -2568,7 +2596,7 @@ static int print_question(char prefix, const char *color, JsonVariant *question)
                 _cleanup_(dns_resource_key_unrefp) DnsResourceKey *key = NULL;
                 char buf[DNS_RESOURCE_KEY_STRING_MAX];
 
-                r = monitor_rkey_from_json(q, &key);
+                r = dns_resource_key_from_json(q, &key);
                 if (r < 0) {
                         log_warning_errno(r, "Received monitor message with invalid question key, ignoring: %m");
                         continue;
@@ -2751,6 +2779,157 @@ static int verb_monitor(int argc, char *argv[], void *userdata) {
         return c;
 }
 
+static int dump_cache_item(JsonVariant *item) {
+
+        struct item_info {
+                JsonVariant *key;
+                JsonVariant *rrs;
+                const char *type;
+                uint64_t until;
+        } item_info = {};
+
+        static const JsonDispatch dispatch_table[] = {
+                { "key",   JSON_VARIANT_OBJECT,   json_dispatch_variant_noref, offsetof(struct item_info, key),   JSON_MANDATORY },
+                { "rrs",   JSON_VARIANT_ARRAY,    json_dispatch_variant_noref, offsetof(struct item_info, rrs),   0              },
+                { "type",  JSON_VARIANT_STRING,   json_dispatch_const_string,  offsetof(struct item_info, type),  0              },
+                { "until", JSON_VARIANT_UNSIGNED, json_dispatch_uint64,        offsetof(struct item_info, until), 0              },
+                {},
+        };
+
+        _cleanup_(dns_resource_key_unrefp) DnsResourceKey *k = NULL;
+        int r, c = 0;
+
+        r = json_dispatch(item, dispatch_table, NULL, JSON_LOG, &item_info);
+        if (r < 0)
+                return r;
+
+        r = dns_resource_key_from_json(item_info.key, &k);
+        if (r < 0)
+                return log_error_errno(r, "Failed to turn JSON data to resource key: %m");
+
+        if (item_info.type)
+                printf("%s %s%s%s\n", DNS_RESOURCE_KEY_TO_STRING(k), ansi_highlight_red(), item_info.type, ansi_normal());
+        else {
+                JsonVariant *i;
+
+                JSON_VARIANT_ARRAY_FOREACH(i, item_info.rrs) {
+                        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+                        _cleanup_free_ void *data = NULL;
+                        JsonVariant *raw;
+                        size_t size;
+
+                        raw = json_variant_by_key(i, "raw");
+                        if (!raw)
+                                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "raw field missing from RR JSON data.");
+
+                        r = json_variant_unbase64(raw, &data, &size);
+                        if (r < 0)
+                                return log_error_errno(r, "Unable to decode raw RR JSON data: %m");
+
+                        r = dns_resource_record_new_from_raw(&rr, data, size);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse DNS data: %m");
+
+                        printf("%s\n", dns_resource_record_to_string(rr));
+                        c++;
+                }
+        }
+
+        return c;
+}
+
+static int dump_cache_scope(JsonVariant *scope) {
+
+        struct scope_info {
+                const char *protocol;
+                int family;
+                int ifindex;
+                const char *ifname;
+                JsonVariant *cache;
+        } scope_info = {
+                .family = AF_UNSPEC,
+        };
+        JsonVariant *i;
+        int r, c = 0;
+
+        static const JsonDispatch dispatch_table[] = {
+                { "protocol", JSON_VARIANT_STRING,  json_dispatch_const_string,  offsetof(struct scope_info, protocol), JSON_MANDATORY },
+                { "family",   JSON_VARIANT_INTEGER, json_dispatch_int,           offsetof(struct scope_info, family),   0              },
+                { "ifindex",  JSON_VARIANT_INTEGER, json_dispatch_int,           offsetof(struct scope_info, ifindex),  0              },
+                { "ifname",   JSON_VARIANT_STRING,  json_dispatch_const_string,  offsetof(struct scope_info, ifname),   0              },
+                { "cache",    JSON_VARIANT_ARRAY,   json_dispatch_variant_noref, offsetof(struct scope_info, cache),    JSON_MANDATORY },
+                {},
+        };
+
+        r = json_dispatch(scope, dispatch_table, NULL, JSON_LOG, &scope_info);
+        if (r < 0)
+                return r;
+
+        printf("%sScope protocol=%s", ansi_underline(), scope_info.protocol);
+
+        if (scope_info.family != AF_UNSPEC)
+                printf(" family=%s", af_to_name(scope_info.family));
+
+        if (scope_info.ifindex > 0)
+                printf(" ifindex=%i", scope_info.ifindex);
+        if (scope_info.ifname)
+                printf(" ifname=%s", scope_info.ifname);
+
+        printf("%s\n", ansi_normal());
+
+        JSON_VARIANT_ARRAY_FOREACH(i, scope_info.cache) {
+                r = dump_cache_item(i);
+                if (r < 0)
+                        return r;
+
+                c += r;
+        }
+
+        if (c == 0)
+                printf("%sNo entries.%s\n\n", ansi_grey(), ansi_normal());
+        else
+                printf("\n");
+
+        return 0;
+}
+
+static int verb_show_cache(int argc, char *argv[], void *userdata) {
+        JsonVariant *reply = NULL, *d = NULL;
+        _cleanup_(varlink_unrefp) Varlink *vl = NULL;
+        int r;
+
+        r = varlink_connect_address(&vl, "/run/systemd/resolve/io.systemd.Resolve.Monitor");
+        if (r < 0)
+                return log_error_errno(r, "Failed to connect to query monitoring service /run/systemd/resolve/io.systemd.Resolve.Monitor: %m");
+
+        r = varlink_call(vl, "io.systemd.Resolve.Monitor.DumpCache", NULL, &reply, NULL, 0);
+        if (r < 0)
+                return log_error_errno(r, "Failed to issue DumpCache() varlink call: %m");
+
+        d = json_variant_by_key(reply, "dump");
+        if (!d)
+                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
+                                       "DumpCache() response is missing 'dump' key.");
+
+        if (!json_variant_is_array(d))
+                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
+                                       "DumpCache() response 'dump' field not an array");
+
+        if (FLAGS_SET(arg_json_format_flags, JSON_FORMAT_OFF)) {
+                JsonVariant *i;
+
+                JSON_VARIANT_ARRAY_FOREACH(i, d) {
+                        r = dump_cache_scope(i);
+                        if (r < 0)
+                                return r;
+                }
+
+                return 0;
+        }
+
+        return json_variant_dump(d, arg_json_format_flags, NULL, NULL);
+}
+
 static void help_protocol_types(void) {
         if (arg_legend)
                 puts("Known protocol types:");
@@ -2857,6 +3036,7 @@ static int native_help(void) {
                "  flush-caches                 Flush all local DNS caches\n"
                "  reset-server-features        Forget learnt DNS server feature levels\n"
                "  monitor                      Monitor DNS queries\n"
+               "  show-cache                   Show cache contents\n"
                "  dns [LINK [SERVER...]]       Get/set per-interface DNS server address\n"
                "  domain [LINK [DOMAIN...]]    Get/set per-interface search domain\n"
                "  default-route [LINK [BOOL]]  Get/set per-interface default route flag\n"
@@ -2883,6 +3063,7 @@ static int native_help(void) {
                "     --validate=BOOL           Allow DNSSEC validation (default: yes)\n"
                "     --synthesize=BOOL         Allow synthetic response (default: yes)\n"
                "     --cache=BOOL              Allow response from cache (default: yes)\n"
+               "     --stale-data=BOOL         Allow response from cache with stale data (default: yes)\n"
                "     --zone=BOOL               Allow response from locally registered mDNS/LLMNR\n"
                "                               records (default: yes)\n"
                "     --trust-anchor=BOOL       Allow response from local trust anchor (default:\n"
@@ -3242,6 +3423,7 @@ static int native_parse_argv(int argc, char *argv[]) {
                 ARG_SEARCH,
                 ARG_NO_PAGER,
                 ARG_JSON,
+                ARG_STALE_DATA
         };
 
         static const struct option options[] = {
@@ -3265,6 +3447,7 @@ static int native_parse_argv(int argc, char *argv[]) {
                 { "search",                required_argument, NULL, ARG_SEARCH                },
                 { "no-pager",              no_argument,       NULL, ARG_NO_PAGER              },
                 { "json",                  required_argument, NULL, ARG_JSON                  },
+                { "stale-data",            required_argument, NULL, ARG_STALE_DATA            },
                 {}
         };
 
@@ -3402,6 +3585,13 @@ static int native_parse_argv(int argc, char *argv[]) {
                         SET_FLAG(arg_flags, SD_RESOLVED_NO_CACHE, r == 0);
                         break;
 
+                case ARG_STALE_DATA:
+                        r = parse_boolean_argument("--stale-data=", optarg, NULL);
+                        if (r < 0)
+                                return r;
+                        SET_FLAG(arg_flags, SD_RESOLVED_NO_STALE, r == 0);
+                        break;
+
                 case ARG_ZONE:
                         r = parse_boolean_argument("--zone=", optarg, NULL);
                         if (r < 0)
@@ -3503,6 +3693,7 @@ static int native_main(int argc, char *argv[], sd_bus *bus) {
                 { "revert",                VERB_ANY, 2,        0,            verb_revert_link      },
                 { "log-level",             VERB_ANY, 2,        0,            verb_log_level        },
                 { "monitor",               VERB_ANY, 1,        0,            verb_monitor          },
+                { "show-cache",            VERB_ANY, 1,        0,            verb_show_cache       },
                 {}
         };
 

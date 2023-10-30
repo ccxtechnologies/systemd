@@ -29,9 +29,9 @@ trap cleanup EXIT
 
 build_integrity_tab()
 {
-cat << _EOL > "/etc/integritytab"
+cat <<EOF >"/etc/integritytab"
 ${DM_NAME} ${loop} - integrity-algorithm=$1
-_EOL
+EOF
 }
 
 image_dir="$(mktemp -d -t -p / integrity.tmp.XXXXXX)"
@@ -116,4 +116,4 @@ do
     separate_data=0
 done
 
-echo OK >/testok
+touch /testok

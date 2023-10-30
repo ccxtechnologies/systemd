@@ -4,7 +4,7 @@
 
 #include "bootspec-fundamental.h"
 #include "bootspec.h"
-#include "chase-symlinks.h"
+#include "chase.h"
 #include "conf-files.h"
 #include "devnum-util.h"
 #include "dirent-util.h"
@@ -19,6 +19,7 @@
 #include "pretty-print.h"
 #include "recurse-dir.h"
 #include "sort-util.h"
+#include "stat-util.h"
 #include "string-table.h"
 #include "strv.h"
 #include "terminal-util.h"
@@ -32,6 +33,15 @@ static const char* const boot_entry_type_table[_BOOT_ENTRY_TYPE_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP_TO_STRING(boot_entry_type, BootEntryType);
+
+static const char* const boot_entry_type_json_table[_BOOT_ENTRY_TYPE_MAX] = {
+        [BOOT_ENTRY_CONF]        = "type1",
+        [BOOT_ENTRY_UNIFIED]     = "type2",
+        [BOOT_ENTRY_LOADER]      = "loader",
+        [BOOT_ENTRY_LOADER_AUTO] = "auto",
+};
+
+DEFINE_STRING_TABLE_LOOKUP_TO_STRING(boot_entry_type_json, BootEntryType);
 
 static void boot_entry_free(BootEntry *entry) {
         assert(entry);
@@ -379,8 +389,7 @@ static int boot_entry_load_type1(
                         return log_syntax(NULL, LOG_ERR, tmp.path, line, r, "Error while parsing: %m");
         }
 
-        *entry = tmp;
-        tmp = (BootEntry) {};
+        *entry = TAKE_STRUCT(tmp);
         return 0;
 }
 
@@ -418,7 +427,6 @@ void boot_config_free(BootConfig *config) {
         free(config->auto_entries);
         free(config->auto_firmware);
         free(config->console_mode);
-        free(config->random_seed_mode);
         free(config->beep);
 
         free(config->entry_oneshot);
@@ -485,7 +493,7 @@ int boot_loader_read_conf(BootConfig *config, FILE *file, const char *path) {
                 else if (streq(field, "console-mode"))
                         r = free_and_strdup(&config->console_mode, p);
                 else if (streq(field, "random-seed-mode"))
-                        r = free_and_strdup(&config->random_seed_mode, p);
+                        log_syntax(NULL, LOG_WARNING, path, line, 0, "'random-seed-mode' has been deprecated, ignoring.");
                 else if (streq(field, "beep"))
                         r = free_and_strdup(&config->beep, p);
                 else {
@@ -507,7 +515,7 @@ static int boot_loader_read_conf_path(BootConfig *config, const char *root, cons
         assert(config);
         assert(path);
 
-        r = chase_symlinks_and_fopen_unlocked(path, root, CHASE_PREFIX_ROOT, "re", &full, &f);
+        r = chase_and_fopen_unlocked(path, root, CHASE_PREFIX_ROOT|CHASE_PROHIBIT_SYMLINKS, "re", &full, &f);
         if (r == -ENOENT)
                 return 0;
         if (r < 0)
@@ -542,23 +550,6 @@ static int boot_entry_compare(const BootEntry *a, const BootEntry *b) {
 
         return -strverscmp_improved(a->id, b->id);
 }
-
-static void inode_hash_func(const struct stat *q, struct siphash *state) {
-        siphash24_compress(&q->st_dev, sizeof(q->st_dev), state);
-        siphash24_compress(&q->st_ino, sizeof(q->st_ino), state);
-}
-
-static int inode_compare_func(const struct stat *a, const struct stat *b) {
-        int r;
-
-        r = CMP(a->st_dev, b->st_dev);
-        if (r != 0)
-                return r;
-
-        return CMP(a->st_ino, b->st_ino);
-}
-
-DEFINE_HASH_OPS_WITH_KEY_DESTRUCTOR(inode_hash_ops, struct stat, inode_hash_func, inode_compare_func, free);
 
 static int config_check_inode_relevant_and_unseen(BootConfig *config, int fd, const char *fname) {
         _cleanup_free_ char *d = NULL;
@@ -602,14 +593,14 @@ static int boot_entries_find_type1(
 
         _cleanup_free_ DirectoryEntries *dentries = NULL;
         _cleanup_free_ char *full = NULL;
-        _cleanup_close_ int dir_fd = -1;
+        _cleanup_close_ int dir_fd = -EBADF;
         int r;
 
         assert(config);
         assert(root);
         assert(dir);
 
-        dir_fd = chase_symlinks_and_open(dir, root, CHASE_PREFIX_ROOT, O_DIRECTORY|O_CLOEXEC, &full);
+        dir_fd = chase_and_open(dir, root, CHASE_PREFIX_ROOT|CHASE_PROHIBIT_SYMLINKS, O_DIRECTORY|O_CLOEXEC, &full);
         if (dir_fd == -ENOENT)
                 return 0;
         if (dir_fd < 0)
@@ -726,7 +717,7 @@ static int boot_entry_load_unified(
         if (!tmp.root)
                 return log_oom();
 
-        tmp.kernel = strdup(skip_leading_chars(k, "/"));
+        tmp.kernel = path_make_absolute(k, "/");
         if (!tmp.kernel)
                 return log_oom();
 
@@ -740,9 +731,11 @@ static int boot_entry_load_unified(
         if (!tmp.title)
                 return log_oom();
 
-        tmp.sort_key = strdup(good_sort_key);
-        if (!tmp.sort_key)
-                return log_oom();
+        if (good_sort_key) {
+                tmp.sort_key = strdup(good_sort_key);
+                if (!tmp.sort_key)
+                        return log_oom();
+        }
 
         if (good_version) {
                 tmp.version = strdup(good_version);
@@ -750,8 +743,7 @@ static int boot_entry_load_unified(
                         return log_oom();
         }
 
-        *ret = tmp;
-        tmp = (BootEntry) {};
+        *ret = TAKE_STRUCT(tmp);
         return 0;
 }
 
@@ -862,14 +854,14 @@ static int boot_entries_find_unified(
                 const char *root,
                 const char *dir) {
 
-        _cleanup_(closedirp) DIR *d = NULL;
+        _cleanup_closedir_ DIR *d = NULL;
         _cleanup_free_ char *full = NULL;
         int r;
 
         assert(config);
         assert(dir);
 
-        r = chase_symlinks_and_opendir(dir, root, CHASE_PREFIX_ROOT, &full, &d);
+        r = chase_and_opendir(dir, root, CHASE_PREFIX_ROOT|CHASE_PROHIBIT_SYMLINKS, &full, &d);
         if (r == -ENOENT)
                 return 0;
         if (r < 0)
@@ -877,7 +869,7 @@ static int boot_entries_find_unified(
 
         FOREACH_DIRENT(de, d, return log_error_errno(errno, "Failed to read %s: %m", full)) {
                 _cleanup_free_ char *j = NULL, *osrelease = NULL, *cmdline = NULL;
-                _cleanup_close_ int fd = -1;
+                _cleanup_close_ int fd = -EBADF;
 
                 if (!dirent_is_file(de))
                         continue;
@@ -993,6 +985,14 @@ static int boot_config_find(const BootConfig *config, const char *id) {
 
         if (!id)
                 return -1;
+
+        if (id[0] == '@') {
+                if (!strcaseeq(id, "@saved"))
+                        return -1;
+                if (!config->entry_selected)
+                        return -1;
+                id = config->entry_selected;
+        }
 
         for (size_t i = 0; i < config->n_entries; i++)
                 if (fnmatch(id, config->entries[i].id, FNM_CASEFOLD) == 0)
@@ -1276,9 +1276,13 @@ static void boot_entry_file_list(
         assert(p);
         assert(ret_status);
 
-        int status = chase_symlinks_and_access(p, root, CHASE_PREFIX_ROOT, F_OK, NULL, NULL);
+        int status = chase_and_access(p, root, CHASE_PREFIX_ROOT|CHASE_PROHIBIT_SYMLINKS, F_OK, NULL);
 
-        printf("%13s%s ", strempty(field), field ? ":" : " ");
+        /* Note that this shows two '/' between the root and the file. This is intentional to highlight (in
+         * the absence of color support) to the user that the boot loader is only interested in the second
+         * part of the file. */
+        printf("%13s%s %s%s/%s", strempty(field), field ? ":" : " ", ansi_grey(), root, ansi_normal());
+
         if (status < 0) {
                 errno = -status;
                 printf("%s%s%s (%m)\n", ansi_highlight_red(), p, ansi_normal());
@@ -1330,14 +1334,21 @@ int show_boot_entry(
         if (e->id)
                 printf("           id: %s\n", e->id);
         if (e->path) {
-                _cleanup_free_ char *link = NULL;
+                _cleanup_free_ char *text = NULL, *link = NULL;
+
+                const char *p = e->root ? path_startswith(e->path, e->root) : NULL;
+                if (p) {
+                        text = strjoin(ansi_grey(), e->root, "/", ansi_normal(), "/", p);
+                        if (!text)
+                                return log_oom();
+                }
 
                 /* Let's urlify the link to make it easy to view in an editor, but only if it is a text
                  * file. Unified images are binary ELFs, and EFI variables are not pure text either. */
                 if (e->type == BOOT_ENTRY_CONF)
-                        (void) terminal_urlify_path(e->path, NULL, &link);
+                        (void) terminal_urlify_path(e->path, text, &link);
 
-                printf("       source: %s\n", link ?: e->path);
+                printf("       source: %s\n", link ?: text ?: e->path);
         }
         if (e->tries_left != UINT_MAX) {
                 printf("        tries: %u left", e->tries_left);
@@ -1358,6 +1369,8 @@ int show_boot_entry(
                 printf(" architecture: %s\n", e->architecture);
         if (e->kernel)
                 boot_entry_file_list("linux", e->root, e->kernel, &status);
+        if (e->efi)
+                boot_entry_file_list("efi", e->root, e->efi, &status);
 
         STRV_FOREACH(s, e->initrd)
                 boot_entry_file_list(s == e->initrd ? "initrd" : NULL,
@@ -1402,6 +1415,8 @@ int show_boot_entries(const BootConfig *config, JsonFormatFlags json_format) {
         assert(config);
 
         if (!FLAGS_SET(json_format, JSON_FORMAT_OFF)) {
+                _cleanup_(json_variant_unrefp) JsonVariant *array = NULL;
+
                 for (size_t i = 0; i < config->n_entries; i++) {
                         _cleanup_free_ char *opts = NULL;
                         const BootEntry *e = config->entries + i;
@@ -1414,6 +1429,7 @@ int show_boot_entries(const BootConfig *config, JsonFormatFlags json_format) {
                         }
 
                         r = json_append(&v, JSON_BUILD_OBJECT(
+                                                       JSON_BUILD_PAIR("type", JSON_BUILD_STRING(boot_entry_type_json_to_string(e->type))),
                                                        JSON_BUILD_PAIR_CONDITION(e->id, "id", JSON_BUILD_STRING(e->id)),
                                                        JSON_BUILD_PAIR_CONDITION(e->path, "path", JSON_BUILD_STRING(e->path)),
                                                        JSON_BUILD_PAIR_CONDITION(e->root, "root", JSON_BUILD_STRING(e->root)),
@@ -1436,13 +1452,21 @@ int show_boot_entries(const BootConfig *config, JsonFormatFlags json_format) {
                          * arguments and trigger false positive warnings. Let's not add too many json objects
                          * at once. */
                         r = json_append(&v, JSON_BUILD_OBJECT(
+                                                       JSON_BUILD_PAIR("isReported", JSON_BUILD_BOOLEAN(e->reported_by_loader)),
                                                        JSON_BUILD_PAIR_CONDITION(e->tries_left != UINT_MAX, "triesLeft", JSON_BUILD_UNSIGNED(e->tries_left)),
-                                                       JSON_BUILD_PAIR_CONDITION(e->tries_done != UINT_MAX, "triesDone", JSON_BUILD_UNSIGNED(e->tries_done))));
+                                                       JSON_BUILD_PAIR_CONDITION(e->tries_done != UINT_MAX, "triesDone", JSON_BUILD_UNSIGNED(e->tries_done)),
+                                                       JSON_BUILD_PAIR_CONDITION(config->default_entry >= 0, "isDefault", JSON_BUILD_BOOLEAN(i == (size_t) config->default_entry)),
+                                                       JSON_BUILD_PAIR_CONDITION(config->selected_entry >= 0, "isSelected", JSON_BUILD_BOOLEAN(i == (size_t) config->selected_entry))));
+
                         if (r < 0)
                                 return log_oom();
 
-                        json_variant_dump(v, json_format, stdout, NULL);
+                        r = json_variant_append_array(&array, v);
+                        if (r < 0)
+                                return log_oom();
                 }
+
+                json_variant_dump(array, json_format | JSON_FORMAT_EMPTY_ARRAY, NULL, NULL);
 
         } else {
                 for (size_t n = 0; n < config->n_entries; n++) {

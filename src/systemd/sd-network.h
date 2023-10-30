@@ -119,6 +119,9 @@ int sd_network_link_get_activation_policy(int ifindex, char **ret);
 /* Get path to .network file applied to link */
 int sd_network_link_get_network_file(int ifindex, char **ret);
 
+/* Get paths to .network file dropins applied to link */
+int sd_network_link_get_network_file_dropins(int ifindex, char ***ret);
+
 /* Get DNS entries for a given link. These are string representations of
  * IP addresses */
 int sd_network_link_get_dns(int ifindex, char ***ret);
@@ -130,6 +133,9 @@ int sd_network_link_get_ntp(int ifindex, char ***ret);
 /* Get SIP entries for a given link. These are string
  * representations of IP addresses */
 int sd_network_link_get_sip(int ifindex, char ***ret);
+
+/* Get the captive portal address for a given link. */
+int sd_network_link_get_captive_portal(int ifindex, char **ret);
 
 /* Indicates whether or not LLMNR should be enabled for the link
  * Possible levels of support: yes, no, resolve

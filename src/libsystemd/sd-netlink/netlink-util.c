@@ -3,7 +3,6 @@
 #include "sd-netlink.h"
 
 #include "fd-util.h"
-#include "format-util.h"
 #include "io-util.h"
 #include "memory-util.h"
 #include "netlink-internal.h"
@@ -12,35 +11,15 @@
 #include "process-util.h"
 #include "strv.h"
 
-int rtnl_set_link_name(sd_netlink **rtnl, int ifindex, const char *name) {
+static int set_link_name(sd_netlink **rtnl, int ifindex, const char *name) {
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
-        _cleanup_strv_free_ char **alternative_names = NULL;
-        char old_name[IF_NAMESIZE] = {};
         int r;
 
         assert(rtnl);
         assert(ifindex > 0);
         assert(name);
 
-        if (!ifname_valid(name))
-                return -EINVAL;
-
-        r = rtnl_get_link_alternative_names(rtnl, ifindex, &alternative_names);
-        if (r < 0)
-                log_debug_errno(r, "Failed to get alternative names on network interface %i, ignoring: %m",
-                                ifindex);
-
-        if (strv_contains(alternative_names, name)) {
-                r = rtnl_delete_link_alternative_names(rtnl, ifindex, STRV_MAKE(name));
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to remove '%s' from alternative names on network interface %i: %m",
-                                               name, ifindex);
-
-                r = format_ifname(ifindex, old_name);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to get current name of network interface %i: %m", ifindex);
-        }
-
+        /* Assign the requested name. */
         r = sd_rtnl_message_new_link(*rtnl, &message, RTM_SETLINK, ifindex);
         if (r < 0)
                 return r;
@@ -49,18 +28,88 @@ int rtnl_set_link_name(sd_netlink **rtnl, int ifindex, const char *name) {
         if (r < 0)
                 return r;
 
-        r = sd_netlink_call(*rtnl, message, 0, NULL);
-        if (r < 0)
-                return r;
+        return sd_netlink_call(*rtnl, message, 0, NULL);
+}
 
-        if (!isempty(old_name)) {
-                r = rtnl_set_link_alternative_names(rtnl, ifindex, STRV_MAKE(old_name));
+int rtnl_set_link_name(sd_netlink **rtnl, int ifindex, const char *name, char* const *alternative_names) {
+        _cleanup_strv_free_ char **original_altnames = NULL, **new_altnames = NULL;
+        bool altname_deleted = false;
+        int r;
+
+        assert(rtnl);
+        assert(ifindex > 0);
+
+        if (isempty(name) && strv_isempty(alternative_names))
+                return 0;
+
+        if (name && !ifname_valid(name))
+                return -EINVAL;
+
+        /* If the requested name is already assigned as an alternative name, then first drop it. */
+        r = rtnl_get_link_alternative_names(rtnl, ifindex, &original_altnames);
+        if (r < 0)
+                log_debug_errno(r, "Failed to get alternative names on network interface %i, ignoring: %m",
+                                ifindex);
+
+        if (name) {
+                if (strv_contains(original_altnames, name)) {
+                        r = rtnl_delete_link_alternative_names(rtnl, ifindex, STRV_MAKE(name));
+                        if (r < 0)
+                                return log_debug_errno(r, "Failed to remove '%s' from alternative names on network interface %i: %m",
+                                                       name, ifindex);
+
+                        altname_deleted = true;
+                }
+
+                r = set_link_name(rtnl, ifindex, name);
                 if (r < 0)
-                        log_debug_errno(r, "Failed to set '%s' as an alternative name on network interface %i, ignoring: %m",
-                                        old_name, ifindex);
+                        goto fail;
         }
 
+        /* Filter out already assigned names from requested alternative names. Also, dedup the request. */
+        STRV_FOREACH(a, alternative_names) {
+                if (streq_ptr(name, *a))
+                        continue;
+
+                if (strv_contains(original_altnames, *a))
+                        continue;
+
+                if (strv_contains(new_altnames, *a))
+                        continue;
+
+                if (!ifname_valid_full(*a, IFNAME_VALID_ALTERNATIVE))
+                        continue;
+
+                r = strv_extend(&new_altnames, *a);
+                if (r < 0)
+                        return r;
+        }
+
+        strv_sort(new_altnames);
+
+        /* Finally, assign alternative names. */
+        r = rtnl_set_link_alternative_names(rtnl, ifindex, new_altnames);
+        if (r == -EEXIST) /* Already assigned to another interface? */
+                STRV_FOREACH(a, new_altnames) {
+                        r = rtnl_set_link_alternative_names(rtnl, ifindex, STRV_MAKE(*a));
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to assign '%s' as an alternative name on network interface %i, ignoring: %m",
+                                                *a, ifindex);
+                }
+        else if (r < 0)
+                log_debug_errno(r, "Failed to assign alternative names on network interface %i, ignoring: %m", ifindex);
+
         return 0;
+
+fail:
+        if (altname_deleted) {
+                int q = rtnl_set_link_alternative_names(rtnl, ifindex, STRV_MAKE(name));
+                if (q < 0)
+                        log_debug_errno(q, "Failed to restore '%s' as an alternative name on network interface %i, ignoring: %m",
+                                        name, ifindex);
+        }
+
+        return r;
 }
 
 int rtnl_set_link_properties(
@@ -658,7 +707,7 @@ static int socket_open(int family) {
 }
 
 int netlink_open_family(sd_netlink **ret, int family) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         int r;
 
         fd = socket_open(family);
@@ -671,6 +720,15 @@ int netlink_open_family(sd_netlink **ret, int family) {
         TAKE_FD(fd);
 
         return 0;
+}
+
+static bool serial_used(sd_netlink *nl, uint32_t serial) {
+        assert(nl);
+
+        return
+                hashmap_contains(nl->reply_callbacks, UINT32_TO_PTR(serial)) ||
+                hashmap_contains(nl->rqueue_by_serial, UINT32_TO_PTR(serial)) ||
+                hashmap_contains(nl->rqueue_partial_by_serial, UINT32_TO_PTR(serial));
 }
 
 void netlink_seal_message(sd_netlink *nl, sd_netlink_message *m) {
@@ -689,7 +747,7 @@ void netlink_seal_message(sd_netlink *nl, sd_netlink_message *m) {
                    such messages */
                 nl->serial = nl->serial == UINT32_MAX ? 1 : nl->serial + 1;
 
-        } while (hashmap_contains(nl->reply_callbacks, UINT32_TO_PTR(picked)));
+        } while (serial_used(nl, picked));
 
         m->hdr->nlmsg_seq = picked;
         message_seal(m);

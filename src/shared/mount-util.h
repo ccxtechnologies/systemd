@@ -11,41 +11,13 @@
 #include "errno-util.h"
 #include "macro.h"
 
-/* The limit used for /dev itself. 4MB should be enough since device nodes and symlinks don't
- * consume any space and udev isn't supposed to create regular file either. There's no limit on the
- * max number of inodes since such limit is hard to guess especially on large storage array
- * systems. */
-#define TMPFS_LIMITS_DEV             ",size=4m"
-
-/* The limit used for /dev in private namespaces. 4MB for contents of regular files. The number of
- * inodes should be relatively low in private namespaces but for now use a 64k limit. */
-#define TMPFS_LIMITS_PRIVATE_DEV     ",size=4m,nr_inodes=64k"
-
-/* Very little, if any use expected */
-#define TMPFS_LIMITS_EMPTY_OR_ALMOST ",size=4m,nr_inodes=1k"
-#define TMPFS_LIMITS_SYS             TMPFS_LIMITS_EMPTY_OR_ALMOST
-#define TMPFS_LIMITS_SYS_FS_CGROUP   TMPFS_LIMITS_EMPTY_OR_ALMOST
-
-/* On an extremely small device with only 256MB of RAM, 20% of RAM should be enough for the re-execution of
- * PID1 because 16MB of free space is required. */
-#define TMPFS_LIMITS_RUN             ",size=20%,nr_inodes=800k"
-
-/* The limit used for various nested tmpfs mounts, in particular for guests started by systemd-nspawn.
- * 10% of RAM (using 16GB of RAM as a baseline) translates to 400k inodes (assuming 4k each) and 25%
- * translates to 1M inodes.
- * (On the host, /tmp is configured through a .mount unit file.) */
-#define NESTED_TMPFS_LIMITS          ",size=10%,nr_inodes=400k"
-
-/* More space for volatile root and /var */
-#define TMPFS_LIMITS_VAR             ",size=25%,nr_inodes=1m"
-#define TMPFS_LIMITS_ROOTFS          TMPFS_LIMITS_VAR
-#define TMPFS_LIMITS_VOLATILE_STATE  TMPFS_LIMITS_VAR
-
-int mount_fd(const char *source, int target_fd, const char *filesystemtype, unsigned long mountflags, const void *data);
-int mount_nofollow(const char *source, const char *target, const char *filesystemtype, unsigned long mountflags, const void *data);
-
 int repeat_unmount(const char *path, int flags);
-int umount_recursive(const char *target, int flags);
+
+int umount_recursive_full(const char *target, int flags, char **keep);
+
+static inline int umount_recursive(const char *target, int flags) {
+        return umount_recursive_full(target, flags, NULL);
+}
 
 int bind_remount_recursive_with_mountinfo(const char *prefix, unsigned long new_flags, unsigned long flags_mask, char **deny_list, FILE *proc_self_mountinfo);
 static inline int bind_remount_recursive(const char *prefix, unsigned long new_flags, unsigned long flags_mask, char **deny_list) {
@@ -54,7 +26,10 @@ static inline int bind_remount_recursive(const char *prefix, unsigned long new_f
 
 int bind_remount_one_with_mountinfo(const char *path, unsigned long new_flags, unsigned long flags_mask, FILE *proc_self_mountinfo);
 
-int mount_move_root(const char *path);
+int mount_switch_root_full(const char *path, unsigned long mount_propagation_flag, bool force_ms_move);
+static inline int mount_switch_root(const char *path, unsigned long mount_propagation_flag) {
+        return mount_switch_root_full(path, mount_propagation_flag, false);
+}
 
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(FILE*, endmntent, NULL);
 #define _cleanup_endmntent_ _cleanup_(endmntentp)
@@ -113,10 +88,19 @@ static inline char* umount_and_rmdir_and_free(char *p) {
 }
 DEFINE_TRIVIAL_CLEANUP_FUNC(char*, umount_and_rmdir_and_free);
 
+static inline char *umount_and_free(char *p) {
+        PROTECT_ERRNO;
+        if (p)
+                (void) umount_recursive(p, 0);
+        return mfree(p);
+}
+DEFINE_TRIVIAL_CLEANUP_FUNC(char*, umount_and_free);
+
 int bind_mount_in_namespace(pid_t target, const char *propagate_path, const char *incoming_path, const char *src, const char *dest, bool read_only, bool make_file_or_directory);
-int mount_image_in_namespace(pid_t target, const char *propagate_path, const char *incoming_path, const char *src, const char *dest, bool read_only, bool make_file_or_directory, const MountOptions *options);
+int mount_image_in_namespace(pid_t target, const char *propagate_path, const char *incoming_path, const char *src, const char *dest, bool read_only, bool make_file_or_directory, const MountOptions *options, const ImagePolicy *image_policy);
 
 int make_mount_point(const char *path);
+int fd_make_mount_point(int fd);
 
 typedef enum RemountIdmapping {
         REMOUNT_IDMAPPING_NONE,
@@ -136,8 +120,27 @@ typedef enum RemountIdmapping {
         _REMOUNT_IDMAPPING_INVALID = -EINVAL,
 } RemountIdmapping;
 
+int make_userns(uid_t uid_shift, uid_t uid_range, uid_t owner, RemountIdmapping idmapping);
+int remount_idmap_fd(const char *p, int userns_fd);
 int remount_idmap(const char *p, uid_t uid_shift, uid_t uid_range, uid_t owner, RemountIdmapping idmapping);
+
+int remount_and_move_sub_mounts(
+                const char *what,
+                const char *where,
+                const char *type,
+                unsigned long flags,
+                const char *options);
+int remount_sysfs(const char *where);
+
+int bind_mount_submounts(
+                const char *source,
+                const char *target);
 
 /* Creates a mount point (not parents) based on the source path or stat - ie, a file or a directory */
 int make_mount_point_inode_from_stat(const struct stat *st, const char *dest, mode_t mode);
 int make_mount_point_inode_from_path(const char *source, const char *dest, mode_t mode);
+
+int trigger_automount_at(int dir_fd, const char *path);
+
+unsigned long credentials_fs_mount_flags(bool ro);
+int mount_credentials_fs(const char *path, size_t size, bool ro);

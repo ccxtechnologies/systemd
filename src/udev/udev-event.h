@@ -12,7 +12,6 @@
 #include "macro.h"
 #include "udev-rules.h"
 #include "udev-util.h"
-#include "util.h"
 
 #define READ_END  0
 #define WRITE_END 1
@@ -23,6 +22,7 @@ typedef struct UdevEvent {
         sd_device *dev_parent;
         sd_device *dev_db_clone;
         char *name;
+        char **altnames;
         char *program_result;
         mode_t mode;
         uid_t uid;
@@ -76,7 +76,6 @@ int udev_event_execute_rules(
                 Hashmap *properties_list,
                 UdevRules *rules);
 void udev_event_execute_run(UdevEvent *event, usec_t timeout_usec, int timeout_signal);
-void udev_event_process_inotify_watch(UdevEvent *event, int inotify_fd);
 
 static inline usec_t udev_warn_timeout(usec_t timeout_usec) {
         return DIV_ROUND_UP(timeout_usec, 3);

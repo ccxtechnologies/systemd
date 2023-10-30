@@ -2,7 +2,6 @@
 
 udevadm_sources = files(
         'udevadm.c',
-        'udevadm.h',
         'udevadm-control.c',
         'udevadm-hwdb.c',
         'udevadm-info.c',
@@ -13,24 +12,18 @@ udevadm_sources = files(
         'udevadm-test-builtin.c',
         'udevadm-trigger.c',
         'udevadm-util.c',
-        'udevadm-util.h',
+        'udevadm-verify.c',
         'udevadm-wait.c',
         'udevd.c',
 )
 
 libudevd_core_sources = files(
         'udev-ctrl.c',
-        'udev-ctrl.h',
         'udev-event.c',
-        'udev-event.h',
         'udev-node.c',
-        'udev-node.h',
         'udev-rules.c',
-        'udev-rules.h',
         'udev-watch.c',
-        'udev-watch.h',
         'udev-builtin.c',
-        'udev-builtin.h',
         'udev-builtin-btrfs.c',
         'udev-builtin-hwdb.c',
         'udev-builtin-input_id.c',
@@ -40,7 +33,6 @@ libudevd_core_sources = files(
         'udev-builtin-path_id.c',
         'udev-builtin-usb_id.c',
         'net/link-config.c',
-        'net/link-config.h',
 )
 
 if conf.get('HAVE_KMOD') == 1
@@ -116,21 +108,19 @@ libudevd_core = static_library(
         include_directories : udev_includes,
         link_with : udev_link_with,
         dependencies : [libblkid,
-                        libkmod],
+                        libkmod,
+                        userspace],
         build_by_default : false)
 
 udev_progs = [['ata_id/ata_id.c'],
               ['cdrom_id/cdrom_id.c'],
               ['fido_id/fido_id.c',
-               'fido_id/fido_id_desc.c',
-               'fido_id/fido_id_desc.h'],
+               'fido_id/fido_id_desc.c'],
+              ['iocost/iocost.c'],
               ['scsi_id/scsi_id.c',
-               'scsi_id/scsi_id.h',
-               'scsi_id/scsi_serial.c',
-               'scsi_id/scsi.h'],
+               'scsi_id/scsi_serial.c'],
               ['v4l_id/v4l_id.c'],
               ['mtd_probe/mtd_probe.c',
-               'mtd_probe/mtd_probe.h',
                'mtd_probe/probe_smartmedia.c']]
 
 dmi_arches = ['x86', 'x86_64', 'aarch64', 'arm', 'ia64', 'loongarch64', 'mips']
@@ -140,32 +130,37 @@ endif
 
 udev_prog_paths = {}
 foreach prog : udev_progs
-        name = prog[0].split('/')[0]
+        name = fs.stem(prog[0])
 
         exe = executable(
                 name,
                 prog,
                 include_directories : includes,
-                dependencies : versiondep,
+                dependencies : [userspace,
+                                versiondep],
                 link_with : udev_link_with,
                 install_rpath : udev_rpath,
                 install : true,
                 install_dir : udevlibexecdir)
 
         udev_prog_paths += {name : exe}
+        public_programs += exe
 endforeach
 
 if install_sysconfdir_samples
         install_data('udev.conf',
                      install_dir : sysconfdir / 'udev')
+        install_data('iocost/iocost.conf',
+                     install_dir : sysconfdir / 'udev')
 endif
 
-custom_target(
+udev_pc = custom_target(
         'udev.pc',
         input : 'udev.pc.in',
         output : 'udev.pc',
         command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
         install : pkgconfigdatadir != 'no',
+        install_tag : 'devel',
         install_dir : pkgconfigdatadir)
 
 if install_sysconfdir
@@ -173,45 +168,55 @@ if install_sysconfdir
                                  mkdir_p.format(sysconfdir / 'udev/rules.d'))
 endif
 
+simple_fuzzers += files(
+        'fuzz-udev-rule-parse-value.c',
+)
+
+fuzzer_udev_base = {
+        'link_with' : [libudevd_core, libshared],
+        'dependencies' : [threads, libacl],
+}
+
 fuzzers += [
-        [files('net/fuzz-link-parser.c'),
-         [libudevd_core,
-          libshared],
-         [threads,
-          libacl],
-         udev_includes],
-
-        [files('fuzz-udev-rules.c'),
-         [libudevd_core,
-          libshared],
-         [threads,
-          libacl]],
-
-        [files('fuzz-udev-rule-parse-value.c')],
-
-        [files('fido_id/fuzz-fido-id-desc.c',
-               'fido_id/fido_id_desc.c')],
+        {
+                'sources' : files('net/fuzz-link-parser.c'),
+                'includes' : udev_includes,
+                'base' : fuzzer_udev_base,
+        },
+        {
+                'sources' : files('fuzz-udev-rules.c'),
+                'base' : fuzzer_udev_base,
+        },
+        {
+                'sources' : files(
+                        'fido_id/fuzz-fido-id-desc.c',
+                        'fido_id/fido_id_desc.c',
+                ),
+        },
 ]
 
+test_libudev_base = {
+        'link_with' : [libudevd_core, libshared],
+        'dependencies' : [threads, libacl],
+}
+
 tests += [
-        [files('test-udev-event.c'),
-         [libudevd_core,
-          libshared],
-         [threads,
-          libacl]],
-
-        [files('test-udev-node.c'),
-         [libudevd_core,
-          libshared],
-         [threads,
-          libacl]],
-
-        [files('test-udev-builtin.c'),
-         [libudevd_core,
-          libshared],
-         [threads,
-          libacl]],
-
-        [files('fido_id/test-fido-id-desc.c',
-               'fido_id/fido_id_desc.c')],
+        {
+                'sources' : files(
+                        'fido_id/test-fido-id-desc.c',
+                        'fido_id/fido_id_desc.c',
+                ),
+        },
+        {
+                'sources' : files('test-udev-builtin.c'),
+                'base' : test_libudev_base,
+        },
+        {
+                'sources' : files('test-udev-event.c'),
+                'base' : test_libudev_base,
+        },
+        {
+                'sources' : files('test-udev-node.c'),
+                'base' : test_libudev_base,
+        },
 ]

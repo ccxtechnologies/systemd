@@ -22,11 +22,26 @@
 #define ALPHANUMERICAL      LETTERS DIGITS
 #define HEXDIGITS           DIGITS "abcdefABCDEF"
 #define LOWERCASE_HEXDIGITS DIGITS "abcdef"
+#define URI_RESERVED        ":/?#[]@!$&'()*+;="         /* [RFC3986] */
+#define URI_UNRESERVED      ALPHANUMERICAL "-._~"       /* [RFC3986] */
+#define URI_VALID           URI_RESERVED URI_UNRESERVED /* [RFC3986] */
 
 static inline char* strstr_ptr(const char *haystack, const char *needle) {
         if (!haystack || !needle)
                 return NULL;
         return strstr(haystack, needle);
+}
+
+static inline char *strstrafter(const char *haystack, const char *needle) {
+        char *p;
+
+        /* Returns NULL if not found, or pointer to first character after needle if found */
+
+        p = strstr_ptr(haystack, needle);
+        if (!p)
+                return NULL;
+
+        return p + strlen(needle);
 }
 
 static inline const char* strnull(const char *s) {
@@ -53,9 +68,13 @@ static inline const char* enable_disable(bool b) {
         return b ? "enable" : "disable";
 }
 
-static inline const char *empty_to_null(const char *p) {
-        return isempty(p) ? NULL : p;
-}
+/* This macro's return pointer will have the "const" qualifier set or unset the same way as the input
+ * pointer. */
+#define empty_to_null(p)                                \
+        ({                                              \
+                const char *_p = (p);                   \
+                (typeof(p)) (isempty(_p) ? NULL : _p);  \
+        })
 
 static inline const char *empty_to_na(const char *p) {
         return isempty(p) ? "n/a" : p;
@@ -74,6 +93,11 @@ static inline bool empty_or_dash(const char *str) {
 static inline const char *empty_or_dash_to_null(const char *p) {
         return empty_or_dash(p) ? NULL : p;
 }
+#define empty_or_dash_to_null(p)                                \
+        ({                                                      \
+                const char *_p = (p);                           \
+                (typeof(p)) (empty_or_dash(_p) ? NULL : _p);    \
+        })
 
 char *first_word(const char *s, const char *word) _pure_;
 
@@ -100,7 +124,10 @@ char *strjoin_real(const char *x, ...) _sentinel_;
 char *strstrip(char *s);
 char *delete_chars(char *s, const char *bad);
 char *delete_trailing_chars(char *s, const char *bad);
-char *truncate_nl(char *s);
+char *truncate_nl_full(char *s, size_t *ret_len);
+static inline char *truncate_nl(char *s) {
+        return truncate_nl_full(s, NULL);
+}
 
 static inline char *skip_leading_chars(const char *s, const char *bad) {
         if (!s)
@@ -161,6 +188,8 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]);
 char *strextend_with_separator_internal(char **x, const char *separator, ...) _sentinel_;
 #define strextend_with_separator(x, separator, ...) strextend_with_separator_internal(x, separator, __VA_ARGS__, NULL)
 #define strextend(x, ...) strextend_with_separator_internal(x, NULL, __VA_ARGS__, NULL)
+
+char *strextendn(char **x, const char *s, size_t l);
 
 int strextendf_with_separator(char **x, const char *separator, const char *format, ...) _printf_(3,4);
 #define strextendf(x, ...) strextendf_with_separator(x, NULL, __VA_ARGS__)
@@ -230,4 +259,28 @@ bool streq_skip_trailing_chars(const char *s1, const char *s2, const char *ok);
 
 char *string_replace_char(char *str, char old_char, char new_char);
 
+typedef enum MakeCStringMode {
+        MAKE_CSTRING_REFUSE_TRAILING_NUL,
+        MAKE_CSTRING_ALLOW_TRAILING_NUL,
+        MAKE_CSTRING_REQUIRE_TRAILING_NUL,
+        _MAKE_CSTRING_MODE_MAX,
+        _MAKE_CSTRING_MODE_INVALID = -1,
+} MakeCStringMode;
+
+int make_cstring(const char *s, size_t n, MakeCStringMode mode, char **ret);
+
 size_t strspn_from_end(const char *str, const char *accept);
+
+char *strdupspn(const char *a, const char *accept);
+char *strdupcspn(const char *a, const char *reject);
+
+char *find_line_startswith(const char *haystack, const char *needle);
+
+char *startswith_strv(const char *string, char **strv);
+
+#define STARTSWITH_SET(p, ...)                                  \
+        startswith_strv(p, STRV_MAKE(__VA_ARGS__))
+
+bool version_is_valid(const char *s);
+
+bool version_is_valid_versionspec(const char *s);

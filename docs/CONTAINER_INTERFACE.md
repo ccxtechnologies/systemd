@@ -138,15 +138,16 @@ manager, please consider supporting the following interfaces.
    `$container_host_version_id=10`
 
 5. systemd supports passing immutable binary data blobs with limited size and
-   restricted access to services via the `LoadCredential=` and `SetCredential=`
-   settings. The same protocol may be used to pass credentials from the
-   container manager to systemd itself. The credential data should be placed in
-   some location (ideally a read-only and non-swappable file system, like
-   'ramfs'), and the absolute path to this directory exported in the
+   restricted access to services via the `ImportCredential=`, `LoadCredential=`
+   and `SetCredential=` settings. The same protocol may be used to pass credentials
+   from the container manager to systemd itself. The credential data should be
+   placed in some location (ideally a read-only and non-swappable file system,
+   like 'ramfs'), and the absolute path to this directory exported in the
    `$CREDENTIALS_DIRECTORY` environment variable. If the container managers
    does this, the credentials passed to the service manager can be propagated
-   to services via `LoadCredential=` (see ...). The container manager can
-   choose any path, but `/run/host/credentials` is recommended.
+   to services via `LoadCredential=` or `ImportCredential=` (see ...). The
+   container manager can choose any path, but `/run/host/credentials` is
+   recommended.
 
 ## Advanced Integration
 
@@ -170,7 +171,7 @@ manager, please consider supporting the following interfaces.
    `SIGRTMIN+3` like this, this might confuse other init systems.
 
 4. To support [Socket Activated
-   Containers](http://0pointer.de/blog/projects/socket-activated-containers.html)
+   Containers](https://0pointer.de/blog/projects/socket-activated-containers.html)
    the container manager should be capable of being run as a systemd
    service. It will then receive the sockets starting with FD 3, the number of
    passed FDs in `$LISTEN_FDS` and its PID as `$LISTEN_PID`. It should take
@@ -181,9 +182,9 @@ manager, please consider supporting the following interfaces.
    activation work. The protocol to hand sockets from systemd to services is
    hence the same as from the container manager to the container systemd. For
    further details see the explanations of
-   [sd_listen_fds(1)](http://0pointer.de/public/systemd-man/sd_listen_fds.html)
+   [sd_listen_fds(1)](https://0pointer.de/public/systemd-man/sd_listen_fds.html)
    and the [blog story for service
-   developers](http://0pointer.de/blog/projects/socket-activation.html).
+   developers](https://0pointer.de/blog/projects/socket-activation.html).
 
 5. Container managers should stay away from the cgroup hierarchy outside of the
    unit they created for their container. That's private property of systemd,
@@ -210,7 +211,7 @@ manager, please consider supporting the following interfaces.
    container name the external side `ve-` + the container name.
 
 3. It is recommended to configure stable MAC addresses for container `veth`
-   devices, for example hashed out of the container names. That way it is more
+   devices, for example, hashed out of the container names. That way it is more
    likely that DHCP and IPv4LL will acquire stable addresses.
 
 ## The `/run/host/` Hierarchy
@@ -298,9 +299,9 @@ care should be taken to avoid naming conflicts. `systemd` (and in particular
    you cannot link them to each other.
 
 4. Do not pretend that the real VTs are available in the container. The VT
-   subsystem consists of all the devices `/dev/tty*`, `/dev/vcs*`, `/dev/vcsa*`
-   plus their `sysfs` counterparts. They speak specific `ioctl()`s and
-   understand specific escape sequences, that other ptys don't understand.
+   subsystem consists of all the devices `/dev/tty[0-9]*`, `/dev/vcs*`,
+   `/dev/vcsa*` plus their `sysfs` counterparts. They speak specific `ioctl()`s
+   and understand specific escape sequences, that other ptys don't understand.
    Hence, it is explicitly not OK to mount a pty to `/dev/tty1`, `/dev/tty2`,
    `/dev/tty3`. This is explicitly not supported.
 
@@ -389,7 +390,7 @@ everybody. However, that's a systemd-specific interface and other init systems
 are unlikely to do the same.
 
 Note that it is our intention to make systemd systems work flawlessly and
-out-of-the-box in containers. In fact we are interested to ensure that the same
+out-of-the-box in containers. In fact, we are interested to ensure that the same
 OS image can be booted on a bare system, in a VM and in a container, and behave
 correctly each time. If you notice that some component in systemd does not work
 in a container as it should, even though the container manager implements

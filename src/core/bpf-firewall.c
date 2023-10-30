@@ -70,7 +70,7 @@ static int add_lookup_instructions(
         }
 
         do {
-                /* Compare IPv4 with one word instruction (32bit) */
+                /* Compare IPv4 with one word instruction (32-bit) */
                 struct bpf_insn insn[] = {
                         /* If skb->protocol != ETH_P_IP, skip this whole block. The offset will be set later. */
                         BPF_JMP_IMM(BPF_JNE, BPF_REG_7, htobe16(protocol), 0),
@@ -411,7 +411,7 @@ static int bpf_firewall_prepare_access_maps(
                 int *ret_ipv6_map_fd,
                 bool *ret_has_any) {
 
-        _cleanup_close_ int ipv4_map_fd = -1, ipv6_map_fd = -1;
+        _cleanup_close_ int ipv4_map_fd = -EBADF, ipv6_map_fd = -EBADF;
         size_t n_ipv4 = 0, n_ipv6 = 0;
         Unit *p;
         int r;
@@ -451,7 +451,9 @@ static int bpf_firewall_prepare_access_maps(
         }
 
         if (n_ipv4 > 0) {
+                char *name = strjoina("4_", u->id);
                 ipv4_map_fd = bpf_map_new(
+                                name,
                                 BPF_MAP_TYPE_LPM_TRIE,
                                 offsetof(struct bpf_lpm_trie_key, data) + sizeof(uint32_t),
                                 sizeof(uint64_t),
@@ -462,7 +464,9 @@ static int bpf_firewall_prepare_access_maps(
         }
 
         if (n_ipv6 > 0) {
+                char *name = strjoina("6_", u->id);
                 ipv6_map_fd = bpf_map_new(
+                                name,
                                 BPF_MAP_TYPE_LPM_TRIE,
                                 offsetof(struct bpf_lpm_trie_key, data) + sizeof(uint32_t)*4,
                                 sizeof(uint64_t),
@@ -500,7 +504,8 @@ static int bpf_firewall_prepare_accounting_maps(Unit *u, bool enabled, int *fd_i
 
         if (enabled) {
                 if (*fd_ingress < 0) {
-                        r = bpf_map_new(BPF_MAP_TYPE_ARRAY, sizeof(int), sizeof(uint64_t), 2, 0);
+                        char *name = strjoina("I_", u->id);
+                        r = bpf_map_new(name, BPF_MAP_TYPE_ARRAY, sizeof(int), sizeof(uint64_t), 2, 0);
                         if (r < 0)
                                 return r;
 
@@ -508,8 +513,8 @@ static int bpf_firewall_prepare_accounting_maps(Unit *u, bool enabled, int *fd_i
                 }
 
                 if (*fd_egress < 0) {
-
-                        r = bpf_map_new(BPF_MAP_TYPE_ARRAY, sizeof(int), sizeof(uint64_t), 2, 0);
+                        char *name = strjoina("E_", u->id);
+                        r = bpf_map_new(name, BPF_MAP_TYPE_ARRAY, sizeof(int), sizeof(uint64_t), 2, 0);
                         if (r < 0)
                                 return r;
 
@@ -874,8 +879,8 @@ int bpf_firewall_supported(void) {
         // Ideally it should behave like GCC, so that we can remove these workarounds.
         zero(attr);
         attr.attach_type = BPF_CGROUP_INET_EGRESS;
-        attr.target_fd = -1;
-        attr.attach_bpf_fd = -1;
+        attr.target_fd = -EBADF;
+        attr.attach_bpf_fd = -EBADF;
 
         if (bpf(BPF_PROG_DETACH, &attr, sizeof(attr)) < 0) {
                 if (errno != EBADF) {
@@ -902,8 +907,8 @@ int bpf_firewall_supported(void) {
 
         zero(attr);
         attr.attach_type = BPF_CGROUP_INET_EGRESS;
-        attr.target_fd = -1;
-        attr.attach_bpf_fd = -1;
+        attr.target_fd = -EBADF;
+        attr.attach_bpf_fd = -EBADF;
         attr.attach_flags = BPF_F_ALLOW_MULTI;
 
         if (bpf(BPF_PROG_ATTACH, &attr, sizeof(attr)) < 0) {

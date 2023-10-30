@@ -18,10 +18,9 @@
 #include "string-util.h"
 #include "strv.h"
 #include "user-util.h"
-#include "util.h"
 
 static int chown_cgroup_path(const char *path, uid_t uid_shift) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         fd = open(path, O_RDONLY|O_CLOEXEC|O_DIRECTORY);
         if (fd < 0)
@@ -142,9 +141,9 @@ finish:
 }
 
 int create_subcgroup(pid_t pid, bool keep_unit, CGroupUnified unified_requested) {
-        _cleanup_free_ char *cgroup = NULL;
+        _cleanup_free_ char *cgroup = NULL, *payload = NULL;
         CGroupMask supported;
-        const char *payload;
+        char *e;
         int r;
 
         assert(pid > 1);
@@ -175,15 +174,26 @@ int create_subcgroup(pid_t pid, bool keep_unit, CGroupUnified unified_requested)
         if (r < 0)
                 return log_error_errno(r, "Failed to get our control group: %m");
 
-        payload = strjoina(cgroup, "/payload");
+        /* If the service manager already placed us in the supervisor cgroup, let's handle that. */
+        e = endswith(cgroup, "/supervisor");
+        if (e)
+                *e = 0; /* chop off, we want the main path delegated to us */
+
+        payload = path_join(cgroup, "payload");
+        if (!payload)
+                return log_oom();
+
         r = cg_create_and_attach(SYSTEMD_CGROUP_CONTROLLER, payload, pid);
         if (r < 0)
                 return log_error_errno(r, "Failed to create %s subcgroup: %m", payload);
 
         if (keep_unit) {
-                const char *supervisor;
+                _cleanup_free_ char *supervisor = NULL;
 
-                supervisor = strjoina(cgroup, "/supervisor");
+                supervisor = path_join(cgroup, "supervisor");
+                if (!supervisor)
+                        return log_oom();
+
                 r = cg_create_and_attach(SYSTEMD_CGROUP_CONTROLLER, supervisor, 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to create %s subcgroup: %m", supervisor);
@@ -318,7 +328,7 @@ static int mount_legacy_cgns_supported(
                  * uid/gid as seen from e.g. /proc/1/mountinfo. So we simply
                  * pass uid 0 and not uid_shift to tmpfs_patch_options().
                  */
-                r = tmpfs_patch_options("mode=755" TMPFS_LIMITS_SYS_FS_CGROUP, 0, selinux_apifs_context, &options);
+                r = tmpfs_patch_options("mode=0755" TMPFS_LIMITS_SYS_FS_CGROUP, 0, selinux_apifs_context, &options);
                 if (r < 0)
                         return log_oom();
 
@@ -391,7 +401,8 @@ skip_controllers:
 
         if (!userns)
                 return mount_nofollow_verbose(LOG_ERR, NULL, cgroup_root, NULL,
-                                              MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME|MS_RDONLY, "mode=755");
+                                              MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME|MS_RDONLY,
+                                              "mode=0755");
 
         return 0;
 }
@@ -420,7 +431,10 @@ static int mount_legacy_cgns_unsupported(
         if (r == 0) {
                 _cleanup_free_ char *options = NULL;
 
-                r = tmpfs_patch_options("mode=755" TMPFS_LIMITS_SYS_FS_CGROUP, uid_shift == 0 ? UID_INVALID : uid_shift, selinux_apifs_context, &options);
+                r = tmpfs_patch_options("mode=0755" TMPFS_LIMITS_SYS_FS_CGROUP,
+                                        uid_shift == 0 ? UID_INVALID : uid_shift,
+                                        selinux_apifs_context,
+                                        &options);
                 if (r < 0)
                         return log_oom();
 
@@ -499,7 +513,8 @@ skip_controllers:
                 return r;
 
         return mount_nofollow_verbose(LOG_ERR, NULL, cgroup_root, NULL,
-                                      MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME|MS_RDONLY, "mode=755");
+                                      MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME|MS_RDONLY,
+                                      "mode=0755");
 }
 
 static int mount_unified_cgroups(const char *dest) {

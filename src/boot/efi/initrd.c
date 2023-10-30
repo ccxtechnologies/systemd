@@ -1,18 +1,19 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <efi.h>
-#include <efilib.h>
-
 #include "initrd.h"
 #include "macro-fundamental.h"
-#include "missing_efi.h"
+#include "proto/device-path.h"
+#include "proto/load-file.h"
 #include "util.h"
+
+#define LINUX_INITRD_MEDIA_GUID \
+        GUID_DEF(0x5568e427, 0x68fc, 0x4f3d, 0xac, 0x74, 0xca, 0x55, 0x52, 0x31, 0xcc, 0x68)
 
 /* extend LoadFileProtocol */
 struct initrd_loader {
         EFI_LOAD_FILE_PROTOCOL load_file;
         const void *address;
-        UINTN length;
+        size_t length;
 };
 
 /* static structure for LINUX_INITRD_MEDIA device path
@@ -26,22 +27,22 @@ static const struct {
                 .Header = {
                         .Type = MEDIA_DEVICE_PATH,
                         .SubType = MEDIA_VENDOR_DP,
-                        .Length = { sizeof(efi_initrd_device_path.vendor), 0 }
+                        .Length = sizeof(efi_initrd_device_path.vendor),
                 },
                 .Guid = LINUX_INITRD_MEDIA_GUID
         },
         .end = {
                 .Type = END_DEVICE_PATH_TYPE,
                 .SubType = END_ENTIRE_DEVICE_PATH_SUBTYPE,
-                .Length = { sizeof(efi_initrd_device_path.end), 0 }
+                .Length = sizeof(efi_initrd_device_path.end),
         }
 };
 
 static EFIAPI EFI_STATUS initrd_load_file(
                 EFI_LOAD_FILE_PROTOCOL *this,
                 EFI_DEVICE_PATH *file_path,
-                BOOLEAN boot_policy,
-                UINTN *buffer_size,
+                bool boot_policy,
+                size_t *buffer_size,
                 void *buffer) {
 
         struct initrd_loader *loader;
@@ -68,7 +69,7 @@ static EFIAPI EFI_STATUS initrd_load_file(
 
 EFI_STATUS initrd_register(
                 const void *initrd_address,
-                UINTN initrd_length,
+                size_t initrd_length,
                 EFI_HANDLE *ret_initrd_handle) {
 
         EFI_STATUS err;
@@ -85,7 +86,7 @@ EFI_STATUS initrd_register(
            LocateDevicePath checks for the "closest DevicePath" and returns its handle,
            where as InstallMultipleProtocolInterfaces only matches identical DevicePaths.
          */
-        err = BS->LocateDevicePath(&EfiLoadFile2Protocol, &dp, &handle);
+        err = BS->LocateDevicePath(MAKE_GUID_PTR(EFI_LOAD_FILE2_PROTOCOL), &dp, &handle);
         if (err != EFI_NOT_FOUND) /* InitrdMedia is already registered */
                 return EFI_ALREADY_STARTED;
 
@@ -98,9 +99,9 @@ EFI_STATUS initrd_register(
 
         /* create a new handle and register the LoadFile2 protocol with the InitrdMediaPath on it */
         err = BS->InstallMultipleProtocolInterfaces(
-                        ret_initrd_handle,
-                        &DevicePathProtocol, &efi_initrd_device_path,
-                        &EfiLoadFile2Protocol, loader,
+                        ret_initrd_handle, MAKE_GUID_PTR(EFI_DEVICE_PATH_PROTOCOL),
+                        &efi_initrd_device_path, MAKE_GUID_PTR(EFI_LOAD_FILE2_PROTOCOL),
+                        loader,
                         NULL);
         if (err != EFI_SUCCESS)
                 free(loader);
@@ -116,20 +117,15 @@ EFI_STATUS initrd_unregister(EFI_HANDLE initrd_handle) {
                 return EFI_SUCCESS;
 
         /* get the LoadFile2 protocol that we allocated earlier */
-        err = BS->OpenProtocol(
-                        initrd_handle, &EfiLoadFile2Protocol, (void **) &loader,
-                        NULL, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
+        err = BS->HandleProtocol(initrd_handle, MAKE_GUID_PTR(EFI_LOAD_FILE2_PROTOCOL), (void **) &loader);
         if (err != EFI_SUCCESS)
                 return err;
 
-        /* close the handle */
-        (void) BS->CloseProtocol(initrd_handle, &EfiLoadFile2Protocol, NULL, NULL);
-
         /* uninstall all protocols thus destroying the handle */
         err = BS->UninstallMultipleProtocolInterfaces(
-                        initrd_handle,
-                        &DevicePathProtocol, &efi_initrd_device_path,
-                        &EfiLoadFile2Protocol, loader,
+                        initrd_handle, MAKE_GUID_PTR(EFI_DEVICE_PATH_PROTOCOL),
+                        &efi_initrd_device_path, MAKE_GUID_PTR(EFI_LOAD_FILE2_PROTOCOL),
+                        loader,
                         NULL);
         if (err != EFI_SUCCESS)
                 return err;

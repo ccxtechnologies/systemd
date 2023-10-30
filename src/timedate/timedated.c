@@ -20,7 +20,7 @@
 #include "bus-polkit.h"
 #include "clock-util.h"
 #include "conf-files.h"
-#include "def.h"
+#include "constants.h"
 #include "fd-util.h"
 #include "fileio-label.h"
 #include "fileio.h"
@@ -392,7 +392,7 @@ static int context_write_data_local_rtc(Context *c) {
                 }
         }
 
-        r = mac_selinux_init();
+        r = mac_init();
         if (r < 0)
                 return r;
 

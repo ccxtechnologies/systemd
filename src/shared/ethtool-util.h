@@ -8,7 +8,7 @@
 #include "conf-parser.h"
 #include "ether-addr-util.h"
 
-#define N_ADVERTISE 3
+#define N_ADVERTISE 4
 
 /* we can't use DUPLEX_ prefix, as it
  * clashes with <linux/ethtool.h> */
@@ -117,7 +117,7 @@ struct ethtool_link_usettings {
 };
 
 typedef struct u32_opt {
-        uint32_t value; /* a value of 0 indicates the hardware advertised maximum should be used.*/
+        uint32_t value; /* a value of 0 indicates the hardware advertised maximum should be used. */
         bool set;
 } u32_opt;
 

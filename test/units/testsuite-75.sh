@@ -2,13 +2,17 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 # vi: ts=4 sw=4 tw=0 et:
 
+# TODO:
+#   - IPv6-only stack
+#   - mDNS
+#   - LLMNR
+#   - DoT/DoH
+
 set -eux
 set -o pipefail
 
-# shellcheck source=test/units/assert.sh
-. "$(dirname "$0")"/assert.sh
-
-: >/failed
+# shellcheck source=test/units/util.sh
+. "$(dirname "$0")"/util.sh
 
 RUN_OUT="$(mktemp)"
 
@@ -16,21 +20,32 @@ run() {
     "$@" |& tee "$RUN_OUT"
 }
 
-monitor_check_rr() {
-    local match="${1:?}"
+disable_ipv6() {
+    sysctl -w net.ipv6.conf.all.disable_ipv6=1
+}
+
+enable_ipv6() {
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0
+    networkctl reconfigure dns0
+    /usr/lib/systemd/systemd-networkd-wait-online --ipv4 --ipv6 --interface=dns0:routable --timeout=30
+}
+
+monitor_check_rr() (
+    set +x
+    set +o pipefail
+    local since="${1:?}"
+    local match="${2:?}"
 
     # Wait until the first mention of the specified log message is
     # displayed. We turn off pipefail for this, since we don't care about the
     # lhs of this pipe expression, we only care about the rhs' result to be
     # clean
-    set +o pipefail
-    journalctl -u resmontest.service -f --full | grep -m1 "$match"
-    set -o pipefail
-}
+    timeout -v 30s journalctl -u resmontest.service --since "$since" -f --full | grep -m1 "$match"
+)
 
 # Test for resolvectl, resolvconf
 systemctl unmask systemd-resolved.service
-systemctl start systemd-resolved.service
+systemctl enable --now systemd-resolved.service
 systemctl service-log-level systemd-resolved.service debug
 ip link add hoge type dummy
 ip link add hoge.foo type dummy
@@ -55,13 +70,102 @@ echo nameserver 10.0.3.1 10.0.3.2 | "$RESOLVCONF" -a hoge.inet.ipsec.192.168.35
 echo nameserver 10.0.3.3 10.0.3.4 | "$RESOLVCONF" -a hoge.foo.dhcp
 assert_in '10.0.3.1 10.0.3.2' "$(resolvectl dns hoge)"
 assert_in '10.0.3.3 10.0.3.4' "$(resolvectl dns hoge.foo)"
+
+# Tests for _localdnsstub and _localdnsproxy
+assert_in '127.0.0.53' "$(resolvectl query _localdnsstub)"
+assert_in '_localdnsstub' "$(resolvectl query 127.0.0.53)"
+assert_in '127.0.0.54' "$(resolvectl query _localdnsproxy)"
+assert_in '_localdnsproxy' "$(resolvectl query 127.0.0.54)"
+
+assert_in '127.0.0.53' "$(dig @127.0.0.53 _localdnsstub)"
+assert_in '_localdnsstub' "$(dig @127.0.0.53 -x 127.0.0.53)"
+assert_in '127.0.0.54' "$(dig @127.0.0.53 _localdnsproxy)"
+assert_in '_localdnsproxy' "$(dig @127.0.0.53 -x 127.0.0.54)"
+
+# Tests for mDNS and LLMNR settings
+mkdir -p /run/systemd/resolved.conf.d
+{
+    echo "[Resolve]"
+    echo "MulticastDNS=yes"
+    echo "LLMNR=yes"
+} >/run/systemd/resolved.conf.d/mdns-llmnr.conf
+systemctl restart systemd-resolved.service
+systemctl service-log-level systemd-resolved.service debug
+# make sure networkd is not running.
+systemctl stop systemd-networkd.service
+# defaults to yes (both the global and per-link settings are yes)
+assert_in 'yes' "$(resolvectl mdns hoge)"
+assert_in 'yes' "$(resolvectl llmnr hoge)"
+# set per-link setting
+resolvectl mdns hoge yes
+resolvectl llmnr hoge yes
+assert_in 'yes' "$(resolvectl mdns hoge)"
+assert_in 'yes' "$(resolvectl llmnr hoge)"
+resolvectl mdns hoge resolve
+resolvectl llmnr hoge resolve
+assert_in 'resolve' "$(resolvectl mdns hoge)"
+assert_in 'resolve' "$(resolvectl llmnr hoge)"
+resolvectl mdns hoge no
+resolvectl llmnr hoge no
+assert_in 'no' "$(resolvectl mdns hoge)"
+assert_in 'no' "$(resolvectl llmnr hoge)"
+# downgrade global setting to resolve
+{
+    echo "[Resolve]"
+    echo "MulticastDNS=resolve"
+    echo "LLMNR=resolve"
+} >/run/systemd/resolved.conf.d/mdns-llmnr.conf
+systemctl restart systemd-resolved.service
+systemctl service-log-level systemd-resolved.service debug
+# set per-link setting
+resolvectl mdns hoge yes
+resolvectl llmnr hoge yes
+assert_in 'resolve' "$(resolvectl mdns hoge)"
+assert_in 'resolve' "$(resolvectl llmnr hoge)"
+resolvectl mdns hoge resolve
+resolvectl llmnr hoge resolve
+assert_in 'resolve' "$(resolvectl mdns hoge)"
+assert_in 'resolve' "$(resolvectl llmnr hoge)"
+resolvectl mdns hoge no
+resolvectl llmnr hoge no
+assert_in 'no' "$(resolvectl mdns hoge)"
+assert_in 'no' "$(resolvectl llmnr hoge)"
+# downgrade global setting to no
+{
+    echo "[Resolve]"
+    echo "MulticastDNS=no"
+    echo "LLMNR=no"
+} >/run/systemd/resolved.conf.d/mdns-llmnr.conf
+systemctl restart systemd-resolved.service
+systemctl service-log-level systemd-resolved.service debug
+# set per-link setting
+resolvectl mdns hoge yes
+resolvectl llmnr hoge yes
+assert_in 'no' "$(resolvectl mdns hoge)"
+assert_in 'no' "$(resolvectl llmnr hoge)"
+resolvectl mdns hoge resolve
+resolvectl llmnr hoge resolve
+assert_in 'no' "$(resolvectl mdns hoge)"
+assert_in 'no' "$(resolvectl llmnr hoge)"
+resolvectl mdns hoge no
+resolvectl llmnr hoge no
+assert_in 'no' "$(resolvectl mdns hoge)"
+assert_in 'no' "$(resolvectl llmnr hoge)"
+
+# Cleanup
+rm -f /run/systemd/resolved.conf.d/mdns-llmnr.conf
 ip link del hoge
 ip link del hoge.foo
 
 ### SETUP ###
 # Configure network
 hostnamectl hostname ns1.unsigned.test
-echo "10.0.0.1 ns1.unsigned.test" >>/etc/hosts
+cat >>/etc/hosts <<EOF
+10.0.0.1               ns1.unsigned.test
+fd00:dead:beef:cafe::1 ns1.unsigned.test
+
+127.128.0.5     localhost5 localhost5.localdomain localhost5.localdomain4 localhost.localdomain5 localhost5.localdomain5
+EOF
 
 mkdir -p /etc/systemd/network
 cat >/etc/systemd/network/dns0.netdev <<EOF
@@ -75,15 +179,24 @@ Name=dns0
 
 [Network]
 Address=10.0.0.1/24
+Address=fd00:dead:beef:cafe::1/64
 DNSSEC=allow-downgrade
 DNS=10.0.0.1
+DNS=fd00:dead:beef:cafe::1
 EOF
 
+DNS_ADDRESSES=(
+    "10.0.0.1"
+    "fd00:dead:beef:cafe::1"
+)
+
+mkdir -p /run/systemd/resolved.conf.d
 {
+    echo "[Resolve]"
     echo "FallbackDNS="
     echo "DNSSEC=allow-downgrade"
     echo "DNSOverTLS=opportunistic"
-} >>/etc/systemd/resolved.conf
+} >/run/systemd/resolved.conf.d/test.conf
 ln -svf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 # Override the default NTA list, which turns off DNSSEC validation for (among
 # others) the test. domain
@@ -127,6 +240,10 @@ resolvectl log-level debug
 # Start monitoring queries
 systemd-run -u resmontest.service -p Type=notify resolvectl monitor
 
+# Check if all the zones are valid (zone-check always returns 0, so let's check
+# if it produces any errors/warnings)
+run knotc zone-check
+[[ ! -s "$RUN_OUT" ]]
 # We need to manually propagate the DS records of onlinesign.test. to the parent
 # zone, since they're generated online
 knotc zone-begin test.
@@ -146,9 +263,20 @@ knotc reload
 
 : "--- nss-resolve/nss-myhostname tests"
 # Sanity check
+TIMESTAMP=$(date '+%F %T')
+# Issue: https://github.com/systemd/systemd/issues/23951
+# With IPv6 enabled
 run getent -s resolve hosts ns1.unsigned.test
-grep -qE "^10\.0\.0\.1\s+ns1\.unsigned\.test" "$RUN_OUT"
-monitor_check_rr "ns1.unsigned.test IN A 10.0.0.1"
+grep -qE "^fd00:dead:beef:cafe::1\s+ns1\.unsigned\.test" "$RUN_OUT"
+monitor_check_rr "$TIMESTAMP" "ns1.unsigned.test IN AAAA fd00:dead:beef:cafe::1"
+# With IPv6 disabled
+# Issue: https://github.com/systemd/systemd/issues/23951
+# FIXME
+#disable_ipv6
+#run getent -s resolve hosts ns1.unsigned.test
+#grep -qE "^10\.0\.0\.1\s+ns1\.unsigned\.test" "$RUN_OUT"
+#monitor_check_rr "$TIMESTAMP" "ns1.unsigned.test IN A 10.0.0.1"
+enable_ipv6
 
 # Issue: https://github.com/systemd/systemd/issues/18812
 # PR: https://github.com/systemd/systemd/pull/18896
@@ -160,13 +288,26 @@ grep -qE "^::1\s+localhost" "$RUN_OUT"
 run getent -s myhostname hosts localhost
 grep -qE "^::1\s+localhost" "$RUN_OUT"
 # With IPv6 disabled
-sysctl -w net.ipv6.conf.all.disable_ipv6=1
+disable_ipv6
 run getent -s resolve hosts localhost
 grep -qE "^127\.0\.0\.1\s+localhost" "$RUN_OUT"
 run getent -s myhostname hosts localhost
 grep -qE "^127\.0\.0\.1\s+localhost" "$RUN_OUT"
-sysctl -w net.ipv6.conf.all.disable_ipv6=0
+enable_ipv6
 
+# Issue: https://github.com/systemd/systemd/issues/25088
+run getent -s resolve hosts 127.128.0.5
+grep -qEx '127\.128\.0\.5\s+localhost5(\s+localhost5?\.localdomain[45]?){4}' "$RUN_OUT"
+[ "$(wc -l <"$RUN_OUT")" -eq 1 ]
+
+# Issue: https://github.com/systemd/systemd/issues/20158
+run dig +noall +answer +additional localhost5.
+grep -qEx 'localhost5\.\s+0\s+IN\s+A\s+127\.128\.0\.5' "$RUN_OUT"
+[ "$(wc -l <"$RUN_OUT")" -eq 1 ]
+run dig +noall +answer +additional localhost5.localdomain4.
+grep -qEx 'localhost5\.localdomain4\.\s+0\s+IN\s+CNAME\s+localhost5\.' "$RUN_OUT"
+grep -qEx 'localhost5\.\s+0\s+IN\s+A\s+127\.128\.0\.5' "$RUN_OUT"
+[ "$(wc -l <"$RUN_OUT")" -eq 2 ]
 
 : "--- Basic resolved tests ---"
 # Issue: https://github.com/systemd/systemd/issues/22229
@@ -192,12 +333,14 @@ grep -qE "IN\s+SOA\s+ns1\.unsigned\.test\." "$RUN_OUT"
 
 
 : "--- ZONE: unsigned.test. ---"
-run dig @10.0.0.1 +short unsigned.test
+run dig @ns1.unsigned.test +short unsigned.test A unsigned.test AAAA
 grep -qF "10.0.0.101" "$RUN_OUT"
+grep -qF "fd00:dead:beef:cafe::101" "$RUN_OUT"
 run resolvectl query unsigned.test
-grep -qF "unsigned.test: 10.0.0.10" "$RUN_OUT"
+grep -qF "10.0.0.10" "$RUN_OUT"
+grep -qF "fd00:dead:beef:cafe::101" "$RUN_OUT"
 grep -qF "authenticated: no" "$RUN_OUT"
-run dig @10.0.0.1 +short MX unsigned.test
+run dig @ns1.unsigned.test +short MX unsigned.test
 grep -qF "15 mail.unsigned.test." "$RUN_OUT"
 run resolvectl query --legend=no -t MX unsigned.test
 grep -qF "unsigned.test IN MX 15 mail.unsigned.test" "$RUN_OUT"
@@ -207,17 +350,28 @@ grep -qF "unsigned.test IN MX 15 mail.unsigned.test" "$RUN_OUT"
 # Check the trust chain (with and without systemd-resolved in between
 # Issue: https://github.com/systemd/systemd/issues/22002
 # PR: https://github.com/systemd/systemd/pull/23289
-run delv @10.0.0.1 signed.test
+run delv @ns1.unsigned.test signed.test
 grep -qF "; fully validated" "$RUN_OUT"
 run delv signed.test
 grep -qF "; fully validated" "$RUN_OUT"
+
+for addr in "${DNS_ADDRESSES[@]}"; do
+    run delv "@$addr" -t A mail.signed.test
+    grep -qF "; fully validated" "$RUN_OUT"
+    run delv "@$addr" -t AAAA mail.signed.test
+    grep -qF "; fully validated" "$RUN_OUT"
+done
+run resolvectl query mail.signed.test
+grep -qF "10.0.0.11" "$RUN_OUT"
+grep -qF "fd00:dead:beef:cafe::11" "$RUN_OUT"
+grep -qF "authenticated: yes" "$RUN_OUT"
 
 run dig +short signed.test
 grep -qF "10.0.0.10" "$RUN_OUT"
 run resolvectl query signed.test
 grep -qF "signed.test: 10.0.0.10" "$RUN_OUT"
 grep -qF "authenticated: yes" "$RUN_OUT"
-run dig @10.0.0.1 +short MX signed.test
+run dig @ns1.unsigned.test +short MX signed.test
 grep -qF "10 mail.signed.test." "$RUN_OUT"
 run resolvectl query --legend=no -t MX signed.test
 grep -qF "signed.test IN MX 10 mail.signed.test" "$RUN_OUT"
@@ -228,25 +382,65 @@ grep -qF "status: NXDOMAIN" "$RUN_OUT"
 run resolvectl query -t TXT this.should.be.authenticated.wild.signed.test
 grep -qF 'this.should.be.authenticated.wild.signed.test IN TXT "this is a wildcard"' "$RUN_OUT"
 grep -qF "authenticated: yes" "$RUN_OUT"
+# Check SRV support
+run resolvectl service _mysvc._tcp signed.test
+grep -qF "myservice.signed.test:1234" "$RUN_OUT"
+grep -qF "10.0.0.20" "$RUN_OUT"
+grep -qF "fd00:dead:beef:cafe::17" "$RUN_OUT"
+grep -qF "authenticated: yes" "$RUN_OUT"
+(! run resolvectl service _invalidsvc._udp signed.test)
+grep -qE "invalidservice\.signed\.test' not found" "$RUN_OUT"
+run resolvectl service _untrustedsvc._udp signed.test
+grep -qF "myservice.untrusted.test:1111" "$RUN_OUT"
+grep -qF "10.0.0.123" "$RUN_OUT"
+grep -qF "fd00:dead:beef:cafe::123" "$RUN_OUT"
+grep -qF "authenticated: yes" "$RUN_OUT"
+# Check OPENPGPKEY support
+run delv -t OPENPGPKEY 5a786cdc59c161cdafd818143705026636962198c66ed4c5b3da321e._openpgpkey.signed.test
+grep -qF "; fully validated" "$RUN_OUT"
+run resolvectl openpgp mr.smith@signed.test
+grep -qF "5a786cdc59c161cdafd818143705026636962198c66ed4c5b3da321e._openpgpkey.signed.test" "$RUN_OUT"
+grep -qF "authenticated: yes" "$RUN_OUT"
 
 # DNSSEC validation with multiple records of the same type for the same name
 # Issue: https://github.com/systemd/systemd/issues/22002
 # PR: https://github.com/systemd/systemd/pull/23289
-run delv @10.0.0.1 dupe.signed.test
-grep -qF "; fully validated" "$RUN_OUT"
-run delv dupe.signed.test
-grep -qF "; fully validated" "$RUN_OUT"
+check_domain() {
+    local domain="${1:?}"
+    local record="${2:?}"
+    local message="${3:?}"
+    local addr
+
+    for addr in "${DNS_ADDRESSES[@]}"; do
+        run delv "@$addr" -t "$record" "$domain"
+        grep -qF "$message" "$RUN_OUT"
+    done
+
+    run delv -t "$record" "$domain"
+    grep -qF "$message" "$RUN_OUT"
+
+    run resolvectl query "$domain"
+    grep -qF "authenticated: yes" "$RUN_OUT"
+}
+
+check_domain "dupe.signed.test"       "A"    "; fully validated"
+check_domain "dupe.signed.test"       "AAAA" "; negative response, fully validated"
+check_domain "dupe-ipv6.signed.test"  "AAAA" "; fully validated"
+check_domain "dupe-ipv6.signed.test"  "A"    "; negative response, fully validated"
+check_domain "dupe-mixed.signed.test" "A"    "; fully validated"
+check_domain "dupe-mixed.signed.test" "AAAA" "; fully validated"
 
 # Test resolution of CNAME chains
+TIMESTAMP=$(date '+%F %T')
 run resolvectl query -t A cname-chain.signed.test
 grep -qF "follow14.final.signed.test IN A 10.0.0.14" "$RUN_OUT"
 grep -qF "authenticated: yes" "$RUN_OUT"
 
-monitor_check_rr "follow10.so.close.signed.test IN CNAME follow11.yet.so.far.signed.test"
-monitor_check_rr "follow11.yet.so.far.signed.test IN CNAME follow12.getting.hot.signed.test"
-monitor_check_rr "follow12.getting.hot.signed.test IN CNAME follow13.almost.final.signed.test"
-monitor_check_rr "follow13.almost.final.signed.test IN CNAME follow14.final.signed.test"
-monitor_check_rr "follow14.final.signed.test IN A 10.0.0.14"
+monitor_check_rr "$TIMESTAMP" "follow10.so.close.signed.test IN CNAME follow11.yet.so.far.signed.test"
+monitor_check_rr "$TIMESTAMP" "follow11.yet.so.far.signed.test IN CNAME follow12.getting.hot.signed.test"
+monitor_check_rr "$TIMESTAMP" "follow12.getting.hot.signed.test IN CNAME follow13.almost.final.signed.test"
+monitor_check_rr "$TIMESTAMP" "follow13.almost.final.signed.test IN CNAME follow14.final.signed.test"
+monitor_check_rr "$TIMESTAMP" "follow14.final.signed.test IN A 10.0.0.14"
 
 # Non-existing RR + CNAME chain
 run dig +dnssec AAAA cname-chain.signed.test
@@ -258,7 +452,7 @@ grep -qE "^follow14\.final\.signed\.test\..+IN\s+NSEC\s+" "$RUN_OUT"
 # Check the trust chain (with and without systemd-resolved in between
 # Issue: https://github.com/systemd/systemd/issues/22002
 # PR: https://github.com/systemd/systemd/pull/23289
-run delv @10.0.0.1 sub.onlinesign.test
+run delv @ns1.unsigned.test sub.onlinesign.test
 grep -qF "; fully validated" "$RUN_OUT"
 run delv sub.onlinesign.test
 grep -qF "; fully validated" "$RUN_OUT"
@@ -268,10 +462,27 @@ grep -qF "10.0.0.133" "$RUN_OUT"
 run resolvectl query sub.onlinesign.test
 grep -qF "sub.onlinesign.test: 10.0.0.133" "$RUN_OUT"
 grep -qF "authenticated: yes" "$RUN_OUT"
-run dig @10.0.0.1 +short TXT onlinesign.test
+run dig @ns1.unsigned.test +short TXT onlinesign.test
 grep -qF '"hello from onlinesign"' "$RUN_OUT"
 run resolvectl query --legend=no -t TXT onlinesign.test
 grep -qF 'onlinesign.test IN TXT "hello from onlinesign"' "$RUN_OUT"
+
+for addr in "${DNS_ADDRESSES[@]}"; do
+    run delv "@$addr" -t A dual.onlinesign.test
+    grep -qF "10.0.0.135" "$RUN_OUT"
+    run delv "@$addr" -t AAAA dual.onlinesign.test
+    grep -qF "fd00:dead:beef:cafe::135" "$RUN_OUT"
+    run delv "@$addr" -t ANY ipv6.onlinesign.test
+    grep -qF "fd00:dead:beef:cafe::136" "$RUN_OUT"
+done
+run resolvectl query dual.onlinesign.test
+grep -qF "10.0.0.135" "$RUN_OUT"
+grep -qF "fd00:dead:beef:cafe::135" "$RUN_OUT"
+grep -qF "authenticated: yes" "$RUN_OUT"
+run resolvectl query ipv6.onlinesign.test
+grep -qF "fd00:dead:beef:cafe::136" "$RUN_OUT"
+grep -qF "authenticated: yes" "$RUN_OUT"
+
 # Check a non-existent domain
 # Note: mod-onlinesign utilizes Minimally Covering NSEC Records, hence the
 #       different response than with "standard" DNSSEC
@@ -284,16 +495,28 @@ grep -qF 'this.should.be.authenticated.wild.onlinesign.test IN TXT "this is an o
 grep -qF "authenticated: yes" "$RUN_OUT"
 
 # Resolve via dbus method
+TIMESTAMP=$(date '+%F %T')
 run busctl call org.freedesktop.resolve1 /org/freedesktop/resolve1 org.freedesktop.resolve1.Manager ResolveHostname 'isit' 0 secondsub.onlinesign.test 0 0
 grep -qF '10 0 0 134 "secondsub.onlinesign.test"' "$RUN_OUT"
-monitor_check_rr "secondsub.onlinesign.test IN A 10.0.0.134"
+monitor_check_rr "$TIMESTAMP" "secondsub.onlinesign.test IN A 10.0.0.134"
+
 
 : "--- ZONE: untrusted.test (DNSSEC without propagated DS records) ---"
-run dig +short untrusted.test
-grep -qF "10.0.0.121" "$RUN_OUT"
+# Issue: https://github.com/systemd/systemd/issues/23955
+# FIXME
+resolvectl flush-caches
+#run dig +short untrusted.test A untrusted.test AAAA
+#grep -qF "10.0.0.121" "$RUN_OUT"
+#grep -qF "fd00:dead:beef:cafe::121" "$RUN_OUT"
 run resolvectl query untrusted.test
-grep -qF "untrusted.test: 10.0.0.121" "$RUN_OUT"
+grep -qF "untrusted.test:" "$RUN_OUT"
+grep -qF "10.0.0.121" "$RUN_OUT"
+grep -qF "fd00:dead:beef:cafe::121" "$RUN_OUT"
 grep -qF "authenticated: no" "$RUN_OUT"
+run resolvectl service _mysvc._tcp untrusted.test
+grep -qF "myservice.untrusted.test:1234" "$RUN_OUT"
+grep -qF "10.0.0.123" "$RUN_OUT"
+grep -qF "fd00:dead:beef:cafe::123" "$RUN_OUT"
 
 # Issue: https://github.com/systemd/systemd/issues/19472
 # 1) Query for a non-existing RR should return NOERROR + NSEC (?), not NXDOMAIN
@@ -307,5 +530,67 @@ grep -qF "authenticated: no" "$RUN_OUT"
 
 systemctl stop resmontest.service
 
+# Test serve stale feature if nftables is installed
+if command -v nft >/dev/null; then
+    ### Test without serve stale feature ###
+    NFT_FILTER_NAME=dns_port_filter
+
+    drop_dns_outbound_traffic() {
+        nft add table inet $NFT_FILTER_NAME
+        nft add chain inet $NFT_FILTER_NAME output \{ type filter hook output priority 0 \; \}
+        nft add rule inet $NFT_FILTER_NAME output ip daddr 10.0.0.1 udp dport 53 drop
+        nft add rule inet $NFT_FILTER_NAME output ip daddr 10.0.0.1 tcp dport 53 drop
+        nft add rule inet $NFT_FILTER_NAME output ip6 daddr fd00:dead:beef:cafe::1 udp dport 53 drop
+        nft add rule inet $NFT_FILTER_NAME output ip6 daddr fd00:dead:beef:cafe::1 tcp dport 53 drop
+    }
+
+    run dig stale1.unsigned.test -t A
+    grep -qE "NOERROR" "$RUN_OUT"
+    sleep 2
+    drop_dns_outbound_traffic
+    set +e
+    run dig stale1.unsigned.test -t A
+    set -eux
+    grep -qE "no servers could be reached" "$RUN_OUT"
+    nft flush ruleset
+
+    ### Test TIMEOUT with serve stale feature ###
+
+    mkdir -p /run/systemd/resolved.conf.d
+    {
+        echo "[Resolve]"
+        echo "StaleRetentionSec=1d"
+    } >/run/systemd/resolved.conf.d/test.conf
+    ln -svf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+    systemctl restart systemd-resolved.service
+    systemctl service-log-level systemd-resolved.service debug
+
+    run dig stale1.unsigned.test -t A
+    grep -qE "NOERROR" "$RUN_OUT"
+    sleep 2
+    drop_dns_outbound_traffic
+    run dig stale1.unsigned.test -t A
+    grep -qE "NOERROR" "$RUN_OUT"
+    grep -qE "10.0.0.112" "$RUN_OUT"
+
+    nft flush ruleset
+
+    ### Test NXDOMAIN with serve stale feature ###
+    # NXDOMAIN response should replace the cache with NXDOMAIN response
+    run dig stale1.unsigned.test -t A
+    grep -qE "NOERROR" "$RUN_OUT"
+    # Delete stale1 record from zone
+    knotc zone-begin unsigned.test
+    knotc zone-unset unsigned.test stale1 A
+    knotc zone-commit unsigned.test
+    knotc reload
+    sleep 2
+    run dig stale1.unsigned.test -t A
+    grep -qE "NXDOMAIN" "$RUN_OUT"
+
+    nft flush ruleset
+else
+    echo "nftables is not installed. Skipped serve stale feature test."
+fi
+
 touch /testok
-rm /failed

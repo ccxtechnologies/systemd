@@ -597,7 +597,7 @@ static void log_route_debug(const Route *route, const char *str, const Link *lin
         if (in_addr_is_set(route->family, &route->prefsrc))
                 (void) in_addr_to_string(route->family, &route->prefsrc, &prefsrc);
         (void) route_scope_to_string_alloc(route->scope, &scope);
-        (void) manager_get_route_table_to_string(manager, route->table, &table);
+        (void) manager_get_route_table_to_string(manager, route->table, /* append_num = */ true, &table);
         (void) route_protocol_full_to_string_alloc(route->protocol, &proto);
         (void) route_flags_to_string_alloc(route->flags, &flags);
 
@@ -1437,9 +1437,13 @@ int link_request_route(
 
         (void) route_get(link->manager, link, route, &existing);
 
-        if (route->lifetime_usec == 0)
+        if (route->lifetime_usec == 0) {
+                if (consume_object)
+                        route_free(route);
+
                 /* The requested route is outdated. Let's remove it. */
                 return route_remove_and_drop(existing);
+        }
 
         if (!existing) {
                 _cleanup_(route_freep) Route *tmp = NULL;

@@ -7,6 +7,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
+#include "memstream-util.h"
 #include "oomd-util.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -145,7 +146,7 @@ bool oomd_swap_free_below(const OomdSystemContext *ctx, int threshold_permyriad)
 }
 
 int oomd_fetch_cgroup_oom_preference(OomdCGroupContext *ctx, const char *prefix) {
-        uid_t uid, prefix_uid;
+        uid_t uid;
         int r;
 
         assert(ctx);
@@ -160,28 +161,34 @@ int oomd_fetch_cgroup_oom_preference(OomdCGroupContext *ctx, const char *prefix)
         if (r < 0)
                 return log_debug_errno(r, "Failed to get owner/group from %s: %m", ctx->path);
 
-        r = cg_get_owner(SYSTEMD_CGROUP_CONTROLLER, prefix, &prefix_uid);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to get owner/group from %s: %m", ctx->path);
+        if (uid != 0) {
+                uid_t prefix_uid;
 
-        if (uid == prefix_uid) {
-                /* Ignore most errors when reading the xattr since it is usually unset and cgroup xattrs are only used
-                 * as an optional feature of systemd-oomd (and the system might not even support them). */
-                r = cg_get_xattr_bool(SYSTEMD_CGROUP_CONTROLLER, ctx->path, "user.oomd_avoid");
-                if (r == -ENOMEM)
-                        return log_oom_debug();
-                if (r < 0 && !ERRNO_IS_XATTR_ABSENT(r))
-                        log_debug_errno(r, "Failed to get xattr user.oomd_avoid, ignoring: %m");
-                ctx->preference = r > 0 ? MANAGED_OOM_PREFERENCE_AVOID : ctx->preference;
+                r = cg_get_owner(SYSTEMD_CGROUP_CONTROLLER, prefix, &prefix_uid);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to get owner/group from %s: %m", prefix);
 
-                r = cg_get_xattr_bool(SYSTEMD_CGROUP_CONTROLLER, ctx->path, "user.oomd_omit");
-                if (r == -ENOMEM)
-                        return log_oom_debug();
-                if (r < 0 && !ERRNO_IS_XATTR_ABSENT(r))
-                        log_debug_errno(r, "Failed to get xattr user.oomd_omit, ignoring: %m");
-                ctx->preference = r > 0 ? MANAGED_OOM_PREFERENCE_OMIT : ctx->preference;
-        } else
-                ctx->preference = MANAGED_OOM_PREFERENCE_NONE;
+                if (uid != prefix_uid) {
+                        ctx->preference = MANAGED_OOM_PREFERENCE_NONE;
+                        return 0;
+                }
+        }
+
+        /* Ignore most errors when reading the xattr since it is usually unset and cgroup xattrs are only used
+         * as an optional feature of systemd-oomd (and the system might not even support them). */
+        r = cg_get_xattr_bool(SYSTEMD_CGROUP_CONTROLLER, ctx->path, "user.oomd_avoid");
+        if (r == -ENOMEM)
+                return log_oom_debug();
+        if (r < 0 && !ERRNO_IS_XATTR_ABSENT(r))
+                log_debug_errno(r, "Failed to get xattr user.oomd_avoid, ignoring: %m");
+        ctx->preference = r > 0 ? MANAGED_OOM_PREFERENCE_AVOID : ctx->preference;
+
+        r = cg_get_xattr_bool(SYSTEMD_CGROUP_CONTROLLER, ctx->path, "user.oomd_omit");
+        if (r == -ENOMEM)
+                return log_oom_debug();
+        if (r < 0 && !ERRNO_IS_XATTR_ABSENT(r))
+                log_debug_errno(r, "Failed to get xattr user.oomd_omit, ignoring: %m");
+        ctx->preference = r > 0 ? MANAGED_OOM_PREFERENCE_OMIT : ctx->preference;
 
         return 0;
 }
@@ -236,7 +243,7 @@ int oomd_cgroup_kill(const char *path, bool recurse, bool dry_run) {
                 if (r < 0)
                         return r;
 
-                log_debug("oomd dry-run: Would have tried to kill %s with recurse=%s", cg_path, true_false(recurse));
+                log_info("oomd dry-run: Would have tried to kill %s with recurse=%s", cg_path, true_false(recurse));
                 return 0;
         }
 
@@ -275,25 +282,20 @@ int oomd_cgroup_kill(const char *path, bool recurse, bool dry_run) {
 typedef void (*dump_candidate_func)(const OomdCGroupContext *ctx, FILE *f, const char *prefix);
 
 static int dump_kill_candidates(OomdCGroupContext **sorted, int n, int dump_until, dump_candidate_func dump_func) {
-        /* Try dumping top offendors, ignoring any errors that might happen. */
-        _cleanup_free_ char *dump = NULL;
-        _cleanup_fclose_ FILE *f = NULL;
-        int r;
-        size_t size;
+        _cleanup_(memstream_done) MemStream m = {};
+        FILE *f;
 
-        f = open_memstream_unlocked(&dump, &size);
+        /* Try dumping top offendors, ignoring any errors that might happen. */
+
+        f = memstream_init(&m);
         if (!f)
-                return -errno;
+                return -ENOMEM;
 
         fprintf(f, "Considered %d cgroups for killing, top candidates were:\n", n);
         for (int i = 0; i < dump_until; i++)
                 dump_func(sorted[i], f, "\t");
 
-        r = fflush_and_check(f);
-        if (r < 0)
-                return r;
-
-        return log_dump(LOG_INFO, dump);
+        return memstream_dump(LOG_INFO, &m);
 }
 
 int oomd_kill_by_pgscan_rate(Hashmap *h, const char *prefix, bool dry_run, char **ret_selected) {
@@ -315,7 +317,7 @@ int oomd_kill_by_pgscan_rate(Hashmap *h, const char *prefix, bool dry_run, char 
                 if (sorted[i]->pgscan == 0 && sorted[i]->current_memory_usage == 0)
                         continue;
 
-                r = oomd_cgroup_kill(sorted[i]->path, true, dry_run);
+                r = oomd_cgroup_kill(sorted[i]->path, /* recurse= */ true, /* dry_run= */ dry_run);
                 if (r == -ENOMEM)
                         return r; /* Treat oom as a hard error */
                 if (r < 0) {
@@ -359,7 +361,7 @@ int oomd_kill_by_swap_usage(Hashmap *h, uint64_t threshold_usage, bool dry_run, 
                 if (sorted[i]->swap_usage <= threshold_usage)
                         continue;
 
-                r = oomd_cgroup_kill(sorted[i]->path, true, dry_run);
+                r = oomd_cgroup_kill(sorted[i]->path, /* recurse= */ true, /* dry_run= */ dry_run);
                 if (r == -ENOMEM)
                         return r; /* Treat oom as a hard error */
                 if (r < 0) {

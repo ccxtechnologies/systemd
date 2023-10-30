@@ -161,7 +161,7 @@ static int show_cgroup_name(
 
         uint64_t cgroupid = UINT64_MAX;
         _cleanup_free_ char *b = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         bool delegate;
         int r;
 
@@ -211,7 +211,6 @@ static int show_cgroup_name(
 
         if (FLAGS_SET(flags, OUTPUT_CGROUP_XATTRS) && fd >= 0) {
                 _cleanup_free_ char *nl = NULL;
-                char *xa;
 
                 r = flistxattr_malloc(fd, &nl);
                 if (r < 0)
@@ -465,7 +464,7 @@ int show_cgroup_get_path_and_warn(
                 if (r < 0)
                         return log_error_errno(r, "Failed to load machine data: %m");
 
-                r = bus_connect_transport_systemd(BUS_TRANSPORT_LOCAL, NULL, false, &bus);
+                r = bus_connect_transport_systemd(BUS_TRANSPORT_LOCAL, NULL, RUNTIME_SCOPE_SYSTEM, &bus);
                 if (r < 0)
                         return bus_log_connect_error(r, BUS_TRANSPORT_LOCAL);
 

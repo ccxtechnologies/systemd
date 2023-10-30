@@ -3,6 +3,7 @@
 #include <getopt.h>
 #include <unistd.h>
 
+#include "build.h"
 #include "creds-util.h"
 #include "dirent-util.h"
 #include "escape.h"
@@ -121,7 +122,7 @@ not_found:
 }
 
 static int add_credentials_to_table(Table *t, bool encrypted) {
-        _cleanup_(closedirp) DIR *d = NULL;
+        _cleanup_closedir_ DIR *d = NULL;
         const char *prefix;
         int r;
 
@@ -136,7 +137,7 @@ static int add_credentials_to_table(Table *t, bool encrypted) {
         for (;;) {
                 _cleanup_free_ char *j = NULL;
                 const char *secure, *secure_color = NULL;
-                _cleanup_close_ int fd = -1;
+                _cleanup_close_ int fd = -EBADF;
                 struct dirent *de;
                 struct stat st;
 
@@ -325,16 +326,12 @@ static int write_blob(FILE *f, const void *data, size_t size) {
 
         if (arg_transcode == TRANSCODE_OFF &&
             arg_json_format_flags != JSON_FORMAT_OFF) {
-
                 _cleanup_(erase_and_freep) char *suffixed = NULL;
                 _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
 
-                if (memchr(data, 0, size))
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Credential data contains embedded NUL, can't parse as JSON.");
-
-                suffixed = memdup_suffix0(data, size);
-                if (!suffixed)
-                        return log_oom();
+                r = make_cstring(data, size, MAKE_CSTRING_REFUSE_TRAILING_NUL, &suffixed);
+                if (r < 0)
+                        return log_error_errno(r, "Unable to convert binary string to C string: %m");
 
                 r = json_parse(suffixed, JSON_PARSE_SENSITIVE, &v, NULL, NULL);
                 if (r < 0)
@@ -385,7 +382,7 @@ static int verb_cat(int argc, char **argv, void *userdata) {
 
                 /* Look both in regular and in encrypted credentials */
                 for (encrypted = 0; encrypted < 2; encrypted++) {
-                        _cleanup_(closedirp) DIR *d = NULL;
+                        _cleanup_closedir_ DIR *d = NULL;
 
                         r = open_credential_directory(encrypted, &d, NULL);
                         if (r < 0)
@@ -509,20 +506,21 @@ static int verb_encrypt(int argc, char **argv, void *userdata) {
         if (base64_size < 0)
                 return base64_size;
 
-        if (arg_pretty) {
+        /* Pretty print makes sense only if we're printing stuff to stdout
+         * and if a cred name is provided via --name= (since we can't use
+         * the output file name as the cred name here) */
+        if (arg_pretty && !output_path && name) {
                 _cleanup_free_ char *escaped = NULL, *indented = NULL, *j = NULL;
 
-                if (name) {
-                        escaped = cescape(name);
-                        if (!escaped)
-                                return log_oom();
-                }
+                escaped = cescape(name);
+                if (!escaped)
+                        return log_oom();
 
                 indented = strreplace(base64_buf, "\n", " \\\n        ");
                 if (!indented)
                         return log_oom();
 
-                j = strjoin("SetCredentialEncrypted=", name, ": \\\n        ", indented, "\n");
+                j = strjoin("SetCredentialEncrypted=", escaped, ": \\\n        ", indented, "\n");
                 if (!j)
                         return log_oom();
 
@@ -562,7 +560,7 @@ static int verb_decrypt(int argc, char **argv, void *userdata) {
         if (r < 0)
                 return log_error_errno(r, "Failed to read encrypted credential data: %m");
 
-        output_path = (argc < 3 || isempty(argv[2]) || streq(argv[2], "-")) ? NULL : argv[2];
+        output_path = (argc < 3 || empty_or_dash(argv[2])) ? NULL : argv[2];
 
         if (arg_name_any)
                 name = NULL;
@@ -638,11 +636,13 @@ static int verb_has_tpm2(int argc, char **argv, void *userdata) {
                 printf("%sfirmware\n"
                        "%sdriver\n"
                        "%ssystem\n"
-                       "%ssubsystem\n",
+                       "%ssubsystem\n"
+                       "%slibraries\n",
                        plus_minus(s & TPM2_SUPPORT_FIRMWARE),
                        plus_minus(s & TPM2_SUPPORT_DRIVER),
                        plus_minus(s & TPM2_SUPPORT_SYSTEM),
-                       plus_minus(s & TPM2_SUPPORT_SUBSYSTEM));
+                       plus_minus(s & TPM2_SUPPORT_SUBSYSTEM),
+                       plus_minus(s & TPM2_SUPPORT_LIBRARIES));
         }
 
         /* Return inverted bit flags. So that TPM2_SUPPORT_FULL becomes EXIT_SUCCESS and the other values
@@ -810,13 +810,11 @@ static int parse_argv(int argc, char *argv[]) {
                         if (isempty(optarg) || streq(optarg, "auto"))
                                 arg_newline = -1;
                         else {
-                                bool b;
-
-                                r = parse_boolean_argument("--newline=", optarg, &b);
+                                r = parse_boolean_argument("--newline=", optarg, NULL);
                                 if (r < 0)
                                         return r;
 
-                                arg_newline = b;
+                                arg_newline = r;
                         }
                         break;
 

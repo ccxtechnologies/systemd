@@ -6,6 +6,7 @@
 #include <stddef.h>
 
 #include "macro.h"
+#include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
@@ -66,15 +67,20 @@ char *path_startswith_full(const char *path, const char *prefix, bool accept_dot
 static inline char* path_startswith(const char *path, const char *prefix) {
         return path_startswith_full(path, prefix, true);
 }
-int path_compare(const char *a, const char *b) _pure_;
 
+int path_compare(const char *a, const char *b) _pure_;
 static inline bool path_equal(const char *a, const char *b) {
         return path_compare(a, b) == 0;
 }
 
-bool path_equal_or_files_same(const char *a, const char *b, int flags);
-/* Compares only the last portion of the input paths, ie: the filenames */
-bool path_equal_filename(const char *a, const char *b);
+int path_compare_filename(const char *a, const char *b);
+static inline bool path_equal_filename(const char *a, const char *b) {
+        return path_compare_filename(a, b) == 0;
+}
+
+static inline bool path_equal_or_inode_same(const char *a, const char *b, int flags) {
+        return path_equal(a, b) || inode_same(a, b, flags) > 0;
+}
 
 char* path_extend_internal(char **x, ...);
 #define path_extend(x, ...) path_extend_internal(x, __VA_ARGS__, POINTER_MAX)
@@ -130,6 +136,7 @@ int fsck_exists_for_fstype(const char *fstype);
 
 /* Similar to path_join(), but only works for two components, and only the first one may be NULL and returns
  * an alloca() buffer, or possibly a const pointer into the path parameter. */
+/* DEPRECATED: use path_join() instead */
 #define prefix_roota(root, path)                                        \
         ({                                                              \
                 const char* _path = (path), *_root = (root), *_ret;     \
@@ -159,6 +166,7 @@ const char *last_path_component(const char *path);
 int path_extract_filename(const char *path, char **ret);
 int path_extract_directory(const char *path, char **ret);
 
+bool filename_part_is_valid(const char *p) _pure_;
 bool filename_is_valid(const char *p) _pure_;
 bool path_is_valid_full(const char *p, bool accept_dot_dot) _pure_;
 static inline bool path_is_valid(const char *p) {
@@ -169,7 +177,7 @@ static inline bool path_is_safe(const char *p) {
 }
 bool path_is_normalized(const char *p) _pure_;
 
-char *file_in_same_dir(const char *path, const char *filename);
+int file_in_same_dir(const char *path, const char *filename, char **ret);
 
 bool hidden_or_backup_file(const char *filename) _pure_;
 

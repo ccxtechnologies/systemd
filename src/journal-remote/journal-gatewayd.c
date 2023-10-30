@@ -14,6 +14,8 @@
 #include "sd-journal.h"
 
 #include "alloc-util.h"
+#include "build.h"
+#include "bus-locator.h"
 #include "bus-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
@@ -29,8 +31,8 @@
 #include "parse-util.h"
 #include "pretty-print.h"
 #include "sigbus.h"
+#include "signal-util.h"
 #include "tmpfile-util.h"
-#include "util.h"
 
 #define JOURNAL_WAIT_TIMEOUT (10*USEC_PER_SEC)
 
@@ -127,7 +129,7 @@ static int request_meta_ensure_tmp(RequestMeta *m) {
         if (m->tmp)
                 rewind(m->tmp);
         else {
-                _cleanup_close_ int fd = -1;
+                _cleanup_close_ int fd = -EBADF;
 
                 fd = open_tmpfile_unlinkable("/tmp", O_RDWR|O_CLOEXEC);
                 if (fd < 0)
@@ -329,7 +331,7 @@ static int request_parse_range(
                                 return r;
                 }
 
-                p = (colon2 ? colon2 : colon) + 1;
+                p = (colon2 ?: colon) + 1;
                 if (*p) {
                         r = safe_atou64(p, &m->n_entries);
                         if (r < 0)
@@ -670,7 +672,7 @@ static int request_handler_file(
                 const char *mime_type) {
 
         _cleanup_(MHD_destroy_responsep) struct MHD_Response *response = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         struct stat st;
 
         assert(connection);
@@ -704,14 +706,7 @@ static int get_virtualization(char **v) {
         if (r < 0)
                 return r;
 
-        r = sd_bus_get_property_string(
-                        bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "Virtualization",
-                        NULL,
-                        &b);
+        r = bus_get_property_string(bus, bus_systemd_mgr, "Virtualization", NULL, &b);
         if (r < 0)
                 return r;
 
@@ -732,7 +727,7 @@ static int request_handler_machine(
         _cleanup_(MHD_destroy_responsep) struct MHD_Response *response = NULL;
         RequestMeta *m = ASSERT_PTR(connection_cls);
         int r;
-        _cleanup_free_ char* hostname = NULL, *os_name = NULL;
+        _cleanup_free_ char* hostname = NULL, *pretty_name = NULL, *os_name = NULL;
         uint64_t cutoff_from = 0, cutoff_to = 0, usage = 0;
         sd_id128_t mid, bid;
         _cleanup_free_ char *v = NULL, *json = NULL;
@@ -763,7 +758,10 @@ static int request_handler_machine(
         if (r < 0)
                 return mhd_respondf(connection, r, MHD_HTTP_INTERNAL_SERVER_ERROR, "Failed to determine disk usage: %m");
 
-        (void) parse_os_release(NULL, "PRETTY_NAME", &os_name);
+        (void) parse_os_release(
+                        NULL,
+                        "PRETTY_NAME", &pretty_name,
+                        "NAME=", &os_name);
         (void) get_virtualization(&v);
 
         r = asprintf(&json,
@@ -778,7 +776,7 @@ static int request_handler_machine(
                      SD_ID128_FORMAT_VAL(mid),
                      SD_ID128_FORMAT_VAL(bid),
                      hostname_cleanup(hostname),
-                     os_name ? os_name : "Linux",
+                     os_release_pretty_name(pretty_name, os_name),
                      v ? v : "bare",
                      usage,
                      cutoff_from,
@@ -1007,11 +1005,15 @@ static int parse_argv(int argc, char *argv[]) {
 
 static int run(int argc, char *argv[]) {
         _cleanup_(MHD_stop_daemonp) struct MHD_Daemon *d = NULL;
+        static const struct sigaction sigterm = {
+                .sa_handler = nop_signal_handler,
+                .sa_flags = SA_RESTART,
+        };
         struct MHD_OptionItem opts[] = {
-                { MHD_OPTION_NOTIFY_COMPLETED,
-                  (intptr_t) request_meta_free, NULL },
                 { MHD_OPTION_EXTERNAL_LOGGER,
                   (intptr_t) microhttpd_logger, NULL },
+                { MHD_OPTION_NOTIFY_COMPLETED,
+                  (intptr_t) request_meta_free, NULL },
                 { MHD_OPTION_END, 0, NULL },
                 { MHD_OPTION_END, 0, NULL },
                 { MHD_OPTION_END, 0, NULL },
@@ -1043,6 +1045,7 @@ static int run(int argc, char *argv[]) {
                 return r;
 
         sigbus_install();
+        assert_se(sigaction(SIGTERM, &sigterm, NULL) >= 0);
 
         r = setup_gnutls_logger(NULL);
         if (r < 0)

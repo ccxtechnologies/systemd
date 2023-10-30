@@ -44,7 +44,7 @@ assert_cc(sizeof(struct iphdr) == 20);
 assert_cc(sizeof(struct udphdr) == 8);
 assert_cc(sizeof(DnsPacketHeader) == 12);
 
-/* The various DNS protocols deviate in how large a packet can grow, but the TCP transport has a 16bit size
+/* The various DNS protocols deviate in how large a packet can grow, but the TCP transport has a 16-bit size
  * field, hence that appears to be the absolute maximum. */
 #define DNS_PACKET_SIZE_MAX 0xFFFFu
 
@@ -55,8 +55,8 @@ assert_cc(sizeof(DnsPacketHeader) == 12);
 /* RFC 1035 say 512 is the maximum, for classic unicast DNS */
 #define DNS_PACKET_UNICAST_SIZE_MAX 512u
 
-/* With EDNS0 we can use larger packets, default to 4096, which is what is commonly used */
-#define DNS_PACKET_UNICAST_SIZE_LARGE_MAX 4096u
+/* With EDNS0 we can use larger packets, default to 1232, which is what is commonly used */
+#define DNS_PACKET_UNICAST_SIZE_LARGE_MAX 1232u
 
 struct DnsPacket {
         unsigned n_ref;

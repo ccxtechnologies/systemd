@@ -46,7 +46,7 @@ static void test_should_fail(const char *p) {
 }
 
 static void test_one(const char *p) {
-        _cleanup_free_ char *with_utc;
+        _cleanup_free_ char *with_utc = NULL;
 
         with_utc = strjoin(p, " UTC");
         test_should_pass(p);
@@ -54,7 +54,7 @@ static void test_one(const char *p) {
 }
 
 static void test_one_noutc(const char *p) {
-        _cleanup_free_ char *with_utc;
+        _cleanup_free_ char *with_utc = NULL;
 
         with_utc = strjoin(p, " UTC");
         test_should_pass(p);
@@ -101,8 +101,8 @@ int main(int argc, char *argv[]) {
         test_should_fail("9999-12-31 00:00:00 UTC");
         test_should_fail("10000-01-01 00:00:00 UTC");
 #elif SIZEOF_TIME_T == 4
-        test_should_pass("2038-01-19 03:14:07 UTC");
-        test_should_fail("2038-01-19 03:14:08 UTC");
+        test_should_pass("2038-01-18 03:14:07 UTC");
+        test_should_fail("2038-01-18 03:14:08 UTC");
 #endif
 
         return 0;

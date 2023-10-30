@@ -16,9 +16,10 @@
 #include "bus-log-control-api.h"
 #include "bus-polkit.h"
 #include "bus-util.h"
+#include "common-signal.h"
 #include "conf-parser.h"
+#include "constants.h"
 #include "daemon-util.h"
-#include "def.h"
 #include "device-private.h"
 #include "device-util.h"
 #include "dns-domain.h"
@@ -26,6 +27,7 @@
 #include "fileio.h"
 #include "firewall-util.h"
 #include "fs-util.h"
+#include "initrd-util.h"
 #include "local-addresses.h"
 #include "netlink-util.h"
 #include "network-internal.h"
@@ -64,25 +66,9 @@
 /* use 128 MB for receive socket kernel queue. */
 #define RCVBUF_SIZE    (128*1024*1024)
 
-static int manager_reset_all(Manager *m) {
-        Link *link;
-        int r;
-
-        assert(m);
-
-        HASHMAP_FOREACH(link, m->links_by_index) {
-                r = link_reconfigure_after_sleep(link);
-                if (r < 0) {
-                        log_link_warning_errno(link, r, "Failed to reconfigure interface: %m");
-                        link_enter_failed(link);
-                }
-        }
-
-        return 0;
-}
-
 static int match_prepare_for_sleep(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
         Manager *m = ASSERT_PTR(userdata);
+        Link *link;
         int b, r;
 
         assert(message);
@@ -96,9 +82,15 @@ static int match_prepare_for_sleep(sd_bus_message *message, void *userdata, sd_b
         if (b)
                 return 0;
 
-        log_debug("Coming back from suspend, resetting all connections...");
+        log_debug("Coming back from suspend, reconfiguring all connections...");
 
-        (void) manager_reset_all(m);
+        HASHMAP_FOREACH(link, m->links_by_index) {
+                r = link_reconfigure(link, /* force = */ true);
+                if (r < 0) {
+                        log_link_warning_errno(link, r, "Failed to reconfigure interface: %m");
+                        link_enter_failed(link);
+                }
+        }
 
         return 0;
 }
@@ -156,12 +148,10 @@ static int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to request match on Connected signal: %m");
 
-        r = sd_bus_match_signal_async(
+        r = bus_match_signal_async(
                         m->bus,
                         NULL,
-                        "org.freedesktop.login1",
-                        "/org/freedesktop/login1",
-                        "org.freedesktop.login1.Manager",
+                        bus_login_mgr,
                         "PrepareForSleep",
                         match_prepare_for_sleep, NULL, m);
         if (r < 0)
@@ -244,7 +234,7 @@ static int manager_connect_udev(Manager *m) {
 
 static int manager_listen_fds(Manager *m, int *ret_rtnl_fd) {
         _cleanup_strv_free_ char **names = NULL;
-        int n, rtnl_fd = -1;
+        int n, rtnl_fd = -EBADF;
 
         assert(m);
         assert(ret_rtnl_fd);
@@ -483,6 +473,14 @@ static int signal_restart_callback(sd_event_source *s, const struct signalfd_sig
         return sd_event_exit(sd_event_source_get_event(s), 0);
 }
 
+static int signal_reload_callback(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata) {
+        Manager *m = ASSERT_PTR(userdata);
+
+        manager_reload(m);
+
+        return 0;
+}
+
 static int manager_set_keep_configuration(Manager *m) {
         int r;
 
@@ -508,7 +506,7 @@ static int manager_set_keep_configuration(Manager *m) {
 }
 
 int manager_setup(Manager *m) {
-        _cleanup_close_ int rtnl_fd = -1;
+        _cleanup_close_ int rtnl_fd = -EBADF;
         int r;
 
         assert(m);
@@ -517,12 +515,16 @@ int manager_setup(Manager *m) {
         if (r < 0)
                 return r;
 
-        assert_se(sigprocmask_many(SIG_SETMASK, NULL, SIGINT, SIGTERM, SIGUSR2, -1) >= 0);
-
         (void) sd_event_set_watchdog(m->event, true);
-        (void) sd_event_add_signal(m->event, NULL, SIGTERM, signal_terminate_callback, m);
-        (void) sd_event_add_signal(m->event, NULL, SIGINT, signal_terminate_callback, m);
-        (void) sd_event_add_signal(m->event, NULL, SIGUSR2, signal_restart_callback, m);
+        (void) sd_event_add_signal(m->event, NULL, SIGTERM | SD_EVENT_SIGNAL_PROCMASK, signal_terminate_callback, m);
+        (void) sd_event_add_signal(m->event, NULL, SIGINT | SD_EVENT_SIGNAL_PROCMASK, signal_terminate_callback, m);
+        (void) sd_event_add_signal(m->event, NULL, SIGUSR2 | SD_EVENT_SIGNAL_PROCMASK, signal_restart_callback, m);
+        (void) sd_event_add_signal(m->event, NULL, SIGHUP | SD_EVENT_SIGNAL_PROCMASK, signal_reload_callback, m);
+        (void) sd_event_add_signal(m->event, NULL, (SIGRTMIN+18) | SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, NULL);
+
+        r = sd_event_add_memory_pressure(m->event, NULL, NULL, NULL);
+        if (r < 0)
+                log_debug_errno(r, "Failed allocate memory pressure event source, ignoring: %m");
 
         r = sd_event_add_post(m->event, NULL, manager_dirty_handler, m);
         if (r < 0)
@@ -587,12 +589,13 @@ int manager_new(Manager **ret, bool test_mode) {
 
         *m = (Manager) {
                 .keep_configuration = _KEEP_CONFIGURATION_INVALID,
+                .ipv6_privacy_extensions = IPV6_PRIVACY_EXTENSIONS_NO,
                 .test_mode = test_mode,
                 .speed_meter_interval_usec = SPEED_METER_DEFAULT_TIME_INTERVAL,
                 .online_state = _LINK_ONLINE_STATE_INVALID,
                 .manage_foreign_routes = true,
                 .manage_foreign_rules = true,
-                .ethtool_fd = -1,
+                .ethtool_fd = -EBADF,
                 .dhcp_duid.type = DUID_TYPE_EN,
                 .dhcp6_duid.type = DUID_TYPE_EN,
                 .duid_product_uuid.type = DUID_TYPE_UUID,
@@ -616,6 +619,7 @@ Manager* manager_free(Manager *m) {
         m->request_queue = ordered_set_free(m->request_queue);
 
         m->dirty_links = set_free_with_destructor(m->dirty_links, link_unref);
+        m->new_wlan_ifindices = set_free(m->new_wlan_ifindices);
         m->links_by_name = hashmap_free(m->links_by_name);
         m->links_by_hw_addr = hashmap_free(m->links_by_hw_addr);
         m->links_by_dhcp_pd_subnet_prefix = hashmap_free(m->links_by_dhcp_pd_subnet_prefix);
@@ -1077,4 +1081,35 @@ int manager_set_timezone(Manager *m, const char *tz) {
                 return log_error_errno(r, "Could not set timezone: %m");
 
         return 0;
+}
+
+int manager_reload(Manager *m) {
+        Link *link;
+        int r;
+
+        assert(m);
+
+        (void) sd_notifyf(/* unset= */ false,
+                          "RELOADING=1\n"
+                          "STATUS=Reloading configuration...\n"
+                          "MONOTONIC_USEC=" USEC_FMT, now(CLOCK_MONOTONIC));
+
+        r = netdev_load(m, /* reload= */ true);
+        if (r < 0)
+                goto finish;
+
+        r = network_reload(m);
+        if (r < 0)
+                goto finish;
+
+        HASHMAP_FOREACH(link, m->links_by_index) {
+                r = link_reconfigure(link, /* force = */ false);
+                if (r < 0)
+                        goto finish;
+        }
+
+        r = 0;
+finish:
+        (void) sd_notify(/* unset= */ false, NOTIFY_READY);
+        return r;
 }

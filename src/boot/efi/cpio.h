@@ -1,9 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <efi.h>
-#include <stdbool.h>
-#include <uchar.h>
+#include "efi.h"
+#include "proto/loaded-image.h"
 
 EFI_STATUS pack_cpio(
                 EFI_LOADED_IMAGE_PROTOCOL *loaded_image,
@@ -12,11 +11,10 @@ EFI_STATUS pack_cpio(
                 const char *target_dir_prefix,
                 uint32_t dir_mode,
                 uint32_t access_mode,
-                const uint32_t tpm_pcr[],
-                UINTN n_tpm_pcr,
+                uint32_t tpm_pcr,
                 const char16_t *tpm_description,
                 void **ret_buffer,
-                UINTN *ret_buffer_size,
+                size_t *ret_buffer_size,
                 bool *ret_measured);
 
 EFI_STATUS pack_cpio_literal(
@@ -26,9 +24,8 @@ EFI_STATUS pack_cpio_literal(
                 const char16_t *target_filename,
                 uint32_t dir_mode,
                 uint32_t access_mode,
-                const uint32_t tpm_pcr[],
-                UINTN n_tpm_pcr,
+                uint32_t tpm_pcr,
                 const char16_t *tpm_description,
                 void **ret_buffer,
-                UINTN *ret_buffer_size,
+                size_t *ret_buffer_size,
                 bool *ret_measured);

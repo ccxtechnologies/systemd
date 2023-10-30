@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "cap-list.h"
 #include "format-util.h"
 #include "fs-util.h"
 #include "process-util.h"
@@ -287,6 +288,22 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
         if (hr->access_mode != MODE_INVALID)
                 printf(" Access Mode: 0%03o\n", user_record_access_mode(hr));
 
+        uint64_t caps = user_record_capability_bounding_set(hr);
+        if (caps != UINT64_MAX) {
+                _cleanup_free_ char *scaps = NULL;
+
+                (void) capability_set_to_string_negative(caps, &scaps);
+                printf(" Bound. Caps: %s\n", strna(scaps));
+        }
+
+        caps = user_record_capability_ambient_set(hr);
+        if (caps != UINT64_MAX) {
+                _cleanup_free_ char *scaps = NULL;
+
+                (void) capability_set_to_string(caps, &scaps);
+                printf("Ambient Caps: %s\n", strna(scaps));
+        }
+
         if (storage == USER_LUKS) {
                 printf("LUKS Discard: online=%s offline=%s\n", yes_no(user_record_luks_discard(hr)), yes_no(user_record_luks_offline_discard(hr)));
 
@@ -314,6 +331,8 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
                         printf("  PBKDF Type: %s\n", hr->luks_pbkdf_type);
                 if (hr->luks_pbkdf_hash_algorithm)
                         printf("  PBKDF Hash: %s\n", hr->luks_pbkdf_hash_algorithm);
+                if (hr->luks_pbkdf_force_iterations != UINT64_MAX)
+                        printf(" PBKDF Iters: %" PRIu64 "\n", hr->luks_pbkdf_force_iterations);
                 if (hr->luks_pbkdf_time_cost_usec != UINT64_MAX)
                         printf("  PBKDF Time: %s\n", FORMAT_TIMESPAN(hr->luks_pbkdf_time_cost_usec, 0));
                 if (hr->luks_pbkdf_memory_cost != UINT64_MAX)

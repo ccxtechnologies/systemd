@@ -86,7 +86,7 @@ _busctl() {
                       --show-machine --unique --acquired --activatable --list
                       -q --quiet --verbose --expect-reply=no --auto-start=no
                       --allow-interactive-authorization=no --augment-creds=no
-                      --watch-bind=yes -j -l --full'
+                      --watch-bind=yes -j -l --full --xml-interface'
         [ARG]='--address -H --host -M --machine --match --timeout --size --json
                       --destination'
     )
@@ -139,7 +139,7 @@ _busctl() {
         fi
     done
 
-    n=$(($COMP_CWORD - $i))
+    n=$((COMP_CWORD - i))
 
     if [[ -z ${verb-} ]]; then
         comps=${VERBS[*]}

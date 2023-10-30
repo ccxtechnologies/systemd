@@ -281,11 +281,10 @@ static int sound_device_compare(const char *devpath_a, const char *devpath_b) {
          * kernel makes this guarantee when creating those devices, and hence we should too when
          * enumerating them. */
 
-        sound_a = strstr(devpath_a, "/sound/card");
+        sound_a = strstrafter(devpath_a, "/sound/card");
         if (!sound_a)
                 return 0;
 
-        sound_a += STRLEN("/sound/card");
         sound_a = strchr(devpath_a, '/');
         if (!sound_a)
                 return 0;
@@ -472,9 +471,7 @@ static bool match_property(sd_device_enumerator *enumerator, sd_device *device) 
         if (hashmap_isempty(enumerator->match_property))
                 return true;
 
-        HASHMAP_FOREACH_KEY(value_patterns, property_pattern, enumerator->match_property) {
-                const char *property, *value;
-
+        HASHMAP_FOREACH_KEY(value_patterns, property_pattern, enumerator->match_property)
                 FOREACH_DEVICE_PROPERTY(device, property, value) {
                         if (fnmatch(property_pattern, property, 0) != 0)
                                 continue;
@@ -482,7 +479,6 @@ static bool match_property(sd_device_enumerator *enumerator, sd_device *device) 
                         if (strv_fnmatch(value_patterns, value))
                                 return true;
                 }
-        }
 
         return false;
 }
@@ -769,7 +765,7 @@ static int enumerator_scan_dir(
                 if (!relevant_sysfs_subdir(de))
                         continue;
 
-                if (!match_subsystem(enumerator, subsystem ? : de->d_name))
+                if (!match_subsystem(enumerator, subsystem ?: de->d_name))
                         continue;
 
                 k = enumerator_scan_dir_and_add_devices(enumerator, basedir, de->d_name, subdir);

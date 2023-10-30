@@ -4,7 +4,7 @@
 
 #include "alloc-util.h"
 #include "blockdev-util.h"
-#include "chase-symlinks.h"
+#include "chase.h"
 #include "devnum-util.h"
 #include "escape.h"
 #include "main-func.h"
@@ -21,7 +21,7 @@ static int make_volatile(const char *path) {
 
         assert(path);
 
-        r = chase_symlinks("/usr", path, CHASE_PREFIX_ROOT, &old_usr, NULL);
+        r = chase("/usr", path, CHASE_PREFIX_ROOT, &old_usr, NULL);
         if (r < 0)
                 return log_error_errno(r, "/usr not available in old root: %m");
 
@@ -29,7 +29,7 @@ static int make_volatile(const char *path) {
         if (r < 0)
                 return log_error_errno(r, "Couldn't generate volatile sysroot directory: %m");
 
-        r = mount_nofollow_verbose(LOG_ERR, "tmpfs", "/run/systemd/volatile-sysroot", "tmpfs", MS_STRICTATIME, "mode=755" TMPFS_LIMITS_ROOTFS);
+        r = mount_nofollow_verbose(LOG_ERR, "tmpfs", "/run/systemd/volatile-sysroot", "tmpfs", MS_STRICTATIME, "mode=0755" TMPFS_LIMITS_ROOTFS);
         if (r < 0)
                 goto finish_rmdir;
 
@@ -80,7 +80,7 @@ static int make_overlay(const char *path) {
         if (r < 0)
                 return log_error_errno(r, "Couldn't create overlay sysroot directory: %m");
 
-        r = mount_nofollow_verbose(LOG_ERR, "tmpfs", "/run/systemd/overlay-sysroot", "tmpfs", MS_STRICTATIME, "mode=755" TMPFS_LIMITS_ROOTFS);
+        r = mount_nofollow_verbose(LOG_ERR, "tmpfs", "/run/systemd/overlay-sysroot", "tmpfs", MS_STRICTATIME, "mode=0755" TMPFS_LIMITS_ROOTFS);
         if (r < 0)
                 goto finish;
 

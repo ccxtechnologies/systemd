@@ -6,13 +6,17 @@
 #include "macro.h"
 #include "main-func.h"
 
-int generator_open_unit_file(
-        const char *dest,
-        const char *source,
-        const char *name,
-        FILE **file);
+int generator_open_unit_file_full(const char *dest, const char *source, const char *name, FILE **ret_file, char **ret_temp_path);
 
-int generator_add_symlink(const char *dir, const char *dst, const char *dep_type, const char *src);
+static inline int generator_open_unit_file(const char *dest, const char *source, const char *name, FILE **ret_file) {
+        return generator_open_unit_file_full(dest, source, name, ret_file, NULL);
+}
+
+int generator_add_symlink_full(const char *dir, const char *dst, const char *dep_type, const char *src, const char *instance);
+
+static inline int generator_add_symlink(const char *dir, const char *dst, const char *dep_type, const char *src) {
+        return generator_add_symlink_full(dir, dst, dep_type, src, NULL);
+}
 
 int generator_write_fsck_deps(
         FILE *f,
@@ -74,6 +78,10 @@ int generator_hook_up_mkfs(
         const char *where,
         const char *type);
 int generator_hook_up_growfs(
+        const char *dir,
+        const char *where,
+        const char *target);
+int generator_hook_up_pcrfs(
         const char *dir,
         const char *where,
         const char *target);
