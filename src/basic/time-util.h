@@ -71,21 +71,26 @@ typedef enum TimestampStyle {
 
 #define TIME_T_MAX (time_t)((UINTMAX_C(1) << ((sizeof(time_t) << 3) - 1)) - 1)
 
-#define DUAL_TIMESTAMP_NULL ((struct dual_timestamp) {})
-#define TRIPLE_TIMESTAMP_NULL ((struct triple_timestamp) {})
+#define DUAL_TIMESTAMP_NULL ((dual_timestamp) {})
+#define DUAL_TIMESTAMP_INFINITY ((dual_timestamp) { USEC_INFINITY, USEC_INFINITY })
+#define TRIPLE_TIMESTAMP_NULL ((triple_timestamp) {})
+
+#define TIMESPEC_OMIT ((const struct timespec) { .tv_nsec = UTIME_OMIT })
 
 usec_t now(clockid_t clock);
 nsec_t now_nsec(clockid_t clock);
 
+usec_t map_clock_usec_raw(usec_t from, usec_t from_base, usec_t to_base);
 usec_t map_clock_usec(usec_t from, clockid_t from_clock, clockid_t to_clock);
 
-dual_timestamp* dual_timestamp_get(dual_timestamp *ts);
+dual_timestamp* dual_timestamp_now(dual_timestamp *ts);
 dual_timestamp* dual_timestamp_from_realtime(dual_timestamp *ts, usec_t u);
 dual_timestamp* dual_timestamp_from_monotonic(dual_timestamp *ts, usec_t u);
 dual_timestamp* dual_timestamp_from_boottime(dual_timestamp *ts, usec_t u);
 
-triple_timestamp* triple_timestamp_get(triple_timestamp *ts);
+triple_timestamp* triple_timestamp_now(triple_timestamp *ts);
 triple_timestamp* triple_timestamp_from_realtime(triple_timestamp *ts, usec_t u);
+triple_timestamp* triple_timestamp_from_boottime(triple_timestamp *ts, usec_t u);
 
 #define DUAL_TIMESTAMP_HAS_CLOCK(clock)                               \
         IN_SET(clock, CLOCK_REALTIME, CLOCK_REALTIME_ALARM, CLOCK_MONOTONIC)
@@ -213,10 +218,16 @@ static inline usec_t usec_sub_signed(usec_t timestamp, int64_t delta) {
 
 static inline int usleep_safe(usec_t usec) {
         /* usleep() takes useconds_t that is (typically?) uint32_t. Also, usleep() may only support the
-         * range [0, 1000000]. See usleep(3). Let's override usleep() with nanosleep(). */
+         * range [0, 1000000]. See usleep(3). Let's override usleep() with clock_nanosleep().
+         *
+         * ⚠️ Note we are not using plain nanosleep() here, since that operates on CLOCK_REALTIME, not
+         *    CLOCK_MONOTONIC! */
+
+        if (usec == 0)
+                return 0;
 
         // FIXME: use RET_NERRNO() macro here. Currently, this header cannot include errno-util.h.
-        return nanosleep(TIMESPEC_STORE(usec), NULL) < 0 ? -errno : 0;
+        return clock_nanosleep(CLOCK_MONOTONIC, 0, TIMESPEC_STORE(usec), NULL) < 0 ? -errno : 0;
 }
 
 /* The last second we can format is 31. Dec 9999, 1s before midnight, because otherwise we'd enter 5 digit

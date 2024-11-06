@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="pstore.conf" conditional="ENABLE_PSTORE"
@@ -22,10 +22,16 @@
   </refnamediv>
 
   <refsynopsisdiv>
-    <para>
-    <filename>/etc/systemd/pstore.conf</filename>
-    <filename>/etc/systemd/pstore.conf.d/*</filename>
-    </para>
+    <para><simplelist>
+      <member><filename>/etc/systemd/pstore.conf</filename></member>
+      <member><filename>/run/systemd/pstore.conf</filename></member>
+      <member><filename>/usr/local/lib/systemd/pstore.conf</filename></member>
+      <member><filename>/usr/lib/systemd/pstore.conf</filename></member>
+      <member><filename>/etc/systemd/pstore.conf.d/*.conf</filename></member>
+      <member><filename>/run/systemd/pstore.conf.d/*.conf</filename></member>
+      <member><filename>/usr/local/lib/systemd/pstore.conf.d/*.conf</filename></member>
+      <member><filename>/usr/lib/systemd/pstore.conf.d/*.conf</filename></member>
+    </simplelist></para>
   </refsynopsisdiv>
 
   <refsect1>
@@ -57,6 +63,8 @@
         When <literal>external</literal> (the default), files are archived into <filename>/var/lib/systemd/pstore/</filename>,
         and logged into the journal.
         When <literal>journal</literal>, pstore file contents are logged only in the journal.</para>
+
+        <xi:include href="version-info.xml" xpointer="v243"/>
         </listitem>
 
       </varlistentry>
@@ -70,7 +78,9 @@
         normally, but the files remain in the pstore.
         The default is true in order to maintain the pstore in a nearly empty state, so that the pstore
         has storage available for the next kernel error event.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v243"/></listitem>
       </varlistentry>
     </variablelist>
 

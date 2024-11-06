@@ -22,6 +22,8 @@
 #include "parse-argument.h"
 #include "pretty-print.h"
 #include "utf8.h"
+#include "varlink.h"
+#include "varlink-io.systemd.BootControl.h"
 #include "verbs.h"
 #include "virt.h"
 
@@ -53,6 +55,7 @@ InstallSource arg_install_source = ARG_INSTALL_SOURCE_AUTO;
 char *arg_efi_boot_option_description = NULL;
 bool arg_dry_run = false;
 ImagePolicy *arg_image_policy = NULL;
+bool arg_varlink = false;
 
 STATIC_DESTRUCTOR_REGISTER(arg_esp_path, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_xbootldr_path, freep);
@@ -132,6 +135,8 @@ static int help(int argc, char *argv[], void *userdata) {
         _cleanup_free_ char *link = NULL;
         int r;
 
+        pager_open(arg_pager_flags);
+
         r = terminal_urlify_man("bootctl", "1", &link);
         if (r < 0)
                 return log_oom();
@@ -142,8 +147,6 @@ static int help(int argc, char *argv[], void *userdata) {
                "  status               Show status of installed boot loader and EFI variables\n"
                "  reboot-to-firmware [BOOL]\n"
                "                       Query or set reboot-to-firmware EFI flag\n"
-               "  systemd-efi-options [STRING]\n"
-               "                       Query or set system options string in EFI variable\n"
                "\n%3$sBoot Loader Specification Commands:%4$s\n"
                "  list                 List boot loader entries\n"
                "  unlink ID            Remove boot loader entry\n"
@@ -262,7 +265,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hpxR", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "hpxRq", options, NULL)) >= 0)
                 switch (c) {
 
                 case 'h':
@@ -324,7 +327,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case 'R':
-                        arg_print_root_device ++;
+                        arg_print_root_device++;
                         break;
 
                 case ARG_NO_VARIABLES:
@@ -418,6 +421,14 @@ static int parse_argv(int argc, char *argv[]) {
         if (arg_dry_run && argv[optind] && !STR_IN_SET(argv[optind], "unlink", "cleanup"))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--dry is only supported with --unlink or --cleanup");
 
+        r = varlink_invocation(VARLINK_ALLOW_ACCEPT);
+        if (r < 0)
+                return log_error_errno(r, "Failed to check if invoked in Varlink mode: %m");
+        if (r > 0) {
+                arg_varlink = true;
+                arg_pager_flags |= PAGER_DISABLE;
+        }
+
         return 1;
 }
 
@@ -462,6 +473,34 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
+        if (arg_varlink) {
+                _cleanup_(varlink_server_unrefp) VarlinkServer *varlink_server = NULL;
+
+                /* Invocation as Varlink service */
+
+                r = varlink_server_new(&varlink_server, VARLINK_SERVER_ROOT_ONLY);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to allocate Varlink server: %m");
+
+                r = varlink_server_add_interface(varlink_server, &vl_interface_io_systemd_BootControl);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add Varlink interface: %m");
+
+                r = varlink_server_bind_method_many(
+                                varlink_server,
+                                "io.systemd.BootControl.ListBootEntries",     vl_method_list_boot_entries,
+                                "io.systemd.BootControl.SetRebootToFirmware", vl_method_set_reboot_to_firmware,
+                                "io.systemd.BootControl.GetRebootToFirmware", vl_method_get_reboot_to_firmware);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to bind Varlink methods: %m");
+
+                r = varlink_server_loop_auto(varlink_server);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to run Varlink event loop: %m");
+
+                return EXIT_SUCCESS;
+        }
+
         if (arg_print_root_device > 0) {
                 _cleanup_free_ char *path = NULL;
                 dev_t devno;
@@ -498,7 +537,8 @@ static int run(int argc, char *argv[]) {
                                 arg_image,
                                 arg_image_policy,
                                 DISSECT_IMAGE_GENERIC_ROOT |
-                                DISSECT_IMAGE_RELAX_VAR_CHECK,
+                                DISSECT_IMAGE_RELAX_VAR_CHECK |
+                                DISSECT_IMAGE_ALLOW_USERSPACE_VERITY,
                                 &mounted_dir,
                                 /* ret_dir_fd= */ NULL,
                                 &loop_device);

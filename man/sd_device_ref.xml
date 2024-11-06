@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_device_ref" xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -81,5 +81,11 @@
     <para><function>sd_device_ref()</function> always returns the argument, and
     <function>sd_device_unref()</function> always returns <constant>NULL</constant>.
     </para>
+  </refsect1>
+<refsect1>
+    <title>History</title>
+    <para><function>sd_device_ref()</function>,
+    <function>sd_device_unref()</function>, and
+    <function>sd_device_unrefp()</function> were added in version 251.</para>
   </refsect1>
 </refentry>

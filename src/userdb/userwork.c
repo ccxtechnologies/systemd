@@ -18,6 +18,7 @@
 #include "user-util.h"
 #include "userdb.h"
 #include "varlink.h"
+#include "varlink-io.systemd.UserDatabase.h"
 
 #define ITERATIONS_MAX 64U
 #define RUNTIME_MAX_USEC (5 * USEC_PER_MINUTE)
@@ -147,8 +148,8 @@ static int vl_method_get_user_record(Varlink *link, JsonVariant *parameters, Var
 
         assert(parameters);
 
-        r = json_dispatch(parameters, dispatch_table, NULL, 0, &p);
-        if (r < 0)
+        r = varlink_dispatch(link, parameters, dispatch_table, &p);
+        if (r != 0)
                 return r;
 
         r = userdb_flags_from_service(link, p.service, &userdb_flags);
@@ -283,8 +284,8 @@ static int vl_method_get_group_record(Varlink *link, JsonVariant *parameters, Va
 
         assert(parameters);
 
-        r = json_dispatch(parameters, dispatch_table, NULL, 0, &p);
-        if (r < 0)
+        r = varlink_dispatch(link, parameters, dispatch_table, &p);
+        if (r != 0)
                 return r;
 
         r = userdb_flags_from_service(link, p.service, &userdb_flags);
@@ -352,9 +353,9 @@ static int vl_method_get_group_record(Varlink *link, JsonVariant *parameters, Va
 
 static int vl_method_get_memberships(Varlink *link, JsonVariant *parameters, VarlinkMethodFlags flags, void *userdata) {
         static const JsonDispatch dispatch_table[] = {
-                { "userName",  JSON_VARIANT_STRING, json_dispatch_const_string, offsetof(LookupParameters, user_name), 0 },
+                { "userName",  JSON_VARIANT_STRING, json_dispatch_const_string, offsetof(LookupParameters, user_name),  0 },
                 { "groupName", JSON_VARIANT_STRING, json_dispatch_const_string, offsetof(LookupParameters, group_name), 0 },
-                { "service",   JSON_VARIANT_STRING, json_dispatch_const_string, offsetof(LookupParameters, service),   0 },
+                { "service",   JSON_VARIANT_STRING, json_dispatch_const_string, offsetof(LookupParameters, service),    0 },
                 {}
         };
 
@@ -366,8 +367,8 @@ static int vl_method_get_memberships(Varlink *link, JsonVariant *parameters, Var
 
         assert(parameters);
 
-        r = json_dispatch(parameters, dispatch_table, NULL, 0, &p);
-        if (r < 0)
+        r = varlink_dispatch(link, parameters, dispatch_table, &p);
+        if (r != 0)
                 return r;
 
         r = userdb_flags_from_service(link, p.service, &userdb_flags);
@@ -424,16 +425,16 @@ static int vl_method_get_memberships(Varlink *link, JsonVariant *parameters, Var
                                               JSON_BUILD_PAIR("groupName", JSON_BUILD_STRING(last_group_name))));
 }
 
-static int process_connection(VarlinkServer *server, int fd) {
+static int process_connection(VarlinkServer *server, int _fd) {
+        _cleanup_close_ int fd = TAKE_FD(_fd); /* always take possession */
         _cleanup_(varlink_close_unrefp) Varlink *vl = NULL;
         int r;
 
         r = varlink_server_add_connection(server, fd, &vl);
-        if (r < 0) {
-                fd = safe_close(fd);
+        if (r < 0)
                 return log_error_errno(r, "Failed to add connection: %m");
-        }
 
+        TAKE_FD(fd);
         vl = varlink_ref(vl);
 
         for (;;) {
@@ -460,6 +461,7 @@ static int process_connection(VarlinkServer *server, int fd) {
 static int run(int argc, char *argv[]) {
         usec_t start_time, listen_idle_usec, last_busy_usec = USEC_INFINITY;
         _cleanup_(varlink_server_unrefp) VarlinkServer *server = NULL;
+        _cleanup_(pidref_done) PidRef parent = PIDREF_NULL;
         unsigned n_iterations = 0;
         int m, listen_fd, r;
 
@@ -483,6 +485,10 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate server: %m");
 
+        r = varlink_server_add_interface(server, &vl_interface_io_systemd_UserDatabase);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add UserDatabase interface to varlink server: %m");
+
         r = varlink_server_bind_method_many(
                         server,
                         "io.systemd.UserDatabase.GetUserRecord",  vl_method_get_user_record,
@@ -499,6 +505,12 @@ static int run(int argc, char *argv[]) {
         r = userdb_block_nss_systemd(true);
         if (r < 0)
                 return log_error_errno(r, "Failed to disable userdb NSS compatibility: %m");
+
+        r = pidref_set_parent(&parent);
+        if (r < 0)
+                return log_error_errno(r, "Failed to acquire pidfd of parent process: %m");
+        if (parent.pid == 1) /* We got reparented away from userdbd? */
+                return log_error_errno(SYNTHETIC_ERRNO(ESRCH), "Parent already died, exiting.");
 
         start_time = now(CLOCK_MONOTONIC);
 
@@ -549,14 +561,11 @@ static int run(int argc, char *argv[]) {
                                 return log_error_errno(r, "Failed to test for POLLIN on listening socket: %m");
 
                         if (FLAGS_SET(r, POLLIN)) {
-                                pid_t parent;
-
-                                parent = getppid();
-                                if (parent <= 1)
-                                        return log_error_errno(SYNTHETIC_ERRNO(ESRCH), "Parent already died?");
-
-                                if (kill(parent, SIGUSR2) < 0)
-                                        return log_error_errno(errno, "Failed to kill our own parent: %m");
+                                r = pidref_kill(&parent, SIGUSR2);
+                                if (r == -ESRCH)
+                                        return log_error_errno(r, "Parent already died?");
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to send SIGUSR2 signal to parent: %m");
                         }
                 }
 

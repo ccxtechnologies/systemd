@@ -17,39 +17,34 @@ int acquire_luks2_key(
                 const char *device,
                 uint32_t hash_pcr_mask,
                 uint16_t pcr_bank,
-                const void *pubkey,
-                size_t pubkey_size,
+                const struct iovec *pubkey,
                 uint32_t pubkey_pcr_mask,
                 const char *signature_path,
                 const char *pin,
+                const char *pcrlock_path,
                 uint16_t primary_alg,
-                const void *key_data,
-                size_t key_data_size,
-                const void *policy_hash,
-                size_t policy_hash_size,
-                const void *salt,
-                size_t salt_size,
-                const void *srk_buf,
-                size_t srk_buf_size,
+                const struct iovec *blob,
+                const struct iovec *policy_hash,
+                const struct iovec *salt,
+                const struct iovec *srk,
+                const struct iovec *pcrlock_nv,
                 TPM2Flags flags,
-                void **ret_decrypted_key,
-                size_t *ret_decrypted_key_size) {
+                struct iovec *ret_decrypted_key) {
 
         _cleanup_(json_variant_unrefp) JsonVariant *signature_json = NULL;
         _cleanup_free_ char *auto_device = NULL;
         _cleanup_(erase_and_freep) char *b64_salted_pin = NULL;
         int r;
 
-        assert(salt || salt_size == 0);
+        assert(iovec_is_valid(salt));
         assert(ret_decrypted_key);
-        assert(ret_decrypted_key_size);
 
         if (!device) {
-                r = tpm2_find_device_auto(LOG_DEBUG, &auto_device);
+                r = tpm2_find_device_auto(&auto_device);
                 if (r == -ENODEV)
                         return -EAGAIN; /* Tell the caller to wait for a TPM2 device to show up */
                 if (r < 0)
-                        return r;
+                        return log_error_errno(r, "Could not find TPM2 device: %m");
 
                 device = auto_device;
         }
@@ -57,14 +52,10 @@ int acquire_luks2_key(
         if ((flags & TPM2_FLAGS_USE_PIN) && !pin)
                 return -ENOANO;
 
-        /* If we're using a PIN, and the luks header has a salt, it better have a pin too */
-        if ((flags & TPM2_FLAGS_USE_PIN) && salt_size > 0 && !pin)
-                return -ENOANO;
-
-        if (pin && salt_size > 0) {
+        if (pin && iovec_is_set(salt)) {
                 uint8_t salted_pin[SHA256_DIGEST_SIZE] = {};
                 CLEANUP_ERASE(salted_pin);
-                r = tpm2_util_pbkdf2_hmac_sha256(pin, strlen(pin), salt, salt_size, salted_pin);
+                r = tpm2_util_pbkdf2_hmac_sha256(pin, strlen(pin), salt->iov_base, salt->iov_len, salted_pin);
                 if (r < 0)
                         return log_error_errno(r, "Failed to perform PBKDF2: %m");
 
@@ -77,20 +68,44 @@ int acquire_luks2_key(
         if (pubkey_pcr_mask != 0) {
                 r = tpm2_load_pcr_signature(signature_path, &signature_json);
                 if (r < 0)
-                        return r;
+                        return log_error_errno(r, "Failed to load PCR signature: %m");
         }
 
-        return tpm2_unseal(
-                        device,
+        _cleanup_(tpm2_pcrlock_policy_done) Tpm2PCRLockPolicy pcrlock_policy = {};
+        if (FLAGS_SET(flags, TPM2_FLAGS_USE_PCRLOCK)) {
+                r = tpm2_pcrlock_policy_load(pcrlock_path, &pcrlock_policy);
+                if (r < 0)
+                        return r;
+                if (r == 0) {
+                        /* Not found? Then search among passed credentials */
+                        r = tpm2_pcrlock_policy_from_credentials(srk, pcrlock_nv, &pcrlock_policy);
+                        if (r < 0)
+                                return r;
+                        if (r == 0)
+                                return log_error_errno(SYNTHETIC_ERRNO(EREMOTE), "Couldn't find pcrlock policy for volume.");
+                }
+        }
+
+        _cleanup_(tpm2_context_unrefp) Tpm2Context *tpm2_context = NULL;
+        r = tpm2_context_new_or_warn(device, &tpm2_context);
+        if (r < 0)
+                return r;
+
+        r = tpm2_unseal(tpm2_context,
                         hash_pcr_mask,
                         pcr_bank,
-                        pubkey, pubkey_size,
+                        pubkey,
                         pubkey_pcr_mask,
                         signature_json,
                         pin,
+                        FLAGS_SET(flags, TPM2_FLAGS_USE_PCRLOCK) ? &pcrlock_policy : NULL,
                         primary_alg,
-                        key_data, key_data_size,
-                        policy_hash, policy_hash_size,
-                        srk_buf, srk_buf_size,
-                        ret_decrypted_key, ret_decrypted_key_size);
+                        blob,
+                        policy_hash,
+                        srk,
+                        ret_decrypted_key);
+        if (r < 0)
+                return log_error_errno(r, "Failed to unseal secret using TPM2: %m");
+
+        return r;
 }

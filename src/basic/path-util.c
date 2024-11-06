@@ -40,7 +40,7 @@ int path_split_and_make_absolute(const char *p, char ***ret) {
         return r;
 }
 
-char *path_make_absolute(const char *p, const char *prefix) {
+char* path_make_absolute(const char *p, const char *prefix) {
         assert(p);
 
         /* Makes every item in the list an absolute path by prepending
@@ -132,11 +132,9 @@ int path_make_relative(const char *from, const char *to, char **ret) {
                                         return -ENOMEM;
                         } else {
                                 /* 'to' is inside of 'from'. */
-                                result = strdup(t);
-                                if (!result)
-                                        return -ENOMEM;
-
-                                path_simplify(result);
+                                r = path_simplify_alloc(t, &result);
+                                if (r < 0)
+                                        return r;
 
                                 if (!path_is_valid(result))
                                         return -EINVAL;
@@ -219,8 +217,10 @@ int path_make_relative_parent(const char *from_child, const char *to, char **ret
         return path_make_relative(from, to, ret);
 }
 
-char* path_startswith_strv(const char *p, char **set) {
-        STRV_FOREACH(s, set) {
+char* path_startswith_strv(const char *p, char * const *strv) {
+        assert(p);
+
+        STRV_FOREACH(s, strv) {
                 char *t;
 
                 t = path_startswith(p, *s);
@@ -252,7 +252,7 @@ int path_strv_make_absolute_cwd(char **l) {
         return 0;
 }
 
-char **path_strv_resolve(char **l, const char *root) {
+char** path_strv_resolve(char **l, const char *root) {
         unsigned k = 0;
         bool enomem = false;
         int r;
@@ -333,7 +333,7 @@ char **path_strv_resolve(char **l, const char *root) {
         return l;
 }
 
-char **path_strv_resolve_uniq(char **l, const char *root) {
+char** path_strv_resolve_uniq(char **l, const char *root) {
 
         if (strv_isempty(l))
                 return l;
@@ -344,9 +344,9 @@ char **path_strv_resolve_uniq(char **l, const char *root) {
         return strv_uniq(l);
 }
 
-char *path_simplify(char *path) {
-        bool add_slash = false;
-        char *f = ASSERT_PTR(path);
+char* path_simplify_full(char *path, PathSimplifyFlags flags) {
+        bool add_slash = false, keep_trailing_slash, absolute, beginning = true;
+        char *f = path;
         int r;
 
         /* Removes redundant inner and trailing slashes. Also removes unnecessary dots.
@@ -354,13 +354,17 @@ char *path_simplify(char *path) {
          *
          * ///foo//./bar/.   becomes /foo/bar
          * .//./foo//./bar/. becomes foo/bar
+         * /../foo/bar       becomes /foo/bar
+         * /../foo/bar/..    becomes /foo/bar/..
          */
 
         if (isempty(path))
                 return path;
 
-        if (path_is_absolute(path))
-                f++;
+        keep_trailing_slash = FLAGS_SET(flags, PATH_SIMPLIFY_KEEP_TRAILING_SLASH) && endswith(path, "/");
+
+        absolute = path_is_absolute(path);
+        f += absolute;  /* Keep leading /, if present. */
 
         for (const char *p = f;;) {
                 const char *e;
@@ -369,11 +373,17 @@ char *path_simplify(char *path) {
                 if (r == 0)
                         break;
 
+                if (r > 0 && absolute && beginning && path_startswith(e, ".."))
+                        /* If we're at the beginning of an absolute path, we can safely skip ".." */
+                        continue;
+
+                beginning = false;
+
                 if (add_slash)
                         *f++ = '/';
 
                 if (r < 0) {
-                        /* if path is invalid, then refuse to simplify remaining part. */
+                        /* if path is invalid, then refuse to simplify the remaining part. */
                         memmove(f, p, strlen(p) + 1);
                         return path;
                 }
@@ -388,11 +398,14 @@ char *path_simplify(char *path) {
         if (f == path)
                 *f++ = '.';
 
+        if (*(f-1) != '/' && keep_trailing_slash)
+                *f++ = '/';
+
         *f = '\0';
         return path;
 }
 
-char *path_startswith_full(const char *path, const char *prefix, bool accept_dot_dot) {
+char* path_startswith_full(const char *path, const char *prefix, bool accept_dot_dot) {
         assert(path);
         assert(prefix);
 
@@ -512,6 +525,18 @@ int path_compare_filename(const char *a, const char *b) {
                 return strcmp(a, b);
 
         return strcmp(fa, fb);
+}
+
+int path_equal_or_inode_same_full(const char *a, const char *b, int flags) {
+        /* Returns true if paths are of the same entry, false if not, <0 on error. */
+
+        if (path_equal(a, b))
+                return 1;
+
+        if (!a || !b)
+                return 0;
+
+        return inode_same(a, b, flags);
 }
 
 char* path_extend_internal(char **x, ...) {
@@ -652,7 +677,14 @@ static int find_executable_impl(const char *name, const char *root, char **ret_f
         return 0;
 }
 
-int find_executable_full(const char *name, const char *root, char **exec_search_path, bool use_path_envvar, char **ret_filename, int *ret_fd) {
+int find_executable_full(
+                const char *name,
+                const char *root,
+                char **exec_search_path,
+                bool use_path_envvar,
+                char **ret_filename,
+                int *ret_fd) {
+
         int last_error = -ENOENT, r = 0;
         const char *p = NULL;
 
@@ -666,7 +698,7 @@ int find_executable_full(const char *name, const char *root, char **exec_search_
                  * binary. */
                 p = getenv("PATH");
         if (!p)
-                p = DEFAULT_PATH;
+                p = default_PATH();
 
         if (exec_search_path) {
                 STRV_FOREACH(element, exec_search_path) {
@@ -802,7 +834,7 @@ int fsck_exists_for_fstype(const char *fstype) {
         return executable_is_good(checker);
 }
 
-static const char *skip_slash_or_dot(const char *p) {
+static const char* skip_slash_or_dot(const char *p) {
         for (; !isempty(p); p++) {
                 if (*p == '/')
                         continue;
@@ -886,7 +918,7 @@ int path_find_first_component(const char **p, bool accept_dot_dot, const char **
         return len;
 }
 
-static const char *skip_slash_or_dot_backward(const char *path, const char *q) {
+static const char* skip_slash_or_dot_backward(const char *path, const char *q) {
         assert(path);
         assert(!q || q >= path);
 
@@ -995,7 +1027,7 @@ int path_find_last_component(const char *path, bool accept_dot_dot, const char *
         return len;
 }
 
-const char *last_path_component(const char *path) {
+const char* last_path_component(const char *path) {
 
         /* Finds the last component of the path, preserving the optional trailing slash that signifies a directory.
          *
@@ -1076,7 +1108,6 @@ int path_extract_filename(const char *path, char **ret) {
 }
 
 int path_extract_directory(const char *path, char **ret) {
-        _cleanup_free_ char *a = NULL;
         const char *c, *next = NULL;
         int r;
 
@@ -1100,14 +1131,10 @@ int path_extract_directory(const char *path, char **ret) {
                 if (*path != '/') /* filename only */
                         return -EDESTADDRREQ;
 
-                a = strdup("/");
-                if (!a)
-                        return -ENOMEM;
-                *ret = TAKE_PTR(a);
-                return 0;
+                return strdup_to(ret, "/");
         }
 
-        a = strndup(path, next - path);
+        _cleanup_free_ char *a = strndup(path, next - path);
         if (!a)
                 return -ENOMEM;
 
@@ -1116,7 +1143,9 @@ int path_extract_directory(const char *path, char **ret) {
         if (!path_is_valid(a))
                 return -EINVAL;
 
-        *ret = TAKE_PTR(a);
+        if (ret)
+                *ret = TAKE_PTR(a);
+
         return 0;
 }
 
@@ -1265,9 +1294,16 @@ bool hidden_or_backup_file(const char *filename) {
 bool is_device_path(const char *path) {
 
         /* Returns true for paths that likely refer to a device, either by path in sysfs or to something in
-         * /dev. */
+         * /dev. This accepts any path that starts with /dev/ or /sys/ and has something after that prefix.
+         * It does not actually resolve the path.
+         *
+         * Examples:
+         * /dev/sda, /dev/sda/foo, /sys/class, /dev/.., /sys/.., /./dev/foo → yes.
+         * /../dev/sda, /dev, /sys, /usr/path, /usr/../dev/sda → no.
+         */
 
-        return PATH_STARTSWITH_SET(path, "/dev/", "/sys/");
+        const char *p = PATH_STARTSWITH_SET(ASSERT_PTR(path), "/dev/", "/sys/");
+        return !isempty(p);
 }
 
 bool valid_device_node_path(const char *path) {
@@ -1309,6 +1345,20 @@ bool dot_or_dot_dot(const char *path) {
         return path[2] == 0;
 }
 
+bool path_implies_directory(const char *path) {
+
+        /* Sometimes, if we look at a path we already know it must refer to a directory, because it is
+         * suffixed with a slash, or its last component is "." or ".." */
+
+        if (!path)
+                return false;
+
+        if (dot_or_dot_dot(path))
+                return true;
+
+        return ENDSWITH_SET(path, "/", "/.", "/..");
+}
+
 bool empty_or_root(const char *path) {
 
         /* For operations relative to some root directory, returns true if the specified root directory is
@@ -1320,7 +1370,9 @@ bool empty_or_root(const char *path) {
         return path_equal(path, "/");
 }
 
-bool path_strv_contains(char **l, const char *path) {
+bool path_strv_contains(char * const *l, const char *path) {
+        assert(path);
+
         STRV_FOREACH(i, l)
                 if (path_equal(*i, path))
                         return true;
@@ -1328,7 +1380,9 @@ bool path_strv_contains(char **l, const char *path) {
         return false;
 }
 
-bool prefixed_path_strv_contains(char **l, const char *path) {
+bool prefixed_path_strv_contains(char * const *l, const char *path) {
+        assert(path);
+
         STRV_FOREACH(i, l) {
                 const char *j = *i;
 
@@ -1336,6 +1390,7 @@ bool prefixed_path_strv_contains(char **l, const char *path) {
                         j++;
                 if (*j == '+')
                         j++;
+
                 if (path_equal(j, path))
                         return true;
         }
@@ -1404,4 +1459,32 @@ int path_glob_can_match(const char *pattern, const char *prefix, char **ret) {
         if (ret)
                 *ret = NULL;
         return false;
+}
+
+const char* default_PATH(void) {
+#if HAVE_SPLIT_BIN
+        static int split = -1;
+        int r;
+
+        /* Check whether /usr/sbin is not a symlink and return the appropriate $PATH.
+         * On error fall back to the safe value with both directories as configured… */
+
+        if (split < 0)
+                STRV_FOREACH_PAIR(bin, sbin, STRV_MAKE("/usr/bin", "/usr/sbin",
+                                                       "/usr/local/bin", "/usr/local/sbin")) {
+                        r = inode_same(*bin, *sbin, AT_NO_AUTOMOUNT);
+                        if (r > 0 || r == -ENOENT)
+                                continue;
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to compare \"%s\" and \"%s\", using compat $PATH: %m",
+                                                *bin, *sbin);
+                        split = true;
+                        break;
+                }
+        if (split < 0)
+                split = false;
+        if (split)
+                return DEFAULT_PATH_WITH_SBIN;
+#endif
+        return DEFAULT_PATH_WITHOUT_SBIN;
 }

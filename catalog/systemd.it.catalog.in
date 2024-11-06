@@ -6,7 +6,7 @@
 # Italian translation
 
 # Il formato dei messaggi di catalogo è descritto (in inglese) qui:
-# https://www.freedesktop.org/wiki/Software/systemd/catalog
+# https://systemd.io/CATALOG
 
 # Subject: The Journal has been started
 -- f77379a8490b408bbe5f6940505a777b
@@ -403,7 +403,6 @@ Defined-By: systemd
 Support: %SUPPORT_URL%
 
 I seguenti "tags" sono possibili:
-- "split-usr" — /usr è un file system separato e non è stato montato all'avvio di systemd
 - "cgroups-missing" — il kernel era compilato senza supporto cgroup o l'accesso ai
   file attesi è ristretto.
 - "var-run-bad" — /var/run non è un link simbolico (symlink) a /run

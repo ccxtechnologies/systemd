@@ -19,6 +19,7 @@
 #include "fd-util.h"
 #include "fs-util.h"
 #include "io-util.h"
+#include "iovec-util.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
@@ -75,7 +76,7 @@ _public_ int sd_listen_fds(int unset_environment) {
                 goto finish;
         }
 
-        for (int fd = SD_LISTEN_FDS_START; fd < SD_LISTEN_FDS_START + n; fd ++) {
+        for (int fd = SD_LISTEN_FDS_START; fd < SD_LISTEN_FDS_START + n; fd++) {
                 r = fd_cloexec(fd, true);
                 if (r < 0)
                         goto finish;
@@ -455,6 +456,7 @@ static int pid_notify_with_fds_internal(
                 const char *state,
                 const int *fds,
                 unsigned n_fds) {
+
         SocketAddress address;
         struct iovec iovec;
         struct msghdr msghdr = {
@@ -463,19 +465,12 @@ static int pid_notify_with_fds_internal(
                 .msg_name = &address.sockaddr,
         };
         _cleanup_close_ int fd = -EBADF;
-        struct cmsghdr *cmsg = NULL;
-        const char *e;
-        bool send_ucred;
-        ssize_t n;
         int type, r;
 
-        if (!state)
-                return -EINVAL;
+        assert_return(state, -EINVAL);
+        assert_return(fds || n_fds == 0, -EINVAL);
 
-        if (n_fds > 0 && !fds)
-                return -EINVAL;
-
-        e = getenv("NOTIFY_SOCKET");
+        const char *e = getenv("NOTIFY_SOCKET");
         if (!e)
                 return 0;
 
@@ -529,12 +524,14 @@ static int pid_notify_with_fds_internal(
 
         iovec = IOVEC_MAKE_STRING(state);
 
-        send_ucred =
+        bool send_ucred =
                 (pid != 0 && pid != getpid_cached()) ||
                 getuid() != geteuid() ||
                 getgid() != getegid();
 
         if (n_fds > 0 || send_ucred) {
+                struct cmsghdr *cmsg;
+
                 /* CMSG_SPACE(0) may return value different than zero, which results in miscalculated controllen. */
                 msghdr.msg_controllen =
                         (n_fds > 0 ? CMSG_SPACE(sizeof(int) * n_fds) : 0) +
@@ -568,6 +565,8 @@ static int pid_notify_with_fds_internal(
                 }
         }
 
+        ssize_t n;
+
         do {
                 /* First try with fake ucred data, as requested */
                 n = sendmsg(fd, &msghdr, MSG_NOSIGNAL);
@@ -584,14 +583,27 @@ static int pid_notify_with_fds_internal(
                         send_ucred = false;
                 } else {
                         /* Unless we're using SOCK_STREAM, we expect to write all the contents immediately. */
-                        if (type != SOCK_STREAM && (size_t) n < IOVEC_TOTAL_SIZE(msghdr.msg_iov, msghdr.msg_iovlen))
+                        if (type != SOCK_STREAM && (size_t) n < iovec_total_size(msghdr.msg_iov, msghdr.msg_iovlen))
                                 return -EIO;
 
                         /* Make sure we only send fds and ucred once, even if we're using SOCK_STREAM. */
                         msghdr.msg_control = NULL;
                         msghdr.msg_controllen = 0;
                 }
-        } while (!IOVEC_INCREMENT(msghdr.msg_iov, msghdr.msg_iovlen, n));
+        } while (!iovec_increment(msghdr.msg_iov, msghdr.msg_iovlen, n));
+
+        if (address.sockaddr.sa.sa_family == AF_VSOCK && IN_SET(type, SOCK_STREAM, SOCK_SEQPACKET)) {
+                /* For AF_VSOCK, we need to close the socket to signal the end of the message. */
+                if (shutdown(fd, SHUT_WR) < 0)
+                        return log_debug_errno(errno, "Failed to shutdown notify socket: %m");
+
+                char c;
+                n = recv(fd, &c, sizeof(c), MSG_NOSIGNAL);
+                if (n < 0)
+                        return log_debug_errno(errno, "Failed to wait for EOF on notify socket: %m");
+                if (n > 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EPROTO), "Unexpectedly received data on notify socket.");
+        }
 
         return 1;
 }
@@ -614,7 +626,7 @@ _public_ int sd_pid_notify_with_fds(
 }
 
 _public_ int sd_pid_notify_barrier(pid_t pid, int unset_environment, uint64_t timeout) {
-        _cleanup_close_pair_ int pipe_fd[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pipe_fd[2] = EBADF_PAIR;
         int r;
 
         if (pipe2(pipe_fd, O_CLOEXEC) < 0)
@@ -649,7 +661,7 @@ _public_ int sd_notify(int unset_environment, const char *state) {
 
 _public_ int sd_pid_notifyf(pid_t pid, int unset_environment, const char *format, ...) {
         _cleanup_free_ char *p = NULL;
-        int r;
+        int r = 0, k;
 
         if (format) {
                 va_list ap;
@@ -658,16 +670,20 @@ _public_ int sd_pid_notifyf(pid_t pid, int unset_environment, const char *format
                 r = vasprintf(&p, format, ap);
                 va_end(ap);
 
-                if (r < 0 || !p)
-                        return -ENOMEM;
+                if (r < 0 || !p) {
+                        r = -ENOMEM;
+                        p = mfree(p);  /* If vasprintf failed, do not use the string,
+                                        * even if something was returned. */
+                }
         }
 
-        return sd_pid_notify(pid, unset_environment, p);
+        k = sd_pid_notify(pid, unset_environment, p);
+        return r < 0 ? r : k;
 }
 
 _public_ int sd_notifyf(int unset_environment, const char *format, ...) {
         _cleanup_free_ char *p = NULL;
-        int r;
+        int r = 0, k;
 
         if (format) {
                 va_list ap;
@@ -676,11 +692,15 @@ _public_ int sd_notifyf(int unset_environment, const char *format, ...) {
                 r = vasprintf(&p, format, ap);
                 va_end(ap);
 
-                if (r < 0 || !p)
-                        return -ENOMEM;
+                if (r < 0 || !p) {
+                        r = -ENOMEM;
+                        p = mfree(p);  /* If vasprintf failed, do not use the string,
+                                        * even if something was returned. */
+                }
         }
 
-        return sd_pid_notify(0, unset_environment, p);
+        k = sd_pid_notify(0, unset_environment, p);
+        return r < 0 ? r : k;
 }
 
 _public_ int sd_pid_notifyf_with_fds(
@@ -690,27 +710,31 @@ _public_ int sd_pid_notifyf_with_fds(
                 const char *format, ...) {
 
         _cleanup_free_ char *p = NULL;
-        int r;
+        int r = 0, k;
 
         /* Paranoia check: we traditionally used 'unsigned' as array size, but we nowadays more correctly use
          * 'size_t'. sd_pid_notifyf_with_fds() and sd_pid_notify_with_fds() are from different eras, hence
          * differ in this. Let's catch resulting incompatibilites early, even though they are pretty much
          * theoretic only */
         if (n_fds > UINT_MAX)
-                return -E2BIG;
+                r = -E2BIG;
 
-        if (format) {
+        else if (format) {
                 va_list ap;
 
                 va_start(ap, format);
                 r = vasprintf(&p, format, ap);
                 va_end(ap);
 
-                if (r < 0 || !p)
-                        return -ENOMEM;
+                if (r < 0 || !p) {
+                        r = -ENOMEM;
+                        p = mfree(p);  /* If vasprintf failed, do not use the string,
+                                        * even if something was returned. */
+                }
         }
 
-        return sd_pid_notify_with_fds(pid, unset_environment, p, fds, n_fds);
+        k = sd_pid_notify_with_fds(pid, unset_environment, p, fds, n_fds);
+        return r < 0 ? r : k;
 }
 
 _public_ int sd_booted(void) {

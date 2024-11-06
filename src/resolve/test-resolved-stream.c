@@ -151,7 +151,7 @@ static void *tls_dns_server(void *p) {
         r = safe_fork_full("(test-resolved-stream-tls-openssl)",
                            (int[]) { fd_tls, fd_tls, STDOUT_FILENO },
                            NULL, 0,
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_REARRANGE_STDIO|FORK_LOG|FORK_REOPEN_LOG,
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG|FORK_REOPEN_LOG,
                            &openssl_pid);
         assert_se(r >= 0);
         if (r == 0) {
@@ -329,14 +329,14 @@ static void test_dns_stream(bool tls) {
         log_info("test-resolved-stream: Finished %s test", tls ? "TLS" : "TCP");
 }
 
-static void try_isolate_network(void) {
+static int try_isolate_network(void) {
         _cleanup_close_ int socket_fd = -EBADF;
         int r;
 
         /* First test if CLONE_NEWUSER/CLONE_NEWNET can actually work for us, i.e. we can open the namespaces
          * and then still access the build dir we are run from. We do that in a child process since it's
          * nasty if we have to go back from the namespace once we entered it and realized it cannot work. */
-        r = safe_fork("(usernstest)", FORK_DEATHSIG|FORK_LOG|FORK_WAIT, NULL);
+        r = safe_fork("(usernstest)", FORK_DEATHSIG_SIGKILL|FORK_LOG|FORK_WAIT, NULL);
         if (r == 0) { /* child */
                 _cleanup_free_ char *rt = NULL, *d = NULL;
 
@@ -356,20 +356,25 @@ static void try_isolate_network(void) {
                 _exit(EXIT_SUCCESS);
         }
         if (r == -EPROTO) /* EPROTO means nonzero exit code of child, i.e. the tests in the child failed */
-                return;
+                return 0;
         assert_se(r > 0);
 
         /* Now that we know that the unshare() is safe, let's actually do it */
         assert_se(unshare(CLONE_NEWUSER | CLONE_NEWNET) >= 0);
 
-        /* Bring up the loopback interfaceon the newly created network namespace */
+        /* Bring up the loopback interface on the newly created network namespace */
         struct ifreq req = { .ifr_ifindex = 1 };
         assert_se((socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) >= 0);
         assert_se(ioctl(socket_fd, SIOCGIFNAME, &req) >= 0);
         assert_se(ioctl(socket_fd, SIOCGIFFLAGS, &req) >= 0);
         assert_se(FLAGS_SET(req.ifr_flags, IFF_LOOPBACK));
         req.ifr_flags |= IFF_UP;
-        assert_se(ioctl(socket_fd, SIOCSIFFLAGS, &req) >= 0);
+        /* Do not assert on this, fails in the Ubuntu 24.04 CI environment */
+        r = RET_NERRNO(ioctl(socket_fd, SIOCSIFFLAGS, &req));
+        if (r < 0)
+                return r;
+
+        return 0;
 }
 
 int main(int argc, char **argv) {
@@ -378,10 +383,14 @@ int main(int argc, char **argv) {
                 .in.sin_port = htobe16(random_u64_range(UINT16_MAX - 1024) + 1024),
                 .in.sin_addr.s_addr = htobe32(INADDR_LOOPBACK)
         };
+        int r;
 
         test_setup_logging(LOG_DEBUG);
 
-        try_isolate_network();
+        r = try_isolate_network();
+        if (ERRNO_IS_NEG_PRIVILEGE(r))
+                return log_tests_skipped("lacking privileges");
+        assert_se(r >= 0);
 
         test_dns_stream(false);
 #if ENABLE_DNS_OVER_TLS

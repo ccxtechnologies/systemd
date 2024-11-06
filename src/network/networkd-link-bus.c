@@ -10,6 +10,7 @@
 #include "bus-message-util.h"
 #include "bus-polkit.h"
 #include "dns-domain.h"
+#include "networkd-dhcp4.h"
 #include "networkd-json.h"
 #include "networkd-link-bus.h"
 #include "networkd-link.h"
@@ -99,10 +100,12 @@ int bus_link_method_set_ntp_servers(sd_bus_message *message, void *userdata, sd_
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid NTP server: %s", *i);
         }
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.set-ntp-servers",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.set-ntp-servers",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -110,8 +113,7 @@ int bus_link_method_set_ntp_servers(sd_bus_message *message, void *userdata, sd_
 
         strv_free_and_replace(l->ntp, ntp);
 
-        link_dirty(l);
-        r = link_save_and_clean(l);
+        r = link_save_and_clean_full(l, /* also_save_manager = */ true);
         if (r < 0)
                 return r;
 
@@ -134,10 +136,12 @@ static int bus_link_method_set_dns_servers_internal(sd_bus_message *message, voi
         if (r < 0)
                 return r;
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.set-dns-servers",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.set-dns-servers",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 goto finalize;
         if (r == 0) {
@@ -152,8 +156,7 @@ static int bus_link_method_set_dns_servers_internal(sd_bus_message *message, voi
         free_and_replace(l->dns, dns);
         l->n_dns = n;
 
-        link_dirty(l);
-        r = link_save_and_clean(l);
+        r = link_save_and_clean_full(l, /* also_save_manager = */ true);
         if (r < 0)
                 return r;
 
@@ -232,10 +235,12 @@ int bus_link_method_set_domains(sd_bus_message *message, void *userdata, sd_bus_
         if (r < 0)
                 return r;
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.set-domains",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.set-domains",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -246,8 +251,7 @@ int bus_link_method_set_domains(sd_bus_message *message, void *userdata, sd_bus_
         l->search_domains = TAKE_PTR(search_domains);
         l->route_domains = TAKE_PTR(route_domains);
 
-        link_dirty(l);
-        r = link_save_and_clean(l);
+        r = link_save_and_clean_full(l, /* also_save_manager = */ true);
         if (r < 0)
                 return r;
 
@@ -268,10 +272,12 @@ int bus_link_method_set_default_route(sd_bus_message *message, void *userdata, s
         if (r < 0)
                 return r;
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.set-default-route",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.set-default-route",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -280,8 +286,7 @@ int bus_link_method_set_default_route(sd_bus_message *message, void *userdata, s
         if (l->dns_default_route != b) {
                 l->dns_default_route = b;
 
-                link_dirty(l);
-                r = link_save_and_clean(l);
+                r = link_save_and_clean_full(l, /* also_save_manager = */ true);
                 if (r < 0)
                         return r;
         }
@@ -313,10 +318,12 @@ int bus_link_method_set_llmnr(sd_bus_message *message, void *userdata, sd_bus_er
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid LLMNR setting: %s", llmnr);
         }
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.set-llmnr",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.set-llmnr",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -325,8 +332,7 @@ int bus_link_method_set_llmnr(sd_bus_message *message, void *userdata, sd_bus_er
         if (l->llmnr != mode) {
                 l->llmnr = mode;
 
-                link_dirty(l);
-                r = link_save_and_clean(l);
+                r = link_save_and_clean_full(l, /* also_save_manager = */ true);
                 if (r < 0)
                         return r;
         }
@@ -358,10 +364,12 @@ int bus_link_method_set_mdns(sd_bus_message *message, void *userdata, sd_bus_err
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid MulticastDNS setting: %s", mdns);
         }
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.set-mdns",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.set-mdns",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -370,8 +378,7 @@ int bus_link_method_set_mdns(sd_bus_message *message, void *userdata, sd_bus_err
         if (l->mdns != mode) {
                 l->mdns = mode;
 
-                link_dirty(l);
-                r = link_save_and_clean(l);
+                r = link_save_and_clean_full(l, /* also_save_manager = */ true);
                 if (r < 0)
                         return r;
         }
@@ -403,10 +410,12 @@ int bus_link_method_set_dns_over_tls(sd_bus_message *message, void *userdata, sd
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid DNSOverTLS setting: %s", dns_over_tls);
         }
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.set-dns-over-tls",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.set-dns-over-tls",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -415,8 +424,7 @@ int bus_link_method_set_dns_over_tls(sd_bus_message *message, void *userdata, sd
         if (l->dns_over_tls_mode != mode) {
                 l->dns_over_tls_mode = mode;
 
-                link_dirty(l);
-                r = link_save_and_clean(l);
+                r = link_save_and_clean_full(l, /* also_save_manager = */ true);
                 if (r < 0)
                         return r;
         }
@@ -448,10 +456,12 @@ int bus_link_method_set_dnssec(sd_bus_message *message, void *userdata, sd_bus_e
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid DNSSEC setting: %s", dnssec);
         }
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.set-dnssec",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.set-dnssec",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -460,8 +470,7 @@ int bus_link_method_set_dnssec(sd_bus_message *message, void *userdata, sd_bus_e
         if (l->dnssec_mode != mode) {
                 l->dnssec_mode = mode;
 
-                link_dirty(l);
-                r = link_save_and_clean(l);
+                r = link_save_and_clean_full(l, /* also_save_manager = */ true);
                 if (r < 0)
                         return r;
         }
@@ -503,10 +512,12 @@ int bus_link_method_set_dnssec_negative_trust_anchors(sd_bus_message *message, v
                         return r;
         }
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.set-dnssec-negative-trust-anchors",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.set-dnssec-negative-trust-anchors",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -515,8 +526,7 @@ int bus_link_method_set_dnssec_negative_trust_anchors(sd_bus_message *message, v
         set_free_free(l->dnssec_negative_trust_anchors);
         l->dnssec_negative_trust_anchors = TAKE_PTR(ns);
 
-        link_dirty(l);
-        r = link_save_and_clean(l);
+        r = link_save_and_clean_full(l, /* also_save_manager = */ true);
         if (r < 0)
                 return r;
 
@@ -533,10 +543,11 @@ int bus_link_method_revert_ntp(sd_bus_message *message, void *userdata, sd_bus_e
         if (r < 0)
                 return r;
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.revert-ntp",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.revert-ntp",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry, error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -544,8 +555,7 @@ int bus_link_method_revert_ntp(sd_bus_message *message, void *userdata, sd_bus_e
 
         link_ntp_settings_clear(l);
 
-        link_dirty(l);
-        r = link_save_and_clean(l);
+        r = link_save_and_clean_full(l, /* also_save_manager = */ true);
         if (r < 0)
                 return r;
 
@@ -562,10 +572,12 @@ int bus_link_method_revert_dns(sd_bus_message *message, void *userdata, sd_bus_e
         if (r < 0)
                 return r;
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.revert-dns",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.revert-dns",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -573,8 +585,7 @@ int bus_link_method_revert_dns(sd_bus_message *message, void *userdata, sd_bus_e
 
         link_dns_settings_clear(l);
 
-        link_dirty(l);
-        r = link_save_and_clean(l);
+        r = link_save_and_clean_full(l, /* also_save_manager = */ true);
         if (r < 0)
                 return r;
 
@@ -590,16 +601,18 @@ int bus_link_method_force_renew(sd_bus_message *message, void *userdata, sd_bus_
                                          "Interface %s is not managed by systemd-networkd",
                                          l->ifname);
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.forcerenew",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.forcerenew",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
                 return 1; /* Polkit will call us back */
 
-        if (l->dhcp_server) {
+        if (sd_dhcp_server_is_running(l->dhcp_server)) {
                 r = sd_dhcp_server_forcerenew(l->dhcp_server);
                 if (r < 0)
                         return r;
@@ -617,20 +630,20 @@ int bus_link_method_renew(sd_bus_message *message, void *userdata, sd_bus_error 
                                          "Interface %s is not managed by systemd-networkd",
                                          l->ifname);
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.renew",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.renew",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
                 return 1; /* Polkit will call us back */
 
-        if (l->dhcp_client) {
-                r = sd_dhcp_client_send_renew(l->dhcp_client);
-                if (r < 0)
-                        return r;
-        }
+        r = dhcp4_renew(l);
+        if (r < 0)
+                return r;
 
         return sd_bus_reply_method_return(message, NULL);
 }
@@ -641,10 +654,12 @@ int bus_link_method_reconfigure(sd_bus_message *message, void *userdata, sd_bus_
 
         assert(message);
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.network1.reconfigure",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.network1.reconfigure",
+                        /* details= */ NULL,
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -655,7 +670,7 @@ int bus_link_method_reconfigure(sd_bus_message *message, void *userdata, sd_bus_
                 return r;
         if (r > 0) {
                 link_set_state(l, LINK_STATE_INITIALIZED);
-                r = link_save_and_clean(l);
+                r = link_save_and_clean_full(l, /* also_save_manager = */ true);
                 if (r < 0)
                         return r;
         }
@@ -860,6 +875,12 @@ int link_object_find(sd_bus *bus, const char *path, const char *interface, void 
 
         if (streq(interface, "org.freedesktop.network1.DHCPServer") &&
             (!link->dhcp_server || sd_dhcp_server_is_in_relay_mode(link->dhcp_server)))
+                return 0;
+
+        if (streq(interface, "org.freedesktop.network1.DHCPv4Client") && !link->dhcp_client)
+                return 0;
+
+        if (streq(interface, "org.freedesktop.network1.DHCPv6Client") && !link->dhcp6_client)
                 return 0;
 
         *found = link;

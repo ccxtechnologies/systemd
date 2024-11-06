@@ -1,9 +1,10 @@
 <?xml version="1.0"?>
 <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
-<refentry id="systemd-random-seed.service" conditional='ENABLE_RANDOMSEED'>
+<refentry id="systemd-random-seed.service" conditional='ENABLE_RANDOMSEED'
+          xmlns:xi="http://www.w3.org/2001/XInclude">
 
   <refentryinfo>
     <title>systemd-random-seed.service</title>
@@ -75,21 +76,23 @@
         a boolean parameter or the special string <literal>force</literal>. Defaults to false, in which case
         no entropy is credited. If true, entropy is credited if the random seed file and system state pass
         various superficial concisistency checks. If set to <literal>force</literal> entropy is credited,
-        regardless of these checks, as long as the random seed file exists.</para></listitem>
+        regardless of these checks, as long as the random seed file exists.</para>
+
+        <xi:include href="version-info.xml" xpointer="v243"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>random</refentrytitle><manvolnum>4</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-boot</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-stub</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>bootctl</refentrytitle><manvolnum>4</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-boot-random-seed.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>random</refentrytitle><manvolnum>4</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-boot</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-stub</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>bootctl</refentrytitle><manvolnum>4</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-boot-random-seed.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

@@ -7,6 +7,7 @@
 #include "efi-api.h"
 #include "efivars.h"
 #include "fd-util.h"
+#include "fileio.h"
 #include "sort-util.h"
 #include "stat-util.h"
 #include "stdio-util.h"
@@ -189,32 +190,6 @@ static ssize_t utf16_size(const uint16_t *s, size_t buf_len_bytes) {
         return -EINVAL; /* The terminator was not found */
 }
 
-struct guid {
-        uint32_t u1;
-        uint16_t u2;
-        uint16_t u3;
-        uint8_t u4[8];
-} _packed_;
-
-static void efi_guid_to_id128(const void *guid, sd_id128_t *id128) {
-        uint32_t u1;
-        uint16_t u2, u3;
-        const struct guid *uuid = guid;
-
-        memcpy(&u1, &uuid->u1, sizeof(uint32_t));
-        id128->bytes[0] = (u1 >> 24) & 0xff;
-        id128->bytes[1] = (u1 >> 16) & 0xff;
-        id128->bytes[2] = (u1 >> 8) & 0xff;
-        id128->bytes[3] = u1 & 0xff;
-        memcpy(&u2, &uuid->u2, sizeof(uint16_t));
-        id128->bytes[4] = (u2 >> 8) & 0xff;
-        id128->bytes[5] = u2 & 0xff;
-        memcpy(&u3, &uuid->u3, sizeof(uint16_t));
-        id128->bytes[6] = (u3 >> 8) & 0xff;
-        id128->bytes[7] = u3 & 0xff;
-        memcpy(&id128->bytes[8], uuid->u4, sizeof(uuid->u4));
-}
-
 int efi_get_boot_option(
                 uint16_t id,
                 char **ret_title,
@@ -290,7 +265,7 @@ int efi_get_boot_option(
                                         continue;
 
                                 if (ret_part_uuid)
-                                        efi_guid_to_id128(dpath->drive.signature, &p_uuid);
+                                        p_uuid = efi_guid_to_id128(dpath->drive.signature);
                                 continue;
                         }
 
@@ -324,16 +299,6 @@ static void to_utf16(uint16_t *dest, const char *src) {
         for (i = 0; src[i] != '\0'; i++)
                 dest[i] = src[i];
         dest[i] = '\0';
-}
-
-static void id128_to_efi_guid(sd_id128_t id, void *guid) {
-        struct guid uuid = {
-                .u1 = id.bytes[0] << 24 | id.bytes[1] << 16 | id.bytes[2] << 8 | id.bytes[3],
-                .u2 = id.bytes[4] << 8 | id.bytes[5],
-                .u3 = id.bytes[6] << 8 | id.bytes[7],
-        };
-        memcpy(uuid.u4, id.bytes+8, sizeof(uuid.u4));
-        memcpy(guid, &uuid, sizeof(uuid));
 }
 
 static uint16_t *tilt_slashes(uint16_t *s) {
@@ -388,7 +353,7 @@ int efi_add_boot_option(
         memcpy(&devicep->drive.part_nr, &part, sizeof(uint32_t));
         memcpy(&devicep->drive.part_start, &pstart, sizeof(uint64_t));
         memcpy(&devicep->drive.part_size, &psize, sizeof(uint64_t));
-        id128_to_efi_guid(part_uuid, devicep->drive.signature);
+        efi_id128_to_guid(part_uuid, devicep->drive.signature);
         devicep->drive.mbr_type = MBR_TYPE_EFI_PARTITION_TABLE_HEADER;
         devicep->drive.signature_type = SIGNATURE_TYPE_GUID;
         size += devicep->length;
@@ -472,10 +437,6 @@ static int boot_id_hex(const char s[static 4]) {
         return id;
 }
 
-static int cmp_uint16(const uint16_t *a, const uint16_t *b) {
-        return CMP(*a, *b);
-}
-
 int efi_get_boot_options(uint16_t **ret_options) {
         _cleanup_closedir_ DIR *dir = NULL;
         _cleanup_free_ uint16_t *list = NULL;
@@ -493,13 +454,13 @@ int efi_get_boot_options(uint16_t **ret_options) {
         FOREACH_DIRENT(de, dir, return -errno) {
                 int id;
 
-                if (strncmp(de->d_name, "Boot", 4) != 0)
+                if (!startswith(de->d_name, "Boot"))
                         continue;
 
                 if (strlen(de->d_name) != 45)
                         continue;
 
-                if (strcmp(de->d_name + 8, EFI_GLOBAL_VARIABLE_STR("")) != 0)  /* generate variable suffix using macro */
+                if (!streq(de->d_name + 8, EFI_GLOBAL_VARIABLE_STR(""))) /* generate variable suffix using macro */
                         continue;
 
                 id = boot_id_hex(de->d_name + 4);
@@ -521,6 +482,7 @@ int efi_get_boot_options(uint16_t **ret_options) {
 
 bool efi_has_tpm2(void) {
         static int cache = -1;
+        int r;
 
         /* Returns whether the system has a TPM2 chip which is known to the EFI firmware. */
 
@@ -528,30 +490,74 @@ bool efi_has_tpm2(void) {
                 return cache;
 
         /* First, check if we are on an EFI boot at all. */
-        if (!is_efi_boot()) {
-                cache = 0;
-                return cache;
-        }
+        if (!is_efi_boot())
+                return (cache = false);
 
         /* Then, check if the ACPI table "TPM2" exists, which is the TPM2 event log table, see:
          * https://trustedcomputinggroup.org/wp-content/uploads/TCG_ACPIGeneralSpecification_v1.20_r8.pdf
-         * This table exists whenever the firmware is hooked up to TPM2. */
-        cache = access("/sys/firmware/acpi/tables/TPM2", F_OK) >= 0;
-        if (cache)
-                return cache;
-
+         * This table exists whenever the firmware knows ACPI and is hooked up to TPM2. */
+        if (access("/sys/firmware/acpi/tables/TPM2", F_OK) >= 0)
+                return (cache = true);
         if (errno != ENOENT)
                 log_debug_errno(errno, "Unable to test whether /sys/firmware/acpi/tables/TPM2 exists, assuming it doesn't: %m");
 
         /* As the last try, check if the EFI firmware provides the EFI_TCG2_FINAL_EVENTS_TABLE
          * stored in EFI configuration table, see:
-         * https://trustedcomputinggroup.org/wp-content/uploads/EFI-Protocol-Specification-rev13-160330final.pdf
-         */
-        cache = access("/sys/kernel/security/tpm0/binary_bios_measurements", F_OK) >= 0;
-        if (!cache && errno != ENOENT)
-                log_debug_errno(errno, "Unable to test whether /sys/kernel/security/tpm0/binary_bios_measurements exists, assuming it doesn't: %m");
+         *
+         * https://trustedcomputinggroup.org/wp-content/uploads/EFI-Protocol-Specification-rev13-160330final.pdf */
+        if (access("/sys/kernel/security/tpm0/binary_bios_measurements", F_OK) >= 0) {
+                _cleanup_free_ char *major = NULL;
 
-        return cache;
+                /* The EFI table might exist for TPM 1.2 as well, hence let's check explicitly which TPM version we are looking at here. */
+                r = read_virtual_file("/sys/class/tpm/tpm0/tpm_version_major", SIZE_MAX, &major, /* ret_size= */ NULL);
+                if (r >= 0)
+                        return (cache = streq(strstrip(major), "2"));
+
+                log_debug_errno(r, "Unable to read /sys/class/tpm/tpm0/tpm_version_major, assuming TPM does not qualify as TPM2: %m");
+
+        } else if (errno != ENOENT)
+                  log_debug_errno(errno, "Unable to test whether /sys/kernel/security/tpm0/binary_bios_measurements exists, assuming it doesn't: %m");
+
+        return (cache = false);
 }
 
 #endif
+
+struct efi_guid {
+        uint32_t u1;
+        uint16_t u2;
+        uint16_t u3;
+        uint8_t u4[8];
+} _packed_;
+
+sd_id128_t efi_guid_to_id128(const void *guid) {
+        const struct efi_guid *uuid = ASSERT_PTR(guid); /* cast is safe, because struct efi_guid is packed */
+        sd_id128_t id128;
+
+        id128.bytes[0] = (uuid->u1 >> 24) & 0xff;
+        id128.bytes[1] = (uuid->u1 >> 16) & 0xff;
+        id128.bytes[2] = (uuid->u1 >> 8) & 0xff;
+        id128.bytes[3] = uuid->u1 & 0xff;
+
+        id128.bytes[4] = (uuid->u2 >> 8) & 0xff;
+        id128.bytes[5] = uuid->u2 & 0xff;
+
+        id128.bytes[6] = (uuid->u3 >> 8) & 0xff;
+        id128.bytes[7] = uuid->u3 & 0xff;
+
+        memcpy(&id128.bytes[8], uuid->u4, sizeof(uuid->u4));
+
+        return id128;
+}
+
+void efi_id128_to_guid(sd_id128_t id, void *ret_guid) {
+        assert(ret_guid);
+
+        struct efi_guid uuid = {
+                .u1 = id.bytes[0] << 24 | id.bytes[1] << 16 | id.bytes[2] << 8 | id.bytes[3],
+                .u2 = id.bytes[4] << 8 | id.bytes[5],
+                .u3 = id.bytes[6] << 8 | id.bytes[7],
+        };
+        memcpy(uuid.u4, id.bytes+8, sizeof(uuid.u4));
+        memcpy(ret_guid, &uuid, sizeof(uuid));
+}

@@ -20,10 +20,12 @@ ConditionDirectoryNotEmpty=|/usr/local/lib/modules-load.d
 ConditionDirectoryNotEmpty=|/etc/modules-load.d
 ConditionDirectoryNotEmpty=|/run/modules-load.d
 ConditionKernelCommandLine=|modules-load
+ConditionKernelCommandLine=|modules_load
 ConditionKernelCommandLine=|rd.modules-load
+ConditionKernelCommandLine=|rd.modules_load
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart={{ROOTLIBEXECDIR}}/systemd-modules-load
+ExecStart={{LIBEXECDIR}}/systemd-modules-load
 TimeoutSec=90s

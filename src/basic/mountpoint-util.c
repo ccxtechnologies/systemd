@@ -329,34 +329,33 @@ fallback_fstat:
 }
 
 /* flags can be AT_SYMLINK_FOLLOW or 0 */
-int path_is_mount_point(const char *t, const char *root, int flags) {
+int path_is_mount_point_full(const char *path, const char *root, int flags) {
         _cleanup_free_ char *canonical = NULL;
         _cleanup_close_ int fd = -EBADF;
         int r;
 
-        assert(t);
+        assert(path);
         assert((flags & ~AT_SYMLINK_FOLLOW) == 0);
 
-        if (path_equal(t, "/"))
+        if (path_equal(path, "/"))
                 return 1;
 
-        /* we need to resolve symlinks manually, we can't just rely on
-         * fd_is_mount_point() to do that for us; if we have a structure like
-         * /bin -> /usr/bin/ and /usr is a mount point, then the parent that we
+        /* we need to resolve symlinks manually, we can't just rely on fd_is_mount_point() to do that for us;
+         * if we have a structure like /bin -> /usr/bin/ and /usr is a mount point, then the parent that we
          * look at needs to be /usr, not /. */
-        if (flags & AT_SYMLINK_FOLLOW) {
-                r = chase(t, root, CHASE_TRAIL_SLASH, &canonical, NULL);
+        if (FLAGS_SET(flags, AT_SYMLINK_FOLLOW)) {
+                r = chase(path, root, CHASE_TRAIL_SLASH, &canonical, NULL);
                 if (r < 0)
                         return r;
 
-                t = canonical;
+                path = canonical;
         }
 
-        fd = open_parent(t, O_PATH|O_CLOEXEC, 0);
+        fd = open_parent(path, O_PATH|O_CLOEXEC, 0);
         if (fd < 0)
                 return fd;
 
-        return fd_is_mount_point(fd, last_path_component(t), flags);
+        return fd_is_mount_point(fd, last_path_component(path), flags);
 }
 
 int path_get_mnt_id_at_fallback(int dir_fd, const char *path, int *ret) {
@@ -446,14 +445,15 @@ bool fstype_needs_quota(const char *fstype) {
 }
 
 bool fstype_is_api_vfs(const char *fstype) {
-        const FilesystemSet *fs;
+        assert(fstype);
 
-        FOREACH_POINTER(fs,
-                filesystem_sets + FILESYSTEM_SET_BASIC_API,
-                filesystem_sets + FILESYSTEM_SET_AUXILIARY_API,
-                filesystem_sets + FILESYSTEM_SET_PRIVILEGED_API,
-                filesystem_sets + FILESYSTEM_SET_TEMPORARY)
-            if (nulstr_contains(fs->value, fstype))
+        const FilesystemSet *fs;
+        FOREACH_ARGUMENT(fs,
+                         filesystem_sets + FILESYSTEM_SET_BASIC_API,
+                         filesystem_sets + FILESYSTEM_SET_AUXILIARY_API,
+                         filesystem_sets + FILESYSTEM_SET_PRIVILEGED_API,
+                         filesystem_sets + FILESYSTEM_SET_TEMPORARY)
+                if (nulstr_contains(fs->value, fstype))
                     return true;
 
         /* Filesystems not present in the internal database */
@@ -484,51 +484,54 @@ bool fstype_is_ro(const char *fstype) {
 }
 
 bool fstype_can_discard(const char *fstype) {
-        int r;
-
         assert(fstype);
 
-        /* On new kernels we can just ask the kernel */
-        r = mount_option_supported(fstype, "discard", NULL);
-        if (r >= 0)
-                return r;
+        /* Use a curated list as first check, to avoid calling fsopen() which might load kmods, which might
+         * not be allowed in our MAC context. */
+        if (STR_IN_SET(fstype, "btrfs", "f2fs", "ext4", "vfat", "xfs"))
+                return true;
 
-        return STR_IN_SET(fstype,
-                          "btrfs",
-                          "f2fs",
-                          "ext4",
-                          "vfat",
-                          "xfs");
+        /* On new kernels we can just ask the kernel */
+        return mount_option_supported(fstype, "discard", NULL) > 0;
 }
 
-bool fstype_can_norecovery(const char *fstype) {
+const char* fstype_norecovery_option(const char *fstype) {
         int r;
 
         assert(fstype);
 
-        /* On new kernels we can just ask the kernel */
-        r = mount_option_supported(fstype, "norecovery", NULL);
-        if (r >= 0)
-                return r;
+        /* Use a curated list as first check, to avoid calling fsopen() which might load kmods, which might
+         * not be allowed in our MAC context. */
+        if (STR_IN_SET(fstype, "ext3", "ext4", "xfs"))
+                return "norecovery";
 
-        return STR_IN_SET(fstype,
-                          "ext3",
-                          "ext4",
-                          "xfs",
-                          "btrfs");
+        /* btrfs dropped support for the "norecovery" option in 6.8
+         * (https://github.com/torvalds/linux/commit/a1912f712188291f9d7d434fba155461f1ebef66) and replaced
+         * it with rescue=nologreplay, so we check for the new name first and fall back to checking for the
+         * old name if the new name doesn't work. */
+        if (streq(fstype, "btrfs")) {
+                r = mount_option_supported(fstype, "rescue=nologreplay", NULL);
+                if (r == -EAGAIN) {
+                        log_debug_errno(r, "Failed to check for btrfs 'rescue=nologreplay' option, assuming old kernel with 'norecovery': %m");
+                        return "norecovery";
+                }
+                if (r < 0)
+                        log_debug_errno(r, "Failed to check for btrfs 'rescue=nologreplay' option, assuming it is not supported: %m");
+                if (r > 0)
+                        return "rescue=nologreplay";
+        }
+
+        /* On new kernels we can just ask the kernel */
+        return mount_option_supported(fstype, "norecovery", NULL) > 0 ? "norecovery" : NULL;
 }
 
 bool fstype_can_umask(const char *fstype) {
-        int r;
-
         assert(fstype);
 
-        /* On new kernels we can just ask the kernel */
-        r = mount_option_supported(fstype, "umask", "0077");
-        if (r >= 0)
-                return r;
-
-        return streq(fstype, "vfat");
+        /* Use a curated list as first check, to avoid calling fsopen() which might load kmods, which might
+         * not be allowed in our MAC context. If we don't know ourselves, on new kernels we can just ask the
+         * kernel. */
+        return streq(fstype, "vfat") || mount_option_supported(fstype, "umask", "0077") > 0;
 }
 
 bool fstype_can_uid_gid(const char *fstype) {
@@ -674,6 +677,21 @@ bool mount_propagation_flag_is_valid(unsigned long flag) {
         return IN_SET(flag, 0, MS_SHARED, MS_PRIVATE, MS_SLAVE);
 }
 
+bool mount_new_api_supported(void) {
+        static int cache = -1;
+        int r;
+
+        if (cache >= 0)
+                return cache;
+
+        /* This is the newer API among the ones we use, so use it as boundary */
+        r = RET_NERRNO(mount_setattr(-EBADF, NULL, 0, NULL, 0));
+        if (r == 0 || ERRNO_IS_NOT_SUPPORTED(r)) /* This should return an error if it is working properly */
+                return (cache = false);
+
+        return (cache = true);
+}
+
 unsigned long ms_nosymfollow_supported(void) {
         _cleanup_close_ int fsfd = -EBADF, mntfd = -EBADF;
         static int cache = -1;
@@ -682,6 +700,9 @@ unsigned long ms_nosymfollow_supported(void) {
 
         if (cache >= 0)
                 return cache ? MS_NOSYMFOLLOW : 0;
+
+        if (!mount_new_api_supported())
+                goto not_supported;
 
         /* Checks if MS_NOSYMFOLLOW is supported (which was added in 5.10). We use the new mount API's
          * mount_setattr() call for that, which was added in 5.12, which is close enough. */
@@ -780,4 +801,11 @@ int mount_option_supported(const char *fstype, const char *key, const char *valu
         }
 
         return true; /* works! */
+}
+
+bool path_below_api_vfs(const char *p) {
+        assert(p);
+
+        /* API VFS are either directly mounted on any of these three paths, or below it. */
+        return PATH_STARTSWITH_SET(p, "/dev", "/sys", "/proc");
 }

@@ -18,6 +18,8 @@
 #include "glob-util.h"
 #include "macro.h"
 #include "path-util.h"
+#include "pidref.h"
+#include "process-util.h"
 #include "reboot-util.h"
 #include "set.h"
 #include "spawn-ask-password-agent.h"
@@ -40,7 +42,7 @@ int acquire_bus(BusFocus focus, sd_bus **ret) {
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "--global is not supported for this operation.");
 
         /* We only go directly to the manager, if we are using a local transport */
-        if (arg_transport != BUS_TRANSPORT_LOCAL)
+        if (!IN_SET(arg_transport, BUS_TRANSPORT_LOCAL, BUS_TRANSPORT_CAPSULE))
                 focus = BUS_FULL;
 
         if (getenv_bool("SYSTEMCTL_FORCE_BUS") > 0)
@@ -62,8 +64,8 @@ int acquire_bus(BusFocus focus, sd_bus **ret) {
 }
 
 void release_busses(void) {
-        for (BusFocus w = 0; w < _BUS_FOCUS_MAX; w++)
-                buses[w] = sd_bus_flush_close_unref(buses[w]);
+        FOREACH_ARRAY(w, buses, _BUS_FOCUS_MAX)
+                *w = sd_bus_flush_close_unref(*w);
 }
 
 void ask_password_agent_open_maybe(void) {
@@ -260,7 +262,13 @@ int get_unit_list(
         return c;
 }
 
-int expand_unit_names(sd_bus *bus, char **names, const char* suffix, char ***ret, bool *ret_expanded) {
+int expand_unit_names(
+                sd_bus *bus,
+                char * const *names,
+                const char *suffix,
+                char ***ret,
+                bool *ret_expanded) {
+
         _cleanup_strv_free_ char **mangled = NULL, **globs = NULL;
         int r;
 
@@ -288,53 +296,50 @@ int expand_unit_names(sd_bus *bus, char **names, const char* suffix, char ***ret
         if (expanded) {
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
                 _cleanup_free_ UnitInfo *unit_infos = NULL;
-                size_t n;
 
                 r = get_unit_list(bus, NULL, globs, &unit_infos, 0, &reply);
                 if (r < 0)
                         return r;
 
-                n = strv_length(mangled);
-
-                for (int i = 0; i < r; i++) {
-                        if (!GREEDY_REALLOC(mangled, n+2))
+                FOREACH_ARRAY(info, unit_infos, r)
+                        if (strv_extend(&mangled, info->id) < 0)
                                 return log_oom();
-
-                        mangled[n] = strdup(unit_infos[i].id);
-                        if (!mangled[n])
-                                return log_oom();
-
-                        mangled[++n] = NULL;
-                }
         }
 
+        *ret = TAKE_PTR(mangled);
         if (ret_expanded)
                 *ret_expanded = expanded;
 
-        *ret = TAKE_PTR(mangled);
         return 0;
 }
 
-int check_triggering_units(sd_bus *bus, const char *unit) {
+int get_active_triggering_units(sd_bus *bus, const char *unit, bool ignore_masked, char ***ret) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_free_ char *n = NULL, *dbus_path = NULL, *load_state = NULL;
-        _cleanup_strv_free_ char **triggered_by = NULL;
+        _cleanup_strv_free_ char **triggered_by = NULL, **active = NULL;
+        _cleanup_free_ char *name = NULL, *dbus_path = NULL;
         int r;
 
-        r = unit_name_mangle(unit, 0, &n);
-        if (r < 0)
-                return log_error_errno(r, "Failed to mangle unit name: %m");
+        assert(bus);
+        assert(unit);
+        assert(ret);
 
-        r = unit_load_state(bus, n, &load_state);
+        r = unit_name_mangle(unit, 0, &name);
         if (r < 0)
                 return r;
 
-        if (streq(load_state, "masked"))
-                return 0;
+        if (ignore_masked) {
+                r = unit_is_masked(bus, name);
+                if (r < 0)
+                        return r;
+                if (r > 0) {
+                        *ret = NULL;
+                        return 0;
+                }
+        }
 
-        dbus_path = unit_dbus_path_from_name(n);
+        dbus_path = unit_dbus_path_from_name(name);
         if (!dbus_path)
-                return log_oom();
+                return -ENOMEM;
 
         r = sd_bus_get_property_strv(
                         bus,
@@ -345,9 +350,9 @@ int check_triggering_units(sd_bus *bus, const char *unit) {
                         &error,
                         &triggered_by);
         if (r < 0)
-                return log_error_errno(r, "Failed to get triggered by array of %s: %s", n, bus_error_message(&error, r));
+                return log_debug_errno(r, "Failed to get TriggeredBy property of unit '%s': %s",
+                                       name, bus_error_message(&error, r));
 
-        bool first = true;
         STRV_FOREACH(i, triggered_by) {
                 UnitActiveState active_state;
 
@@ -358,15 +363,41 @@ int check_triggering_units(sd_bus *bus, const char *unit) {
                 if (!IN_SET(active_state, UNIT_ACTIVE, UNIT_RELOADING))
                         continue;
 
-                if (first) {
-                        log_warning("Warning: Stopping %s, but it can still be activated by:", n);
-                        first = false;
-                }
-
-                log_warning("  %s", *i);
+                r = strv_extend(&active, *i);
+                if (r < 0)
+                        return r;
         }
 
+        *ret = TAKE_PTR(active);
         return 0;
+}
+
+void warn_triggering_units(sd_bus *bus, const char *unit, const char *operation, bool ignore_masked) {
+        _cleanup_strv_free_ char **triggered_by = NULL;
+        _cleanup_free_ char *joined = NULL;
+        int r;
+
+        assert(bus);
+        assert(unit);
+        assert(operation);
+
+        r = get_active_triggering_units(bus, unit, ignore_masked, &triggered_by);
+        if (r < 0) {
+                log_warning_errno(r,
+                                  "Failed to get triggering units for '%s', ignoring: %m", unit);
+                return;
+        }
+
+        if (strv_isempty(triggered_by))
+                return;
+
+        joined = strv_join(triggered_by, ", ");
+        if (!joined)
+                return (void) log_oom();
+
+        log_warning("%s '%s', but its triggering units are still active:\n"
+                    "%s",
+                    operation, unit, joined);
 }
 
 int need_daemon_reload(sd_bus *bus, const char *unit) {
@@ -404,6 +435,9 @@ int need_daemon_reload(sd_bus *bus, const char *unit) {
 
 void warn_unit_file_changed(const char *unit) {
         assert(unit);
+
+        if (arg_no_warn)
+                return;
 
         log_warning("Warning: The unit file, source configuration file or drop-ins of %s changed on disk. Run 'systemctl%s daemon-reload' to reload units.",
                     unit,
@@ -447,8 +481,8 @@ int unit_find_paths(
                 const char *unit_name,
                 LookupPaths *lp,
                 bool force_client_side,
-                Hashmap **cached_name_map,
                 Hashmap **cached_id_map,
+                Hashmap **cached_name_map,
                 char **ret_fragment_path,
                 char ***ret_dropin_paths) {
 
@@ -624,25 +658,31 @@ static int unit_find_template_path(
         return r;
 }
 
-int unit_is_masked(sd_bus *bus, LookupPaths *lp, const char *name) {
+int unit_is_masked(sd_bus *bus, const char *unit) {
         _cleanup_free_ char *load_state = NULL;
         int r;
 
-        if (unit_name_is_valid(name, UNIT_NAME_TEMPLATE)) {
-                _cleanup_free_ char *path = NULL;
+        assert(bus);
+        assert(unit);
 
-                /* A template cannot be loaded, but it can be still masked, so
-                 * we need to use a different method. */
+        if (unit_name_is_valid(unit, UNIT_NAME_TEMPLATE)) {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+                const char *state;
 
-                r = unit_file_find_path(lp, name, &path);
+                r = bus_call_method(bus, bus_systemd_mgr, "GetUnitFileState", &error, &reply, "s", unit);
                 if (r < 0)
-                        return r;
-                if (r == 0)
-                        return false;
-                return null_or_empty_path(path);
+                        return log_debug_errno(r, "Failed to get UnitFileState for '%s': %s",
+                                               unit, bus_error_message(&error, r));
+
+                r = sd_bus_message_read(reply, "s", &state);
+                if (r < 0)
+                        return bus_log_parse_error_debug(r);
+
+                return STR_IN_SET(state, "masked", "masked-runtime");
         }
 
-        r = unit_load_state(bus, name, &load_state);
+        r = unit_load_state(bus, unit, &load_state);
         if (r < 0)
                 return r;
 
@@ -724,9 +764,7 @@ int maybe_extend_with_unit_dependencies(sd_bus *bus, char ***list) {
         if (r < 0)
                 return log_error_errno(r, "Failed to append unit dependencies: %m");
 
-        strv_free(*list);
-        *list = TAKE_PTR(list_with_deps);
-        return 0;
+        return strv_free_and_replace(*list, list_with_deps);
 }
 
 int unit_get_dependencies(sd_bus *bus, const char *name, char ***ret) {
@@ -882,37 +920,31 @@ UnitFileFlags unit_file_flags_from_args(void) {
                (arg_force   ? UNIT_FILE_FORCE   : 0);
 }
 
-int mangle_names(const char *operation, char **original_names, char ***ret_mangled_names) {
+int mangle_names(const char *operation, char * const *original_names, char ***ret) {
         _cleanup_strv_free_ char **l = NULL;
-        char **i;
         int r;
 
-        assert(ret_mangled_names);
-
-        l = i = new(char*, strv_length(original_names) + 1);
-        if (!l)
-                return log_oom();
+        assert(operation);
+        assert(ret);
 
         STRV_FOREACH(name, original_names) {
-
-                /* When enabling units qualified path names are OK, too, hence allow them explicitly. */
+                char *mangled;
 
                 if (is_path(*name))
-                        r = path_make_absolute_cwd(*name, i);
+                        /* When enabling units qualified path names are OK, too, hence allow them explicitly. */
+                        r = path_make_absolute_cwd(*name, &mangled);
                 else
                         r = unit_name_mangle_with_suffix(*name, operation,
                                                          arg_quiet ? 0 : UNIT_NAME_MANGLE_WARN,
-                                                         ".service", i);
-                if (r < 0) {
-                        *i = NULL;
+                                                         ".service", &mangled);
+                if (r < 0)
                         return log_error_errno(r, "Failed to mangle unit name or path '%s': %m", *name);
-                }
 
-                i++;
+                if (strv_consume(&l, mangled) < 0)
+                        return log_oom();
         }
 
-        *i = NULL;
-        *ret_mangled_names = TAKE_PTR(l);
+        *ret = TAKE_PTR(l);
 
         return 0;
 }
@@ -954,4 +986,150 @@ int halt_now(enum action a) {
         default:
                 assert_not_reached();
         }
+}
+
+int get_unit_by_pid(sd_bus *bus, pid_t pid, char **ret_unit, char **ret_path) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        int r;
+
+        assert(bus);
+        assert(pid >= 0); /* 0 is accepted by GetUnitByPID for querying our own process. */
+
+        r = bus_call_method(bus, bus_systemd_mgr, "GetUnitByPID", &error, &reply, "u", (uint32_t) pid);
+        if (r < 0) {
+                if (sd_bus_error_has_name(&error, BUS_ERROR_NO_UNIT_FOR_PID))
+                        return log_error_errno(r, "%s", bus_error_message(&error, r));
+
+                return log_error_errno(r,
+                                       "Failed to get unit that PID " PID_FMT " belongs to: %s",
+                                       pid > 0 ? pid : getpid_cached(),
+                                       bus_error_message(&error, r));
+        }
+
+        _cleanup_free_ char *u = NULL, *p = NULL;
+        const char *path;
+
+        r = sd_bus_message_read_basic(reply, 'o', &path);
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        if (ret_unit) {
+                r = unit_name_from_dbus_path(path, &u);
+                if (r < 0)
+                        return log_error_errno(r,
+                                               "Failed to extract unit name from D-Bus object path '%s': %m",
+                                               path);
+        }
+
+        if (ret_path) {
+                p = strdup(path);
+                if (!p)
+                        return log_oom();
+        }
+
+        if (ret_unit)
+                *ret_unit = TAKE_PTR(u);
+        if (ret_path)
+                *ret_path = TAKE_PTR(p);
+
+        return 0;
+}
+
+static int get_unit_by_pidfd(sd_bus *bus, const PidRef *pid, char **ret_unit, char **ret_path) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        int r;
+
+        assert(bus);
+        assert(pidref_is_set(pid));
+
+        if (pid->fd < 0)
+                return -EOPNOTSUPP;
+
+        r = bus_call_method(bus, bus_systemd_mgr, "GetUnitByPIDFD", &error, &reply, "h", pid->fd);
+        if (r < 0) {
+                if (sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_METHOD))
+                        return -EOPNOTSUPP;
+
+                if (sd_bus_error_has_names(&error, BUS_ERROR_NO_UNIT_FOR_PID, BUS_ERROR_NO_SUCH_PROCESS))
+                        return log_error_errno(r, "%s", bus_error_message(&error, r));
+
+                return log_error_errno(r,
+                                       "Failed to get unit that PID " PID_FMT " belongs to: %s",
+                                       pid->pid, bus_error_message(&error, r));
+        }
+
+        _cleanup_free_ char *u = NULL, *p = NULL;
+        const char *path, *unit;
+
+        r = sd_bus_message_read(reply, "os", &path, &unit);
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        if (ret_unit) {
+                u = strdup(unit);
+                if (!u)
+                        return log_oom();
+        }
+
+        if (ret_path) {
+                p = strdup(path);
+                if (!p)
+                        return log_oom();
+        }
+
+        if (ret_unit)
+                *ret_unit = TAKE_PTR(u);
+        if (ret_path)
+                *ret_path = TAKE_PTR(p);
+
+        return 0;
+}
+
+int lookup_unit_by_pidref(sd_bus *bus, pid_t pid, char **ret_unit, char **ret_path) {
+        int r;
+
+        assert(bus);
+        assert(pid >= 0); /* 0 means our own process */
+
+        if (arg_transport != BUS_TRANSPORT_LOCAL)
+                return get_unit_by_pid(bus, pid, ret_unit, ret_path);
+
+        static bool use_pidfd = true;
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+
+        r = pidref_set_pid(&pidref, pid);
+        if (r < 0)
+                return log_error_errno(r,
+                                       r == -ESRCH ?
+                                       "PID " PID_FMT " doesn't exist or is already gone." :
+                                       "Failed to create reference to PID " PID_FMT ": %m",
+                                       pid);
+
+        if (use_pidfd) {
+                r = get_unit_by_pidfd(bus, &pidref, ret_unit, ret_path);
+                if (r != -EOPNOTSUPP)
+                        return r;
+
+                use_pidfd = false;
+                log_debug_errno(r, "Unable to look up process using pidfd, falling back to pid.");
+        }
+
+        _cleanup_free_ char *u = NULL, *p = NULL;
+
+        r = get_unit_by_pid(bus, pidref.pid, ret_unit ? &u : NULL, ret_path ? &p : NULL);
+        if (r < 0)
+                return r;
+
+        r = pidref_verify(&pidref);
+        if (r < 0)
+                return log_error_errno(r, "Failed to verify our reference to PID " PID_FMT ": %m", pidref.pid);
+
+        if (ret_unit)
+                *ret_unit = TAKE_PTR(u);
+        if (ret_path)
+                *ret_path = TAKE_PTR(p);
+
+        return 0;
 }

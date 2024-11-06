@@ -219,6 +219,7 @@ static int method_list_machines(sd_bus_message *message, void *userdata, sd_bus_
 }
 
 static int method_create_or_register_machine(Manager *manager, sd_bus_message *message, bool read_network, Machine **_m, sd_bus_error *error) {
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
         const char *name, *service, *class, *root_directory;
         const int32_t *netif = NULL;
         MachineClass c;
@@ -294,6 +295,10 @@ static int method_create_or_register_machine(Manager *manager, sd_bus_message *m
                         return r;
         }
 
+        r = pidref_set_pid(&pidref, leader);
+        if (r < 0)
+                return sd_bus_error_set_errnof(error, r, "Failed to pin process " PID_FMT ": %m", pidref.pid);
+
         if (hashmap_get(manager->machines, name))
                 return sd_bus_error_setf(error, BUS_ERROR_MACHINE_EXISTS, "Machine '%s' already exists", name);
 
@@ -301,7 +306,7 @@ static int method_create_or_register_machine(Manager *manager, sd_bus_message *m
         if (r < 0)
                 return r;
 
-        m->leader = leader;
+        m->leader = TAKE_PIDREF(pidref);
         m->class = c;
         m->id = id;
 
@@ -388,11 +393,11 @@ static int method_register_machine_internal(sd_bus_message *message, bool read_n
         if (r < 0)
                 return r;
 
-        r = cg_pid_get_unit(m->leader, &m->unit);
+        r = cg_pid_get_unit(m->leader.pid, &m->unit);
         if (r < 0) {
                 r = sd_bus_error_set_errnof(error, r,
                                             "Failed to determine unit of process "PID_FMT" : %m",
-                                            m->leader);
+                                            m->leader.pid);
                 goto fail;
         }
 
@@ -455,6 +460,10 @@ static int method_kill_machine(sd_bus_message *message, void *userdata, sd_bus_e
 
 static int method_get_machine_addresses(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         return redirect_method_to_machine(message, userdata, error, bus_machine_method_get_addresses);
+}
+
+static int method_get_machine_ssh_info(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        return redirect_method_to_machine(message, userdata, error, bus_machine_method_get_ssh_info);
 }
 
 static int method_get_machine_os_release(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -541,8 +550,8 @@ static int method_get_machine_uid_shift(sd_bus_message *message, void *userdata,
 }
 
 static int redirect_method_to_image(sd_bus_message *message, Manager *m, sd_bus_error *error, sd_bus_message_handler_t method) {
-        _cleanup_(image_unrefp) Image* i = NULL;
         const char *name;
+        Image *i;
         int r;
 
         assert(message);
@@ -556,13 +565,12 @@ static int redirect_method_to_image(sd_bus_message *message, Manager *m, sd_bus_
         if (!image_name_is_valid(name))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Image name '%s' is invalid.", name);
 
-        r = image_find(IMAGE_MACHINE, name, NULL, &i);
+        r = manager_acquire_image(m, name, &i);
         if (r == -ENOENT)
                 return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_IMAGE, "No image '%s' known", name);
         if (r < 0)
                 return r;
 
-        i->userdata = m;
         return method(message, i, error);
 }
 
@@ -608,7 +616,7 @@ static int clean_pool_done(Operation *operation, int ret, sd_bus_error *error) {
         assert(operation);
         assert(operation->extra_fd >= 0);
 
-        if (lseek(operation->extra_fd, 0, SEEK_SET) == (off_t) -1)
+        if (lseek(operation->extra_fd, 0, SEEK_SET) < 0)
                 return -errno;
 
         f = take_fdopen(&operation->extra_fd, "r");
@@ -683,7 +691,7 @@ static int method_clean_pool(sd_bus_message *message, void *userdata, sd_bus_err
                 REMOVE_HIDDEN,
         } mode;
 
-        _cleanup_close_pair_ int errno_pipe_fd[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int errno_pipe_fd[2] = EBADF_PAIR;
         _cleanup_close_ int result_fd = -EBADF;
         Manager *m = userdata;
         Operation *operation;
@@ -715,11 +723,8 @@ static int method_clean_pool(sd_bus_message *message, void *userdata, sd_bus_err
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-machines",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -850,11 +855,8 @@ static int method_set_pool_limit(sd_bus_message *message, void *userdata, sd_bus
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-machines",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -1067,6 +1069,11 @@ const sd_bus_vtable manager_vtable[] = {
                                 SD_BUS_ARGS("s", name),
                                 SD_BUS_RESULT("a(iay)", addresses),
                                 method_get_machine_addresses,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("GetMachineSSHInfo",
+                                SD_BUS_ARGS("s", name),
+                                SD_BUS_RESULT("s", ssh_address, "s", ssh_private_key_path),
+                                method_get_machine_ssh_info,
                                 SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD_WITH_ARGS("GetMachineOSRelease",
                                 SD_BUS_ARGS("s", name),
@@ -1499,9 +1506,13 @@ int manager_add_machine(Manager *m, const char *name, Machine **_machine) {
 
         machine = hashmap_get(m->machines, name);
         if (!machine) {
-                r = machine_new(m, _MACHINE_CLASS_INVALID, name, &machine);
+                r = machine_new(_MACHINE_CLASS_INVALID, name, &machine);
                 if (r < 0)
                         return r;
+
+                r = machine_link(m, machine);
+                if (r < 0)
+                        return 0;
         }
 
         if (_machine)

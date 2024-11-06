@@ -331,15 +331,14 @@ static int stack_directory_get_name(const char *slink, char **ret) {
         _cleanup_free_ char *s = NULL, *dirname = NULL;
         char name_enc[NAME_MAX+1];
         const char *name;
+        int r;
 
         assert(slink);
         assert(ret);
 
-        s = strdup(slink);
-        if (!s)
-                return -ENOMEM;
-
-        path_simplify(s);
+        r = path_simplify_alloc(slink, &s);
+        if (r < 0)
+                return r;
 
         if (!path_is_normalized(s))
                 return -EINVAL;
@@ -468,13 +467,13 @@ static int link_update(sd_device *dev, const char *slink, bool add) {
                                 /* The devlink priority is downgraded. Another device may have a higher
                                  * priority now. Let's find the device node with the highest priority. */
                         } else {
-                                if (current_prio >= prio)
-                                        /* The devlink with equal or higher priority already exists and is
-                                         * owned by another device. Hence, it is not necessary to recreate it. */
+                                if (current_prio > prio)
+                                        /* The devlink with a higher priority already exists and is owned by
+                                         * another device. Hence, it is not necessary to recreate it. */
                                         return 0;
 
-                                /* This device has a higher priority than the current. Let's create the
-                                 * devlink to our device node. */
+                                /* This device has the equal or a higher priority than the current. Let's
+                                 * create the devlink to our device node. */
                                 return node_symlink(dev, NULL, slink);
                         }
 
@@ -511,22 +510,17 @@ static int link_update(sd_device *dev, const char *slink, bool add) {
 }
 
 static int device_get_devpath_by_devnum(sd_device *dev, char **ret) {
-        const char *subsystem;
         dev_t devnum;
         int r;
 
         assert(dev);
         assert(ret);
 
-        r = sd_device_get_subsystem(dev, &subsystem);
-        if (r < 0)
-                return r;
-
         r = sd_device_get_devnum(dev, &devnum);
         if (r < 0)
                 return r;
 
-        return device_path_make_major_minor(streq(subsystem, "block") ? S_IFBLK : S_IFCHR, devnum, ret);
+        return device_path_make_major_minor(device_in_subsystem(dev, "block") ? S_IFBLK : S_IFCHR, devnum, ret);
 }
 
 int udev_node_update(sd_device *dev, sd_device *dev_old) {

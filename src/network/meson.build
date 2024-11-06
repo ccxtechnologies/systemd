@@ -43,8 +43,11 @@ sources = files(
         'networkd-dhcp-server-bus.c',
         'networkd-dhcp-server-static-lease.c',
         'networkd-dhcp-server.c',
+        'networkd-dhcp4-bus.c',
         'networkd-dhcp4.c',
+        'networkd-dhcp6-bus.c',
         'networkd-dhcp6.c',
+        'networkd-dns.c',
         'networkd-ipv4acd.c',
         'networkd-ipv4ll.c',
         'networkd-ipv6-proxy-ndp.c',
@@ -54,18 +57,22 @@ sources = files(
         'networkd-link.c',
         'networkd-lldp-rx.c',
         'networkd-lldp-tx.c',
-        'networkd-manager-bus.c',
         'networkd-manager.c',
+        'networkd-manager-bus.c',
+        'networkd-manager-varlink.c',
         'networkd-ndisc.c',
         'networkd-neighbor.c',
         'networkd-netlabel.c',
         'networkd-network-bus.c',
         'networkd-network.c',
         'networkd-nexthop.c',
+        'networkd-ntp.c',
         'networkd-queue.c',
         'networkd-radv.c',
-        'networkd-route-util.c',
         'networkd-route.c',
+        'networkd-route-metric.c',
+        'networkd-route-nexthop.c',
+        'networkd-route-util.c',
         'networkd-routing-policy-rule.c',
         'networkd-setlink.c',
         'networkd-speed-meter.c',
@@ -107,12 +114,18 @@ systemd_networkd_wait_online_sources = files(
         'wait-online/wait-online.c',
 )
 
-networkctl_sources = files('networkctl.c')
+networkctl_sources = files(
+        'networkctl.c',
+        'networkctl-config-file.c'
+)
 
 network_generator_sources = files(
         'generator/main.c',
         'generator/network-generator.c',
 )
+
+networkd_network_gperf_gperf = files('networkd-network-gperf.gperf')
+networkd_netdev_gperf_gperf = files('netdev/netdev-gperf.gperf')
 
 sources += custom_target(
         'networkd-gperf.c',
@@ -122,13 +135,13 @@ sources += custom_target(
 
 sources += custom_target(
         'networkd-network-gperf.c',
-        input : 'networkd-network-gperf.gperf',
+        input : networkd_network_gperf_gperf,
         output : 'networkd-network-gperf.c',
         command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
 sources += custom_target(
         'netdev-gperf.c',
-        input : 'netdev/netdev-gperf.gperf',
+        input : networkd_netdev_gperf_gperf,
         output : 'netdev-gperf.c',
         command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
@@ -136,8 +149,7 @@ if get_option('link-networkd-shared')
         networkd_link_with = [libshared]
 else
         networkd_link_with = [libsystemd_static,
-                              libshared_static,
-                              libbasic_gcrypt]
+                              libshared_static]
 endif
 
 network_includes = [libsystemd_network_includes, include_directories(['.', 'netdev', 'tc'])]
@@ -149,6 +161,94 @@ libnetworkd_core = static_library(
         dependencies : userspace,
         link_with : networkd_link_with,
         build_by_default : false)
+
+network_test_template = test_template + {
+        'link_with' : [
+                libnetworkd_core,
+                libsystemd_network,
+        ],
+        'include_directories' : network_includes,
+}
+
+network_fuzz_template = fuzz_template + {
+        'link_with' : [
+                libnetworkd_core,
+                libsystemd_network,
+        ],
+        'dependencies' : threads,
+        'include_directories' : network_includes,
+}
+
+executables += [
+        libexec_template + {
+                'name' : 'systemd-networkd',
+                'dbus' : true,
+                'conditions' : ['ENABLE_NETWORKD'],
+                'sources' : systemd_networkd_sources,
+                'include_directories' : network_includes,
+                'link_with' : [
+                        libnetworkd_core,
+                        libsystemd_network,
+                        networkd_link_with,
+                ],
+                'dependencies' : threads,
+        },
+        libexec_template + {
+                'name' : 'systemd-networkd-wait-online',
+                'public' : true,
+                'conditions' : ['ENABLE_NETWORKD'],
+                'sources' : systemd_networkd_wait_online_sources,
+                'link_with' : networkd_link_with,
+        },
+        executable_template + {
+                'name' : 'networkctl',
+                'public' : true,
+                'conditions' : ['ENABLE_NETWORKD'],
+                'sources' : networkctl_sources,
+                'include_directories' : libsystemd_network_includes,
+                'link_with' : [
+                        libsystemd_network,
+                        networkd_link_with,
+                ],
+        },
+        libexec_template + {
+                'name' : 'systemd-network-generator',
+                'sources' : network_generator_sources,
+                'link_with' : networkd_link_with,
+        },
+        test_template + {
+                'sources' : files(
+                        'generator/test-network-generator.c',
+                        'generator/network-generator.c',
+                ),
+                'suite' : 'network',
+        },
+        network_test_template + {
+                'sources' : files('test-network-tables.c'),
+                'dependencies' : threads,
+        },
+        network_test_template + {
+                'sources' : files('test-network.c'),
+                'dependencies' : threads,
+        },
+        network_test_template + {
+                'sources' : files('test-networkd-address.c'),
+                'dependencies' : libatomic,
+        },
+        network_test_template + {
+                'sources' : files('test-networkd-conf.c'),
+                'dependencies' : libatomic,
+        },
+        network_test_template + {
+                'sources' : files('test-networkd-util.c'),
+        },
+        network_fuzz_template + {
+                'sources' : files('fuzz-netdev-parser.c'),
+        },
+        network_fuzz_template + {
+                'sources' : files('fuzz-network-parser.c'),
+        },
+]
 
 if conf.get('ENABLE_NETWORKD') == 1
         install_data('org.freedesktop.network1.conf',
@@ -168,61 +268,6 @@ if conf.get('ENABLE_NETWORKD') == 1
 
         if install_sysconfdir_samples
                 install_data('networkd.conf',
-                             install_dir : pkgsysconfdir)
+                             install_dir : pkgconfigfiledir)
         endif
 endif
-
-fuzzer_network_base = {
-        'link_with' : [libnetworkd_core, libsystemd_network, networkd_link_with],
-        'dependencies' : threads,
-        'includes' : network_includes,
-}
-
-fuzzers += [
-        {
-                'sources' : files('fuzz-netdev-parser.c'),
-                'base' : fuzzer_network_base,
-        },
-        {
-                'sources' : files('fuzz-network-parser.c'),
-                'base' : fuzzer_network_base,
-        },
-]
-
-test_network_base = {
-        'link_with' : [libnetworkd_core, libsystemd_network],
-        'includes' : network_includes,
-}
-
-tests += [
-        {
-                'sources' : files(
-                        'generator/network-generator.c',
-                        'generator/test-network-generator.c'
-                )
-        },
-        {
-                'sources' : files('test-network-tables.c'),
-                'dependencies' : threads,
-                'base' : test_network_base,
-        },
-        {
-                'sources' : files('test-network.c'),
-                'dependencies' : threads,
-                'base' : test_network_base,
-        },
-        {
-                'sources' : files('test-networkd-address.c'),
-                'dependencies' : libatomic,
-                'base' : test_network_base,
-        },
-        {
-                'sources' : files('test-networkd-conf.c'),
-                'dependencies' : libatomic,
-                'base' : test_network_base,
-        },
-        {
-                'sources' : files('test-networkd-util.c'),
-                'base' : test_network_base,
-        },
-]

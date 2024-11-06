@@ -1,12 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "analyze.h"
 #include "analyze-time-data.h"
+#include "analyze.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-map-properties.h"
 #include "bus-unit-util.h"
+#include "memory-util.h"
 #include "special.h"
+#include "strv.h"
 
 static void subtract_timestamp(usec_t *a, usec_t b) {
         assert(a);
@@ -36,6 +38,7 @@ int acquire_boot_times(sd_bus *bus, bool require_finished, BootTimes **ret) {
                 { "FinishTimestampMonotonic",                 "t", NULL, offsetof(BootTimes, finish_time)                   },
                 { "SecurityStartTimestampMonotonic",          "t", NULL, offsetof(BootTimes, security_start_time)           },
                 { "SecurityFinishTimestampMonotonic",         "t", NULL, offsetof(BootTimes, security_finish_time)          },
+                { "ShutdownStartTimestampMonotonic",          "t", NULL, offsetof(BootTimes, shutdown_start_time)           },
                 { "GeneratorsStartTimestampMonotonic",        "t", NULL, offsetof(BootTimes, generators_start_time)         },
                 { "GeneratorsFinishTimestampMonotonic",       "t", NULL, offsetof(BootTimes, generators_finish_time)        },
                 { "UnitsLoadStartTimestampMonotonic",         "t", NULL, offsetof(BootTimes, unitsload_start_time)          },
@@ -46,6 +49,7 @@ int acquire_boot_times(sd_bus *bus, bool require_finished, BootTimes **ret) {
                 { "InitRDGeneratorsFinishTimestampMonotonic", "t", NULL, offsetof(BootTimes, initrd_generators_finish_time) },
                 { "InitRDUnitsLoadStartTimestampMonotonic",   "t", NULL, offsetof(BootTimes, initrd_unitsload_start_time)   },
                 { "InitRDUnitsLoadFinishTimestampMonotonic",  "t", NULL, offsetof(BootTimes, initrd_unitsload_finish_time)  },
+                { "SoftRebootsCount",                         "t", NULL, offsetof(BootTimes, soft_reboots_count)            },
                 {},
         };
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -79,7 +83,25 @@ int acquire_boot_times(sd_bus *bus, bool require_finished, BootTimes **ret) {
         if (require_finished && times.finish_time <= 0)
                 return log_not_finished(times.finish_time);
 
-        if (arg_runtime_scope == RUNTIME_SCOPE_SYSTEM && times.security_start_time > 0) {
+        if (arg_runtime_scope == RUNTIME_SCOPE_SYSTEM && times.soft_reboots_count > 0) {
+                /* On soft-reboot ignore kernel/firmware/initrd times as they are from the previous boot */
+                times.firmware_time = times.loader_time = times.kernel_time = times.initrd_time =
+                                times.initrd_security_start_time = times.initrd_security_finish_time =
+                                times.initrd_generators_start_time = times.initrd_generators_finish_time =
+                                times.initrd_unitsload_start_time = times.initrd_unitsload_finish_time = 0;
+                times.reverse_offset = times.shutdown_start_time;
+
+                /* Clamp all timestamps to avoid showing huge graphs */
+                if (timestamp_is_set(times.finish_time))
+                        subtract_timestamp(&times.finish_time, times.reverse_offset);
+                subtract_timestamp(&times.userspace_time, times.reverse_offset);
+
+                subtract_timestamp(&times.generators_start_time, times.reverse_offset);
+                subtract_timestamp(&times.generators_finish_time, times.reverse_offset);
+
+                subtract_timestamp(&times.unitsload_start_time, times.reverse_offset);
+                subtract_timestamp(&times.unitsload_finish_time, times.reverse_offset);
+        } else if (arg_runtime_scope == RUNTIME_SCOPE_SYSTEM && timestamp_is_set(times.security_start_time)) {
                 /* security_start_time is set when systemd is not running under container environment. */
                 if (times.initrd_time > 0)
                         times.kernel_done_time = times.initrd_time;
@@ -181,6 +203,8 @@ int pretty_boot_time(sd_bus *bus, char **ret) {
                 return log_oom();
         if (timestamp_is_set(t->initrd_time) && !strextend(&text, FORMAT_TIMESPAN(t->userspace_time - t->initrd_time, USEC_PER_MSEC), " (initrd) + "))
                 return log_oom();
+        if (t->soft_reboots_count > 0 && strextendf(&text, "%s (soft reboot #%" PRIu64 ") + ", FORMAT_TIMESPAN(t->userspace_time, USEC_PER_MSEC), t->soft_reboots_count) < 0)
+                return log_oom();
 
         if (!strextend(&text, FORMAT_TIMESPAN(t->finish_time - t->userspace_time, USEC_PER_MSEC), " (userspace) "))
                 return log_oom();
@@ -190,7 +214,13 @@ int pretty_boot_time(sd_bus *bus, char **ret) {
                         return log_oom();
 
         if (unit_id && timestamp_is_set(activated_time)) {
-                usec_t base = timestamp_is_set(t->userspace_time) ? t->userspace_time : t->reverse_offset;
+                usec_t base;
+
+                /* On soft-reboot times are clamped to avoid showing huge graphs */
+                if (t->soft_reboots_count > 0 && timestamp_is_set(t->userspace_time))
+                        base = t->userspace_time + t->reverse_offset;
+                else
+                        base = timestamp_is_set(t->userspace_time) ? t->userspace_time : t->reverse_offset;
 
                 if (!strextend(&text, "\n", unit_id, " reached after ", FORMAT_TIMESPAN(activated_time - base, USEC_PER_MSEC), " in userspace."))
                         return log_oom();
@@ -215,22 +245,41 @@ int pretty_boot_time(sd_bus *bus, char **ret) {
         return 0;
 }
 
+void unit_times_clear(UnitTimes *t) {
+        if (!t)
+                return;
+
+        FOREACH_ELEMENT(d, t->deps)
+                *d = strv_free(*d);
+
+        t->name = mfree(t->name);
+}
+
 UnitTimes* unit_times_free_array(UnitTimes *t) {
         if (!t)
                 return NULL;
 
         for (UnitTimes *p = t; p->has_data; p++)
-                free(p->name);
+                unit_times_clear(p);
 
         return mfree(t);
 }
 
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(UnitTimes*, unit_times_clear, NULL);
+
 int acquire_time_data(sd_bus *bus, bool require_finished, UnitTimes **out) {
         static const struct bus_properties_map property_map[] = {
-                { "InactiveExitTimestampMonotonic",  "t", NULL, offsetof(UnitTimes, activating)   },
-                { "ActiveEnterTimestampMonotonic",   "t", NULL, offsetof(UnitTimes, activated)    },
-                { "ActiveExitTimestampMonotonic",    "t", NULL, offsetof(UnitTimes, deactivating) },
-                { "InactiveEnterTimestampMonotonic", "t", NULL, offsetof(UnitTimes, deactivated)  },
+                { "InactiveExitTimestampMonotonic",  "t",  NULL, offsetof(UnitTimes, activating)           },
+                { "ActiveEnterTimestampMonotonic",   "t",  NULL, offsetof(UnitTimes, activated)            },
+                { "ActiveExitTimestampMonotonic",    "t",  NULL, offsetof(UnitTimes, deactivating)         },
+                { "InactiveEnterTimestampMonotonic", "t",  NULL, offsetof(UnitTimes, deactivated)          },
+                { "After",                           "as", NULL, offsetof(UnitTimes, deps[UNIT_AFTER])     },
+                { "Before",                          "as", NULL, offsetof(UnitTimes, deps[UNIT_BEFORE])    },
+                { "Requires",                        "as", NULL, offsetof(UnitTimes, deps[UNIT_REQUIRES])  },
+                { "Requisite",                       "as", NULL, offsetof(UnitTimes, deps[UNIT_REQUISITE]) },
+                { "Wants",                           "as", NULL, offsetof(UnitTimes, deps[UNIT_WANTS])     },
+                { "Conflicts",                       "as", NULL, offsetof(UnitTimes, deps[UNIT_CONFLICTS]) },
+                { "Upholds",                         "as", NULL, offsetof(UnitTimes, deps[UNIT_UPHOLDS])   },
                 {},
         };
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
@@ -254,14 +303,14 @@ int acquire_time_data(sd_bus *bus, bool require_finished, UnitTimes **out) {
                 return bus_log_parse_error(r);
 
         while ((r = bus_parse_unit_info(reply, &u)) > 0) {
-                UnitTimes *t;
+                _cleanup_(unit_times_clearp) UnitTimes *t = NULL;
 
-                if (!GREEDY_REALLOC(unit_times, c + 2))
+                if (!GREEDY_REALLOC0(unit_times, c + 2))
                         return log_oom();
 
-                unit_times[c + 1].has_data = false;
+                /* t initially has pointers zeroed by the allocation, and unit_times_clearp will have zeroed
+                 * them if the entry is being reused. */
                 t = &unit_times[c];
-                t->name = NULL;
 
                 assert_cc(sizeof(usec_t) == sizeof(uint64_t));
 
@@ -278,10 +327,28 @@ int acquire_time_data(sd_bus *bus, bool require_finished, UnitTimes **out) {
                         return log_error_errno(r, "Failed to get timestamp properties of unit %s: %s",
                                                u.id, bus_error_message(&error, r));
 
+                /* Activated in the previous soft-reboot iteration? Ignore it, we want new activations */
+                if ((t->activated > 0 && t->activated < boot_times->shutdown_start_time) ||
+                    (t->activating > 0 && t->activating < boot_times->shutdown_start_time))
+                        continue;
+
                 subtract_timestamp(&t->activating, boot_times->reverse_offset);
                 subtract_timestamp(&t->activated, boot_times->reverse_offset);
-                subtract_timestamp(&t->deactivating, boot_times->reverse_offset);
-                subtract_timestamp(&t->deactivated, boot_times->reverse_offset);
+
+                /* If the last deactivation was in the previous soft-reboot, ignore it */
+                if (boot_times->soft_reboots_count > 0) {
+                        if (t->deactivating < boot_times->reverse_offset)
+                                t->deactivating = 0;
+                        else
+                                subtract_timestamp(&t->deactivating, boot_times->reverse_offset);
+                        if (t->deactivated < boot_times->reverse_offset)
+                                t->deactivated = 0;
+                        else
+                                subtract_timestamp(&t->deactivated, boot_times->reverse_offset);
+                } else {
+                        subtract_timestamp(&t->deactivating, boot_times->reverse_offset);
+                        subtract_timestamp(&t->deactivated, boot_times->reverse_offset);
+                }
 
                 if (t->activated >= t->activating)
                         t->time = t->activated - t->activating;
@@ -298,6 +365,8 @@ int acquire_time_data(sd_bus *bus, bool require_finished, UnitTimes **out) {
                         return log_oom();
 
                 t->has_data = true;
+                /* Prevent destructor from running on t reference. */
+                TAKE_PTR(t);
                 c++;
         }
         if (r < 0)

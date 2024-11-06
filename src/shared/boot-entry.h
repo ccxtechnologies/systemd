@@ -17,17 +17,19 @@ bool boot_entry_token_valid(const char *p);
 
 int boot_entry_token_ensure(
                 const char *root,
-                const char *etc_kernel,   /* will be prefixed with root, typically /etc/kernel. */
+                const char *conf_root,   /* will be prefixed with root, typically /etc/kernel. */
                 sd_id128_t machine_id,
                 bool machine_id_is_random,
                 BootEntryTokenType *type, /* input and output */
                 char **token);            /* output, but do not pass uninitialized value. */
 int boot_entry_token_ensure_at(
                 int rfd,
-                const char *etc_kernel,
+                const char *conf_root,
                 sd_id128_t machine_id,
                 bool machine_id_is_random,
                 BootEntryTokenType *type,
                 char **token);
 
 int parse_boot_entry_token_type(const char *s, BootEntryTokenType *type, char **token);
+
+const char* boot_entry_token_type_to_string(BootEntryTokenType t);

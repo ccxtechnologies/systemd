@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/prctl.h>
@@ -20,7 +21,8 @@
 
 int have_effective_cap(int value) {
         _cleanup_cap_free_ cap_t cap = NULL;
-        cap_flag_value_t fv;
+        cap_flag_value_t fv = CAP_CLEAR; /* To avoid false-positive use-of-uninitialized-value error reported
+                                          * by fuzzers. */
 
         cap = cap_get_proc();
         if (!cap)
@@ -33,37 +35,38 @@ int have_effective_cap(int value) {
 }
 
 unsigned cap_last_cap(void) {
-        static thread_local unsigned saved;
-        static thread_local bool valid = false;
+        static atomic_int saved = INT_MAX;
+        int r, c;
+
+        c = saved;
+        if (c != INT_MAX)
+                return c;
+
+        /* Available since linux-3.2 */
         _cleanup_free_ char *content = NULL;
-        unsigned long p = 0;
-        int r;
-
-        if (valid)
-                return saved;
-
-        /* available since linux-3.2 */
         r = read_one_line_file("/proc/sys/kernel/cap_last_cap", &content);
-        if (r >= 0) {
-                r = safe_atolu(content, &p);
-                if (r >= 0) {
-
-                        if (p > CAP_LIMIT) /* Safety for the future: if one day the kernel learns more than
+        if (r < 0)
+                log_debug_errno(r, "Failed to read /proc/sys/kernel/cap_last_cap, ignoring: %m");
+        else {
+                r = safe_atoi(content, &c);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to parse /proc/sys/kernel/cap_last_cap, ignoring: %m");
+                else {
+                        if (c > CAP_LIMIT) /* Safety for the future: if one day the kernel learns more than
                                             * 64 caps, then we are in trouble (since we, as much userspace
                                             * and kernel space store capability masks in uint64_t types). We
                                             * also want to use UINT64_MAX as marker for "unset". Hence let's
                                             * hence protect ourselves against that and always cap at 62 for
                                             * now. */
-                                p = CAP_LIMIT;
+                                c = CAP_LIMIT;
 
-                        saved = p;
-                        valid = true;
-                        return p;
+                        saved = c;
+                        return c;
                 }
         }
 
-        /* fall back to syscall-probing for pre linux-3.2 */
-        p = (unsigned long) MIN(CAP_LAST_CAP, CAP_LIMIT);
+        /* Fall back to syscall-probing for pre linux-3.2, or where /proc/ is not mounted */
+        unsigned long p = (unsigned long) MIN(CAP_LAST_CAP, CAP_LIMIT);
 
         if (prctl(PR_CAPBSET_READ, p) < 0) {
 
@@ -80,10 +83,9 @@ unsigned cap_last_cap(void) {
                                 break;
         }
 
-        saved = p;
-        valid = true;
-
-        return p;
+        c = (int) p;
+        saved = c;
+        return c;
 }
 
 int capability_update_inherited_set(cap_t caps, uint64_t set) {
@@ -367,22 +369,30 @@ int drop_privileges(uid_t uid, gid_t gid, uint64_t keep_capabilities) {
         return 0;
 }
 
-int drop_capability(cap_value_t cv) {
+static int change_capability(cap_value_t cv, cap_flag_value_t flag) {
         _cleanup_cap_free_ cap_t tmp_cap = NULL;
 
         tmp_cap = cap_get_proc();
         if (!tmp_cap)
                 return -errno;
 
-        if ((cap_set_flag(tmp_cap, CAP_INHERITABLE, 1, &cv, CAP_CLEAR) < 0) ||
-            (cap_set_flag(tmp_cap, CAP_PERMITTED, 1, &cv, CAP_CLEAR) < 0) ||
-            (cap_set_flag(tmp_cap, CAP_EFFECTIVE, 1, &cv, CAP_CLEAR) < 0))
+        if ((cap_set_flag(tmp_cap, CAP_INHERITABLE, 1, &cv, flag) < 0) ||
+            (cap_set_flag(tmp_cap, CAP_PERMITTED, 1, &cv, flag) < 0) ||
+            (cap_set_flag(tmp_cap, CAP_EFFECTIVE, 1, &cv, flag) < 0))
                 return -errno;
 
         if (cap_set_proc(tmp_cap) < 0)
                 return -errno;
 
         return 0;
+}
+
+int drop_capability(cap_value_t cv) {
+        return change_capability(cv, CAP_CLEAR);
+}
+
+int keep_capability(cap_value_t cv) {
+        return change_capability(cv, CAP_SET);
 }
 
 bool ambient_capabilities_supported(void) {

@@ -173,6 +173,10 @@ evdev:atkbd:dmi:*:svnPackardBell:pndots:*:rvnPackardBell:rnSJE01_CT:*
  KEYBOARD_KEY_ce=unknown  # Brightness Up, also emitted by acpi-video, ignore
  KEYBOARD_KEY_ef=unknown  # Brightness Down, also emitted by acpi-video, ignore
 
+# Predator PT314-52s
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAcer*:pnPredator*PT314-52s:pvr*
+ KEYBOARD_KEY_66=micmute                                # Microphone mute button
+
 # Predator PH 315-52
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAcer*:pnPredator*PH*315-52:*
  KEYBOARD_KEY_ef=kbdillumup                             # Fn+F10
@@ -216,6 +220,21 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAcer*:pnAOA*:*
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnGateway*:pn*:*
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnPackard*Bell*:pn*:*
  KEYBOARD_KEY_86=wlan                                   # Fn+F3 or Fn+Q for communication key
+
+# Swift SF314-511
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAcer*:pnSwiftSF314-511:pvr*
+ KEYBOARD_KEY_8a=f20					# Fn+F12, microphone mute
+
+# Predator PHN16-71
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAcer*:pnPredatorPHN16-71:*
+ KEYBOARD_KEY_ef=unknown                                # Keyboard backlight up
+ KEYBOARD_KEY_f5=prog1                                  # "predator sense" button
+ KEYBOARD_KEY_66=micmute                                # Microphone mute button
+
+# Nitro AN515-58
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAcer*:pnNitro*AN*515-58:pvr*
+ KEYBOARD_KEY_8a=f20                                    # Microphone mute button
+ KEYBOARD_KEY_55=power
 
 ###########################################################
 # Alienware
@@ -261,6 +280,22 @@ evdev:name:gpio-keys:phys:gpio-keys/input0:ev:100003:dmi:*:svnASUSTeKCOMPUTERINC
  KEYBOARD_KEY_0=volumedown
 
 ###########################################################
+# Ayaneo
+###########################################################
+
+# The Ayaneo Kun is a portable PC handheld console. Four of its
+# face buttons are not exposed through the integrated Xbox360
+# controller, but by a raw AT keyboard.
+#
+# All four of these buttons generate a multi-scancode sequence
+# consisting of Left_Meta, Right_Ctrl and another scancode.
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAYANEO:pnKUN:pvr*
+ KEYBOARD_KEY_18=f13                              # LC (next to the left shoulder button)
+ KEYBOARD_KEY_20=f14                              # RC (next to the right shoulder button)
+ KEYBOARD_KEY_30=f15                              # Start (upper-right corner of screen)
+ KEYBOARD_KEY_28=f16                              # Ayaneo (lower-right corner of screen)
+
+###########################################################
 # BenQ
 ###########################################################
 
@@ -281,6 +316,7 @@ evdev:atkbd:dmi:bvn*:bvr*:svnNotebook:pnNS50_70MU:*
 evdev:atkbd:dmi:bvn*:bvr*:svnNotebook:pnNV4XMB,ME,MZ:*
 evdev:atkbd:dmi:bvn*:bvr*:svnNotebook:pnNS5x_NS7xPU:*
 evdev:atkbd:dmi:bvn*:bvr*:svnNotebook:pnNV4xPZ:*
+evdev:atkbd:dmi:bvn*:bvr*:svnNotebook:pnV54x_6x_TU:*
  KEYBOARD_KEY_f7=f21                                    # Touchpad Toggle
  KEYBOARD_KEY_f8=f21                                    # Touchpad Toggle
 
@@ -605,6 +641,11 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHewlett-Packard*:pn*[pP][aA][vV][iI][lL][iI][oO
  KEYBOARD_KEY_d9=unknown
  KEYBOARD_KEY_d2=sysrq                                  # Fn+Print = SYSRQ
 
+# Pavilion gaming 15-dk1* (lid keys)
+evdev:atkbd:dmi:bvn*:bvr*:bd*:br*:efr*:svnHP:pnHPPavilionGamingLaptop15-dk1*:*
+ KEYBOARD_KEY_d7=unknown
+ KEYBOARD_KEY_d8=unknown
+
 # Spectre x360 13 (Prevents random airplane mode activation)
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHewlett-Packard*:pn*[sS][pP][eE][cC][tT][rR][eE]*x360*13*:*
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pn*[sS][pP][eE][cC][tT][rR][eE]*x360Convertible*:*
@@ -896,6 +937,22 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svnINVENTEC:pnSYMPHONY*6.0/7.0:*
  KEYBOARD_KEY_f4=prog1
 
 ###########################################################
+# JP-IK
+###########################################################
+
+# LEAP W502
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnJP-IK:pnLEAPW502:pvr*
+ KEYBOARD_KEY_76=f21                                    # touchpad toggle
+
+###########################################################
+# Kvadra
+###########################################################
+
+# LE14U/LE15U
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnKVADRA*:pn*LE1*U*:*
+ KEYBOARD_KEY_76=f21					# Fn+F1 Toggle touchpad, sends meta+ctrl+toggle
+
+###########################################################
 # Lenovo
 ###########################################################
 
@@ -1014,6 +1071,8 @@ evdev:atkbd:dmi:bvn*:bvr*:svnLENOVO*:pn*IdeaPad*Z370*:pvr*
 evdev:atkbd:dmi:bvn*:bvr*:svnLENOVO:*:pvrIdeaPadFlex5*
 # Lenovo Yoga S940 (9th gen)
 evdev:atkbd:dmi:bvn*:bvr*:svnLENOVO:pn81Q7*:pvrLenovoYogaS940:*
+# Lenovo ThinkBook 16G6IRL
+evdev:atkbd:dmi:bvn*:bvr*:svnLENOVO:pn21KH*:pvrThinkBook16G6IRL:*
  KEYBOARD_KEY_a0=!mute
  KEYBOARD_KEY_ae=!volumedown
  KEYBOARD_KEY_b0=!volumeup
@@ -1024,6 +1083,8 @@ evdev:atkbd:dmi:*:svnLENOVO:*:pvrLenovoYoga300-11IBR:*
 
 # Lenovo Y50-70
 evdev:atkbd:dmi:bvn*:bvr*:svnLENOVO*:pn*20378*:pvr*
+# Lenovo IdeaPad Z500
+evdev:atkbd:dmi:bvn*:bvr*:svnLENOVO*:pn*5931*:pvr*
  KEYBOARD_KEY_f3=f21                                    # Fn+F6 (toggle touchpad)
 
 # V480
@@ -1049,6 +1110,9 @@ evdev:input:b0003v04B3p301B*
 # Lenovo Ideapad D330-10IGM
 evdev:name:SIPODEV Lenovo HID Device:dmi:*:svnLENOVO:*:pvrLenovoideapadD330-10IGM:*
  KEYBOARD_KEY_70073=f21                                 # Fn+Supr (Touchpad toggle)
+
+evdev:name:SIPODEV Lenovo HID Device Consumer Control:dmi:*:svnLENOVO:*:pvrLenovoideapadD330-10IGM:*
+ KEYBOARD_KEY_c00ff=fn_esc                              # Fn+Tab (FnLk toggle)
 
 ###########################################################
 # LG
@@ -1438,9 +1502,13 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svnMicro-Star*:pn*PR200*:*
  KEYBOARD_KEY_f7=reserved
  KEYBOARD_KEY_f8=reserved
 
-# MSI Wind U90/U100 generates separate touchpad on/off keycodes so ignore touchpad toggle keycode
+# MSI Wind U90/U100 generates separate touchpad on/off keycodes so ignore touchpad toggle keycode.
+# Also ignore Wi-Fi and Bluetooth keycodes, because they are generated when the HW rfkill state
+# changes, but the userspace also toggles the SW rfkill upon receiving these keycodes.
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnMICRO-STAR*:pnU90/U100:*
- KEYBOARD_KEY_e4=reserved
+ KEYBOARD_KEY_e4=unknown
+ KEYBOARD_KEY_e2=unknown
+ KEYBOARD_KEY_f6=unknown
 
 # Keymaps MSI Prestige And MSI Modern FnKeys and Special keys
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnMicro-Star*:pn*Prestige*:*
@@ -1716,6 +1784,11 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svn[sS][aA][mM][sS][uU][nN][gG]*:pn*550P*:*
  KEYBOARD_KEY_a8=!                                      # Fn Lock - Function lock on
  KEYBOARD_KEY_a9=!                                      # Fn Lock - Function lock off
 
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svn[sS][aA][mM][sS][uU][nN][gG]*:pn*550X*:*
+ KEYBOARD_KEY_ce=!prog1                                 # Fn+F1 launch settings
+ KEYBOARD_KEY_ae=!volumedown                            # Fn+F7 volume up
+ KEYBOARD_KEY_b0=!volumeup                              # Fn+F8 volume down
+
 # Series 7 / 9
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svn[sS][aA][mM][sS][uU][nN][gG]*:pn*350V*:*
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svn[sS][aA][mM][sS][uU][nN][gG]*:pn*670Z*:*
@@ -1907,6 +1980,16 @@ evdev:name:Toshiba*input*device:dmi:bvn*:bvr*:bd*:svnTOSHIBA*:pnSatellite*P75-A:
  KEYBOARD_KEY_13f=f21                                   # Touchpad toggle
  KEYBOARD_KEY_9e=wlan
 
+# Portege Z830 ACPI quickstart buttons
+evdev:name:Quickstart Button 1:dmi:bvn*:bvr*:bd*:svnTOSHIBA*:pnPORTEGEZ830:*
+ KEYBOARD_KEY_1=prog1					# TOSHIBA eco button
+
+evdev:name:Quickstart Button 2:dmi:bvn*:bvr*:bd*:svnTOSHIBA*:pnPORTEGEZ830:*
+ KEYBOARD_KEY_1=prog2					# TOSHIBA Presentation button
+
+evdev:name:Quickstart Button 3:dmi:bvn*:bvr*:bd*:svnTOSHIBA*:pnPORTEGEZ830:*
+ KEYBOARD_KEY_1=f21					# Touchpad toggle
+
 ###########################################################
 # VIA
 ###########################################################
@@ -1928,6 +2011,21 @@ evdev:name:SIPODEV USB Composite Device:dmi:bvn*:bvr*:bd*:svnVIOS:pnLTH17:*
 # P325J
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnINET:pnP325J:*
  KEYBOARD_KEY_76=f21                                    # Touchpad toggle
+
+###########################################################
+# Xiaomi
+###########################################################
+
+# Fix mapping of menu / home / back capacitive buttons on bottom bezel
+# Menu: LeftMeta + S   -> menu      (ignore LeftMeta, map S to menu)
+# Home: LeftCtrl + Esc -> LeftMeta  (ignore LeftCtrl, map Esc to LeftMeta)
+# Back: Backspace      -> back      (map backspace to back)
+evdev:name:FTSC1000:00 2808:509C Keyboard:dmi:*:svnXiaomiInc:pnMipad2:*
+ KEYBOARD_KEY_700e0=unknown	# LeftCtrl -> ignore
+ KEYBOARD_KEY_700e3=unknown	# LeftMeta -> ignore
+ KEYBOARD_KEY_70016=menu	# S -> menu
+ KEYBOARD_KEY_70029=leftmeta	# Esc -> LeftMeta (Windows key / Win8 tablets home)
+ KEYBOARD_KEY_7002a=back	# Backspace -> back
 
 ###########################################################
 # Zepto
@@ -2052,10 +2150,20 @@ evdev:name:AT Translated Set 2 keyboard:dmi:bvn*:svnPositivoTecnologiaSA:pn*:pvr
 evdev:name:AT Translated Set 2 keyboard:dmi:bvn*:svnPositivoTecnologiaSA:pn*:pvr*:rvnPositivoTecnologiaSA:rnK116*
  KEYBOARD_KEY_76=f21                                    # Fn+F1 toggle touchpad
 
+# Positivo (N14NPE-N, N15NPE-N)
+evdev:name:AT Translated Set 2 keyboard:dmi:bvn*:svnPositivo*:pn*:pvr*:rvnPositivo*:rnN1[45]NPE-N*
+ KEYBOARD_KEY_76=f21                                    # Fn+F1 toggle touchpad
+ KEYBOARD_KEY_dd=search
+
+# Positivo (N15EPE, N14EPE)
+evdev:name:AT Translated Set 2 keyboard:dmi:bvn*:svnPositivo*:pn*:pvr*:rvnPositivo*:rnN1[45]EPE*
+ KEYBOARD_KEY_76=f21                                    # Fn+F1 toggle touchpad
+ KEYBOARD_KEY_6e=search
+
 # Positivo (CG15D)
 evdev:name:AT Translated Set 2 keyboard:dmi:bvn*:bvr*:svnPositivoTecnologiaSA:pn*:pvr*:rvn*:rnCG15D*
-# Positivo Motion (N14DP6, N14DP7, N14DP7-V2, N14DP9, N14JP6, N14KP6)
-evdev:name:AT Translated Set 2 keyboard:dmi:bvn*:bvr*:svnPositivoTecnologiaSA:pn*:pvr*:rvn*:rnN14[DJK]P*
+# Positivo Motion (N14AP7, N14DP6, N14DP7, N14DP7-V2, N14DP9, N14JP6, N14KP6)
+evdev:name:AT Translated Set 2 keyboard:dmi:bvn*:bvr*:svnPositivoTecnologiaSA:pn*:pvr*:rvn*:rnN14[ADJK]P*
  KEYBOARD_KEY_76=f21                                    # Fn+f2 toggle touchpad
  KEYBOARD_KEY_67=prog1                                  # Programmable button
  KEYBOARD_KEY_68=prog2                                  # Programmable button
@@ -2066,6 +2174,8 @@ evdev:name:AT Translated Set 2 keyboard:dmi:bvn*:bvr*:svnPositivoTecnologiaSA:pn
 evdev:name:SIPODEV USB Composite Device:dmi:bvn*:bvr*:svnPositivoTecnologiaSA:pn*:pvr*:rvn*:rnK142*
 # Positivo Motion (N14ZP6, N14ZP7)
 evdev:name:SIPODEV USB Composite Device:dmi:bvn*:bvr*:svnPositivoTecnologiaSA:pn*:pvr*:rvn*:rnN14ZP[67]*
+# Positivo Motion (N14EP6)
+evdev:name:SIPODEV USB Composite Device:dmi:bvn*:bvr*:br*:svnPositivoTecnologiaSA:pn*:pvr*:rvn*:rnN14EP6*
 # Positivo Motion (CW14Q01P) (CW14Q01P-V2)
 evdev:name:SIPODEV USB Composite Device:dmi:bvn*:bvr*:svnPositivoTecnologiaSA:pn*:pvr*:rvn*:rnCW14Q01P*
  KEYBOARD_KEY_70073=f21                                 # Fn+f2 toggle touchpad

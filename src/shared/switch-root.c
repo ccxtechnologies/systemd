@@ -30,23 +30,21 @@ int switch_root(const char *new_root,
                 const char *old_root_after,   /* path below the new root, where to place the old root after the transition; may be NULL to unmount it */
                 SwitchRootFlags flags) {
 
-        /* Stuff mounted below /run we don't save on soft reboot, as it might have lost its relevance, i.e.
-         * credentials, removable media and such, we rather want that the new boot mounts this fresh.
-         * But on the switch from initrd we do use MS_REC, as it is expected that mounts set up in /run
-         * are maintained. */
-        unsigned long run_mount_flags = MS_BIND|(!FLAGS_SET(flags, SWITCH_ROOT_SKIP_RECURSIVE_RUN) ? MS_REC : 0);
-        struct {
+        /* Stuff mounted below /run/ we don't save on soft reboot, as it might have lost its relevance,
+         * e.g. removable media and such. We rather want that the new boot mounts this fresh. But on
+         * the switch from initrd we do use MS_REC, as it is expected that mounts set up in /run/ are
+         * maintained. */
+        static const struct {
                 const char *path;
-                unsigned long mount_flags;
-                bool skip_if_run_is_rec; /* For child mounts of /run, if it's moved recursively no need to handle */
+                unsigned long mount_flags;                 /* Flags to apply if SWITCH_ROOT_RECURSIVE_RUN is unset */
+                unsigned long mount_flags_recursive_run;   /* Flags to apply if SWITCH_ROOT_RECURSIVE_RUN is set (0 if shall be skipped) */
         } transfer_table[] = {
-                { "/dev",                                 MS_BIND|MS_REC,  false }, /* Recursive, because we want to save the original /dev/shm + /dev/pts and similar */
-                { "/sys",                                 MS_BIND|MS_REC,  false }, /* Similar, we want to retain various API VFS, or the cgroupv1 /sys/fs/cgroup/ tree */
-                { "/proc",                                MS_BIND|MS_REC,  false }, /* Similar */
-                { "/run",                                 run_mount_flags, false }, /* Recursive except on soft reboot, see above */
-                { SYSTEM_CREDENTIALS_DIRECTORY,           MS_BIND,         true },  /* Credentials passed into the system should survive */
-                { ENCRYPTED_SYSTEM_CREDENTIALS_DIRECTORY, MS_BIND,         true },  /* Similar */
-                { "/run/host",                            MS_BIND|MS_REC,  true },  /* Host supplied hierarchy should also survive */
+                { "/dev",             MS_BIND|MS_REC,  MS_BIND|MS_REC }, /* Recursive, because we want to save the original /dev/shm/ + /dev/pts/ and similar */
+                { "/sys",             MS_BIND|MS_REC,  MS_BIND|MS_REC }, /* Similar, we want to retain various API VFS, or the cgroupv1 /sys/fs/cgroup/ tree */
+                { "/proc",            MS_BIND|MS_REC,  MS_BIND|MS_REC }, /* Similar */
+                { "/run",             MS_BIND,         MS_BIND|MS_REC }, /* Recursive except on soft reboot, see above */
+                { "/run/credentials", MS_BIND|MS_REC,  0 /* skip! */  }, /* Credential mounts should survive */
+                { "/run/host",        MS_BIND|MS_REC,  0 /* skip! */  }, /* Host supplied hierarchy should also survive */
         };
 
         _cleanup_close_ int old_root_fd = -EBADF, new_root_fd = -EBADF;
@@ -64,11 +62,11 @@ int switch_root(const char *new_root,
         if (new_root_fd < 0)
                 return log_error_errno(errno, "Failed to open target directory '%s': %m", new_root);
 
-        r = inode_same_at(old_root_fd, "", new_root_fd, "", AT_EMPTY_PATH);
+        r = fds_are_same_mount(old_root_fd, new_root_fd);
         if (r < 0)
-                return log_error_errno(r, "Failed to determine if old and new root directory are the same: %m");
+                return log_error_errno(r, "Failed to check if old and new root directory/mount are the same: %m");
         if (r > 0) {
-                log_debug("Skipping switch root, as old and new root directory are the same.");
+                log_debug("Skipping switch root, as old and new root directories/mounts are the same.");
                 return 0;
         }
 
@@ -76,6 +74,18 @@ int switch_root(const char *new_root,
         r = fd_make_mount_point(new_root_fd);
         if (r < 0)
                 return log_error_errno(r, "Failed to make new root directory a mount point: %m");
+        if (r > 0) {
+                int fd;
+
+                /* When the path was not a mount point, then we need to reopen the path, otherwise, it still
+                 * points to the underlying directory. */
+
+                fd = open(new_root, O_DIRECTORY|O_CLOEXEC);
+                if (fd < 0)
+                        return log_error_errno(errno, "Failed to reopen target directory '%s': %m", new_root);
+
+                close_and_replace(new_root_fd, fd);
+        }
 
         if (FLAGS_SET(flags, SWITCH_ROOT_DESTROY_OLD_ROOT)) {
                 istmp = fd_is_temporary_fs(old_root_fd);
@@ -115,10 +125,12 @@ int switch_root(const char *new_root,
          * and switch_root() nevertheless. */
         (void) base_filesystem_create_fd(new_root_fd, new_root, UID_INVALID, GID_INVALID);
 
-        FOREACH_ARRAY(transfer, transfer_table, ELEMENTSOF(transfer_table)) {
+        FOREACH_ELEMENT(transfer, transfer_table) {
                 _cleanup_free_ char *chased = NULL;
+                unsigned long mount_flags;
 
-                if (transfer->skip_if_run_is_rec && !FLAGS_SET(flags, SWITCH_ROOT_SKIP_RECURSIVE_RUN))
+                mount_flags = FLAGS_SET(flags, SWITCH_ROOT_RECURSIVE_RUN) ? transfer->mount_flags_recursive_run : transfer->mount_flags;
+                if (mount_flags == 0) /* skip if zero */
                         continue;
 
                 if (access(transfer->path, F_OK) < 0) {
@@ -131,13 +143,13 @@ int switch_root(const char *new_root,
                         return log_error_errno(r, "Failed to resolve %s/%s: %m", new_root, transfer->path);
 
                 /* Let's see if it is a mount point already. */
-                r = path_is_mount_point(chased, NULL, 0);
+                r = path_is_mount_point(chased);
                 if (r < 0)
                         return log_error_errno(r, "Failed to determine whether %s is a mount point: %m", chased);
                 if (r > 0) /* If it is already mounted, then do nothing */
                         continue;
 
-                r = mount_nofollow_verbose(LOG_ERR, transfer->path, chased, NULL, transfer->mount_flags, NULL);
+                r = mount_nofollow_verbose(LOG_ERR, transfer->path, chased, NULL, mount_flags, NULL);
                 if (r < 0)
                         return r;
         }
@@ -159,6 +171,12 @@ int switch_root(const char *new_root,
         }
         if (r < 0) {
                 log_debug_errno(r, "Pivoting root file system failed, moving mounts instead: %m");
+
+                if (resolved_old_root_after) {
+                        r = mount_nofollow_verbose(LOG_ERR, "/", resolved_old_root_after, NULL, MS_BIND|MS_REC, NULL);
+                        if (r < 0)
+                                return r;
+                }
 
                 /* If we have to use MS_MOVE let's first try to get rid of *all* mounts we can, with the
                  * exception of the path we want to switch to, plus everything leading to it and within

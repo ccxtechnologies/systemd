@@ -17,9 +17,10 @@
 #include "sd-event.h"
 
 #include "alloc-util.h"
-#include "dhcp-identifier.h"
-#include "dhcp-internal.h"
-#include "dhcp-protocol.h"
+#include "dhcp-duid-internal.h"
+#include "dhcp-network.h"
+#include "dhcp-option.h"
+#include "dhcp-packet.h"
 #include "ether-addr-util.h"
 #include "fd-util.h"
 #include "random-util.h"
@@ -56,14 +57,14 @@ static void test_request_basic(sd_event *e) {
         r = sd_dhcp_client_attach_event(client, e, 0);
         assert_se(r >= 0);
 
-        assert_se(sd_dhcp_client_set_request_option(NULL, 0) == -EINVAL);
-        assert_se(sd_dhcp_client_set_request_address(NULL, NULL) == -EINVAL);
-        assert_se(sd_dhcp_client_set_ifindex(NULL, 0) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_dhcp_client_set_request_option(NULL, 0) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_dhcp_client_set_request_address(NULL, NULL) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_dhcp_client_set_ifindex(NULL, 0) == -EINVAL);
 
         assert_se(sd_dhcp_client_set_ifindex(client, 15) == 0);
-        assert_se(sd_dhcp_client_set_ifindex(client, -42) == -EINVAL);
-        assert_se(sd_dhcp_client_set_ifindex(client, -1) == -EINVAL);
-        assert_se(sd_dhcp_client_set_ifindex(client, 0) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_dhcp_client_set_ifindex(client, -42) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_dhcp_client_set_ifindex(client, -1) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_dhcp_client_set_ifindex(client, 0) == -EINVAL);
         assert_se(sd_dhcp_client_set_ifindex(client, 1) == 0);
 
         assert_se(sd_dhcp_client_set_hostname(client, "host") == 1);
@@ -164,19 +165,18 @@ static int check_options(uint8_t code, uint8_t len, const void *option, void *us
         switch (code) {
         case SD_DHCP_OPTION_CLIENT_IDENTIFIER:
         {
+                sd_dhcp_duid duid;
                 uint32_t iaid;
-                struct duid duid;
-                size_t duid_len;
 
-                assert_se(dhcp_identifier_set_duid_en(/* test_mode = */ true, &duid, &duid_len) >= 0);
+                assert_se(sd_dhcp_duid_set_en(&duid) >= 0);
                 assert_se(dhcp_identifier_set_iaid(NULL, &hw_addr, /* legacy = */ true, &iaid) >= 0);
 
-                assert_se(len == sizeof(uint8_t) + sizeof(uint32_t) + duid_len);
+                assert_se(len == sizeof(uint8_t) + sizeof(uint32_t) + duid.size);
                 assert_se(len == 19);
                 assert_se(((uint8_t*) option)[0] == 0xff);
 
                 assert_se(memcmp((uint8_t*) option + 1, &iaid, sizeof(iaid)) == 0);
-                assert_se(memcmp((uint8_t*) option + 5, &duid, duid_len) == 0);
+                assert_se(memcmp((uint8_t*) option + 5, &duid.duid, duid.size) == 0);
                 break;
         }
 
@@ -291,7 +291,6 @@ static void test_discover_message(sd_event *e) {
 
         assert_se(sd_dhcp_client_set_ifindex(client, 42) >= 0);
         assert_se(sd_dhcp_client_set_mac(client, hw_addr.bytes, bcast_addr.bytes, hw_addr.length, ARPHRD_ETHER) >= 0);
-        dhcp_client_set_test_mode(client, true);
 
         assert_se(sd_dhcp_client_set_request_option(client, 248) >= 0);
 
@@ -509,14 +508,13 @@ static void test_addr_acq(sd_event *e) {
 
         assert_se(sd_dhcp_client_set_ifindex(client, 42) >= 0);
         assert_se(sd_dhcp_client_set_mac(client, hw_addr.bytes, bcast_addr.bytes, hw_addr.length, ARPHRD_ETHER) >= 0);
-        dhcp_client_set_test_mode(client, true);
 
         assert_se(sd_dhcp_client_set_callback(client, test_addr_acq_acquired, e) >= 0);
 
         callback_recv = test_addr_acq_recv_discover;
 
         assert_se(sd_event_add_time_relative(e, NULL, CLOCK_BOOTTIME,
-                                             2 * USEC_PER_SEC, 0,
+                                             30 * USEC_PER_SEC, 0,
                                              NULL, INT_TO_PTR(-ETIMEDOUT)) >= 0);
 
         res = sd_dhcp_client_start(client);
@@ -536,6 +534,8 @@ static void test_addr_acq(sd_event *e) {
 
 int main(int argc, char *argv[]) {
         _cleanup_(sd_event_unrefp) sd_event *e;
+
+        assert_se(setenv("SYSTEMD_NETWORK_TEST_MODE", "1", 1) >= 0);
 
         test_setup_logging(LOG_DEBUG);
 

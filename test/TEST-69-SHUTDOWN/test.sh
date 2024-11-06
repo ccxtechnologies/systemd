@@ -4,7 +4,9 @@ set -e
 
 TEST_DESCRIPTION="shutdown testing"
 IMAGE_NAME="shutdown"
-TEST_NO_QEMU=1
+TEST_NO_QEMU=yes
+# Prevent shutdown in test suite, the expect script does that manually.
+TEST_SKIP_SHUTDOWN=yes
 
 # shellcheck source=test/test-functions
 . "${TEST_BASE_DIR:?}/test-functions"
@@ -15,7 +17,7 @@ SYSTEMD_NSPAWN="${STATEDIR:?}/run-nspawn"
 setup_nspawn_root_hook() {
     cat >"${STATEDIR:?}/run-nspawn" <<EOF
 #!/bin/bash
-exec "${TEST_BASE_DIR:?}/test-shutdown.py" -v -- "$_ORIG_NSPAWN" "\$@"
+exec "${TEST_BASE_DIR:?}/test-shutdown.py" -v -- "$_ORIG_NSPAWN" --background= "\$@"
 exit 1
 EOF
     chmod 755 "${STATEDIR:?}"/run-nspawn
@@ -23,15 +25,20 @@ EOF
 
 test_append_files() {
     local workspace="${1:?}"
-    # prevent shutdown in test suite, the expect script does that manually.
-    mkdir -p "${workspace:?}/etc/systemd/system/end.service.d"
-    cat >"$workspace/etc/systemd/system/end.service.d/99-override.conf" <<EOF
-[Service]
-ExecStart=
-ExecStart=/bin/true
+
+    # Shorten the service stop/abort timeouts to let systemd SIGKILL stubborn
+    # processes as soon as possible, as we don't really care about them in this
+    # particular test
+    mkdir -p "$workspace/etc/systemd/system.conf.d"
+    cat >"$workspace/etc/systemd/system.conf.d/99-timeout.conf" <<EOF
+[Manager]
+DefaultTimeoutStopSec=30s
+DefaultTimeoutAbortSec=30s
 EOF
+
     inst /usr/bin/screen
     echo "PS1='screen\$WINDOW # '" >>"$workspace/root/.bashrc"
+    echo "TERM=linux" >>"$workspace/root/.bash_profile"
     echo 'startup_message off' >"$workspace/etc/screenrc"
     echo 'bell_msg ""' >>"$workspace/etc/screenrc"
 }

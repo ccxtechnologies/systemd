@@ -1,6 +1,6 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-dissect" conditional='HAVE_BLKID'
@@ -24,34 +24,43 @@
 
   <refsynopsisdiv>
     <cmdsynopsis>
-      <command>systemd-dissect <arg choice="opt" rep="repeat">OPTIONS</arg> <arg choice="plain"><replaceable>IMAGE</replaceable></arg></command>
+      <command>systemd-dissect</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg choice="plain"><replaceable>IMAGE</replaceable></arg>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>systemd-dissect <arg choice="opt" rep="repeat">OPTIONS</arg> <option>--mount</option> <arg choice="plain"><replaceable>IMAGE</replaceable></arg> <arg choice="plain"><replaceable>PATH</replaceable></arg></command>
+      <command>systemd-dissect</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>--mount</arg> <arg choice="plain"><replaceable>IMAGE</replaceable></arg> <arg choice="plain"><replaceable>PATH</replaceable></arg>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>systemd-dissect <arg choice="opt" rep="repeat">OPTIONS</arg> <option>--umount</option> <arg choice="plain"><replaceable>PATH</replaceable></arg></command>
+      <command>systemd-dissect</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>--umount</arg> <arg choice="plain"><replaceable>PATH</replaceable></arg>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>systemd-dissect <arg choice="opt" rep="repeat">OPTIONS</arg> <option>--attach</option> <arg choice="plain"><replaceable>IMAGE</replaceable></arg></command>
+      <command>systemd-dissect</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>--attach</arg> <arg choice="plain"><replaceable>IMAGE</replaceable></arg>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>systemd-dissect <arg choice="opt" rep="repeat">OPTIONS</arg> <option>--detach</option> <arg choice="plain"><replaceable>PATH</replaceable></arg></command>
+      <command>systemd-dissect</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>--detach</arg> <arg choice="plain"><replaceable>PATH</replaceable></arg>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>systemd-dissect <arg choice="opt" rep="repeat">OPTIONS</arg> <option>--list</option> <arg choice="plain"><replaceable>IMAGE</replaceable></arg></command>
+      <command>systemd-dissect</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>--list</arg> <arg choice="plain"><replaceable>IMAGE</replaceable></arg>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>systemd-dissect <arg choice="opt" rep="repeat">OPTIONS</arg> <option>--mtree</option> <arg choice="plain"><replaceable>IMAGE</replaceable></arg></command>
+      <command>systemd-dissect</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>--mtree</arg> <arg choice="plain"><replaceable>IMAGE</replaceable></arg>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>systemd-dissect <arg choice="opt" rep="repeat">OPTIONS</arg> <option>--with</option> <arg choice="plain"><replaceable>IMAGE</replaceable></arg> <arg choice="opt" rep="repeat"><replaceable>COMMAND</replaceable></arg></command>
+      <command>systemd-dissect</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>--with</arg> <arg choice="plain"><replaceable>IMAGE</replaceable></arg> <arg choice="opt" rep="repeat"><replaceable>COMMAND</replaceable></arg>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>systemd-dissect <arg choice="opt" rep="repeat">OPTIONS</arg> <option>--copy-from</option> <arg choice="plain"><replaceable>IMAGE</replaceable></arg> <arg choice="plain"><replaceable>PATH</replaceable></arg> <arg choice="opt"><replaceable>TARGET</replaceable></arg></command>
+      <command>systemd-dissect</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>--copy-from</arg> <arg choice="plain"><replaceable>IMAGE</replaceable></arg> <arg choice="plain"><replaceable>PATH</replaceable></arg> <arg choice="opt"><replaceable>TARGET</replaceable></arg>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>systemd-dissect <arg choice="opt" rep="repeat">OPTIONS</arg> <option>--copy-to</option> <arg choice="plain"><replaceable>IMAGE</replaceable></arg> <arg choice="opt"><replaceable>SOURCE</replaceable></arg> <arg choice="plain"><replaceable>PATH</replaceable></arg></command>
+      <command>systemd-dissect</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>--copy-to</arg> <arg choice="plain"><replaceable>IMAGE</replaceable></arg> <arg choice="opt"><replaceable>SOURCE</replaceable></arg> <arg choice="plain"><replaceable>PATH</replaceable></arg>
+    </cmdsynopsis>
+    <cmdsynopsis>
+      <command>systemd-dissect</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>--make-archive</arg> <arg choice="plain"><replaceable>IMAGE</replaceable></arg> <arg choice="opt"><replaceable>TARGET</replaceable></arg>
+    </cmdsynopsis>
+    <cmdsynopsis>
+      <command>systemd-dissect</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>--discover</arg>
+    </cmdsynopsis>
+    <cmdsynopsis>
+      <command>systemd-dissect</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>--validate</arg> <arg choice="plain"><replaceable>IMAGE</replaceable></arg>
     </cmdsynopsis>
   </refsynopsisdiv>
 
@@ -114,6 +123,8 @@
     mounted directly by <command>mount</command> and <citerefentry
     project='man-pages'><refentrytitle>fstab</refentrytitle><manvolnum>5</manvolnum></citerefentry>. For
     details see below.</para>
+
+    <xi:include href="vpick.xml" xpointer="image"/>
   </refsect1>
 
   <refsect1>
@@ -153,13 +164,17 @@
         project='man-pages'><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry> via a
         command such as <command>mount -t ddi myimage.raw targetdir/</command>, as well as in <citerefentry
         project='man-pages'><refentrytitle>fstab</refentrytitle><manvolnum>5</manvolnum></citerefentry>. For
-        details, see below.</para></listitem>
+        details, see below.</para>
+
+        <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>-M</option></term>
 
-        <listitem><para>This is a shortcut for <option>--mount --mkdir</option>.</para></listitem>
+        <listitem><para>This is a shortcut for <option>--mount --mkdir</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -170,13 +185,17 @@
         a directory where an OS image was mounted.</para>
 
         <para>All mounted partitions will be recursively unmounted, and the underlying loop device will be
-        removed, along with all its partition sub-devices.</para></listitem>
+        removed, along with all its partition sub-devices.</para>
+
+        <xi:include href="version-info.xml" xpointer="v252"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>-U</option></term>
 
-        <listitem><para>This is a shortcut for <option>--umount --rmdir</option>.</para></listitem>
+        <listitem><para>This is a shortcut for <option>--umount --rmdir</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v252"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -186,7 +205,9 @@
         and print the path to the loopback block device to standard output. This is similar to an invocation
         of <command>losetup --find --show</command>, but will validate the image as DDI before attaching, and
         derive the correct sector size to use automatically. Moreover, it ensures the per-partition block
-        devices are created before returning. Takes a path to a disk image file.</para></listitem>
+        devices are created before returning. Takes a path to a disk image file.</para>
+
+        <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -195,7 +216,9 @@
         <listitem><para>Detach the specified disk image from a loopback block device. This undoes the effect
         of <option>--attach</option> above. This expects either a path to a loopback block device as an
         argument, or the path to the backing image file. In the latter case it will automatically determine
-        the right device to detach.</para></listitem>
+        the right device to detach.</para>
+
+        <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -203,12 +226,13 @@
         <term><option>-l</option></term>
 
         <listitem><para>Prints the paths of all the files and directories in the specified OS image or
-        directory to standard output.</para></listitem>
+        directory to standard output.</para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--mtree</option></term>
-        <term><option>-l</option></term>
 
         <listitem><para>Generates a BSD
         <citerefentry project='die-net'><refentrytitle>mtree</refentrytitle><manvolnum>8</manvolnum></citerefentry>
@@ -218,11 +242,13 @@
         capabilities, MAC labels,
         <citerefentry project='man-pages'><refentrytitle>chattr</refentrytitle><manvolnum>1</manvolnum></citerefentry>
         file flags,
-        <citerefentry project='url'><refentrytitle url='https://btrfs.wiki.kernel.org/index.php/Manpage/btrfs(5)'>btrfs</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        <citerefentry project='url'><refentrytitle url='https://btrfs.readthedocs.io/en/latest/btrfs-man5.html'>btrfs</refentrytitle><manvolnum>5</manvolnum></citerefentry>
         subvolume information, and various other file metadata. File content information is shown via a
         SHA256 digest. Additional fields might be added in future. Note that inode information such as link
         counts, inode numbers and timestamps is excluded from the output on purpose, as it typically
-        complicates reproducibility.</para></listitem>
+        complicates reproducibility.</para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -235,7 +261,10 @@
         use <option>--read-only</option> to switch to read-only operation. The invoked process will have the
         <varname>$SYSTEMD_DISSECT_ROOT</varname> environment variable set, containing the absolute path name
         of the temporary mount point, i.e. the same directory that is set as the current working
-        directory.</para></listitem>
+        directory. It will also have the <varname>$SYSTEMD_DISSECT_DEVICE</varname> environment variable set,
+        containing the absolute path name of the loop device the image was attached to.</para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -251,7 +280,9 @@
         the destination path. In this case access mode, extended attributes and timestamps are copied as
         well, but file ownership is not. If the source path in the image refers to a directory, it is copied
         to the destination path, recursively with all containing files and directories. In this case the file
-        ownership is copied too.</para></listitem>
+        ownership is copied too.</para>
+
+        <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -270,7 +301,24 @@
         ownership is copied too.</para>
 
         <para>As with <option>--mount</option> file system checks are implicitly run before the copy
-        operation begins.</para></listitem>
+        operation begins.</para>
+
+        <xi:include href="version-info.xml" xpointer="v247"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--make-archive</option></term>
+
+        <listitem><para>Generates an archive file from the specified disk image. Expects two arguments: the
+        path to the disk image and optionally the output archive file path. If the latter is omitted the
+        archive is written to standard output. The archive file format is determined automatically from the
+        specified output archive file name, e.g. any path suffixed with <literal>.tar.xz</literal> will
+        result in an xz compressed UNIX tarball (if the path is omitted an uncompressed UNIX tarball is
+        created). See
+        <citerefentry><refentrytitle>libarchive</refentrytitle><manvolnum>3</manvolnum></citerefentry> for a
+        list of supported archive formats and compression schemes.</para>
+
+        <xi:include href="version-info.xml" xpointer="v256"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -281,7 +329,9 @@
         <filename>/usr/lib/machines/</filename>, <filename>/usr/lib/portables/</filename>,
         <filename>/usr/lib/confexts/</filename>, <filename>/var/lib/machines/</filename>,
         <filename>/var/lib/portables/</filename>, <filename>/var/lib/extensions/</filename> and so
-        on.</para></listitem>
+        on.</para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -295,7 +345,9 @@
         unlike all other commands implemented by this tool – requires no privileges other than the ability to
         access the specified file. Prints "OK" and returns zero if the image appears to be in order and
         matches the specified image dissection policy. Otherwise prints an error message and returns
-        non-zero.</para></listitem>
+        non-zero.</para>
+
+        <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="help" />
@@ -316,7 +368,9 @@
 
         <listitem><para>Operate in read-only mode. By default <option>--mount</option> will establish
         writable mount points. If this option is specified they are established in read-only mode
-        instead.</para></listitem>
+        instead.</para>
+
+        <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -327,7 +381,9 @@
         OS image are automatically checked using the appropriate <citerefentry
         project='man-pages'><refentrytitle>fsck</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         command, in automatic fixing mode. This behavior may be switched off using
-        <option>--fsck=no</option>.</para></listitem>
+        <option>--fsck=no</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -349,6 +405,8 @@
           <listitem><para>Bit 59 of the GPT partition flags for this partition is set, as per specification</para></listitem>
           <listitem><para>The <option>--growfs=no</option> option is not passed.</para></listitem>
         </orderedlist>
+
+          <xi:include href="version-info.xml" xpointer="v249"/>
         </listitem>
       </varlistentry>
 
@@ -357,14 +415,18 @@
 
         <listitem><para>If combined with <option>--mount</option> the directory to mount the OS image to is
         created if it is missing. Note that the directory is not automatically removed when the disk image is
-        unmounted again.</para></listitem>
+        unmounted again.</para>
+
+        <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--rmdir</option></term>
 
         <listitem><para>If combined with <option>--umount</option> the specified directory where the OS image
-        is mounted is removed after unmounting the OS image.</para></listitem>
+        is mounted is removed after unmounting the OS image.</para>
+
+        <xi:include href="version-info.xml" xpointer="v252"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -374,7 +436,9 @@
         <literal>all</literal>, <literal>crypto</literal>. If <literal>disabled</literal> the image is
         accessed with empty block discarding turned off. If <literal>loop</literal> discarding is enabled if
         operating on a regular file. If <literal>crypt</literal> discarding is enabled even on encrypted file
-        systems. If <literal>all</literal> discarding is unconditionally enabled.</para></listitem>
+        systems. If <literal>all</literal> discarding is unconditionally enabled.</para>
+
+        <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -383,7 +447,9 @@
         <listitem><para>If specified an in-memory copy of the specified disk image is used. This may be used
         to operate with write-access on a (possibly read-only) image, without actually modifying the original
         file. This may also be used in order to operate on a disk image without keeping the originating file
-        system busy, in order to allow it to be unmounted.</para></listitem>
+        system busy, in order to allow it to be unmounted.</para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -400,7 +466,9 @@
         image, in case it is stored in a detached file. It is recommended to embed the Verity data directly
         in the image, using the Verity mechanisms in the <ulink
         url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable Partitions Specification</ulink>.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -413,7 +481,16 @@
         <literal>.lo_file_name</literal> field for the block device. Note this is distinct from the
         <filename>/sys/class/block/loopX/loop/backing_file</filename> attribute file that always reports a
         path referring to the actual backing file. The latter is subject to mount namespace translation, the
-        former is not.</para></listitem>
+        former is not.</para>
+
+        <para>This setting is particularly useful in combination with the <option>--attach</option> command,
+        as it allows later referencing the allocated loop device via
+        <filename>/dev/disk/by-loop-ref/…</filename> symlinks. Example: first, set up the loopback device
+        via <command>systemd-dissect attach --loop-ref=quux foo.raw</command>, and then reference it in a
+        command via the specified filename: <command>cfdisk /dev/disk/by-loop-ref/quux</command>.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -421,7 +498,9 @@
 
         <listitem><para>If combined with <option>--mtree</option>, turns off inclusion of file hashes in the
         mtree output. This makes the <option>--mtree</option> faster when operating on large images.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="image-policy-open" />
@@ -472,23 +551,32 @@
     <title>Examples</title>
 
     <example>
-      <title>Generate a tarball from an OS disk image</title>
+      <title>Generate a tarball from an OS disk image (<option>--with</option>)</title>
 
       <programlisting># systemd-dissect --with foo.raw tar cz . >foo.tar.gz</programlisting>
+    </example>
+
+    <para>or alternatively just:</para>
+
+    <example>
+      <title>Generate a tarball from an OS disk image (<option>--make-archive</option>)</title>
+
+      <programlisting># systemd-dissect --make-archive foo.raw foo.tar.gz</programlisting>
     </example>
   </refsect1>
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <ulink url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable Partitions Specification</ulink>,
-      <citerefentry project='man-pages'><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>umount</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>fdisk</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.v</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><ulink url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable Partitions Specification</ulink></member>
+      <member><citerefentry project='man-pages'><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>umount</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>fdisk</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

@@ -113,7 +113,7 @@ int sockaddr_pretty(const struct sockaddr *_sa, socklen_t salen, bool translate_
 int getpeername_pretty(int fd, bool include_port, char **ret);
 int getsockname_pretty(int fd, char **ret);
 
-int socknameinfo_pretty(union sockaddr_union *sa, socklen_t salen, char **_ret);
+int socknameinfo_pretty(const struct sockaddr *sa, socklen_t salen, char **_ret);
 
 const char* socket_address_bind_ipv6_only_to_string(SocketAddressBindIPv6Only b) _const_;
 SocketAddressBindIPv6Only socket_address_bind_ipv6_only_from_string(const char *s) _pure_;
@@ -152,7 +152,30 @@ bool address_label_valid(const char *p);
 int getpeercred(int fd, struct ucred *ucred);
 int getpeersec(int fd, char **ret);
 int getpeergroups(int fd, gid_t **ret);
+int getpeerpidfd(int fd);
 
+ssize_t send_many_fds_iov_sa(
+                int transport_fd,
+                int *fds_array, size_t n_fds_array,
+                const struct iovec *iov, size_t iovlen,
+                const struct sockaddr *sa, socklen_t len,
+                int flags);
+static inline ssize_t send_many_fds_iov(
+                int transport_fd,
+                int *fds_array, size_t n_fds_array,
+                const struct iovec *iov, size_t iovlen,
+                int flags) {
+
+        return send_many_fds_iov_sa(transport_fd, fds_array, n_fds_array, iov, iovlen, NULL, 0, flags);
+}
+static inline int send_many_fds(
+                int transport_fd,
+                int *fds_array,
+                size_t n_fds_array,
+                int flags) {
+
+        return send_many_fds_iov_sa(transport_fd, fds_array, n_fds_array, NULL, 0, NULL, 0, flags);
+}
 ssize_t send_one_fd_iov_sa(
                 int transport_fd,
                 int fd,
@@ -167,6 +190,8 @@ int send_one_fd_sa(int transport_fd,
 #define send_one_fd(transport_fd, fd, flags) send_one_fd_iov_sa(transport_fd, fd, NULL, 0, NULL, 0, flags)
 ssize_t receive_one_fd_iov(int transport_fd, struct iovec *iov, size_t iovlen, int flags, int *ret_fd);
 int receive_one_fd(int transport_fd, int flags);
+ssize_t receive_many_fds_iov(int transport_fd, struct iovec *iov, size_t iovlen, int **ret_fds_array, size_t *ret_n_fds_array, int flags);
+int receive_many_fds(int transport_fd, int **ret_fds_array, size_t *ret_n_fds_array, int flags);
 
 ssize_t next_datagram_size_fd(int fd);
 
@@ -349,6 +374,14 @@ int socket_get_mtu(int fd, int af, size_t *ret);
 
 int connect_unix_path(int fd, int dir_fd, const char *path);
 
+static inline bool VSOCK_CID_IS_REGULAR(unsigned cid) {
+        /* 0, 1, 2, UINT32_MAX are special, refuse those */
+        return cid > 2 && cid < UINT32_MAX;
+}
+
+int vsock_parse_port(const char *s, unsigned *ret);
+int vsock_parse_cid(const char *s, unsigned *ret);
+
 /* Parses AF_UNIX and AF_VSOCK addresses. AF_INET[6] require some netlink calls, so it cannot be in
  * src/basic/ and is done from 'socket_local_address from src/shared/. Return -EPROTO in case of
  * protocol mismatch. */
@@ -361,3 +394,5 @@ int socket_address_parse_vsock(SocketAddress *ret_address, const char *s);
  * /proc/sys/net/core/somaxconn anyway, thus by setting this to unbounded we just make that sysctl file
  * authoritative. */
 #define SOMAXCONN_DELUXE INT_MAX
+
+int vsock_get_local_cid(unsigned *ret);

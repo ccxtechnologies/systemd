@@ -1,6 +1,6 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-analyze" conditional='ENABLE_ANALYZE'
@@ -136,13 +136,13 @@
       <command>systemd-analyze</command>
       <arg choice="opt" rep="repeat">OPTIONS</arg>
       <arg choice="plain">verify</arg>
-      <arg choice="opt" rep="repeat"><replaceable>FILE</replaceable></arg>
+      <arg choice="plain" rep="repeat"><replaceable>FILE</replaceable></arg>
     </cmdsynopsis>
     <cmdsynopsis>
       <command>systemd-analyze</command>
       <arg choice="opt" rep="repeat">OPTIONS</arg>
       <arg choice="plain">security</arg>
-      <arg choice="plain" rep="repeat"><replaceable>UNIT</replaceable></arg>
+      <arg choice="opt" rep="repeat"><replaceable>UNIT</replaceable></arg>
     </cmdsynopsis>
     <cmdsynopsis>
       <command>systemd-analyze</command>
@@ -160,7 +160,7 @@
       <command>systemd-analyze</command>
       <arg choice="opt" rep="repeat">OPTIONS</arg>
       <arg choice="plain">fdstore</arg>
-      <arg choice="opt" rep="repeat"><replaceable>UNIT</replaceable></arg>
+      <arg choice="plain" rep="repeat"><replaceable>UNIT</replaceable></arg>
     </cmdsynopsis>
     <cmdsynopsis>
       <command>systemd-analyze</command>
@@ -173,6 +173,18 @@
       <arg choice="opt" rep="repeat">OPTIONS</arg>
       <arg choice="plain">pcrs</arg>
       <arg choice="opt" rep="repeat"><replaceable>PCR</replaceable></arg>
+    </cmdsynopsis>
+    <cmdsynopsis>
+      <command>systemd-analyze</command>
+      <arg choice="opt" rep="repeat">OPTIONS</arg>
+      <arg choice="plain">srk</arg>
+      <arg choice="opt"><replaceable>&gt;FILE</replaceable></arg>
+    </cmdsynopsis>
+    <cmdsynopsis>
+      <command>systemd-analyze</command>
+      <arg choice="opt" rep="repeat">OPTIONS</arg>
+      <arg choice="plain">architectures</arg>
+      <arg choice="opt" rep="repeat"><replaceable>NAME</replaceable></arg>
     </cmdsynopsis>
   </refsynopsisdiv>
 
@@ -828,7 +840,7 @@ alias.service:7: Unknown key name 'MysteryKey' in section 'Service', ignoring.
     </refsect2>
 
     <refsect2>
-      <title><command>systemd-analyze fdstore <optional><replaceable>UNIT</replaceable>...</optional></command></title>
+      <title><command>systemd-analyze fdstore <replaceable>UNIT</replaceable>...</command></title>
 
       <para>Lists the current contents of the specified service unit's file descriptor store. This shows
       names, inode types, device numbers, inode numbers, paths and open modes of the open file
@@ -857,13 +869,13 @@ stored sock 0:8   4213190 -      socket:[4213190] ro
     </refsect2>
 
     <refsect2>
-      <title><command>systemd-analyze image-policy <optional><replaceable>POLICY</replaceable>…</optional></command></title>
+      <title><command>systemd-analyze image-policy <replaceable>POLICY</replaceable>…</command></title>
 
       <para>This command analyzes the specified image policy string, as per
       <citerefentry><refentrytitle>systemd.image-policy</refentrytitle><manvolnum>7</manvolnum></citerefentry>. The
       policy is normalized and simplified. For each currently defined partition identifier (as per the <ulink
       url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable
-      Partitions Specification</ulink> the effect of the image policy string is shown in tabular form.</para>
+      Partitions Specification</ulink>) the effect of the image policy string is shown in tabular form.</para>
 
       <example>
         <title>Example Output</title>
@@ -926,6 +938,47 @@ NR NAME                SHA256
 23 application-support 0000000000000000000000000000000000000000000000000000000000000000</programlisting>
       </example>
     </refsect2>
+
+    <refsect2>
+      <title><command>systemd-analyze srk <optional>&gt;<replaceable>FILE</replaceable></optional></command></title>
+
+      <para>This command reads the Storage Root Key (SRK) from the TPM2 device, and writes it in marshalled
+      TPM2B_PUBLIC format to stdout. The output is non-printable data, so it should be redirected to a file
+      or into a pipe.</para>
+
+      <example>
+        <title>Save the Storage Root Key to <filename>srk.tpm2b_public</filename></title>
+
+        <programlisting>systemd-analyze srk &gt;srk.tpm2b_public</programlisting>
+      </example>
+    </refsect2>
+
+    <refsect2>
+      <title><command>systemd-analyze architectures <optional><replaceable>NAME</replaceable>...</optional></command></title>
+
+      <para>Lists all known CPU architectures, and which ones are native. The listed architecture names are
+      those <varname>ConditionArchitecture=</varname> supports, see
+      <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
+      details. If architecture names are specified only those specified are listed.</para>
+
+      <example>
+        <title>Table output</title>
+        <programlisting>$ systemd-analyze architectures
+NAME        SUPPORT
+alpha       foreign
+arc         foreign
+arc-be      foreign
+arm         foreign
+arm64       foreign
+…
+sparc       foreign
+sparc64     foreign
+tilegx      foreign
+x86         secondary
+x86-64      native</programlisting>
+      </example>
+    </refsect2>
+
   </refsect1>
 
   <refsect1>
@@ -938,38 +991,42 @@ NR NAME                SHA256
         <term><option>--system</option></term>
 
         <listitem><para>Operates on the system systemd instance. This
-        is the implied default.</para></listitem>
+        is the implied default.</para>
+
+        <xi:include href="version-info.xml" xpointer="v209"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--user</option></term>
 
         <listitem><para>Operates on the user systemd
-        instance.</para></listitem>
+        instance.</para>
+
+        <xi:include href="version-info.xml" xpointer="v186"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--global</option></term>
 
         <listitem><para>Operates on the system-wide configuration for
-        user systemd instance.</para></listitem>
+        user systemd instance.</para>
+
+        <xi:include href="version-info.xml" xpointer="v238"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--order</option></term>
         <term><option>--require</option></term>
 
-        <listitem><para>When used in conjunction with the
-        <command>dot</command> command (see above), selects which
-        dependencies are shown in the dependency graph. If
-        <option>--order</option> is passed, only dependencies of type
-        <varname>After=</varname> or <varname>Before=</varname> are
-        shown. If <option>--require</option> is passed, only
-        dependencies of type <varname>Requires=</varname>,
-        <varname>Requisite=</varname>,
-        <varname>Wants=</varname> and <varname>Conflicts=</varname>
-        are shown. If neither is passed, this shows dependencies of
-        all these types.</para></listitem>
+        <listitem><para>When used in conjunction with the <command>dot</command> command (see above),
+        selects which dependencies are shown in the dependency graph. If <option>--order</option> is passed,
+        only dependencies of type <varname>After=</varname> or <varname>Before=</varname> are shown.
+        If <option>--require</option> is passed, only dependencies of type <varname>Requires=</varname>,
+        <varname>Requisite=</varname>, <varname>BindsTo=</varname>, <varname>Wants=</varname>, and
+        <varname>Conflicts=</varname> are shown. If neither is passed, this shows dependencies of
+        all these types.</para>
+
+        <xi:include href="version-info.xml" xpointer="v198"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -993,11 +1050,13 @@ NR NAME                SHA256
         relation. In other words, patterns specified with those two
         options will trim the list of edges matched by the positional
         arguments, if any are given, and fully determine the list of
-        edges shown otherwise.</para></listitem>
+        edges shown otherwise.</para>
+
+        <xi:include href="version-info.xml" xpointer="v201"/></listitem>
       </varlistentry>
 
       <varlistentry>
-        <term><option>--fuzz=</option><replaceable>timespan</replaceable></term>
+        <term><option>--fuzz=<replaceable>timespan</replaceable></option></term>
 
         <listitem><para>When used in conjunction with the
         <command>critical-chain</command> command (see above), also
@@ -1005,7 +1064,9 @@ NR NAME                SHA256
         earlier, than the latest unit in the same level. The unit of
         <replaceable>timespan</replaceable> is seconds unless
         specified with a different unit, e.g.
-        "50ms".</para></listitem>
+        "50ms".</para>
+
+        <xi:include href="version-info.xml" xpointer="v203"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -1013,7 +1074,9 @@ NR NAME                SHA256
 
         <listitem><para>Do not invoke
         <citerefentry project='man-pages'><refentrytitle>man</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-        to verify the existence of man pages listed in <varname>Documentation=</varname>.</para></listitem>
+        to verify the existence of man pages listed in <varname>Documentation=</varname>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v235"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -1022,7 +1085,9 @@ NR NAME                SHA256
         <listitem><para>Invoke unit generators, see
         <citerefentry><refentrytitle>systemd.generator</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
         Some generators require root privileges. Under a normal user, running with
-        generators enabled will generally result in some warnings.</para></listitem>
+        generators enabled will generally result in some warnings.</para>
+
+        <xi:include href="version-info.xml" xpointer="v235"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -1036,21 +1101,31 @@ NR NAME                SHA256
         unit. With <command>one</command>, return a non-zero process exit status when warnings arise during
         verification of either the specified unit or its immediate dependencies. If this option is not
         specified, zero is returned as the exit status regardless whether warnings arise during verification
-        or not.</para></listitem>
+        or not.</para>
+
+        <xi:include href="version-info.xml" xpointer="v250"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--root=<replaceable>PATH</replaceable></option></term>
 
-        <listitem><para>With <command>cat-files</command> and <command>verify</command>,
-        operate on files underneath the specified root path <replaceable>PATH</replaceable>.</para></listitem>
+        <listitem><para>With <command>cat-config</command>, <command>verify</command>,
+        <command>condition</command> and <command>security</command> when used with
+        <option>--offline=</option>, operate on files underneath the specified root path
+        <replaceable>PATH</replaceable>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--image=<replaceable>PATH</replaceable></option></term>
 
-        <listitem><para>With <command>cat-files</command> and <command>verify</command>,
-        operate on files inside the specified image path <replaceable>PATH</replaceable>.</para></listitem>
+        <listitem><para>With <command>cat-config</command>, <command>verify</command>,
+        <command>condition</command> and <command>security</command> when used with
+        <option>--offline=</option>, operate on files inside the specified image path
+        <replaceable>PATH</replaceable>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v250"/></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="image-policy-open" />
@@ -1064,7 +1139,9 @@ NR NAME                SHA256
         This means that <option>--offline=</option> can be used with <option>--root=</option> and
         <option>--image=</option> as well. If a unit's overall exposure level is above that set by
         <option>--threshold=</option> (default value is 100), <option>--offline=</option> will return
-        an error.</para></listitem>
+        an error.</para>
+
+        <xi:include href="version-info.xml" xpointer="v250"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -1073,7 +1150,9 @@ NR NAME                SHA256
         <listitem><para>With <command>security</command> <option>--offline=</option>, takes into
         consideration the specified portable profile when assessing unit settings.
         The profile can be passed by name, in which case the well-known system locations will
-        be searched, or it can be the full path to a specific drop-in file.</para></listitem>
+        be searched, or it can be the full path to a specific drop-in file.</para>
+
+        <xi:include href="version-info.xml" xpointer="v250"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -1083,7 +1162,9 @@ NR NAME                SHA256
         to compare the overall exposure level with, for the specified unit files. If a unit's
         overall exposure level, is greater than that set by the user, <command>security</command>
         will return an error. <option>--threshold=</option> can be used with <option>--offline=</option>
-        as well and its default value is 100.</para></listitem>
+        as well and its default value is 100.</para>
+
+        <xi:include href="version-info.xml" xpointer="v250"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -1234,6 +1315,9 @@ NR NAME                SHA256
                 <entry>CapabilityBoundingSet_CAP_SYS_TTY_CONFIG</entry>
               </row>
               <row>
+                <entry>CapabilityBoundingSet_CAP_BPF</entry>
+              </row>
+              <row>
                 <entry>UMask</entry>
               </row>
               <row>
@@ -1345,7 +1429,9 @@ NR NAME                SHA256
           </tgroup>
         </table>
 
-        <para>See example "JSON Policy" below.</para></listitem>
+        <para>See example "JSON Policy" below.</para>
+
+        <xi:include href="version-info.xml" xpointer="v250"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -1371,21 +1457,27 @@ NR NAME                SHA256
         from when it was initially started, <varname>deactivated</varname> which is the time after startup
         that the service was deactivated, <varname>deactivating</varname> which is the time after startup
         that the service was initially told to deactivate.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v250"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--iterations=<replaceable>NUMBER</replaceable></option></term>
 
         <listitem><para>When used with the <command>calendar</command> command, show the specified number of
-        iterations the specified calendar expression will elapse next. Defaults to 1.</para></listitem>
+        iterations the specified calendar expression will elapse next. Defaults to 1.</para>
+
+        <xi:include href="version-info.xml" xpointer="v242"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--base-time=<replaceable>TIMESTAMP</replaceable></option></term>
 
         <listitem><para>When used with the <command>calendar</command> command, show next iterations relative
-        to the specified point in time. If not specified defaults to the current time.</para></listitem>
+        to the specified point in time. If not specified defaults to the current time.</para>
+
+        <xi:include href="version-info.xml" xpointer="v244"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -1399,14 +1491,18 @@ NR NAME                SHA256
         compiled in set of unit load paths; see
         <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>. All
         units files present in the directory containing the specified unit will be used in preference to the
-        other paths.</para></listitem>
+        other paths.</para>
+
+        <xi:include href="version-info.xml" xpointer="v250"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--table</option></term>
 
         <listitem><para>When used with the <command>plot</command> command, the raw time data is output in a table.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -1414,16 +1510,31 @@ NR NAME                SHA256
 
         <listitem><para>When used with the <command>plot</command> command in combination with either
         <option>--table</option> or <option>--json=</option>, no legends or hints are included in the output.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <xi:include href="user-system-options.xml" xpointer="host" />
       <xi:include href="user-system-options.xml" xpointer="machine" />
 
       <varlistentry>
+        <term><option>-q</option></term>
         <term><option>--quiet</option></term>
 
-        <listitem><para>Suppress hints and other non-essential output.</para></listitem>
+        <listitem><para>Suppress hints and other non-essential output.</para>
+
+        <xi:include href="version-info.xml" xpointer="v250"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--tldr</option></term>
+
+        <listitem><para>With <command>cat-config</command>, only print the "interesting" parts of the
+        configuration files, skipping comments and empty lines and section headers followed only by
+        comments and empty lines.</para>
+
+        <xi:include href="version-info.xml" xpointer="v255"/></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="help" />
@@ -1512,10 +1623,10 @@ NR NAME                SHA256
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

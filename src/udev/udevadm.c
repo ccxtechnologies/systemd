@@ -123,7 +123,7 @@ static int run(int argc, char *argv[]) {
         if (invoked_as(argv, "udevd"))
                 return run_udevd(argc, argv);
 
-        udev_parse_config();
+        (void) udev_parse_config();
         log_setup();
 
         r = parse_argv(argc, argv);
@@ -137,4 +137,4 @@ static int run(int argc, char *argv[]) {
         return udevadm_main(argc, argv);
 }
 
-DEFINE_MAIN_FUNCTION(run);
+DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);

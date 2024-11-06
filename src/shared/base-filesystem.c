@@ -71,7 +71,7 @@ static const BaseFilesystem table[] = {
                          "usr/lib\0",                "ld-linux-x86-64.so.2" },
 #  define KNOW_LIB64_DIRS 1
 #elif defined(__ia64__)
-#elif defined(__loongarch64)
+#elif defined(__loongarch_lp64)
 #  define KNOW_LIB64_DIRS 1
 #  if defined(__loongarch_double_float)
         { "lib64",    0, "usr/lib/"LIB_ARCH_TUPLE"\0"
@@ -120,13 +120,13 @@ static const BaseFilesystem table[] = {
 #  else
 #    error "Unknown RISC-V ABI"
 #  endif
-#elif defined(__s390__)
-        /* s390-linux-gnu */
 #elif defined(__s390x__)
         { "lib64",    0, "usr/lib/"LIB_ARCH_TUPLE"\0"
                          "usr/lib64\0"
                          "usr/lib\0",                "ld-lsb-s390x.so.3" },
 #    define KNOW_LIB64_DIRS 1
+#elif defined(__s390__)
+        /* s390-linux-gnu */
 #elif defined(__sparc__)
 #endif
         /* gcc doesn't allow pragma to be used within constructs, hence log about this separately below */

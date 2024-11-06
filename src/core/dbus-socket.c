@@ -44,30 +44,12 @@ static int property_get_listen(
 
         LIST_FOREACH(port, p, s->ports) {
                 _cleanup_free_ char *address = NULL;
-                const char *a;
 
-                switch (p->type) {
-                        case SOCKET_SOCKET: {
-                                r = socket_address_print(&p->address, &address);
-                                if (r)
-                                        return r;
+                r = socket_port_to_address(p, &address);
+                if (r < 0)
+                        return r;
 
-                                a = address;
-                                break;
-                        }
-
-                        case SOCKET_SPECIAL:
-                        case SOCKET_MQUEUE:
-                        case SOCKET_FIFO:
-                        case SOCKET_USB_FUNCTION:
-                                a = p->path;
-                                break;
-
-                        default:
-                                assert_not_reached();
-                }
-
-                r = sd_bus_message_append(reply, "(ss)", socket_port_type_to_string(p), a);
+                r = sd_bus_message_append(reply, "(ss)", socket_port_type_to_string(p), address);
                 if (r < 0)
                         return r;
         }
@@ -104,6 +86,7 @@ const sd_bus_vtable bus_socket_vtable[] = {
         SD_BUS_PROPERTY("Transparent", "b", bus_property_get_bool, offsetof(Socket, transparent), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Broadcast", "b", bus_property_get_bool, offsetof(Socket, broadcast), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("PassCredentials", "b", bus_property_get_bool, offsetof(Socket, pass_cred), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("PassFileDescriptorsToExec", "b", bus_property_get_bool, offsetof(Socket, pass_fds_to_exec), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("PassSecurity", "b", bus_property_get_bool, offsetof(Socket, pass_sec), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("PassPacketInfo", "b", bus_property_get_bool, offsetof(Socket, pass_pktinfo), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Timestamping", "s", property_get_timestamping, offsetof(Socket, timestamping), SD_BUS_VTABLE_PROPERTY_CONST),
@@ -129,6 +112,8 @@ const sd_bus_vtable bus_socket_vtable[] = {
         SD_BUS_PROPERTY("SocketProtocol", "i", bus_property_get_int, offsetof(Socket, socket_protocol), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("TriggerLimitIntervalUSec", "t", bus_property_get_usec, offsetof(Socket, trigger_limit.interval), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("TriggerLimitBurst", "u", bus_property_get_unsigned, offsetof(Socket, trigger_limit.burst), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("PollLimitIntervalUSec", "t", bus_property_get_usec, offsetof(Socket, poll_limit_interval), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("PollLimitBurst", "u", bus_property_get_unsigned, offsetof(Socket, poll_limit_burst), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("UID", "u", bus_property_get_uid, offsetof(Unit, ref_uid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("GID", "u", bus_property_get_gid, offsetof(Unit, ref_gid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         BUS_EXEC_COMMAND_LIST_VTABLE("ExecStartPre", offsetof(Socket, exec_command[SOCKET_EXEC_START_PRE]), SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
@@ -206,6 +191,9 @@ static int bus_socket_set_transient_property(
         if (streq(name, "PassCredentials"))
                 return bus_set_transient_bool(u, name, &s->pass_cred, message, flags, error);
 
+        if (streq(name, "PassFileDescriptorsToExec"))
+                return bus_set_transient_bool(u, name, &s->pass_fds_to_exec, message, flags, error);
+
         if (streq(name, "PassSecurity"))
                 return bus_set_transient_bool(u, name, &s->pass_sec, message, flags, error);
 
@@ -248,6 +236,9 @@ static int bus_socket_set_transient_property(
         if (streq(name, "TriggerLimitBurst"))
                 return bus_set_transient_unsigned(u, name, &s->trigger_limit.burst, message, flags, error);
 
+        if (streq(name, "PollLimitBurst"))
+                return bus_set_transient_unsigned(u, name, &s->poll_limit_burst, message, flags, error);
+
         if (streq(name, "SocketMode"))
                 return bus_set_transient_mode_t(u, name, &s->socket_mode, message, flags, error);
 
@@ -274,6 +265,9 @@ static int bus_socket_set_transient_property(
 
         if (streq(name, "TriggerLimitIntervalUSec"))
                 return bus_set_transient_usec(u, name, &s->trigger_limit.interval, message, flags, error);
+
+        if (streq(name, "PollLimitIntervalUSec"))
+                return bus_set_transient_usec(u, name, &s->poll_limit_interval, message, flags, error);
 
         if (streq(name, "SmackLabel"))
                 return bus_set_transient_string(u, name, &s->smack, message, flags, error);
@@ -383,11 +377,9 @@ static int bus_socket_set_transient_property(
                                 if (!path_is_absolute(a) || !path_is_valid(a))
                                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid socket path: %s", a);
 
-                                p->path = strdup(a);
-                                if (!p->path)
-                                        return log_oom();
-
-                                path_simplify(p->path);
+                                r = path_simplify_alloc(a, &p->path);
+                                if (r < 0)
+                                        return r;
 
                         } else if (streq(t, "Netlink")) {
                                 r = socket_address_parse_netlink(&p->address, a);

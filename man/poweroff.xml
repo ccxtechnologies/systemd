@@ -1,6 +1,6 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="poweroff"
@@ -55,14 +55,20 @@
       <varlistentry>
         <term><option>--help</option></term>
 
-        <xi:include href="standard-options.xml" xpointer="help-text" />
+        <listitem>
+          <xi:include href="standard-options.xml" xpointer="help-para" />
+
+          <xi:include href="version-info.xml" xpointer="v253"/>
+        </listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--halt</option></term>
 
         <listitem><para>Halt the machine, regardless of which one of
-        the three commands is invoked.</para></listitem>
+        the three commands is invoked.</para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -71,14 +77,18 @@
 
         <listitem><para>Power off the machine, when either <command>halt</command>
         or <command>poweroff</command> is invoked. This option is ignored when
-        <command>reboot</command> is invoked.</para></listitem>
+        <command>reboot</command> is invoked.</para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--reboot</option></term>
 
         <listitem><para>Reboot the machine, regardless of which one of
-        the three commands is invoked.</para></listitem>
+        the three commands is invoked.</para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -91,6 +101,8 @@
           the command <command>reboot -f</command> is mostly equivalent to
           <command>systemctl reboot -ff</command>, instead of <command>systemctl reboot -f</command>.
           </para>
+
+          <xi:include href="version-info.xml" xpointer="v253"/>
         </listitem>
       </varlistentry>
 
@@ -99,14 +111,18 @@
         <term><option>--wtmp-only</option></term>
 
         <listitem><para>Only write wtmp shutdown entry, do not actually power off, reboot, or halt.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>-d</option></term>
         <term><option>--no-wtmp</option></term>
 
-        <listitem><para>Do not write wtmp shutdown entry.</para></listitem>
+        <listitem><para>Do not write wtmp shutdown entry.</para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -114,13 +130,17 @@
         <term><option>--no-sync</option></term>
 
         <listitem><para>Don't sync hard disks/storage media before power-off, reboot, or halt.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--no-wall</option></term>
 
-        <listitem><para>Do not send wall message before power-off, reboot, or halt.</para></listitem>
+        <listitem><para>Do not send wall message before power-off, reboot, or halt.</para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -147,12 +167,12 @@
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>shutdown</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>wall</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>shutdown</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>wall</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

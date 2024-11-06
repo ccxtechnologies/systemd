@@ -11,6 +11,7 @@
 #include "json.h"
 #include "rm-rf.h"
 #include "strv.h"
+#include "tests.h"
 #include "tmpfile-util.h"
 #include "user-util.h"
 #include "varlink.h"
@@ -49,6 +50,45 @@ static int method_something(Varlink *link, JsonVariant *parameters, VarlinkMetho
         return varlink_reply(link, ret);
 }
 
+static int method_something_more(Varlink *link, JsonVariant *parameters, VarlinkMethodFlags flags, void *userdata) {
+        _cleanup_(json_variant_unrefp) JsonVariant *ret = NULL;
+        int r;
+
+        struct Something {
+                int x;
+                int y;
+        };
+
+        static const JsonDispatch dispatch_table[] = {
+                { "a", JSON_VARIANT_INTEGER, json_dispatch_int, offsetof(struct Something, x), JSON_MANDATORY },
+                { "b", JSON_VARIANT_INTEGER, json_dispatch_int, offsetof(struct Something, y), JSON_MANDATORY},
+                {}
+        };
+        struct Something s = {};
+
+        r = varlink_dispatch(link, parameters, dispatch_table, &s);
+        if (r != 0)
+                return r;
+
+        for (int i = 0; i < 5; i++) {
+                _cleanup_(json_variant_unrefp) JsonVariant *w = NULL;
+
+                r = json_build(&w, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("sum", JSON_BUILD_INTEGER(s.x + (s.y * i)))));
+                if (r < 0)
+                        return r;
+
+                r = varlink_notify(link, w);
+                if (r < 0)
+                        return r;
+        }
+
+        r = json_build(&ret, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("sum", JSON_BUILD_INTEGER(s.x + (s.y * 5)))));
+        if (r < 0)
+                return r;
+
+        return varlink_reply(link, ret);
+}
+
 static void test_fd(int fd, const void *buf, size_t n) {
         char rbuf[n + 1];
         ssize_t m;
@@ -67,7 +107,7 @@ static int method_passfd(Varlink *link, JsonVariant *parameters, VarlinkMethodFl
         if (!a)
                 return varlink_error(link, "io.test.BadParameters", NULL);
 
-        assert_se(streq_ptr(json_variant_string(a), "whoop"));
+        ASSERT_STREQ(json_variant_string(a), "whoop");
 
         int xx = varlink_peek_fd(link, 0),
                 yy = varlink_peek_fd(link, 1),
@@ -83,8 +123,8 @@ static int method_passfd(Varlink *link, JsonVariant *parameters, VarlinkMethodFl
         test_fd(yy, "bar", 3);
         test_fd(zz, "quux", 4);
 
-        _cleanup_close_ int vv = acquire_data_fd("miau", 4, 0);
-        _cleanup_close_ int ww = acquire_data_fd("wuff", 4, 0);
+        _cleanup_close_ int vv = acquire_data_fd("miau");
+        _cleanup_close_ int ww = acquire_data_fd("wuff");
 
         assert_se(vv >= 0);
         assert_se(ww >= 0);
@@ -143,7 +183,7 @@ static int overload_reply(Varlink *link, JsonVariant *parameters, const char *er
          * be talking to an overloaded server */
 
         log_debug("Over reply triggered with error: %s", strna(error_id));
-        assert_se(streq(error_id, VARLINK_ERROR_DISCONNECTED));
+        ASSERT_STREQ(error_id, VARLINK_ERROR_DISCONNECTED);
         sd_event_exit(varlink_get_event(link), 0);
 
         return 0;
@@ -199,8 +239,11 @@ static void flood_test(const char *address) {
 static void *thread(void *arg) {
         _cleanup_(varlink_flush_close_unrefp) Varlink *c = NULL;
         _cleanup_(json_variant_unrefp) JsonVariant *i = NULL;
-        JsonVariant *o = NULL;
+        _cleanup_(json_variant_unrefp) JsonVariant *wrong = NULL;
+        JsonVariant *o = NULL, *k = NULL, *j = NULL;
+        const char *error_id;
         const char *e;
+        int x = 0;
 
         assert_se(json_build(&i, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("a", JSON_BUILD_INTEGER(88)),
                                                    JSON_BUILD_PAIR("b", JSON_BUILD_INTEGER(99)))) >= 0);
@@ -210,13 +253,31 @@ static void *thread(void *arg) {
         assert_se(varlink_set_allow_fd_passing_input(c, true) >= 0);
         assert_se(varlink_set_allow_fd_passing_output(c, true) >= 0);
 
-        assert_se(varlink_call(c, "io.test.DoSomething", i, &o, &e, NULL) >= 0);
+        /* Test that client is able to perform two sequential varlink_collect calls if first resulted in an error */
+        assert_se(json_build(&wrong, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("a", JSON_BUILD_INTEGER(88)),
+                                                       JSON_BUILD_PAIR("c", JSON_BUILD_INTEGER(99)))) >= 0);
+        assert_se(varlink_collect(c, "io.test.DoSomethingMore", wrong, &j, &error_id) >= 0);
+        assert_se(strcmp_ptr(error_id, "org.varlink.service.InvalidParameter") == 0);
+
+
+        assert_se(varlink_collect(c, "io.test.DoSomethingMore", i, &j, &error_id) >= 0);
+
+        assert_se(!error_id);
+        assert_se(json_variant_is_array(j) && !json_variant_is_blank_array(j));
+
+        JSON_VARIANT_ARRAY_FOREACH(k, j) {
+                assert_se(json_variant_integer(json_variant_by_key(k, "sum")) == 88 + (99 * x));
+                x++;
+        }
+        assert_se(x == 6);
+
+        assert_se(varlink_call(c, "io.test.DoSomething", i, &o, &e) >= 0);
         assert_se(json_variant_integer(json_variant_by_key(o, "sum")) == 88 + 99);
         assert_se(!e);
 
-        int fd1 = acquire_data_fd("foo", 3, 0);
-        int fd2 = acquire_data_fd("bar", 3, 0);
-        int fd3 = acquire_data_fd("quux", 4, 0);
+        int fd1 = acquire_data_fd("foo");
+        int fd2 = acquire_data_fd("bar");
+        int fd3 = acquire_data_fd("quux");
 
         assert_se(fd1 >= 0);
         assert_se(fd2 >= 0);
@@ -226,7 +287,7 @@ static void *thread(void *arg) {
         assert_se(varlink_push_fd(c, fd2) == 1);
         assert_se(varlink_push_fd(c, fd3) == 2);
 
-        assert_se(varlink_callb(c, "io.test.PassFD", &o, &e, NULL, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("fd", JSON_BUILD_STRING("whoop")))) >= 0);
+        assert_se(varlink_callb(c, "io.test.PassFD", &o, &e, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("fd", JSON_BUILD_STRING("whoop")))) >= 0);
 
         int fd4 = varlink_peek_fd(c, 0);
         int fd5 = varlink_peek_fd(c, 1);
@@ -237,9 +298,9 @@ static void *thread(void *arg) {
         test_fd(fd4, "miau", 4);
         test_fd(fd5, "wuff", 4);
 
-        assert_se(varlink_callb(c, "io.test.IDontExist", &o, &e, NULL, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("x", JSON_BUILD_REAL(5.5)))) >= 0);
-        assert_se(streq_ptr(json_variant_string(json_variant_by_key(o, "method")), "io.test.IDontExist"));
-        assert_se(streq(e, VARLINK_ERROR_METHOD_NOT_FOUND));
+        assert_se(varlink_callb(c, "io.test.IDontExist", &o, &e, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("x", JSON_BUILD_REAL(5.5)))) >= 0);
+        ASSERT_STREQ(json_variant_string(json_variant_by_key(o, "method")), "io.test.IDontExist");
+        ASSERT_STREQ(e, VARLINK_ERROR_METHOD_NOT_FOUND);
 
         flood_test(arg);
 
@@ -272,12 +333,11 @@ int main(int argc, char *argv[]) {
         _cleanup_(rm_rf_physical_and_freep) char *tmpdir = NULL;
         _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
-        _cleanup_close_pair_ int block_fds[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int block_fds[2] = EBADF_PAIR;
         pthread_t t;
         const char *sp;
 
-        log_set_max_level(LOG_DEBUG);
-        log_open();
+        test_setup_logging(LOG_DEBUG);
 
         assert_se(mkdtemp_malloc("/tmp/varlink-test-XXXXXX", &tmpdir) >= 0);
         sp = strjoina(tmpdir, "/socket");
@@ -294,18 +354,19 @@ int main(int argc, char *argv[]) {
 
         assert_se(varlink_server_bind_method(s, "io.test.PassFD", method_passfd) >= 0);
         assert_se(varlink_server_bind_method(s, "io.test.DoSomething", method_something) >= 0);
+        assert_se(varlink_server_bind_method(s, "io.test.DoSomethingMore", method_something_more) >= 0);
         assert_se(varlink_server_bind_method(s, "io.test.Done", method_done) >= 0);
         assert_se(varlink_server_bind_connect(s, on_connect) >= 0);
         assert_se(varlink_server_listen_address(s, sp, 0600) >= 0);
         assert_se(varlink_server_attach_event(s, e, 0) >= 0);
         assert_se(varlink_server_set_connections_max(s, OVERLOAD_CONNECTIONS) >= 0);
 
+        assert_se(json_build(&v, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("a", JSON_BUILD_INTEGER(7)),
+                                                   JSON_BUILD_PAIR("b", JSON_BUILD_INTEGER(22)))) >= 0);
+
         assert_se(varlink_connect_address(&c, sp) >= 0);
         assert_se(varlink_set_description(c, "main-client") >= 0);
         assert_se(varlink_bind_reply(c, reply) >= 0);
-
-        assert_se(json_build(&v, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("a", JSON_BUILD_INTEGER(7)),
-                                                   JSON_BUILD_PAIR("b", JSON_BUILD_INTEGER(22)))) >= 0);
 
         assert_se(varlink_invoke(c, "io.test.DoSomething", v) >= 0);
 

@@ -1,6 +1,6 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-detect-virt"
@@ -139,12 +139,17 @@
 
           <row>
             <entry><varname>apple</varname></entry>
-            <entry><ulink url="https://developer.apple.com/documentation/virtualization">Apple Virtualization.framework</ulink></entry>
+            <entry><ulink url="https://developer.apple.com/documentation/virtualization">Apple virtualization framework</ulink></entry>
           </row>
 
           <row>
             <entry><varname>sre</varname></entry>
             <entry><ulink url="https://www.lockheedmartin.com/en-us/products/Hardened-Security-for-Intel-Processors.html">LMHS SRE hypervisor</ulink></entry>
+          </row>
+
+          <row>
+            <entry><varname>google</varname></entry>
+            <entry><ulink url="https://cloud.google.com/compute">Google Compute Engine</ulink></entry>
           </row>
 
           <row>
@@ -244,7 +249,9 @@
         environment. In this mode, no output is written, but the return
         value indicates whether the process was invoked in a
         <function>chroot()</function>
-        environment or not.</para></listitem>
+        environment or not.</para>
+
+        <xi:include href="version-info.xml" xpointer="v228"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -254,7 +261,9 @@
         output is written, but the return value indicates whether the process was invoked
         inside of a user namespace or not. See
         <citerefentry project='man-pages'><refentrytitle>user_namespaces</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-        for more information.</para></listitem>
+        for more information.</para>
+
+        <xi:include href="version-info.xml" xpointer="v232"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -264,7 +273,9 @@
         The result of this detection may be used to disable features that should
         not be used in confidential VMs. It must not be used to release security
         sensitive information. The latter must only be released after attestation
-        of the confidential environment.</para></listitem>
+        of the confidential environment.</para>
+
+        <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -278,13 +289,17 @@
       <varlistentry>
         <term><option>--list</option></term>
 
-        <listitem><para>Output all currently known and detectable container and VM environments.</para></listitem>
+        <listitem><para>Output all currently known and detectable container and VM environments.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--list-cvm</option></term>
 
-        <listitem><para>Output all currently known and detectable confidential virtualization technologies.</para></listitem>
+        <listitem><para>Output all currently known and detectable confidential virtualization technologies.</para>
+
+        <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="help" />
@@ -302,12 +317,12 @@
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>chroot</refentrytitle><manvolnum>2</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>namespaces</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>chroot</refentrytitle><manvolnum>2</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>namespaces</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

@@ -91,6 +91,7 @@ typedef enum ExecKeyringMode {
 struct ExecStatus {
         dual_timestamp start_timestamp;
         dual_timestamp exit_timestamp;
+        dual_timestamp handoff_timestamp;
         pid_t pid;
         int code;     /* as in siginfo_t::si_code */
         int status;   /* as in siginfo_t::si_status */
@@ -100,7 +101,7 @@ struct ExecStatus {
 struct ExecCommand {
         char *path;
         char **argv;
-        ExecStatus exec_status;
+        ExecStatus exec_status; /* Note that this is not serialized to sd-executor */
         ExecCommandFlags flags;
         LIST_FIELDS(ExecCommand, command); /* useful for chaining commands */
 };
@@ -176,20 +177,6 @@ typedef enum ExecCleanMask {
         _EXEC_CLEAN_MASK_INVALID = -EINVAL,
 } ExecCleanMask;
 
-/* A credential configured with LoadCredential= */
-typedef struct ExecLoadCredential {
-        char *id, *path;
-        bool encrypted;
-} ExecLoadCredential;
-
-/* A credential configured with SetCredential= */
-typedef struct ExecSetCredential {
-        char *id;
-        bool encrypted;
-        void *data;
-        size_t size;
-} ExecSetCredential;
-
 /* Encodes configuration parameters applied to invoked commands. Does not carry runtime data, but only configuration
  * changes sourced from unit files and suchlike. ExecContext objects are usually embedded into Unit objects, and do not
  * change after being loaded. */
@@ -213,7 +200,6 @@ struct ExecContext {
         bool nice_set:1;
         bool ioprio_set:1;
         bool cpu_sched_set:1;
-        bool mount_apivfs_set:1;
 
         /* This is not exposed to the user but available internally. We need it to make sure that whenever we
          * spawn /usr/bin/mount it is run in the same process group as us so that the autofs logic detects
@@ -238,7 +224,11 @@ struct ExecContext {
         ExecInput std_input;
         ExecOutput std_output;
         ExecOutput std_error;
+
+        /* At least one of stdin/stdout/stderr was initialized from an fd passed in. This boolean survives
+         * the fds being closed. This only makes sense for transient units. */
         bool stdio_as_fds;
+
         char *stdio_fdname[3];
         char *stdio_file[3];
 
@@ -267,6 +257,8 @@ struct ExecContext {
         char *user;
         char *group;
         char **supplementary_groups;
+
+        int set_login_environment;
 
         char *pam_name;
 
@@ -320,6 +312,7 @@ struct ExecContext {
         ProcSubset proc_subset;    /* subset= */
 
         int private_mounts;
+        int mount_apivfs;
         int memory_ksm;
         bool private_tmp;
         bool private_network;
@@ -334,7 +327,6 @@ struct ExecContext {
         ProtectSystem protect_system;
         ProtectHome protect_home;
         bool protect_hostname;
-        bool mount_apivfs;
 
         bool dynamic_user;
         bool remove_ipc;
@@ -398,22 +390,23 @@ static inline bool exec_context_with_rootfs(const ExecContext *c) {
 }
 
 typedef enum ExecFlags {
-        EXEC_APPLY_SANDBOXING      = 1 << 0,
-        EXEC_APPLY_CHROOT          = 1 << 1,
-        EXEC_APPLY_TTY_STDIN       = 1 << 2,
-        EXEC_PASS_LOG_UNIT         = 1 << 3, /* Whether to pass the unit name to the service's journal stream connection */
-        EXEC_CHOWN_DIRECTORIES     = 1 << 4, /* chown() the runtime/state/cache/log directories to the user we run as, under all conditions */
-        EXEC_NSS_DYNAMIC_BYPASS    = 1 << 5, /* Set the SYSTEMD_NSS_DYNAMIC_BYPASS environment variable, to disable nss-systemd blocking on PID 1, for use by dbus-daemon */
-        EXEC_CGROUP_DELEGATE       = 1 << 6,
-        EXEC_IS_CONTROL            = 1 << 7,
-        EXEC_CONTROL_CGROUP        = 1 << 8, /* Place the process not in the indicated cgroup but in a subcgroup '/.control', but only EXEC_CGROUP_DELEGATE and EXEC_IS_CONTROL is set, too */
-        EXEC_WRITE_CREDENTIALS     = 1 << 9, /* Set up the credential store logic */
+        EXEC_APPLY_SANDBOXING        = 1 << 0,
+        EXEC_APPLY_CHROOT            = 1 << 1,
+        EXEC_APPLY_TTY_STDIN         = 1 << 2,
+        EXEC_PASS_LOG_UNIT           = 1 << 3,  /* Whether to pass the unit name to the service's journal stream connection */
+        EXEC_CHOWN_DIRECTORIES       = 1 << 4,  /* chown() the runtime/state/cache/log directories to the user we run as, under all conditions */
+        EXEC_NSS_DYNAMIC_BYPASS      = 1 << 5,  /* Set the SYSTEMD_NSS_DYNAMIC_BYPASS environment variable, to disable nss-systemd blocking on PID 1, for use by dbus-daemon */
+        EXEC_CGROUP_DELEGATE         = 1 << 6,
+        EXEC_IS_CONTROL              = 1 << 7,
+        EXEC_CONTROL_CGROUP          = 1 << 8,  /* Place the process not in the indicated cgroup but in a subcgroup '/.control', but only EXEC_CGROUP_DELEGATE and EXEC_IS_CONTROL is set, too */
+        EXEC_SETUP_CREDENTIALS       = 1 << 9,  /* Set up the credential store logic */
+        EXEC_SETUP_CREDENTIALS_FRESH = 1 << 10, /* Set up a new credential store (disable reuse) */
 
         /* The following are not used by execute.c, but by consumers internally */
-        EXEC_PASS_FDS              = 1 << 10,
-        EXEC_SETENV_RESULT         = 1 << 11,
-        EXEC_SET_WATCHDOG          = 1 << 12,
-        EXEC_SETENV_MONITOR_RESULT = 1 << 13, /* Pass exit status to OnFailure= and OnSuccess= dependencies. */
+        EXEC_PASS_FDS                = 1 << 11,
+        EXEC_SETENV_RESULT           = 1 << 12,
+        EXEC_SET_WATCHDOG            = 1 << 13,
+        EXEC_SETENV_MONITOR_RESULT   = 1 << 14, /* Pass exit status to OnFailure= and OnSuccess= dependencies. */
 } ExecFlags;
 
 /* Parameters for a specific invocation of a command. This structure is put together right before a command is
@@ -432,13 +425,15 @@ struct ExecParameters {
         bool selinux_context_net:1;
 
         CGroupMask cgroup_supported;
-        const char *cgroup_path;
+        char *cgroup_path;
+        uint64_t cgroup_id;
 
         char **prefix;
-        const char *received_credentials_directory;
-        const char *received_encrypted_credentials_directory;
+        char *received_credentials_directory;
+        char *received_encrypted_credentials_directory;
 
-        const char *confirm_spawn;
+        char *confirm_spawn;
+        bool shall_confirm_spawn;
 
         usec_t watchdog_usec;
 
@@ -448,30 +443,61 @@ struct ExecParameters {
         int stdout_fd;
         int stderr_fd;
 
-        /* An fd that is closed by the execve(), and thus will result in EOF when the execve() is done */
+        /* An fd that is closed by the execve(), and thus will result in EOF when the execve() is done. */
         int exec_fd;
 
-        const char *notify_socket;
+        char *notify_socket;
 
         LIST_HEAD(OpenFile, open_files);
+
+        char *fallback_smack_process_label;
+
+        char **files_env;
+        int user_lookup_fd;
+        int handoff_timestamp_fd;
+
+        int bpf_restrict_fs_map_fd;
+
+        /* Used for logging in the executor functions */
+        char *unit_id;
+        sd_id128_t invocation_id;
+        char invocation_id_string[SD_ID128_STRING_MAX];
 };
+
+#define EXEC_PARAMETERS_INIT(_flags)              \
+        (ExecParameters) {                        \
+                .flags = (_flags),                \
+                .stdin_fd               = -EBADF, \
+                .stdout_fd              = -EBADF, \
+                .stderr_fd              = -EBADF, \
+                .exec_fd                = -EBADF, \
+                .bpf_restrict_fs_map_fd = -EBADF, \
+                .user_lookup_fd         = -EBADF, \
+                .handoff_timestamp_fd   = -EBADF, \
+        }
 
 #include "unit.h"
 #include "dynamic-user.h"
 
-int exec_spawn(Unit *unit,
-               ExecCommand *command,
-               const ExecContext *context,
-               const ExecParameters *exec_params,
-               ExecRuntime *runtime,
-               const CGroupContext *cgroup_context,
-               pid_t *ret);
+int exec_spawn(
+                Unit *unit,
+                ExecCommand *command,
+                const ExecContext *context,
+                ExecParameters *exec_params,
+                ExecRuntime *runtime,
+                const CGroupContext *cgroup_context,
+                PidRef *ret);
 
+void exec_command_done(ExecCommand *c);
 void exec_command_done_array(ExecCommand *c, size_t n);
+ExecCommand* exec_command_free(ExecCommand *c);
+DEFINE_TRIVIAL_CLEANUP_FUNC(ExecCommand*, exec_command_free);
 ExecCommand* exec_command_free_list(ExecCommand *c);
 void exec_command_free_array(ExecCommand **c, size_t n);
 void exec_command_reset_status_array(ExecCommand *c, size_t n);
 void exec_command_reset_status_list_array(ExecCommand **c, size_t n);
+
+void exec_command_dump(ExecCommand *c, FILE *f, const char *prefix);
 void exec_command_dump_list(ExecCommand *c, FILE *f, const char *prefix);
 void exec_command_append_list(ExecCommand **l, ExecCommand *e);
 int exec_command_set(ExecCommand *c, const char *path, ...) _sentinel_;
@@ -482,15 +508,12 @@ void exec_context_done(ExecContext *c);
 void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix);
 
 int exec_context_destroy_runtime_directory(const ExecContext *c, const char *runtime_root);
-int exec_context_destroy_credentials(const ExecContext *c, const char *runtime_root, const char *unit);
 int exec_context_destroy_mount_ns_dir(Unit *u);
 
 const char* exec_context_fdname(const ExecContext *c, int fd_index);
 
 bool exec_context_may_touch_console(const ExecContext *c);
 bool exec_context_maintains_privileges(const ExecContext *c);
-bool exec_context_has_encrypted_credentials(ExecContext *c);
-bool exec_context_has_credentials(const ExecContext *context);
 
 int exec_context_get_effective_ioprio(const ExecContext *c);
 bool exec_context_get_effective_mount_apivfs(const ExecContext *c);
@@ -502,8 +525,27 @@ void exec_context_revert_tty(ExecContext *c);
 int exec_context_get_clean_directories(ExecContext *c, char **prefix, ExecCleanMask mask, char ***ret);
 int exec_context_get_clean_mask(ExecContext *c, ExecCleanMask *ret);
 
-void exec_status_start(ExecStatus *s, pid_t pid);
+const char *exec_context_tty_path(const ExecContext *context);
+int exec_context_apply_tty_size(const ExecContext *context, int tty_fd, const char *tty_path);
+void exec_context_tty_reset(const ExecContext *context, const ExecParameters *p);
+
+uint64_t exec_context_get_rlimit(const ExecContext *c, const char *name);
+int exec_context_get_oom_score_adjust(const ExecContext *c);
+uint64_t exec_context_get_coredump_filter(const ExecContext *c);
+int exec_context_get_nice(const ExecContext *c);
+int exec_context_get_cpu_sched_policy(const ExecContext *c);
+int exec_context_get_cpu_sched_priority(const ExecContext *c);
+uint64_t exec_context_get_timer_slack_nsec(const ExecContext *c);
+bool exec_context_get_set_login_environment(const ExecContext *c);
+char** exec_context_get_syscall_filter(const ExecContext *c);
+char** exec_context_get_syscall_archs(const ExecContext *c);
+char** exec_context_get_syscall_log(const ExecContext *c);
+char** exec_context_get_address_families(const ExecContext *c);
+char** exec_context_get_restrict_filesystems(const ExecContext *c);
+
+void exec_status_start(ExecStatus *s, pid_t pid, const dual_timestamp *ts);
 void exec_status_exit(ExecStatus *s, const ExecContext *context, pid_t pid, int code, int status);
+void exec_status_handoff(ExecStatus *s, const struct ucred *ucred, const dual_timestamp *ts);
 void exec_status_dump(const ExecStatus *s, FILE *f, const char *prefix);
 void exec_status_reset(ExecStatus *s);
 
@@ -515,31 +557,28 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(ExecSharedRuntime*, exec_shared_runtime_unref);
 int exec_shared_runtime_serialize(const Manager *m, FILE *f, FDSet *fds);
 int exec_shared_runtime_deserialize_compat(Unit *u, const char *key, const char *value, FDSet *fds);
 int exec_shared_runtime_deserialize_one(Manager *m, const char *value, FDSet *fds);
+void exec_shared_runtime_done(ExecSharedRuntime *rt);
 void exec_shared_runtime_vacuum(Manager *m);
 
 int exec_runtime_make(const Unit *unit, const ExecContext *context, ExecSharedRuntime *shared, DynamicCreds *creds, ExecRuntime **ret);
 ExecRuntime* exec_runtime_free(ExecRuntime *rt);
 DEFINE_TRIVIAL_CLEANUP_FUNC(ExecRuntime*, exec_runtime_free);
 ExecRuntime* exec_runtime_destroy(ExecRuntime *rt);
+void exec_runtime_clear(ExecRuntime *rt);
 
-void exec_params_clear(ExecParameters *p);
+int exec_params_get_cgroup_path(const ExecParameters *params, const CGroupContext *c, char **ret);
+void exec_params_shallow_clear(ExecParameters *p);
+void exec_params_dump(const ExecParameters *p, FILE* f, const char *prefix);
+void exec_params_deep_clear(ExecParameters *p);
 
 bool exec_context_get_cpu_affinity_from_numa(const ExecContext *c);
-
-ExecSetCredential *exec_set_credential_free(ExecSetCredential *sc);
-DEFINE_TRIVIAL_CLEANUP_FUNC(ExecSetCredential*, exec_set_credential_free);
-
-ExecLoadCredential *exec_load_credential_free(ExecLoadCredential *lc);
-DEFINE_TRIVIAL_CLEANUP_FUNC(ExecLoadCredential*, exec_load_credential_free);
 
 void exec_directory_done(ExecDirectory *d);
 int exec_directory_add(ExecDirectory *d, const char *path, const char *symlink);
 void exec_directory_sort(ExecDirectory *d);
+bool exec_directory_is_private(const ExecContext *context, ExecDirectoryType type);
 
 ExecCleanMask exec_clean_mask_from_string(const char *s);
-
-extern const struct hash_ops exec_set_credential_hash_ops;
-extern const struct hash_ops exec_load_credential_hash_ops;
 
 const char* exec_output_to_string(ExecOutput i) _const_;
 ExecOutput exec_output_from_string(const char *s) _pure_;
@@ -562,8 +601,98 @@ ExecDirectoryType exec_directory_type_from_string(const char *s) _pure_;
 const char* exec_directory_type_symlink_to_string(ExecDirectoryType i) _const_;
 ExecDirectoryType exec_directory_type_symlink_from_string(const char *s) _pure_;
 
+const char* exec_directory_type_mode_to_string(ExecDirectoryType i) _const_;
+ExecDirectoryType exec_directory_type_mode_from_string(const char *s) _pure_;
+
 const char* exec_resource_type_to_string(ExecDirectoryType i) _const_;
 ExecDirectoryType exec_resource_type_from_string(const char *s) _pure_;
 
 bool exec_needs_mount_namespace(const ExecContext *context, const ExecParameters *params, const ExecRuntime *runtime);
 bool exec_needs_network_namespace(const ExecContext *context);
+bool exec_needs_ipc_namespace(const ExecContext *context);
+
+/* These logging macros do the same logging as those in unit.h, but using ExecContext and ExecParameters
+ * instead of the unit object, so that it can be used in the sd-executor context (where the unit object is
+ * not available). */
+
+#define LOG_EXEC_ID_FIELD(ep) \
+        ((ep)->runtime_scope == RUNTIME_SCOPE_USER ? "USER_UNIT=" : "UNIT=")
+#define LOG_EXEC_ID_FIELD_FORMAT(ep) \
+        ((ep)->runtime_scope == RUNTIME_SCOPE_USER ? "USER_UNIT=%s" : "UNIT=%s")
+#define LOG_EXEC_INVOCATION_ID_FIELD(ep) \
+        ((ep)->runtime_scope == RUNTIME_SCOPE_USER ? "USER_INVOCATION_ID=" : "INVOCATION_ID=")
+#define LOG_EXEC_INVOCATION_ID_FIELD_FORMAT(ep) \
+        ((ep)->runtime_scope == RUNTIME_SCOPE_USER ? "USER_INVOCATION_ID=%s" : "INVOCATION_ID=%s")
+
+#define log_exec_full_errno_zerook(ec, ep, level, error, ...)                     \
+        ({                                                                        \
+                const ExecContext *_c = (ec);                                     \
+                const ExecParameters *_p = (ep);                                  \
+                const int _l = (level);                                           \
+                bool _do_log = _c->log_level_max < 0 ||                           \
+                               _c->log_level_max >= LOG_PRI(_l);                  \
+                LOG_CONTEXT_PUSH_IOV(_c->log_extra_fields,                        \
+                                     _c->n_log_extra_fields);                     \
+                !_do_log ? -ERRNO_VALUE(error) :                                  \
+                        log_object_internal(_l, error,                            \
+                                            PROJECT_FILE, __LINE__, __func__,     \
+                                            LOG_EXEC_ID_FIELD(_p),                \
+                                            _p->unit_id,                          \
+                                            LOG_EXEC_INVOCATION_ID_FIELD(_p),     \
+                                            _p->invocation_id_string,             \
+                                            ##__VA_ARGS__);                       \
+        })
+
+#define log_exec_full_errno(ec, ep, level, error, ...)                            \
+        ({                                                                        \
+                int _error = (error);                                             \
+                ASSERT_NON_ZERO(_error);                                          \
+                log_exec_full_errno_zerook(ec, ep, level, _error, ##__VA_ARGS__); \
+        })
+
+#define log_exec_full(ec, ep, level, ...) (void) log_exec_full_errno_zerook(ec, ep, level, 0, __VA_ARGS__)
+
+#define log_exec_debug(ec, ep, ...)   log_exec_full(ec, ep, LOG_DEBUG, __VA_ARGS__)
+#define log_exec_info(ec, ep, ...)    log_exec_full(ec, ep, LOG_INFO, __VA_ARGS__)
+#define log_exec_notice(ec, ep, ...)  log_exec_full(ec, ep, LOG_NOTICE, __VA_ARGS__)
+#define log_exec_warning(ec, ep, ...) log_exec_full(ec, ep, LOG_WARNING, __VA_ARGS__)
+#define log_exec_error(ec, ep, ...)   log_exec_full(ec, ep, LOG_ERR, __VA_ARGS__)
+
+#define log_exec_debug_errno(ec, ep, error, ...)   log_exec_full_errno(ec, ep, LOG_DEBUG, error, __VA_ARGS__)
+#define log_exec_info_errno(ec, ep, error, ...)    log_exec_full_errno(ec, ep, LOG_INFO, error, __VA_ARGS__)
+#define log_exec_notice_errno(ec, ep, error, ...)  log_exec_full_errno(ec, ep, LOG_NOTICE, error, __VA_ARGS__)
+#define log_exec_warning_errno(ec, ep, error, ...) log_exec_full_errno(ec, ep, LOG_WARNING, error, __VA_ARGS__)
+#define log_exec_error_errno(ec, ep, error, ...)   log_exec_full_errno(ec, ep, LOG_ERR, error, __VA_ARGS__)
+
+/* Like LOG_MESSAGE(), but with the unit name prefixed. */
+#define LOG_EXEC_MESSAGE(ep, fmt, ...) LOG_MESSAGE("%s: " fmt, (ep)->unit_id, ##__VA_ARGS__)
+#define LOG_EXEC_ID(ep) LOG_EXEC_ID_FIELD_FORMAT(ep), (ep)->unit_id
+#define LOG_EXEC_INVOCATION_ID(ep) LOG_EXEC_INVOCATION_ID_FIELD_FORMAT(ep), (ep)->invocation_id_string
+
+#define log_exec_struct_errno(ec, ep, level, error, ...)                          \
+        ({                                                                        \
+                const ExecContext *_c = (ec);                                     \
+                const ExecParameters *_p = (ep);                                  \
+                const int _l = (level);                                           \
+                bool _do_log = _c->log_level_max < 0 ||                           \
+                               _c->log_level_max >= LOG_PRI(_l);                  \
+                LOG_CONTEXT_PUSH_IOV(_c->log_extra_fields,                        \
+                                     _c->n_log_extra_fields);                     \
+                !_do_log ? -ERRNO_VALUE(error) :                                  \
+                        log_struct_errno(_l, error,                               \
+                                         LOG_EXEC_ID(_p),                         \
+                                         LOG_EXEC_INVOCATION_ID(_p),              \
+                                         __VA_ARGS__);                            \
+        })
+
+#define log_exec_struct(ec, ep, level, ...) log_exec_struct_errno(ec, ep, level, 0, __VA_ARGS__)
+
+#define _LOG_CONTEXT_PUSH_EXEC(ec, ep, p, c)                                                       \
+        const ExecContext *c = (ec);                                                               \
+        const ExecParameters *p = (ep);                                                            \
+        LOG_CONTEXT_PUSH_KEY_VALUE(LOG_EXEC_ID_FIELD(p), p->unit_id);                              \
+        LOG_CONTEXT_PUSH_KEY_VALUE(LOG_EXEC_INVOCATION_ID_FIELD(p), p->invocation_id_string);      \
+        LOG_CONTEXT_PUSH_IOV(c->log_extra_fields, c->n_log_extra_fields)
+
+#define LOG_CONTEXT_PUSH_EXEC(ec, ep) \
+        _LOG_CONTEXT_PUSH_EXEC(ec, ep, UNIQ_T(p, UNIQ), UNIQ_T(c, UNIQ))

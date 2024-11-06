@@ -1,6 +1,6 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="oomd.conf" conditional='ENABLE_OOMD'
@@ -22,9 +22,16 @@
   </refnamediv>
 
   <refsynopsisdiv>
-    <para><filename>/etc/systemd/oomd.conf</filename></para>
-    <para><filename>/etc/systemd/oomd.conf.d/*.conf</filename></para>
-    <para><filename>/usr/lib/systemd/oomd.conf.d/*.conf</filename></para>
+    <para><simplelist>
+      <member><filename>/etc/systemd/oomd.conf</filename></member>
+      <member><filename>/run/systemd/oomd.conf</filename></member>
+      <member><filename>/usr/local/lib/systemd/oomd.conf</filename></member>
+      <member><filename>/usr/lib/systemd/oomd.conf</filename></member>
+      <member><filename>/etc/systemd/oomd.conf.d/*.conf</filename></member>
+      <member><filename>/run/systemd/oomd.conf.d/*.conf</filename></member>
+      <member><filename>/usr/local/lib/systemd/oomd.conf.d/*.conf</filename></member>
+      <member><filename>/usr/lib/systemd/oomd.conf.d/*.conf</filename></member>
+    </simplelist></para>
   </refsynopsisdiv>
 
   <refsect1>
@@ -56,7 +63,9 @@
         usage greater than 5% of total swap, starting from the ones with the highest swap usage. Which
         control groups are monitored and what action gets taken depends on what the unit has configured for
         <varname>ManagedOOMSwap=</varname>.  Takes a value specified in percent (when suffixed with "%"),
-        permille ("‰") or permyriad ("‱"), between 0% and 100%, inclusive. Defaults to 90%.</para></listitem>
+        permille ("‰") or permyriad ("‱"), between 0% and 100%, inclusive. Defaults to 90%.</para>
+
+        <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -72,7 +81,9 @@
         ones with the most reclaim activity to the least reclaim activity. Which control groups are monitored
         and what action gets taken depends on what the unit has configured for
         <varname>ManagedOOMMemoryPressure=</varname>. Takes a fraction specified in the same way as
-        <varname>SwapUsedLimit=</varname> above. Defaults to 60%.</para></listitem>
+        <varname>SwapUsedLimit=</varname> above. Defaults to 60%.</para>
+
+        <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -81,7 +92,9 @@
         <listitem><para>Sets the amount of time a unit's control group needs to have exceeded memory pressure
         limits before <command>systemd-oomd</command> will take action. Memory pressure limits are defined by
         <varname>DefaultMemoryPressureLimit=</varname> and <varname>ManagedOOMMemoryPressureLimit=</varname>.
-        Must be set to 0, or at least 1 second. Defaults to 30 seconds when unset or 0.</para></listitem>
+        Must be set to 0, or at least 1 second. Defaults to 30 seconds when unset or 0.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/></listitem>
       </varlistentry>
 
     </variablelist>
@@ -89,12 +102,12 @@
 
   <refsect1>
       <title>See Also</title>
-      <para>
-        <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd-oomd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>oomctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-      </para>
+      <para><simplelist type="inline">
+        <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd-oomd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>oomctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      </simplelist></para>
   </refsect1>
 
 </refentry>

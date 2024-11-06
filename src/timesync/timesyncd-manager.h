@@ -45,10 +45,9 @@ struct Manager {
         LIST_HEAD(ServerName, runtime_servers);
         LIST_HEAD(ServerName, fallback_servers);
 
-        bool have_fallbacks:1;
-
         RateLimit ratelimit;
         bool exhausted_servers;
+        bool have_fallbacks;
 
         /* network */
         sd_event_source *network_event_source;
@@ -71,6 +70,7 @@ struct Manager {
         /* last sent packet */
         struct timespec trans_time_mon;
         struct timespec trans_time;
+        struct ntp_ts request_nonce;
         usec_t retry_interval;
         usec_t connection_retry_usec;
         bool pending;
@@ -116,6 +116,10 @@ struct Manager {
         sd_event_source *event_save_time;
         usec_t save_time_interval_usec;
         bool save_on_exit;
+
+        /* Used to coalesce bus PropertiesChanged events */
+        sd_event_source *deferred_ntp_server_event_source;
+        unsigned ntp_server_change_mask;
 };
 
 int manager_new(Manager **ret);
@@ -133,3 +137,5 @@ void manager_disconnect(Manager *m);
 bool manager_is_connected(Manager *m);
 
 int manager_setup_save_time_event(Manager *m);
+
+int bus_manager_emit_ntp_server_changed(Manager *m);

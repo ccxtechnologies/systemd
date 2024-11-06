@@ -31,8 +31,8 @@ TEST(STRERROR) {
         assert_se(strstr(b, "201"));
 
         /* Check with negative values */
-        assert_se(streq(a, STRERROR(-200)));
-        assert_se(streq(b, STRERROR(-201)));
+        ASSERT_STREQ(a, STRERROR(-200));
+        ASSERT_STREQ(b, STRERROR(-201));
 
         const char *c = STRERROR(INT_MAX);
         char buf[DECIMAL_STR_MAX(int)];
@@ -76,6 +76,37 @@ TEST(UNPROTECT_ERRNO) {
         test_unprotect_errno_inner_function();
 
         assert_se(errno == 4711);
+}
+
+TEST(RET_GATHER) {
+        int x = 0, y = 2;
+
+        assert_se(RET_GATHER(x, 5) == 0);
+        assert_se(RET_GATHER(x, -5) == -5);
+        assert_se(RET_GATHER(x, -1) == -5);
+
+        assert_se(RET_GATHER(x, y++) == -5);
+        assert_se(y == 3);
+}
+
+TEST(ERRNO_IS_TRANSIENT) {
+        assert_se( ERRNO_IS_NEG_TRANSIENT(-EINTR));
+        assert_se(!ERRNO_IS_NEG_TRANSIENT(EINTR));
+        assert_se( ERRNO_IS_TRANSIENT(-EINTR));
+        assert_se( ERRNO_IS_TRANSIENT(EINTR));
+
+        /* Test with type wider than int */
+        ssize_t r = -EAGAIN;
+        assert_se( ERRNO_IS_NEG_TRANSIENT(r));
+
+        /* On 64-bit arches, now (int) r == EAGAIN */
+        r = SSIZE_MAX - EAGAIN + 1;
+        assert_se(!ERRNO_IS_NEG_TRANSIENT(r));
+
+        assert_se(!ERRNO_IS_NEG_TRANSIENT(INT_MAX));
+        assert_se(!ERRNO_IS_NEG_TRANSIENT(INT_MIN));
+        assert_se(!ERRNO_IS_NEG_TRANSIENT(INTMAX_MAX));
+        assert_se(!ERRNO_IS_NEG_TRANSIENT(INTMAX_MIN));
 }
 
 DEFINE_TEST_MAIN(LOG_INFO);

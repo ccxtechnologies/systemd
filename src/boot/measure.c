@@ -18,8 +18,9 @@
 #include "pretty-print.h"
 #include "sha256.h"
 #include "terminal-util.h"
-#include "tpm-pcr.h"
+#include "tpm2-pcr.h"
 #include "tpm2-util.h"
+#include "uki.h"
 #include "verbs.h"
 
 /* Tool for pre-calculating expected TPM PCR values based on measured resources. This is intended to be used
@@ -29,7 +30,10 @@ static char *arg_sections[_UNIFIED_SECTION_MAX] = {};
 static char **arg_banks = NULL;
 static char *arg_tpm2_device = NULL;
 static char *arg_private_key = NULL;
+static KeySourceType arg_private_key_source_type = OPENSSL_KEY_SOURCE_FILE;
+static char *arg_private_key_source = NULL;
 static char *arg_public_key = NULL;
+static char *arg_certificate = NULL;
 static JsonFormatFlags arg_json_format_flags = JSON_FORMAT_PRETTY_AUTO|JSON_FORMAT_COLOR_AUTO|JSON_FORMAT_OFF;
 static PagerFlags arg_pager_flags = 0;
 static bool arg_current = false;
@@ -39,11 +43,13 @@ static char *arg_append = NULL;
 STATIC_DESTRUCTOR_REGISTER(arg_banks, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_tpm2_device, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_private_key, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_private_key_source, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_public_key, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_certificate, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_phase, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_append, freep);
 
-static inline void free_sections(char*(*sections)[_UNIFIED_SECTION_MAX]) {
+static void free_sections(char*(*sections)[_UNIFIED_SECTION_MAX]) {
         for (UnifiedSection c = 0; c < _UNIFIED_SECTION_MAX; c++)
                 free((*sections)[c]);
 }
@@ -73,7 +79,11 @@ static int help(int argc, char *argv[], void *userdata) {
                "     --bank=DIGEST       Select TPM bank (SHA1, SHA256, SHA384, SHA512)\n"
                "     --tpm2-device=PATH  Use specified TPM2 device\n"
                "     --private-key=KEY   Private key (PEM) to sign with\n"
+               "     --private-key-source=file|provider:PROVIDER|engine:ENGINE\n"
+               "                         Specify how to use KEY for --private-key=. Allows\n"
+               "                         an OpenSSL engine/provider to be used for signing\n"
                "     --public-key=KEY    Public key (PEM) to validate against\n"
+               "     --certificate=PATH  PEM certificate to use when signing with a URI\n"
                "     --json=MODE         Output as JSON\n"
                "  -j                     Same as --json=pretty on tty, --json=short otherwise\n"
                "     --append=PATH       Load specified JSON signature, and append new signature to it\n"
@@ -82,6 +92,7 @@ static int help(int argc, char *argv[], void *userdata) {
                "     --osrel=PATH        Path to os-release file                %7$s .osrel\n"
                "     --cmdline=PATH      Path to file with kernel command line  %7$s .cmdline\n"
                "     --initrd=PATH       Path to initrd image file              %7$s .initrd\n"
+               "     --ucode=PATH        Path to microcode image file           %7$s .ucode\n"
                "     --splash=PATH       Path to splash bitmap file             %7$s .splash\n"
                "     --dtb=PATH          Path to Devicetree file                %7$s .dtb\n"
                "     --uname=PATH        Path to 'uname -r' file                %7$s .uname\n"
@@ -123,6 +134,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_OSREL,
                 ARG_CMDLINE,
                 ARG_INITRD,
+                ARG_UCODE,
                 ARG_SPLASH,
                 ARG_DTB,
                 ARG_UNAME,
@@ -132,7 +144,9 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_PCRPKEY = _ARG_SECTION_LAST,
                 ARG_BANK,
                 ARG_PRIVATE_KEY,
+                ARG_PRIVATE_KEY_SOURCE,
                 ARG_PUBLIC_KEY,
+                ARG_CERTIFICATE,
                 ARG_TPM2_DEVICE,
                 ARG_JSON,
                 ARG_PHASE,
@@ -140,26 +154,29 @@ static int parse_argv(int argc, char *argv[]) {
         };
 
         static const struct option options[] = {
-                { "help",        no_argument,       NULL, 'h'             },
-                { "no-pager",    no_argument,       NULL, ARG_NO_PAGER    },
-                { "version",     no_argument,       NULL, ARG_VERSION     },
-                { "linux",       required_argument, NULL, ARG_LINUX       },
-                { "osrel",       required_argument, NULL, ARG_OSREL       },
-                { "cmdline",     required_argument, NULL, ARG_CMDLINE     },
-                { "initrd",      required_argument, NULL, ARG_INITRD      },
-                { "splash",      required_argument, NULL, ARG_SPLASH      },
-                { "dtb",         required_argument, NULL, ARG_DTB         },
-                { "uname",       required_argument, NULL, ARG_UNAME       },
-                { "sbat",        required_argument, NULL, ARG_SBAT        },
-                { "pcrpkey",     required_argument, NULL, ARG_PCRPKEY     },
-                { "current",     no_argument,       NULL, 'c'             },
-                { "bank",        required_argument, NULL, ARG_BANK        },
-                { "tpm2-device", required_argument, NULL, ARG_TPM2_DEVICE },
-                { "private-key", required_argument, NULL, ARG_PRIVATE_KEY },
-                { "public-key",  required_argument, NULL, ARG_PUBLIC_KEY  },
-                { "json",        required_argument, NULL, ARG_JSON        },
-                { "phase",       required_argument, NULL, ARG_PHASE       },
-                { "append",      required_argument, NULL, ARG_APPEND      },
+                { "help",               no_argument,       NULL, 'h'                    },
+                { "no-pager",           no_argument,       NULL, ARG_NO_PAGER           },
+                { "version",            no_argument,       NULL, ARG_VERSION            },
+                { "linux",              required_argument, NULL, ARG_LINUX              },
+                { "osrel",              required_argument, NULL, ARG_OSREL              },
+                { "cmdline",            required_argument, NULL, ARG_CMDLINE            },
+                { "initrd",             required_argument, NULL, ARG_INITRD             },
+                { "ucode",              required_argument, NULL, ARG_UCODE              },
+                { "splash",             required_argument, NULL, ARG_SPLASH             },
+                { "dtb",                required_argument, NULL, ARG_DTB                },
+                { "uname",              required_argument, NULL, ARG_UNAME              },
+                { "sbat",               required_argument, NULL, ARG_SBAT               },
+                { "pcrpkey",            required_argument, NULL, ARG_PCRPKEY            },
+                { "current",            no_argument,       NULL, 'c'                    },
+                { "bank",               required_argument, NULL, ARG_BANK               },
+                { "tpm2-device",        required_argument, NULL, ARG_TPM2_DEVICE        },
+                { "private-key",        required_argument, NULL, ARG_PRIVATE_KEY        },
+                { "private-key-source", required_argument, NULL, ARG_PRIVATE_KEY_SOURCE },
+                { "public-key",         required_argument, NULL, ARG_PUBLIC_KEY         },
+                { "certificate",        required_argument, NULL, ARG_CERTIFICATE        },
+                { "json",               required_argument, NULL, ARG_JSON               },
+                { "phase",              required_argument, NULL, ARG_PHASE              },
+                { "append",             required_argument, NULL, ARG_APPEND             },
                 {}
         };
 
@@ -212,7 +229,17 @@ static int parse_argv(int argc, char *argv[]) {
                 }
 
                 case ARG_PRIVATE_KEY:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_private_key);
+                        r = free_and_strdup_warn(&arg_private_key, optarg);
+                        if (r < 0)
+                                return r;
+
+                        break;
+
+                case ARG_PRIVATE_KEY_SOURCE:
+                        r = parse_openssl_key_source_argument(
+                                        optarg,
+                                        &arg_private_key_source,
+                                        &arg_private_key_source_type);
                         if (r < 0)
                                 return r;
 
@@ -220,6 +247,13 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_PUBLIC_KEY:
                         r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_public_key);
+                        if (r < 0)
+                                return r;
+
+                        break;
+
+                case ARG_CERTIFICATE:
+                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_certificate);
                         if (r < 0)
                                 return r;
 
@@ -280,6 +314,12 @@ static int parse_argv(int argc, char *argv[]) {
                         assert_not_reached();
                 }
 
+        if (arg_public_key && arg_certificate)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Both --public-key= and --certificate= specified, refusing.");
+
+        if (arg_private_key_source && !arg_certificate)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "When using --private-key-source=, --certificate= must be specified.");
+
         if (strv_isempty(arg_banks)) {
                 /* If no banks are specifically selected, pick all known banks */
                 arg_banks = strv_new("SHA1", "SHA256", "SHA384", "SHA512");
@@ -299,12 +339,11 @@ static int parse_argv(int argc, char *argv[]) {
         if (strv_isempty(arg_phase)) {
                 /* If no phases are specifically selected, pick everything from the beginning of the initrd
                  * to the beginning of shutdown. */
-                if (strv_extend_strv(&arg_phase,
-                                     STRV_MAKE("enter-initrd",
-                                               "enter-initrd:leave-initrd",
-                                               "enter-initrd:leave-initrd:sysinit",
-                                               "enter-initrd:leave-initrd:sysinit:ready"),
-                                     /* filter_duplicates= */ false) < 0)
+                if (strv_extend_many(&arg_phase,
+                                     "enter-initrd",
+                                     "enter-initrd:leave-initrd",
+                                     "enter-initrd:leave-initrd:sysinit",
+                                     "enter-initrd:leave-initrd:sysinit:ready") < 0)
                         return log_oom();
         } else {
                 strv_sort(arg_phase);
@@ -409,7 +448,7 @@ static int measure_kernel(PcrState *pcr_states, size_t n) {
                         _cleanup_free_ void *v = NULL;
                         size_t sz;
 
-                        if (asprintf(&p, "/sys/class/tpm/tpm0/pcr-%s/%" PRIu32, pcr_states[i].bank, TPM_PCR_INDEX_KERNEL_IMAGE) < 0)
+                        if (asprintf(&p, "/sys/class/tpm/tpm0/pcr-%s/%i", pcr_states[i].bank, TPM2_PCR_KERNEL_BOOT) < 0)
                                 return log_oom();
 
                         r = read_virtual_file(p, 4096, &s, NULL);
@@ -418,7 +457,7 @@ static int measure_kernel(PcrState *pcr_states, size_t n) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to read '%s': %m", p);
 
-                        r = unhexmem(strstrip(s), SIZE_MAX, &v, &sz);
+                        r = unhexmem(strstrip(s), &v, &sz);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to decode PCR value '%s': %m", s);
 
@@ -679,9 +718,9 @@ static int verb_calculate(int argc, char *argv[], void *userdata) {
 
                                 if (i == 0) {
                                         fflush(stdout);
-                                        fprintf(stderr, "%s# PCR[%" PRIu32 "] Phase <%s>%s\n",
+                                        fprintf(stderr, "%s# PCR[%i] Phase <%s>%s\n",
                                                 ansi_grey(),
-                                                TPM_PCR_INDEX_KERNEL_IMAGE,
+                                                TPM2_PCR_KERNEL_BOOT,
                                                 isempty(*phase) ? ":" : *phase,
                                                 ansi_normal());
                                         fflush(stderr);
@@ -691,23 +730,18 @@ static int verb_calculate(int argc, char *argv[], void *userdata) {
                                 if (!hd)
                                         return log_oom();
 
-                                printf("%" PRIu32 ":%s=%s\n", TPM_PCR_INDEX_KERNEL_IMAGE, pcr_states[i].bank, hd);
+                                printf("%i:%s=%s\n", TPM2_PCR_KERNEL_BOOT, pcr_states[i].bank, hd);
                         } else {
-                                _cleanup_(json_variant_unrefp) JsonVariant *bv = NULL, *array = NULL;
+                                _cleanup_(json_variant_unrefp) JsonVariant *array = NULL;
 
                                 array = json_variant_ref(json_variant_by_key(w, pcr_states[i].bank));
 
-                                r = json_build(&bv,
-                                               JSON_BUILD_OBJECT(
-                                                               JSON_BUILD_PAIR_CONDITION(!isempty(*phase), "phase", JSON_BUILD_STRING(*phase)),
-                                                               JSON_BUILD_PAIR("pcr", JSON_BUILD_INTEGER(TPM_PCR_INDEX_KERNEL_IMAGE)),
-                                                               JSON_BUILD_PAIR("hash", JSON_BUILD_HEX(pcr_states[i].value, pcr_states[i].value_size))
-                                               )
-                                );
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to build JSON object: %m");
-
-                                r = json_variant_append_array(&array, bv);
+                                r = json_variant_append_arrayb(
+                                                &array,
+                                                JSON_BUILD_OBJECT(
+                                                                JSON_BUILD_PAIR_CONDITION(!isempty(*phase), "phase", JSON_BUILD_STRING(*phase)),
+                                                                JSON_BUILD_PAIR("pcr", JSON_BUILD_INTEGER(TPM2_PCR_KERNEL_BOOT)),
+                                                                JSON_BUILD_PAIR("hash", JSON_BUILD_HEX(pcr_states[i].value, pcr_states[i].value_size))));
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to append JSON object to array: %m");
 
@@ -736,7 +770,7 @@ static int verb_sign(int argc, char *argv[], void *userdata) {
         _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
         _cleanup_(pcr_state_free_all) PcrState *pcr_states = NULL;
         _cleanup_(EVP_PKEY_freep) EVP_PKEY *privkey = NULL, *pubkey = NULL;
-        _cleanup_fclose_ FILE *privkeyf = NULL;
+        _cleanup_(X509_freep) X509 *certificate = NULL;
         size_t n;
         int r;
 
@@ -764,13 +798,57 @@ static int verb_sign(int argc, char *argv[], void *userdata) {
         /* When signing we only support JSON output */
         arg_json_format_flags &= ~JSON_FORMAT_OFF;
 
-        privkeyf = fopen(arg_private_key, "re");
-        if (!privkeyf)
-                return log_error_errno(errno, "Failed to open private key file '%s': %m", arg_private_key);
+        /* This must be done before openssl_load_key_from_token() otherwise it will get stuck */
+        if (arg_certificate) {
+                _cleanup_(BIO_freep) BIO *cb = NULL;
+                _cleanup_free_ char *crt = NULL;
 
-        privkey = PEM_read_PrivateKey(privkeyf, NULL, NULL, NULL);
-        if (!privkey)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to parse private key '%s'.", arg_private_key);
+                r = read_full_file_full(
+                                AT_FDCWD, arg_certificate, UINT64_MAX, SIZE_MAX,
+                                READ_FULL_FILE_CONNECT_SOCKET,
+                                /* bind_name= */ NULL,
+                                &crt, &n);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read certificate file '%s': %m", arg_certificate);
+
+                cb = BIO_new_mem_buf(crt, n);
+                if (!cb)
+                        return log_oom();
+
+                certificate = PEM_read_bio_X509(cb, NULL, NULL, NULL);
+                if (!certificate)
+                        return log_error_errno(
+                                        SYNTHETIC_ERRNO(EBADMSG),
+                                        "Failed to parse X.509 certificate: %s",
+                                        ERR_error_string(ERR_get_error(), NULL));
+        }
+
+        if (arg_private_key_source_type == OPENSSL_KEY_SOURCE_FILE) {
+                _cleanup_fclose_ FILE *privkeyf = NULL;
+                _cleanup_free_ char *resolved_pkey = NULL;
+
+                r = parse_path_argument(arg_private_key, /* suppress_root= */ false, &resolved_pkey);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse private key path %s: %m", arg_private_key);
+
+                privkeyf = fopen(resolved_pkey, "re");
+                if (!privkeyf)
+                        return log_error_errno(errno, "Failed to open private key file '%s': %m", resolved_pkey);
+
+                privkey = PEM_read_PrivateKey(privkeyf, NULL, NULL, NULL);
+                if (!privkey)
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to parse private key '%s'.", resolved_pkey);
+        } else if (arg_private_key_source &&
+                   IN_SET(arg_private_key_source_type, OPENSSL_KEY_SOURCE_ENGINE, OPENSSL_KEY_SOURCE_PROVIDER)) {
+                r = openssl_load_key_from_token(
+                                arg_private_key_source_type, arg_private_key_source, arg_private_key, &privkey);
+                if (r < 0)
+                        return log_error_errno(
+                                        r,
+                                        "Failed to load key '%s' from OpenSSL key source %s: %m",
+                                        arg_private_key,
+                                        arg_private_key_source);
+        }
 
         if (arg_public_key) {
                 _cleanup_fclose_ FILE *pubkeyf = NULL;
@@ -782,6 +860,13 @@ static int verb_sign(int argc, char *argv[], void *userdata) {
                 pubkey = PEM_read_PUBKEY(pubkeyf, NULL, NULL, NULL);
                 if (!pubkey)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to parse public key '%s'.", arg_public_key);
+        } else if (certificate) {
+                pubkey = X509_get_pubkey(certificate);
+                if (!pubkey)
+                        return log_error_errno(
+                                        SYNTHETIC_ERRNO(EIO),
+                                        "Failed to extract public key from certificate %s.",
+                                        arg_certificate);
         } else {
                 _cleanup_(memstream_done) MemStream m = {};
                 FILE *tf;
@@ -831,51 +916,22 @@ static int verb_sign(int argc, char *argv[], void *userdata) {
                         if (tpmalg < 0)
                                 return log_error_errno(tpmalg, "Unsupported PCR bank");
 
-                        TPML_PCR_SELECTION pcr_selection;
-                        tpm2_tpml_pcr_selection_from_mask(1 << TPM_PCR_INDEX_KERNEL_IMAGE,
-                                                          tpmalg,
-                                                          &pcr_selection);
+                        Tpm2PCRValue pcr_value = TPM2_PCR_VALUE_MAKE(TPM2_PCR_KERNEL_BOOT,
+                                                                     tpmalg,
+                                                                     TPM2B_DIGEST_MAKE(p->value, p->value_size));
 
-                        TPM2B_DIGEST pcr_values = {
-                                .size = p->value_size,
-                        };
-                        assert(sizeof(pcr_values.buffer) >= p->value_size);
-                        memcpy_safe(pcr_values.buffer, p->value, p->value_size);
+                        TPM2B_DIGEST pcr_policy_digest = TPM2B_DIGEST_MAKE(NULL, TPM2_SHA256_DIGEST_SIZE);
 
-                        TPM2B_DIGEST pcr_policy_digest;
-                        r = tpm2_digest_init(TPM2_ALG_SHA256, &pcr_policy_digest);
+                        r = tpm2_calculate_policy_pcr(&pcr_value, 1, &pcr_policy_digest);
                         if (r < 0)
-                                return r;
+                                return log_error_errno(r, "Could not calculate PolicyPCR digest: %m");
 
-                        r = tpm2_calculate_policy_pcr(&pcr_selection, &pcr_values, 1, &pcr_policy_digest);
-                        if (r < 0)
-                                return r;
-
-                        _cleanup_(EVP_MD_CTX_freep) EVP_MD_CTX* mdctx = NULL;
-                        mdctx = EVP_MD_CTX_new();
-                        if (!mdctx)
-                                return log_oom();
-
-                        if (EVP_DigestSignInit(mdctx, NULL, p->md, NULL, privkey) != 1)
-                                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
-                                                       "Failed to initialize signature context.");
-
-                        if (EVP_DigestSignUpdate(mdctx, pcr_policy_digest.buffer, pcr_policy_digest.size) != 1)
-                                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
-                                                       "Failed to sign data.");
-
+                        _cleanup_free_ void *sig = NULL;
                         size_t ss;
-                        if (EVP_DigestSignFinal(mdctx, NULL, &ss) != 1)
-                                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
-                                                       "Failed to finalize signature");
 
-                        _cleanup_free_ void *sig = malloc(ss);
-                        if (!sig)
-                                return log_oom();
-
-                        if (EVP_DigestSignFinal(mdctx, sig, &ss) != 1)
-                                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
-                                                       "Failed to acquire signature data");
+                        r = digest_and_sign(p->md, privkey, pcr_policy_digest.buffer, pcr_policy_digest.size, &sig, &ss);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to sign PCR policy: %m");
 
                         _cleanup_free_ void *pubkey_fp = NULL;
                         size_t pubkey_fp_size = 0;
@@ -884,7 +940,7 @@ static int verb_sign(int argc, char *argv[], void *userdata) {
                                 return r;
 
                         _cleanup_(json_variant_unrefp) JsonVariant *a = NULL;
-                        r = tpm2_make_pcr_json_array(UINT64_C(1) << TPM_PCR_INDEX_KERNEL_IMAGE, &a);
+                        r = tpm2_make_pcr_json_array(UINT64_C(1) << TPM2_PCR_KERNEL_BOOT, &a);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to build JSON PCR mask array: %m");
 
@@ -959,15 +1015,15 @@ static int validate_stub(void) {
                 log_warning("Warning: current kernel image does not support measuring itself, the command line or initrd system extension images.\n"
                             "The PCR measurements seen are unlikely to be valid.");
 
-        r = compare_reported_pcr_nr(TPM_PCR_INDEX_KERNEL_IMAGE, EFI_LOADER_VARIABLE(StubPcrKernelImage), "kernel image");
+        r = compare_reported_pcr_nr(TPM2_PCR_KERNEL_BOOT, EFI_LOADER_VARIABLE(StubPcrKernelImage), "kernel image");
         if (r < 0)
                 return r;
 
-        r = compare_reported_pcr_nr(TPM_PCR_INDEX_KERNEL_PARAMETERS, EFI_LOADER_VARIABLE(StubPcrKernelParameters), "kernel parameters");
+        r = compare_reported_pcr_nr(TPM2_PCR_KERNEL_CONFIG, EFI_LOADER_VARIABLE(StubPcrKernelParameters), "kernel parameters");
         if (r < 0)
                 return r;
 
-        r = compare_reported_pcr_nr(TPM_PCR_INDEX_INITRD_SYSEXTS, EFI_LOADER_VARIABLE(StubPcrInitRDSysExts), "initrd system extension images");
+        r = compare_reported_pcr_nr(TPM2_PCR_SYSEXTS, EFI_LOADER_VARIABLE(StubPcrInitRDSysExts), "initrd system extension images");
         if (r < 0)
                 return r;
 
@@ -995,17 +1051,13 @@ static int validate_stub(void) {
 }
 
 static int verb_status(int argc, char *argv[], void *userdata) {
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
-
-        static const struct {
-                uint32_t nr;
-                const char *description;
-        } relevant_pcrs[] = {
-                { TPM_PCR_INDEX_KERNEL_IMAGE,      "Unified Kernel Image"     },
-                { TPM_PCR_INDEX_KERNEL_PARAMETERS, "Kernel Parameters"        },
-                { TPM_PCR_INDEX_INITRD_SYSEXTS,    "initrd System Extensions" },
+        static const uint32_t relevant_pcrs[] = {
+                TPM2_PCR_KERNEL_BOOT,
+                TPM2_PCR_KERNEL_CONFIG,
+                TPM2_PCR_SYSEXTS,
         };
 
+        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
         int r;
 
         r = validate_stub();
@@ -1023,7 +1075,7 @@ static int verb_status(int argc, char *argv[], void *userdata) {
                         if (!b)
                                 return log_oom();
 
-                        if (asprintf(&p, "/sys/class/tpm/tpm0/pcr-%s/%" PRIu32, ascii_strlower(b), relevant_pcrs[i].nr) < 0)
+                        if (asprintf(&p, "/sys/class/tpm/tpm0/pcr-%s/%" PRIu32, ascii_strlower(b), relevant_pcrs[i]) < 0)
                                 return log_oom();
 
                         r = read_virtual_file(p, 4096, &s, NULL);
@@ -1032,7 +1084,7 @@ static int verb_status(int argc, char *argv[], void *userdata) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to read '%s': %m", p);
 
-                        r = unhexmem(strstrip(s), SIZE_MAX, &h, &l);
+                        r = unhexmem(strstrip(s), &h, &l);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to decode PCR value '%s': %m", s);
 
@@ -1049,21 +1101,21 @@ static int verb_status(int argc, char *argv[], void *userdata) {
                                         fflush(stdout);
                                         fprintf(stderr, "%s# PCR[%" PRIu32 "] %s%s%s\n",
                                                 ansi_grey(),
-                                                relevant_pcrs[i].nr,
-                                                relevant_pcrs[i].description,
+                                                relevant_pcrs[i],
+                                                tpm2_pcr_index_to_string(relevant_pcrs[i]),
                                                 memeqzero(h, l) ? " (NOT SET!)" : "",
                                                 ansi_normal());
                                         fflush(stderr);
                                 }
 
-                                printf("%" PRIu32 ":%s=%s\n", relevant_pcrs[i].nr, b, f);
+                                printf("%" PRIu32 ":%s=%s\n", relevant_pcrs[i], b, f);
 
                         } else {
                                 _cleanup_(json_variant_unrefp) JsonVariant *bv = NULL, *a = NULL;
 
                                 r = json_build(&bv,
                                                JSON_BUILD_OBJECT(
-                                                               JSON_BUILD_PAIR("pcr", JSON_BUILD_INTEGER(relevant_pcrs[i].nr)),
+                                                               JSON_BUILD_PAIR("pcr", JSON_BUILD_INTEGER(relevant_pcrs[i])),
                                                                JSON_BUILD_PAIR("hash", JSON_BUILD_HEX(h, l))
                                                )
                                 );
@@ -1108,9 +1160,7 @@ static int measure_main(int argc, char *argv[]) {
 static int run(int argc, char *argv[]) {
         int r;
 
-        log_show_color(true);
-        log_parse_environment();
-        log_open();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)

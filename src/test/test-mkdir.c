@@ -80,7 +80,7 @@ TEST(mkdir_p_safe) {
         p = mfree(p);
         assert_se(p = path_join(tmp, "zero-mode/should-fail-to-create-child"));
         assert_se(mkdir_parents_safe(tmp, p, 0000, UID_INVALID, GID_INVALID, 0) >= 0);
-        r = safe_fork("(test-mkdir-no-cap)", FORK_DEATHSIG | FORK_WAIT | FORK_LOG, NULL);
+        r = safe_fork("(test-mkdir-no-cap)", FORK_DEATHSIG_SIGTERM | FORK_WAIT | FORK_LOG, NULL);
         if (r == 0) {
                 (void) capability_bounding_set_drop(0, /* right_now = */ true);
                 assert_se(mkdir_p_safe(tmp, p, 0000, UID_INVALID, GID_INVALID, 0) == -EACCES);
@@ -136,6 +136,33 @@ TEST(mkdir_p_root) {
         assert_se(is_dir(p, false) > 0);
         assert_se(is_dir(p, true) > 0);
         */
+}
+
+TEST(mkdir_p_root_full) {
+        _cleanup_(rm_rf_physical_and_freep) char *tmp = NULL;
+        _cleanup_free_ char *p = NULL;
+        struct stat st;
+
+        ASSERT_OK(mkdtemp_malloc("/tmp/test-mkdir-XXXXXX", &tmp));
+
+        ASSERT_NOT_NULL(p = path_join(tmp, "foo"));
+        ASSERT_OK(mkdir_p_root_full(tmp, "/foo", UID_INVALID, GID_INVALID, 0755, 2 * USEC_PER_SEC, NULL));
+        ASSERT_GT(is_dir(p, false), 0);
+        ASSERT_GT(is_dir(p, true), 0);
+        ASSERT_OK_ERRNO(stat(p, &st));
+        ASSERT_EQ(st.st_mtim.tv_sec, 2);
+        ASSERT_EQ(st.st_atim.tv_sec, 2);
+
+        p = mfree(p);
+        ASSERT_NOT_NULL(p = path_join(tmp, "dir-not-exists/foo"));
+        ASSERT_OK(mkdir_p_root_full(NULL, p, UID_INVALID, GID_INVALID, 0755, 90 * USEC_PER_HOUR, NULL));
+        ASSERT_GT(is_dir(p, false), 0);
+        ASSERT_GT(is_dir(p, true), 0);
+        p = mfree(p);
+        ASSERT_NOT_NULL(p = path_join(tmp, "dir-not-exists"));
+        ASSERT_OK_ERRNO(stat(p, &st));
+        ASSERT_EQ(st.st_mtim.tv_sec, 90 * 60 * 60);
+        ASSERT_EQ(st.st_atim.tv_sec, 90 * 60 * 60);
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

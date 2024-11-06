@@ -48,7 +48,7 @@ static int get_current_pcr(const char *alg, uint32_t pcr, void **ret, size_t *re
         if (r < 0)
                 return log_error_errno(r, "Failed to read '%s': %m", p);
 
-        r = unhexmem(s, ss, &buf, &bufsize);
+        r = unhexmem_full(s, ss, /* secure = */ false, &buf, &bufsize);
         if (r < 0)
                 return log_error_errno(r, "Failed to decode hex PCR data '%s': %m", s);
 
@@ -82,7 +82,7 @@ static int add_pcr_to_table(Table *table, const char *alg, uint32_t pcr) {
 
         r = table_add_many(table,
                            TABLE_UINT32, pcr,
-                           TABLE_STRING, pcr_index_to_string(pcr),
+                           TABLE_STRING, tpm2_pcr_index_to_string(pcr),
                            TABLE_STRING, h,
                            TABLE_SET_COLOR, color);
         if (r < 0)
@@ -104,7 +104,7 @@ int verb_pcrs(int argc, char *argv[], void *userdata) {
                         return r;
         }
 
-        table = table_new("nr", "name", alg);
+        table = table_new("nr", "name", alg ?: "-");
         if (!table)
                 return log_oom();
 
@@ -115,7 +115,7 @@ int verb_pcrs(int argc, char *argv[], void *userdata) {
                 (void) table_set_display(table, 0, 1);
 
         if (strv_isempty(strv_skip(argv, 1)))
-                for (uint32_t pi = 0; pi < _PCR_INDEX_MAX_DEFINED; pi++) {
+                for (uint32_t pi = 0; pi < _TPM2_PCR_INDEX_MAX_DEFINED; pi++) {
                         r = add_pcr_to_table(table, alg, pi);
                         if (r < 0)
                                 return r;
@@ -124,7 +124,7 @@ int verb_pcrs(int argc, char *argv[], void *userdata) {
                 for (int i = 1; i < argc; i++) {
                         int pi;
 
-                        pi = pcr_index_from_string(argv[i]);
+                        pi = tpm2_pcr_index_from_string(argv[i]);
                         if (pi < 0)
                                 return log_error_errno(pi, "PCR index \"%s\" not known.", argv[i]);
 

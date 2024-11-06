@@ -10,15 +10,15 @@
 [Unit]
 Description=User Manager for UID %i
 Documentation=man:user@.service(5)
+BindsTo=user-runtime-dir@%i.service
 After=user-runtime-dir@%i.service dbus.service systemd-oomd.service
-Requires=user-runtime-dir@%i.service
 IgnoreOnIsolate=yes
 
 [Service]
 User=%i
 PAMName=systemd-user
 Type=notify-reload
-ExecStart={{ROOTLIBEXECDIR}}/systemd --user
+ExecStart={{LIBEXECDIR}}/systemd --user
 Slice=user-%i.slice
 KillMode=mixed
 Delegate=pids memory cpu

@@ -16,12 +16,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
-# pylint: disable=missing-docstring,invalid-name,import-outside-toplevel
-# pylint: disable=consider-using-with,unspecified-encoding,line-too-long
-# pylint: disable=too-many-locals,too-many-statements,too-many-return-statements
-# pylint: disable=too-many-branches,too-many-lines,too-many-instance-attributes
-# pylint: disable=too-many-arguments,unnecessary-lambda-assignment,fixme
-# pylint: disable=unused-argument
+# pylint: disable=import-outside-toplevel,consider-using-with,unused-argument
+# pylint: disable=unnecessary-lambda-assignment
 
 import argparse
 import configparser
@@ -43,6 +39,9 @@ import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
+import struct
+from hashlib import sha256
 from typing import (Any,
                     Callable,
                     IO,
@@ -52,7 +51,7 @@ from typing import (Any,
 
 import pefile  # type: ignore
 
-__version__ = '{{PROJECT_VERSION}} ({{GIT_VERSION}})'
+__version__ = '{{PROJECT_VERSION_FULL}} ({{VERSION_TAG}})'
 
 EFI_ARCH_MAP = {
     # host_arch glob : [efi_arch, 32_bit_efi_arch if mixed mode is supported]
@@ -66,6 +65,19 @@ EFI_ARCH_MAP = {
     'riscv64'      : ['riscv64'],
 }
 EFI_ARCHES: list[str] = sum(EFI_ARCH_MAP.values(), [])
+
+# Default configuration directories and file name.
+# When the user does not specify one, the directories are searched in this order and the first file found is used.
+DEFAULT_CONFIG_DIRS = ['/etc/systemd', '/run/systemd', '/usr/local/lib/systemd', '/usr/lib/systemd']
+DEFAULT_CONFIG_FILE = 'ukify.conf'
+
+class Style:
+    bold = "\033[0;1;39m" if sys.stderr.isatty() else ""
+    gray = "\033[0;38;5;245m" if sys.stderr.isatty() else ""
+    red = "\033[31;1m" if sys.stderr.isatty() else ""
+    yellow = "\033[33;1m" if sys.stderr.isatty() else ""
+    reset = "\033[0m" if sys.stderr.isatty() else ""
+
 
 def guess_efi_arch():
     arch = os.uname().machine
@@ -89,7 +101,7 @@ def guess_efi_arch():
             if int(size) == 32:
                 efi_arch = fallback[0]
 
-    print(f'Host arch {arch!r}, EFI arch {efi_arch!r}')
+    # print(f'Host arch {arch!r}, EFI arch {efi_arch!r}')
     return efi_arch
 
 
@@ -117,6 +129,45 @@ def try_import(modname, name=None):
     except ImportError as e:
         raise ValueError(f'Kernel is compressed with {name or modname}, but module unavailable') from e
 
+def get_zboot_kernel(f):
+    """Decompress zboot efistub kernel if compressed. Return contents."""
+    # See linux/drivers/firmware/efi/libstub/Makefile.zboot
+    # and linux/drivers/firmware/efi/libstub/zboot-header.S
+
+    # 4 bytes at offset 0x08 contain the starting offset of compressed data
+    f.seek(8)
+    _start = f.read(4)
+    start = struct.unpack('<i', _start)[0]
+
+    # Reading 4 bytes from address 0x0c is the size of compressed data,
+    # but it needs to be corrected according to the compressed type.
+    f.seek(0xc)
+    _sizes = f.read(4)
+    size = struct.unpack('<i', _sizes)[0]
+
+    # Read 6 bytes from address 0x18, which is a nul-terminated
+    # string representing the compressed type.
+    f.seek(0x18)
+    comp_type = f.read(6)
+    f.seek(start)
+    if comp_type.startswith(b'gzip'):
+        gzip = try_import('gzip')
+        return gzip.open(f).read(size)
+    elif comp_type.startswith(b'lz4'):
+        lz4 = try_import('lz4.frame', 'lz4')
+        return lz4.frame.decompress(f.read(size))
+    elif comp_type.startswith(b'lzma'):
+        lzma = try_import('lzma')
+        return lzma.open(f).read(size)
+    elif comp_type.startswith(b'lzo'):
+        raise NotImplementedError('lzo decompression not implemented')
+    elif comp_type.startswith(b'xzkern'):
+        raise NotImplementedError('xzkern decompression not implemented')
+    elif comp_type.startswith(b'zstd22'):
+        zstd = try_import('zstd')
+        return zstd.uncompress(f.read(size))
+    else:
+        raise NotImplementedError(f'unknown compressed type: {comp_type}')
 
 def maybe_decompress(filename):
     """Decompress file if compressed. Return contents."""
@@ -129,8 +180,14 @@ def maybe_decompress(filename):
         return f.read()
 
     if start.startswith(b'MZ'):
-        # not compressed aarch64 and riscv64
-        return f.read()
+        f.seek(4)
+        img_type = f.read(4)
+        if img_type.startswith(b'zimg'):
+            # zboot efistub kernel
+            return get_zboot_kernel(f)
+        else:
+            # not compressed aarch64 and riscv64
+            return f.read()
 
     if start.startswith(b'\x1f\x8b'):
         gzip = try_import('gzip')
@@ -179,7 +236,7 @@ class Uname:
     @classmethod
     def scrape_x86(cls, filename, opts=None):
         # Based on https://gitlab.archlinux.org/archlinux/mkinitcpio/mkinitcpio/-/blob/master/functions#L136
-        # and https://www.kernel.org/doc/html/latest/x86/boot.html#the-real-mode-kernel-header
+        # and https://docs.kernel.org/arch/x86/boot.html#the-real-mode-kernel-header
         with open(filename, 'rb') as f:
             f.seek(0x202)
             magic = f.read(4)
@@ -243,13 +300,28 @@ class Uname:
                 print(str(e))
         return None
 
+DEFAULT_SECTIONS_TO_SHOW = {
+        '.linux'    : 'binary',
+        '.initrd'   : 'binary',
+        '.ucode'    : 'binary',
+        '.splash'   : 'binary',
+        '.dtb'      : 'binary',
+        '.cmdline'  : 'text',
+        '.osrel'    : 'text',
+        '.uname'    : 'text',
+        '.pcrpkey'  : 'text',
+        '.pcrsig'   : 'text',
+        '.sbat'     : 'text',
+        '.sbom'     : 'binary',
+}
 
 @dataclasses.dataclass
 class Section:
     name: str
-    content: pathlib.Path
+    content: Optional[pathlib.Path]
     tmpfile: Optional[IO] = None
     measure: bool = False
+    output_mode: Optional[str] = None
 
     @classmethod
     def create(cls, name, contents, **kwargs):
@@ -265,7 +337,7 @@ class Section:
         return cls(name, contents, tmpfile=tmp, **kwargs)
 
     @classmethod
-    def parse_arg(cls, s):
+    def parse_input(cls, s):
         try:
             name, contents, *rest = s.split(':')
         except ValueError as e:
@@ -276,7 +348,19 @@ class Section:
         if contents.startswith('@'):
             contents = pathlib.Path(contents[1:])
 
-        return cls.create(name, contents)
+        sec = cls.create(name, contents)
+        sec.check_name()
+        return sec
+
+    @classmethod
+    def parse_output(cls, s):
+        if not (m := re.match(r'([a-zA-Z0-9_.]+):(text|binary)(?:@(.+))?', s)):
+            raise ValueError(f'Cannot parse section spec: {s!r}')
+
+        name, ttype, out = m.groups()
+        out = pathlib.Path(out) if out else None
+
+        return cls.create(name, out, output_mode=ttype)
 
     def size(self):
         return self.content.stat().st_size
@@ -366,7 +450,7 @@ def check_cert_and_keys_nonexistent(opts):
         *((priv_key, pub_key)
           for priv_key, pub_key, _ in key_path_groups(opts)))
     for path in paths:
-        if path and path.exists():
+        if path and pathlib.Path(path).exists():
             raise ValueError(f'{path} is present')
 
 
@@ -456,7 +540,11 @@ def call_systemd_measure(uki, linux, opts):
 
         for priv_key, pub_key, group in key_path_groups(opts):
             extra = [f'--private-key={priv_key}']
-            if pub_key:
+            if opts.signing_engine is not None:
+                assert pub_key
+                extra += [f'--private-key-source=engine:{opts.signing_engine}']
+                extra += [f'--certificate={pub_key}']
+            elif pub_key:
                 extra += [f'--public-key={pub_key}']
             extra += [f'--phase={phase_path}' for phase_path in group or ()]
 
@@ -551,6 +639,7 @@ def pe_add_sections(uki: UKI, output: str):
         if offset + new_section.sizeof() > pe.OPTIONAL_HEADER.SizeOfHeaders:
             raise PEError(f'Not enough header space to add section {section.name}.')
 
+        assert section.content
         data = section.content.read_bytes()
 
         new_section.set_file_offset(offset)
@@ -644,11 +733,13 @@ def sbsign_sign(sbsign_tool, input_f, output_f, opts=None):
         sbsign_tool,
         '--key', opts.sb_key,
         '--cert', opts.sb_cert,
-        input_f,
-        '--output', output_f,
     ]
     if opts.signing_engine is not None:
         sign_invocation += ['--engine', opts.signing_engine]
+    sign_invocation += [
+        input_f,
+        '--output', output_f,
+    ]
     signer_sign(sign_invocation)
 
 def find_pesign(opts=None):
@@ -696,31 +787,32 @@ def make_uki(opts):
     # kernel payload signing
 
     sign_tool = None
-    if opts.signtool == 'sbsign':
-        sign_tool = find_sbsign(opts=opts)
-        sign = sbsign_sign
-        verify_tool = SBVERIFY
-    else:
-        sign_tool = find_pesign(opts=opts)
-        sign = pesign_sign
-        verify_tool = PESIGCHECK
-
     sign_args_present = opts.sb_key or opts.sb_cert_name
-
-    if sign_tool is None and sign_args_present:
-        raise ValueError(f'{opts.signtool}, required for signing, is not installed')
-
     sign_kernel = opts.sign_kernel
-    if sign_kernel is None and opts.linux is not None and sign_args_present:
-        # figure out if we should sign the kernel
-        sign_kernel = verify(verify_tool, opts)
+    sign = None
+    linux = opts.linux
 
-    if sign_kernel:
-        linux_signed = tempfile.NamedTemporaryFile(prefix='linux-signed')
-        linux = pathlib.Path(linux_signed.name)
-        sign(sign_tool, opts.linux, linux, opts=opts)
-    else:
-        linux = opts.linux
+    if sign_args_present:
+        if opts.signtool == 'sbsign':
+            sign_tool = find_sbsign(opts=opts)
+            sign = sbsign_sign
+            verify_tool = SBVERIFY
+        else:
+            sign_tool = find_pesign(opts=opts)
+            sign = pesign_sign
+            verify_tool = PESIGCHECK
+
+        if sign_tool is None:
+            raise ValueError(f'{opts.signtool}, required for signing, is not installed')
+
+        if sign_kernel is None and opts.linux is not None:
+            # figure out if we should sign the kernel
+            sign_kernel = verify(verify_tool, opts)
+
+        if sign_kernel:
+            linux_signed = tempfile.NamedTemporaryFile(prefix='linux-signed')
+            linux = pathlib.Path(linux_signed.name)
+            sign(sign_tool, opts.linux, linux, opts=opts)
 
     if opts.uname is None and opts.linux is not None:
         print('Kernel version not specified, starting autodetection 😖.')
@@ -733,9 +825,23 @@ def make_uki(opts):
     if pcrpkey is None:
         if opts.pcr_public_keys and len(opts.pcr_public_keys) == 1:
             pcrpkey = opts.pcr_public_keys[0]
+            # If we are getting a certificate when using an engine, we need to convert it to public key format
+            if opts.signing_engine is not None and pathlib.Path(pcrpkey).exists():
+                from cryptography.hazmat.primitives import serialization
+                from cryptography.x509 import load_pem_x509_certificate
+
+                try:
+                    cert = load_pem_x509_certificate(pathlib.Path(pcrpkey).read_bytes())
+                except ValueError:
+                    raise ValueError(f'{pcrpkey} must be an X.509 certificate when signing with an engine')
+                else:
+                    pcrpkey = cert.public_key().public_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
         elif opts.pcr_private_keys and len(opts.pcr_private_keys) == 1:
-            import cryptography.hazmat.primitives.serialization as serialization
-            privkey = serialization.load_pem_private_key(opts.pcr_private_keys[0].read_bytes(), password=None)
+            from cryptography.hazmat.primitives import serialization
+            privkey = serialization.load_pem_private_key(pathlib.Path(opts.pcr_private_keys[0]).read_bytes(), password=None)
             pcrpkey = privkey.public_key().public_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PublicFormat.SubjectPublicKeyInfo,
@@ -750,6 +856,7 @@ def make_uki(opts):
         ('.splash',  opts.splash,     True ),
         ('.pcrpkey', pcrpkey,         True ),
         ('.initrd',  initrd,          True ),
+        ('.ucode',   opts.microcode,  True ),
 
         # linux shall be last to leave breathing room for decompression.
         # We'll add it later.
@@ -763,44 +870,53 @@ def make_uki(opts):
     for section in opts.sections:
         uki.add_section(section)
 
-    # PCR measurement and signing
-
-    call_systemd_measure(uki, linux, opts=opts)
-
-    # UKI or addon creation - addons don't use the stub so we add SBAT manually
-
     if linux is not None:
         # Merge the .sbat sections from stub, kernel and parameter, so that revocation can be done on either.
-        uki.add_section(Section.create('.sbat', merge_sbat([opts.stub, linux], opts.sbat), measure=True))
-        uki.add_section(Section.create('.linux', linux, measure=True))
-    else:
+        input_pes = [opts.stub, linux]
         if not opts.sbat:
             opts.sbat = ["""sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md
-uki,1,UKI,uki,1,https://www.freedesktop.org/software/systemd/man/systemd-stub.html
+uki,1,UKI,uki,1,https://uapi-group.org/specifications/specs/unified_kernel_image/
 """]
-        uki.add_section(Section.create('.sbat', merge_sbat([], opts.sbat), measure=False))
+    else:
+        # Addons don't use the stub so we add SBAT manually
+        input_pes = []
+        if not opts.sbat:
+            opts.sbat = ["""sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md
+uki-addon,1,UKI Addon,addon,1,https://www.freedesktop.org/software/systemd/man/latest/systemd-stub.html
+"""]
+    uki.add_section(Section.create('.sbat', merge_sbat(input_pes, opts.sbat), measure=linux is not None))
+
+    # PCR measurement and signing
+
+    # We pass in the contents for .linux separately because we need them to do the measurement but can't add
+    # the section yet because we want .linux to be the last section. Make sure any other sections are added
+    # before this function is called.
+    call_systemd_measure(uki, linux, opts=opts)
+
+    # UKI creation
+
+    if linux is not None:
+        uki.add_section(Section.create('.linux', linux, measure=True))
 
     if sign_args_present:
         unsigned = tempfile.NamedTemporaryFile(prefix='uki')
-        output = unsigned.name
+        unsigned_output = unsigned.name
     else:
-        output = opts.output
+        unsigned_output = opts.output
 
-    pe_add_sections(uki, output)
+    pe_add_sections(uki, unsigned_output)
 
     # UKI signing
 
     if sign_args_present:
-        sign(sign_tool, unsigned.name, opts.output, opts=opts)
+        assert sign
+        sign(sign_tool, unsigned_output, opts.output, opts=opts)
 
         # We end up with no executable bits, let's reapply them
         os.umask(umask := os.umask(0))
         os.chmod(opts.output, 0o777 & ~umask)
 
     print(f"Wrote {'signed' if sign_args_present else 'unsigned'} {opts.output}")
-
-
-ONE_DAY = datetime.timedelta(1, 0, 0)
 
 
 @contextlib.contextmanager
@@ -821,15 +937,16 @@ def generate_key_cert_pair(
 ) -> tuple[bytes]:
 
     from cryptography import x509
-    import cryptography.hazmat.primitives as hp
+    from cryptography.hazmat.primitives import serialization, hashes
+    from cryptography.hazmat.primitives.asymmetric import rsa
 
     # We use a keylength of 2048 bits. That is what Microsoft documents as
     # supported/expected:
     # https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/windows-secure-boot-key-creation-and-management-guidance?view=windows-11#12-public-key-cryptography
 
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc)
 
-    key = hp.asymmetric.rsa.generate_private_key(
+    key = rsa.generate_private_key(
         public_exponent=65537,
         key_size=keylength,
     )
@@ -841,7 +958,7 @@ def generate_key_cert_pair(
     ).not_valid_before(
         now,
     ).not_valid_after(
-        now + ONE_DAY * valid_days
+        now + datetime.timedelta(days=valid_days)
     ).serial_number(
         x509.random_serial_number()
     ).public_key(
@@ -851,42 +968,45 @@ def generate_key_cert_pair(
         critical=True,
     ).sign(
         private_key=key,
-        algorithm=hp.hashes.SHA256(),
+        algorithm=hashes.SHA256(),
     )
 
     cert_pem = cert.public_bytes(
-        encoding=hp.serialization.Encoding.PEM,
+        encoding=serialization.Encoding.PEM,
     )
     key_pem = key.private_bytes(
-        encoding=hp.serialization.Encoding.PEM,
-        format=hp.serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=hp.serialization.NoEncryption(),
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
     )
 
     return key_pem, cert_pem
 
 
 def generate_priv_pub_key_pair(keylength : int = 2048) -> tuple[bytes]:
-    import cryptography.hazmat.primitives as hp
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
 
-    key = hp.asymmetric.rsa.generate_private_key(
+    key = rsa.generate_private_key(
         public_exponent=65537,
         key_size=keylength,
     )
     priv_key_pem = key.private_bytes(
-        encoding=hp.serialization.Encoding.PEM,
-        format=hp.serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=hp.serialization.NoEncryption(),
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
     )
     pub_key_pem = key.public_key().public_bytes(
-        encoding=hp.serialization.Encoding.PEM,
-        format=hp.serialization.PublicFormat.SubjectPublicKeyInfo,
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
 
     return priv_key_pem, pub_key_pem
 
 
 def generate_keys(opts):
+    work = False
+
     # This will generate keys and certificates and write them to the paths that
     # are specified as input paths.
     if opts.sb_key or opts.sb_cert:
@@ -902,15 +1022,76 @@ def generate_keys(opts):
         print(f'Writing SecureBoot certificate to {opts.sb_cert}')
         opts.sb_cert.write_bytes(cert_pem)
 
+        work = True
+
     for priv_key, pub_key, _ in key_path_groups(opts):
         priv_key_pem, pub_key_pem = generate_priv_pub_key_pair()
 
         print(f'Writing private key for PCR signing to {priv_key}')
         with temporary_umask(0o077):
-            priv_key.write_bytes(priv_key_pem)
+            pathlib.Path(priv_key).write_bytes(priv_key_pem)
         if pub_key:
             print(f'Writing public key for PCR signing to {pub_key}')
             pub_key.write_bytes(pub_key_pem)
+
+        work = True
+
+    if not work:
+        raise ValueError('genkey: --secureboot-private-key=/--secureboot-certificate= or --pcr-private-key/--pcr-public-key must be specified')
+
+
+def inspect_section(opts, section):
+    name = section.Name.rstrip(b"\x00").decode()
+
+    # find the config for this section in opts and whether to show it
+    config = opts.sections_by_name.get(name, None)
+    show = (config or
+            opts.all or
+            (name in DEFAULT_SECTIONS_TO_SHOW and not opts.sections))
+    if not show:
+        return name, None
+
+    ttype = config.output_mode if config else DEFAULT_SECTIONS_TO_SHOW.get(name, 'binary')
+
+    size = section.Misc_VirtualSize
+    # TODO: Use ignore_padding once we can depend on a newer version of pefile
+    data = section.get_data(length=size)
+    digest = sha256(data).hexdigest()
+
+    struct = {
+        'size' : size,
+        'sha256' : digest,
+    }
+
+    if ttype == 'text':
+        try:
+            struct['text'] = data.decode()
+        except UnicodeDecodeError as e:
+            print(f"Section {name!r} is not valid text: {e}")
+            struct['text'] = '(not valid UTF-8)'
+
+    if config and config.content:
+        assert isinstance(config.content, pathlib.Path)
+        config.content.write_bytes(data)
+
+    if opts.json == 'off':
+        print(f"{name}:\n  size: {size} bytes\n  sha256: {digest}")
+        if ttype == 'text':
+            text = textwrap.indent(struct['text'].rstrip(), ' ' * 4)
+            print(f"  text:\n{text}")
+
+    return name, struct
+
+
+def inspect_sections(opts):
+    indent = 4 if opts.json == 'pretty' else None
+
+    for file in opts.files:
+        pe = pefile.PE(file, fast_load=True)
+        gen = (inspect_section(opts, section) for section in pe.sections)
+        descs = {key:val for (key, val) in gen if val}
+        if opts.json != 'off':
+            json.dump(descs, sys.stdout, indent=indent)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -927,6 +1108,8 @@ class ConfigItem:
         assert not group
 
         old = getattr(namespace, dest, [])
+        if old is None:
+            old = []
         setattr(namespace, dest, value + old)
 
     @staticmethod
@@ -942,6 +1125,19 @@ class ConfigItem:
 
         if getattr(namespace, dest) is None:
             setattr(namespace, dest, value)
+
+    @staticmethod
+    def config_set(
+            namespace: argparse.Namespace,
+            group: Optional[str],
+            dest: str,
+            value: Any,
+    ) -> None:
+        "Set namespace.<dest> to value only if it was None"
+
+        assert not group
+
+        setattr(namespace, dest, value)
 
     @staticmethod
     def config_set_group(
@@ -983,6 +1179,7 @@ class ConfigItem:
     default: Any = None
     version: Optional[str] = None
     choices: Optional[tuple[str, ...]] = None
+    const: Optional[Any] = None
     help: Optional[str] = None
 
     # metadata for config file parsing
@@ -1045,14 +1242,14 @@ class ConfigItem:
         return (section_name, key, value)
 
 
-VERBS = ('build', 'genkey')
+VERBS = ('build', 'genkey', 'inspect')
 
 CONFIG_ITEMS = [
     ConfigItem(
         'positional',
         metavar = 'VERB',
         nargs = '*',
-        help = f"operation to perform ({','.join(VERBS)})",
+        help = argparse.SUPPRESS,
     ),
 
     ConfigItem(
@@ -1085,8 +1282,17 @@ CONFIG_ITEMS = [
     ),
 
     ConfigItem(
+        '--microcode',
+        metavar = 'UCODE',
+        type = pathlib.Path,
+        help = 'microcode file [.ucode section]',
+        config_key = 'UKI/Microcode',
+    ),
+
+    ConfigItem(
         ('--config', '-c'),
         metavar = 'PATH',
+        type = pathlib.Path,
         help = 'configuration file',
     ),
 
@@ -1160,10 +1366,9 @@ CONFIG_ITEMS = [
         '--section',
         dest = 'sections',
         metavar = 'NAME:TEXT|@PATH',
-        type = Section.parse_arg,
         action = 'append',
         default = [],
-        help = 'additional section as name and contents [NAME section]',
+        help = 'section as name and contents [NAME section] or section to print',
     ),
 
     ConfigItem(
@@ -1183,8 +1388,9 @@ CONFIG_ITEMS = [
         '--signtool',
         choices = ('sbsign', 'pesign'),
         dest = 'signtool',
-        default = 'sbsign',
-        help = 'whether to use sbsign or pesign. Default is sbsign.',
+        help = 'whether to use sbsign or pesign. It will also be inferred by the other \
+        parameters given: when using --secureboot-{private-key/certificate}, sbsign \
+        will be used, otherwise pesign will be used',
         config_key = 'UKI/SecureBootSigningTool',
     ),
     ConfigItem(
@@ -1205,6 +1411,7 @@ CONFIG_ITEMS = [
         default = '/etc/pki/pesign',
         help = 'required by --signtool=pesign. Path to nss certificate database directory for PE signing. Default is /etc/pki/pesign',
         config_key = 'UKI/SecureBootCertificateDir',
+        config_push = ConfigItem.config_set
     ),
     ConfigItem(
         '--secureboot-certificate-name',
@@ -1215,10 +1422,12 @@ CONFIG_ITEMS = [
     ConfigItem(
         '--secureboot-certificate-validity',
         metavar = 'DAYS',
+        type = int,
         dest = 'sb_cert_validity',
         default = 365 * 10,
         help = "period of validity (in days) for a certificate created by 'genkey'",
         config_key = 'UKI/SecureBootCertificateValidity',
+        config_push = ConfigItem.config_set
     ),
 
     ConfigItem(
@@ -1231,10 +1440,8 @@ CONFIG_ITEMS = [
     ConfigItem(
         '--pcr-private-key',
         dest = 'pcr_private_keys',
-        metavar = 'PATH',
-        type = pathlib.Path,
         action = 'append',
-        help = 'private part of the keypair for signing PCR signatures',
+        help = 'private part of the keypair or engine-specific designation for signing PCR signatures',
         config_key = 'PCRSignature:/PCRPrivateKey',
         config_push = ConfigItem.config_set_group,
     ),
@@ -1244,7 +1451,7 @@ CONFIG_ITEMS = [
         metavar = 'PATH',
         type = pathlib.Path,
         action = 'append',
-        help = 'public part of the keypair for signing PCR signatures',
+        help = 'public part of the keypair or engine-specific designation for signing PCR signatures',
         config_key = 'PCRSignature:/PCRPublicKey',
         config_push = ConfigItem.config_set_group,
     ),
@@ -1277,6 +1484,26 @@ CONFIG_ITEMS = [
         action = argparse.BooleanOptionalAction,
         help = 'print systemd-measure output for the UKI',
     ),
+
+    ConfigItem(
+        '--json',
+        choices = ('pretty', 'short', 'off'),
+        default = 'off',
+        help = 'generate JSON output',
+    ),
+    ConfigItem(
+        '-j',
+        dest='json',
+        action='store_const',
+        const='pretty',
+        help='equivalent to --json=pretty',
+    ),
+
+    ConfigItem(
+        '--all',
+        help = 'print all sections',
+        action = 'store_true',
+    ),
 ]
 
 CONFIGFILE_ITEMS = { item.config_key:item
@@ -1286,9 +1513,21 @@ CONFIGFILE_ITEMS = { item.config_key:item
 
 def apply_config(namespace, filename=None):
     if filename is None:
-        filename = namespace.config
-    if filename is None:
-        return
+        if namespace.config:
+            # Config set by the user, use that.
+            filename = namespace.config
+            print(f'Using config file: {filename}')
+        else:
+            # Try to look for a config file then use the first one found.
+            for config_dir in DEFAULT_CONFIG_DIRS:
+                filename = pathlib.Path(config_dir) / DEFAULT_CONFIG_FILE
+                if filename.is_file():
+                    # Found a config file, use it.
+                    print(f'Using found config file: {filename}')
+                    break
+            else:
+                # No config file specified or found, nothing to do.
+                return
 
     # Fill in ._groups based on --pcr-public-key=, --pcr-private-key=, and --phases=.
     assert '_groups' not in namespace
@@ -1305,7 +1544,10 @@ def apply_config(namespace, filename=None):
     # Do not make keys lowercase
     cp.optionxform = lambda option: option
 
-    cp.read(filename)
+    # The API is not great.
+    read = cp.read(filename)
+    if not read:
+        raise IOError(f'Failed to read {filename}')
 
     for section_name, section in cp.items():
         idx = section_name.find(':')
@@ -1352,11 +1594,13 @@ class PagerHelpAction(argparse._HelpAction):  # pylint: disable=protected-access
 def create_parser():
     p = argparse.ArgumentParser(
         description='Build and sign Unified Kernel Images',
+        usage='\n  ' + textwrap.dedent('''\
+          ukify {b}build{e} [--linux=LINUX] [--initrd=INITRD] [options…]
+            ukify {b}genkey{e} [options…]
+            ukify {b}inspect{e} FILE… [options…]
+        ''').format(b=Style.bold, e=Style.reset),
         allow_abbrev=False,
         add_help=False,
-        usage='''\
-ukify [options…] VERB
-''',
         epilog='\n  '.join(('config file:', *config_example())),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1381,12 +1625,20 @@ def finalize_options(opts):
     # Figure out which syntax is being used, one of:
     # ukify verb --arg --arg --arg
     # ukify linux initrd…
-    if len(opts.positional) == 1 and opts.positional[0] in VERBS:
+    if len(opts.positional) >= 1 and opts.positional[0] == 'inspect':
+        opts.verb = opts.positional[0]
+        opts.files = opts.positional[1:]
+        if not opts.files:
+            raise ValueError('file(s) to inspect must be specified')
+        if len(opts.files) > 1 and opts.json != 'off':
+            # We could allow this in the future, but we need to figure out the right structure
+            raise ValueError('JSON output is not allowed with multiple files')
+    elif len(opts.positional) == 1 and opts.positional[0] in VERBS:
         opts.verb = opts.positional[0]
     elif opts.linux or opts.initrd:
         raise ValueError('--linux/--initrd options cannot be used with positional arguments')
     else:
-        print("Assuming obsolete commandline syntax with no verb. Please use 'build'.")
+        print("Assuming obsolete command line syntax with no verb. Please use 'build'.")
         if opts.positional:
             opts.linux = pathlib.Path(opts.positional[0])
         # If we have initrds from parsing config files, append our positional args at the end
@@ -1394,7 +1646,7 @@ def finalize_options(opts):
         opts.verb = 'build'
 
     # Check that --pcr-public-key=, --pcr-private-key=, and --phases=
-    # have either the same number of arguments are are not specified at all.
+    # have either the same number of arguments or are not specified at all.
     n_pcr_pub = None if opts.pcr_public_keys is None else len(opts.pcr_public_keys)
     n_pcr_priv = None if opts.pcr_private_keys is None else len(opts.pcr_private_keys)
     n_phase_path_groups = None if opts.phase_path_groups is None else len(opts.phase_path_groups)
@@ -1406,8 +1658,8 @@ def finalize_options(opts):
     if opts.cmdline and opts.cmdline.startswith('@'):
         opts.cmdline = pathlib.Path(opts.cmdline[1:])
     elif opts.cmdline:
-        # Drop whitespace from the commandline. If we're reading from a file,
-        # we copy the contents verbatim. But configuration specified on the commandline
+        # Drop whitespace from the command line. If we're reading from a file,
+        # we copy the contents verbatim. But configuration specified on the command line
         # or in the config file may contain additional whitespace that has no meaning.
         opts.cmdline = ' '.join(opts.cmdline.split())
 
@@ -1434,12 +1686,19 @@ def finalize_options(opts):
         if opts.sb_cert:
             opts.sb_cert = pathlib.Path(opts.sb_cert)
 
-    if opts.signtool == 'sbsign':
-        if bool(opts.sb_key) ^ bool(opts.sb_cert):
-            raise ValueError('--secureboot-private-key= and --secureboot-certificate= must be specified together when using --signtool=sbsign')
-    else:
-        if not bool(opts.sb_cert_name):
-            raise ValueError('--certificate-name must be specified when using --signtool=pesign')
+    if bool(opts.sb_key) ^ bool(opts.sb_cert):
+        # one param only given, sbsign needs both
+        raise ValueError('--secureboot-private-key= and --secureboot-certificate= must be specified together')
+    elif bool(opts.sb_key) and bool(opts.sb_cert):
+        # both param given, infer sbsign and in case it was given, ensure signtool=sbsign
+        if opts.signtool and opts.signtool != 'sbsign':
+            raise ValueError(f'Cannot provide --signtool={opts.signtool} with --secureboot-private-key= and --secureboot-certificate=')
+        opts.signtool = 'sbsign'
+    elif bool(opts.sb_cert_name):
+        # sb_cert_name given, infer pesign and in case it was given, ensure signtool=pesign
+        if opts.signtool and opts.signtool != 'pesign':
+            raise ValueError(f'Cannot provide --signtool={opts.signtool} with --secureboot-certificate-name=')
+        opts.signtool = 'pesign'
 
     if opts.sign_kernel and not opts.sb_key and not opts.sb_cert_name:
         raise ValueError('--sign-kernel requires either --secureboot-private-key= and --secureboot-certificate= (for sbsign) or --secureboot-certificate-name= (for pesign) to be specified')
@@ -1450,8 +1709,11 @@ def finalize_options(opts):
         suffix = '.efi' if opts.sb_key or opts.sb_cert_name else '.unsigned.efi'
         opts.output = opts.linux.name + suffix
 
-    for section in opts.sections:
-        section.check_name()
+    # Now that we know if we're inputting or outputting, really parse section config
+    f = Section.parse_output if opts.verb == 'inspect' else Section.parse_input
+    opts.sections = [f(s) for s in opts.sections]
+    # A convenience dictionary to make it easy to look up sections
+    opts.sections_by_name = {s.name:s for s in opts.sections}
 
     if opts.summary:
         # TODO: replace pprint() with some fancy formatting.
@@ -1474,6 +1736,8 @@ def main():
     elif opts.verb == 'genkey':
         check_cert_and_keys_nonexistent(opts)
         generate_keys(opts)
+    elif opts.verb == 'inspect':
+        inspect_sections(opts)
     else:
         assert False
 

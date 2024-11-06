@@ -3,7 +3,6 @@
 
 # shellcheck disable=SC2206
 PHASES=(${@:-SETUP RUN RUN_ASAN_UBSAN CLEANUP})
-RELEASE="$(lsb_release -cs)"
 ADDITIONAL_DEPS=(
     clang
     expect
@@ -23,6 +22,7 @@ ADDITIONAL_DEPS=(
     python3-pefile
     python3-pyelftools
     python3-pyparsing
+    python3-pytest
     rpm
     zstd
 )
@@ -42,25 +42,41 @@ set -ex
 
 MESON_ARGS=(-Dcryptolib=${CRYPTOLIB:-auto})
 
+# (Re)set the current oom-{score-}adj. For some reason root on GH actions is able to _decrease_
+# its oom-score even after dropping all capabilities (including CAP_SYS_RESOURCE), until the
+# score is explicitly changed after sudo. No idea what's going on, but it breaks
+# exec-oomscoreadjust-negative.service from test-execute when running unprivileged.
+choom -p $$ -n 0
+
 for phase in "${PHASES[@]}"; do
     case $phase in
         SETUP)
             info "Setup phase"
-            bash -c "echo 'deb-src http://archive.ubuntu.com/ubuntu/ $RELEASE main restricted universe multiverse' >>/etc/apt/sources.list"
-            # PPA with some newer build dependencies
-            add-apt-repository -y ppa:upstream-systemd-ci/systemd-ci
+            # This is added by default, and it is often broken, but we don't need anything from it
+            rm -f /etc/apt/sources.list.d/microsoft-prod.{list,sources}
+            # add-apt-repository --enable-source does not work on deb822 style sources.
+            for f in /etc/apt/sources.list.d/*.sources; do
+                sed -i "s/Types: deb/Types: deb deb-src/g" "$f"
+            done
             apt-get -y update
             apt-get -y build-dep systemd
             apt-get -y install "${ADDITIONAL_DEPS[@]}"
-            pip3 install -r .github/workflows/requirements.txt --require-hashes
+            pip3 install -r .github/workflows/requirements.txt --require-hashes --break-system-packages
+
+            # Make sure the build dir is accessible even when drop privileges, otherwise the unprivileged
+            # part of test-execute gets skipped, since it can't run systemd-executor
+            chmod o+x /home/runner
+            capsh --drop=all -- -c "stat $PWD/meson.build"
             ;;
         RUN|RUN_GCC|RUN_CLANG|RUN_CLANG_RELEASE)
             if [[ "$phase" =~ ^RUN_CLANG ]]; then
                 export CC=clang
                 export CXX=clang++
+                export CFLAGS="-fno-sanitize=function"
+                export CXXFLAGS="-fno-sanitize=function"
                 if [[ "$phase" == RUN_CLANG ]]; then
                     # The docs build is slow and is not affected by compiler/flags, so do it just once
-                    MESON_ARGS+=(-Dman=true)
+                    MESON_ARGS+=(-Dman=enabled)
                 else
                     MESON_ARGS+=(-Dmode=release --optimization=2)
                 fi
@@ -73,7 +89,8 @@ for phase in "${PHASES[@]}"; do
             MESON_ARGS+=(--fatal-meson-warnings)
             run_meson -Dnobody-group=nogroup --werror -Dtests=unsafe -Dslow-tests=true -Dfuzz-tests=true "${MESON_ARGS[@]}" build
             ninja -C build -v
-            meson test -C build --print-errorlogs
+            # Ensure setting a timezone (like the reproducible build tests do) does not break time/date unit tests
+            TZ=GMT+12 meson test -C build --print-errorlogs
             ;;
         RUN_ASAN_UBSAN|RUN_GCC_ASAN_UBSAN|RUN_CLANG_ASAN_UBSAN|RUN_CLANG_ASAN_UBSAN_NO_DEPS)
             MESON_ARGS=(--optimization=1)
@@ -81,13 +98,15 @@ for phase in "${PHASES[@]}"; do
             if [[ "$phase" =~ ^RUN_CLANG_ASAN_UBSAN ]]; then
                 export CC=clang
                 export CXX=clang++
+                export CFLAGS="-fno-sanitize=function"
+                export CXXFLAGS="-fno-sanitize=function"
                 # Build fuzzer regression tests only with clang (for now),
                 # see: https://github.com/systemd/systemd/pull/15886#issuecomment-632689604
                 # -Db_lundef=false: See https://github.com/mesonbuild/meson/issues/764
                 MESON_ARGS+=(-Db_lundef=false -Dfuzz-tests=true)
 
                 if [[ "$phase" == "RUN_CLANG_ASAN_UBSAN_NO_DEPS" ]]; then
-                    MESON_ARGS+=(-Dskip-deps=true)
+                    MESON_ARGS+=(--auto-features=disabled)
                 fi
             fi
             MESON_ARGS+=(--fatal-meson-warnings)

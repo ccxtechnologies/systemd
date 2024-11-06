@@ -5,19 +5,24 @@ set -e
 TEST_DESCRIPTION="Test Soft-Rebooting"
 # We temporarily remount rootfs read-only, so ignore any missing coverage
 IGNORE_MISSING_COVERAGE=yes
+# Prevent shutdown in test suite, the expect script does that manually.
+TEST_SKIP_SHUTDOWN=yes
+IMAGE_NAME="softreboot"
+TEST_NO_NSPAWN=1
+TEST_INSTALL_VERITY_MINIMAL=1
+KERNEL_APPEND="${KERNEL_APPEND:-} systemd.set_credential=kernelcmdlinecred:uff"
 
 # shellcheck source=test/test-functions
 . "$TEST_BASE_DIR/test-functions"
 
+test_require_bin mksquashfs veritysetup sfdisk
+
 test_append_files() {
-    local workspace="${1:?}"
-    # prevent shutdown in test suite, the expect script does that manually.
-    mkdir -p "${workspace:?}/etc/systemd/system/end.service.d"
-    cat >"$workspace/etc/systemd/system/end.service.d/99-override.conf" <<EOF
-[Service]
-ExecStart=
-ExecStart=/bin/true
-EOF
+    instmods squashfs =squashfs
+    instmods dm_verity =md
+    install_dmevent
+    generate_module_dependencies
+    install_verity_minimal
 }
 
 do_test "$@"

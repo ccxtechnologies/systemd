@@ -6,6 +6,7 @@
 #include "escape.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "reboot-util.h"
 #include "unit-printf.h"
 #include "user-util.h"
 #include "unit.h"
@@ -33,12 +34,13 @@ int bus_property_get_triggered_unit(
 BUS_DEFINE_SET_TRANSIENT(mode_t, "u", uint32_t, mode_t, "%04o");
 BUS_DEFINE_SET_TRANSIENT(unsigned, "u", uint32_t, unsigned, "%" PRIu32);
 
-static inline bool valid_user_group_name_or_id_relaxed(const char *u) {
+static bool valid_user_group_name_or_id_relaxed(const char *u) {
         return valid_user_group_name(u, VALID_USER_ALLOW_NUMERIC|VALID_USER_RELAX);
 }
 
 BUS_DEFINE_SET_TRANSIENT_STRING_WITH_CHECK(user_relaxed, valid_user_group_name_or_id_relaxed);
 BUS_DEFINE_SET_TRANSIENT_STRING_WITH_CHECK(path, path_is_absolute);
+BUS_DEFINE_SET_TRANSIENT_STRING_WITH_CHECK(reboot_parameter, reboot_parameter_is_valid);
 
 int bus_set_transient_string(
                 Unit *u,
@@ -151,9 +153,7 @@ int bus_set_transient_usec_internal(
 int bus_verify_manage_units_async_full(
                 Unit *u,
                 const char *verb,
-                int capability,
                 const char *polkit_message,
-                bool interactive,
                 sd_bus_message *call,
                 sd_bus_error *error) {
 
@@ -171,11 +171,8 @@ int bus_verify_manage_units_async_full(
 
         return bus_verify_polkit_async(
                         call,
-                        capability,
                         "org.freedesktop.systemd1.manage-units",
                         details,
-                        interactive,
-                        UID_INVALID,
                         &u->manager->polkit_registry,
                         error);
 }

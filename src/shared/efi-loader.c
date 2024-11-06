@@ -1,13 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
+#include "efi-api.h"
 #include "efi-loader.h"
 #include "env-util.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "stat-util.h"
 #include "strv.h"
-#include "tpm-pcr.h"
+#include "tpm2-pcr.h"
 #include "utf8.h"
 
 #if ENABLE_EFI
@@ -101,7 +102,8 @@ int efi_loader_get_entries(char ***ret) {
         if (r < 0)
                 return r;
 
-        /* The variable contains a series of individually NUL terminated UTF-16 strings. */
+        /* The variable contains a series of individually NUL terminated UTF-16 strings. We gracefully
+         * consider the final NUL byte optional (i.e. the last string may or may not end in a NUL byte).*/
 
         for (size_t i = 0, start = 0;; i++) {
                 _cleanup_free_ char *decoded = NULL;
@@ -115,6 +117,11 @@ int efi_loader_get_entries(char ***ret) {
                 if (!end && entries[i] != 0)
                         continue;
 
+                /* Empty string at the end of variable? That's the trailer, we are done (i.e. we have a final
+                 * NUL terminator). */
+                if (end && start == i)
+                        break;
+
                 /* We reached the end of a string, let's decode it into UTF-8 */
                 decoded = utf16_to_utf8(entries + start, (i - start) * sizeof(char16_t));
                 if (!decoded)
@@ -127,7 +134,8 @@ int efi_loader_get_entries(char ***ret) {
                 } else
                         log_debug("Ignoring invalid loader entry '%s'.", decoded);
 
-                /* We reached the end of the variable */
+                /* Exit the loop if we reached the end of the variable (i.e. we do not have a final NUL
+                 * terminator) */
                 if (end)
                         break;
 
@@ -238,31 +246,35 @@ int efi_stub_get_features(uint64_t *ret) {
         return 0;
 }
 
-int efi_stub_measured(int log_level) {
+int efi_measured_uki(int log_level) {
         _cleanup_free_ char *pcr_string = NULL;
+        static int cached = -1;
         unsigned pcr_nr;
         int r;
 
-        /* Checks if we are booted on a kernel with sd-stub which measured the kernel into PCR 11. Or in
-         * other words, if we are running on a TPM enabled UKI.
+        if (cached >= 0)
+                return cached;
+
+        /* Checks if we are booted on a kernel with sd-stub which measured the kernel into PCR 11 on a TPM2
+         * chip. Or in other words, if we are running on a TPM enabled UKI. (TPM 1.2 situations are ignored.)
          *
          * Returns == 0 and > 0 depending on the result of the test. Returns -EREMOTE if we detected a stub
          * being used, but it measured things into a different PCR than we are configured for in
          * userspace. (i.e. we expect PCR 11 being used for this by both sd-stub and us) */
 
-        r = getenv_bool_secure("SYSTEMD_FORCE_MEASURE"); /* Give user a chance to override the variable test,
+        r = secure_getenv_bool("SYSTEMD_FORCE_MEASURE"); /* Give user a chance to override the variable test,
                                                           * for debugging purposes */
         if (r >= 0)
-                return r;
+                return (cached = r);
         if (r != -ENXIO)
                 log_debug_errno(r, "Failed to parse $SYSTEMD_FORCE_MEASURE, ignoring: %m");
 
-        if (!is_efi_boot())
-                return 0;
+        if (!efi_has_tpm2())
+                return (cached = 0);
 
         r = efi_get_variable_string(EFI_LOADER_VARIABLE(StubPcrKernelImage), &pcr_string);
         if (r == -ENOENT)
-                return 0;
+                return (cached = 0);
         if (r < 0)
                 return log_full_errno(log_level, r,
                                       "Failed to get StubPcrKernelImage EFI variable: %m");
@@ -271,12 +283,12 @@ int efi_stub_measured(int log_level) {
         if (r < 0)
                 return log_full_errno(log_level, r,
                                       "Failed to parse StubPcrKernelImage EFI variable: %s", pcr_string);
-        if (pcr_nr != TPM_PCR_INDEX_KERNEL_IMAGE)
+        if (pcr_nr != TPM2_PCR_KERNEL_BOOT)
                 return log_full_errno(log_level, SYNTHETIC_ERRNO(EREMOTE),
-                                      "Kernel stub measured kernel image into PCR %u, which is different than expected %u.",
-                                      pcr_nr, TPM_PCR_INDEX_KERNEL_IMAGE);
+                                      "Kernel stub measured kernel image into PCR %u, which is different than expected %i.",
+                                      pcr_nr, TPM2_PCR_KERNEL_BOOT);
 
-        return 1;
+        return (cached = 1);
 }
 
 int efi_loader_get_config_timeout_one_shot(usec_t *ret) {

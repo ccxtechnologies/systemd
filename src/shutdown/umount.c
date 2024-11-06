@@ -95,7 +95,7 @@ int mount_points_list_get(const char *mountinfo, MountPoint **head) {
                  * we might lack the rights to unmount these things, hence don't bother. */
                 if (mount_point_is_api(path) ||
                     mount_point_ignore(path) ||
-                    PATH_STARTSWITH_SET(path, "/dev", "/sys", "/proc"))
+                    path_below_api_vfs(path))
                         continue;
 
                 is_api_vfs = fstype_is_api_vfs(fstype);
@@ -222,7 +222,7 @@ static void log_umount_blockers(const char *mnt) {
                         continue;
 
                 _cleanup_free_ char *comm = NULL;
-                r = get_process_comm(pid, &comm);
+                r = pid_get_comm(pid, &comm);
                 if (r < 0) {
                         if (r != -ESRCH) /* process gone by now */
                                 log_debug_errno(r, "Failed to read process name of PID " PID_FMT ": %m", pid);
@@ -241,7 +241,7 @@ static void log_umount_blockers(const char *mnt) {
 }
 
 static int remount_with_timeout(MountPoint *m, bool last_try) {
-        _cleanup_close_pair_ int pfd[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pfd[2] = EBADF_PAIR;
         _cleanup_(sigkill_nowaitp) pid_t pid = 0;
         int r;
 
@@ -297,7 +297,7 @@ static int remount_with_timeout(MountPoint *m, bool last_try) {
 }
 
 static int umount_with_timeout(MountPoint *m, bool last_try) {
-        _cleanup_close_pair_ int pfd[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pfd[2] = EBADF_PAIR;
         _cleanup_(sigkill_nowaitp) pid_t pid = 0;
         int r;
 

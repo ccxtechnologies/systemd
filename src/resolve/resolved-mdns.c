@@ -36,7 +36,7 @@ int manager_mdns_start(Manager *m) {
         if (r < 0)
                 return r;
 
-        if (socket_ipv6_is_supported()) {
+        if (socket_ipv6_is_enabled()) {
                 r = manager_mdns_ipv6_fd(m);
                 if (r == -EADDRINUSE)
                         goto eaddrinuse;
@@ -254,8 +254,9 @@ static int mdns_scope_process_query(DnsScope *s, DnsPacket *p) {
         if (r < 0)
                 return log_debug_errno(r, "Failed to extract resource records from incoming packet: %m");
 
+        /* TODO: Support Known-Answers only packets gracefully. */
         if (dns_question_size(p->question) <= 0)
-                return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Received mDNS query without question, ignoring.");
+                return 0;
 
         unicast_reply = mdns_should_reply_using_unicast(p);
         if (unicast_reply && !sender_on_local_subnet(s, p)) {
@@ -314,7 +315,7 @@ static int mdns_scope_process_query(DnsScope *s, DnsPacket *p) {
                 }
 
                 DNS_ANSWER_FOREACH_ITEM(item, answer) {
-                        DnsAnswerFlags flags = item->flags;
+                        DnsAnswerFlags flags = item->flags | DNS_ANSWER_REFUSE_TTL_NO_MATCH;
                         /* The cache-flush bit must not be set in legacy unicast responses.
                          * See section 6.7 of RFC 6762. */
                         if (legacy_query)
@@ -344,6 +345,33 @@ static int mdns_scope_process_query(DnsScope *s, DnsPacket *p) {
         r = dns_scope_emit_udp(s, -1, AF_UNSPEC, reply);
         if (r < 0)
                 return log_debug_errno(r, "Failed to send reply packet: %m");
+
+        return 0;
+}
+
+static int mdns_goodbye_callback(sd_event_source *s, uint64_t usec, void *userdata) {
+        DnsScope *scope = userdata;
+        int r;
+
+        assert(s);
+        assert(scope);
+
+        scope->mdns_goodbye_event_source = sd_event_source_disable_unref(scope->mdns_goodbye_event_source);
+
+        dns_cache_prune(&scope->cache);
+
+        if (dns_cache_expiry_in_one_second(&scope->cache, usec)) {
+                r = sd_event_add_time_relative(
+                        scope->manager->event,
+                        &scope->mdns_goodbye_event_source,
+                        CLOCK_BOOTTIME,
+                        USEC_PER_SEC,
+                        0,
+                        mdns_goodbye_callback,
+                        scope);
+                if (r < 0)
+                        return log_error_errno(r, "mDNS: Failed to re-schedule goodbye callback: %m");
+        }
 
         return 0;
 }
@@ -406,6 +434,22 @@ static int on_mdns_packet(sd_event_source *s, int fd, uint32_t revents, void *us
                                 log_debug("Got a goodbye packet");
                                 /* See the section 10.1 of RFC6762 */
                                 rr->ttl = 1;
+
+                                /* Look at the cache 1 second later and remove stale entries.
+                                 * This is particularly useful to keep service browsers updated on service removal,
+                                 * as there are no other reliable triggers to propagate that info. */
+                                if (!scope->mdns_goodbye_event_source) {
+                                        r = sd_event_add_time_relative(
+                                                        scope->manager->event,
+                                                        &scope->mdns_goodbye_event_source,
+                                                        CLOCK_BOOTTIME,
+                                                        USEC_PER_SEC,
+                                                        0,
+                                                        mdns_goodbye_callback,
+                                                        scope);
+                                        if (r < 0)
+                                                return r;
+                                }
                         }
                 }
 

@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     concurrency:
       group: ${{ github.workflow }}-${{ toJSON(matrix.env) }}-${{ github.ref }}
       cancel-in-progress: true
@@ -26,13 +26,13 @@ jobs:
       matrix:
         env:
           - { COMPILER: "gcc",   COMPILER_VERSION: "11", LINKER: "bfd",  CRYPTOLIB: "gcrypt"  }
-          - { COMPILER: "gcc",   COMPILER_VERSION: "13", LINKER: "gold", CRYPTOLIB: "openssl" }
+          - { COMPILER: "gcc",   COMPILER_VERSION: "13", LINKER: "mold", CRYPTOLIB: "openssl" }
           - { COMPILER: "clang", COMPILER_VERSION: "14", LINKER: "mold", CRYPTOLIB: "gcrypt"  }
-          - { COMPILER: "clang", COMPILER_VERSION: "15", LINKER: "lld",  CRYPTOLIB: "openssl" }
-          - { COMPILER: "clang", COMPILER_VERSION: "16", LINKER: "bfd",  CRYPTOLIB: "auto"    }
+          - { COMPILER: "clang", COMPILER_VERSION: "16", LINKER: "bfd",  CRYPTOLIB: "openssl" }
+          - { COMPILER: "clang", COMPILER_VERSION: "18", LINKER: "lld",  CRYPTOLIB: "auto"    }
     env: ${{ matrix.env }}
     steps:
       - name: Repository checkout
-        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9
-      - name: ${{ format('Build check ({0}-{1}-{2}-{3})', env.COMPILER, env.COMPILER_VERSION, env.LINKER, env.CRYPTOLIB) }}
-        run: sudo -E .github/workflows/build_test.sh
+        uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29
+      - name: Build check
+        run: .github/workflows/build_test.sh

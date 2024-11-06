@@ -20,7 +20,7 @@
 #include "strv.h"
 #include "varlink.h"
 
-static JsonDispatchFlags json_dispatch_flags = 0;
+static JsonDispatchFlags json_dispatch_flags = JSON_ALLOW_EXTENSIONS;
 
 static void setup_logging(void) {
         log_parse_environment_variables();
@@ -142,9 +142,9 @@ static void resolve_hostname_reply_destroy(ResolveHostnameReply *p) {
 }
 
 static const JsonDispatch resolve_hostname_reply_dispatch_table[] = {
-        { "addresses", JSON_VARIANT_ARRAY,    json_dispatch_variant, offsetof(ResolveHostnameReply, addresses), JSON_MANDATORY },
-        { "name",      JSON_VARIANT_STRING,   json_dispatch_string,  offsetof(ResolveHostnameReply, name),      0              },
-        { "flags",     JSON_VARIANT_UNSIGNED, json_dispatch_uint64,  offsetof(ResolveHostnameReply, flags),     0              },
+        { "addresses", JSON_VARIANT_ARRAY,         json_dispatch_variant, offsetof(ResolveHostnameReply, addresses), JSON_MANDATORY },
+        { "name",      JSON_VARIANT_STRING,        json_dispatch_string,  offsetof(ResolveHostnameReply, name),      0              },
+        { "flags",     _JSON_VARIANT_TYPE_INVALID, json_dispatch_uint64,  offsetof(ResolveHostnameReply, flags),     0              },
         {}
 };
 
@@ -202,9 +202,10 @@ static uint64_t query_flag(
                 const char *name,
                 const int value,
                 uint64_t flag) {
+
         int r;
 
-        r = getenv_bool_secure(name);
+        r = secure_getenv_bool(name);
         if (r >= 0)
                 return r == value ? flag : 0;
         if (r != -ENXIO)
@@ -261,7 +262,7 @@ enum nss_status _nss_resolve_gethostbyname4_r(
          * configuration can distinguish such executed but negative replies from complete failure to
          * talk to resolved). */
         const char *error_id;
-        r = varlink_call(link, "io.systemd.Resolve.ResolveHostname", cparams, &rparams, &error_id, NULL);
+        r = varlink_call(link, "io.systemd.Resolve.ResolveHostname", cparams, &rparams, &error_id);
         if (r < 0)
                 goto fail;
         if (!isempty(error_id)) {
@@ -274,7 +275,7 @@ enum nss_status _nss_resolve_gethostbyname4_r(
                 goto not_found;
         }
 
-        r = json_dispatch(rparams, resolve_hostname_reply_dispatch_table, NULL, json_dispatch_flags, &p);
+        r = json_dispatch(rparams, resolve_hostname_reply_dispatch_table, json_dispatch_flags, &p);
         if (r < 0)
                 goto fail;
         if (json_variant_is_blank_object(p.addresses))
@@ -284,7 +285,7 @@ enum nss_status _nss_resolve_gethostbyname4_r(
         JSON_VARIANT_ARRAY_FOREACH(entry, p.addresses) {
                 AddressParameters q = {};
 
-                r = json_dispatch(entry, address_parameters_dispatch_table, NULL, json_dispatch_flags, &q);
+                r = json_dispatch(entry, address_parameters_dispatch_table, json_dispatch_flags, &q);
                 if (r < 0)
                         goto fail;
 
@@ -322,7 +323,7 @@ enum nss_status _nss_resolve_gethostbyname4_r(
         JSON_VARIANT_ARRAY_FOREACH(entry, p.addresses) {
                 AddressParameters q = {};
 
-                r = json_dispatch(entry, address_parameters_dispatch_table, NULL, json_dispatch_flags, &q);
+                r = json_dispatch(entry, address_parameters_dispatch_table, json_dispatch_flags, &q);
                 if (r < 0)
                         goto fail;
 
@@ -423,7 +424,7 @@ enum nss_status _nss_resolve_gethostbyname3_r(
                 goto fail;
 
         const char *error_id;
-        r = varlink_call(link, "io.systemd.Resolve.ResolveHostname", cparams, &rparams, &error_id, NULL);
+        r = varlink_call(link, "io.systemd.Resolve.ResolveHostname", cparams, &rparams, &error_id);
         if (r < 0)
                 goto fail;
         if (!isempty(error_id)) {
@@ -436,7 +437,7 @@ enum nss_status _nss_resolve_gethostbyname3_r(
                 goto not_found;
         }
 
-        r = json_dispatch(rparams, resolve_hostname_reply_dispatch_table, NULL, json_dispatch_flags, &p);
+        r = json_dispatch(rparams, resolve_hostname_reply_dispatch_table, json_dispatch_flags, &p);
         if (r < 0)
                 goto fail;
         if (json_variant_is_blank_object(p.addresses))
@@ -446,7 +447,7 @@ enum nss_status _nss_resolve_gethostbyname3_r(
         JSON_VARIANT_ARRAY_FOREACH(entry, p.addresses) {
                 AddressParameters q = {};
 
-                r = json_dispatch(entry, address_parameters_dispatch_table, NULL, json_dispatch_flags, &q);
+                r = json_dispatch(entry, address_parameters_dispatch_table, json_dispatch_flags, &q);
                 if (r < 0)
                         goto fail;
 
@@ -492,7 +493,7 @@ enum nss_status _nss_resolve_gethostbyname3_r(
         JSON_VARIANT_ARRAY_FOREACH(entry, p.addresses) {
                 AddressParameters q = {};
 
-                r = json_dispatch(entry, address_parameters_dispatch_table, NULL, json_dispatch_flags, &q);
+                r = json_dispatch(entry, address_parameters_dispatch_table, json_dispatch_flags, &q);
                 if (r < 0)
                         goto fail;
 
@@ -573,8 +574,8 @@ static void resolve_address_reply_destroy(ResolveAddressReply *p) {
 }
 
 static const JsonDispatch resolve_address_reply_dispatch_table[] = {
-        { "names", JSON_VARIANT_ARRAY,    json_dispatch_variant, offsetof(ResolveAddressReply, names), JSON_MANDATORY },
-        { "flags", JSON_VARIANT_UNSIGNED, json_dispatch_uint64,  offsetof(ResolveAddressReply, flags), 0              },
+        { "names", JSON_VARIANT_ARRAY,         json_dispatch_variant, offsetof(ResolveAddressReply, names), JSON_MANDATORY },
+        { "flags", _JSON_VARIANT_TYPE_INVALID, json_dispatch_uint64,  offsetof(ResolveAddressReply, flags), 0              },
         {}
 };
 
@@ -641,7 +642,7 @@ enum nss_status _nss_resolve_gethostbyaddr2_r(
                 goto fail;
 
         const char* error_id;
-        r = varlink_call(link, "io.systemd.Resolve.ResolveAddress", cparams, &rparams, &error_id, NULL);
+        r = varlink_call(link, "io.systemd.Resolve.ResolveAddress", cparams, &rparams, &error_id);
         if (r < 0)
                 goto fail;
         if (!isempty(error_id)) {
@@ -652,7 +653,7 @@ enum nss_status _nss_resolve_gethostbyaddr2_r(
                 goto not_found;
         }
 
-        r = json_dispatch(rparams, resolve_address_reply_dispatch_table, NULL, json_dispatch_flags, &p);
+        r = json_dispatch(rparams, resolve_address_reply_dispatch_table, json_dispatch_flags, &p);
         if (r < 0)
                 goto fail;
         if (json_variant_is_blank_object(p.names))
@@ -663,7 +664,7 @@ enum nss_status _nss_resolve_gethostbyaddr2_r(
         JSON_VARIANT_ARRAY_FOREACH(entry, p.names) {
                 _cleanup_(name_parameters_destroy) NameParameters q = {};
 
-                r = json_dispatch(entry, name_parameters_dispatch_table, NULL, json_dispatch_flags, &q);
+                r = json_dispatch(entry, name_parameters_dispatch_table, json_dispatch_flags, &q);
                 if (r < 0)
                         goto fail;
 
@@ -704,7 +705,7 @@ enum nss_status _nss_resolve_gethostbyaddr2_r(
         JSON_VARIANT_ARRAY_FOREACH(entry, p.names) {
                 _cleanup_(name_parameters_destroy) NameParameters q = {};
 
-                r = json_dispatch(entry, name_parameters_dispatch_table, NULL, json_dispatch_flags, &q);
+                r = json_dispatch(entry, name_parameters_dispatch_table, json_dispatch_flags, &q);
                 if (r < 0)
                         goto fail;
 

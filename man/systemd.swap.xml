@@ -1,6 +1,6 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd.swap" xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -128,6 +128,8 @@
         be activated automatically during boot, unless it is pulled in
         by some other unit. The <option>auto</option> option has the
         opposite meaning and is the default.</para>
+
+        <xi:include href="version-info.xml" xpointer="v218"/>
         </listitem>
       </varlistentry>
 
@@ -139,6 +141,8 @@
         <filename>swap.target</filename>. This means that the boot
         will continue even if this swap device is not activated
         successfully.</para>
+
+        <xi:include href="version-info.xml" xpointer="v218"/>
         </listitem>
       </varlistentry>
 
@@ -159,7 +163,9 @@
         and the discussion of
         <citerefentry project='man-pages'><refentrytitle>wipefs</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         in <citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v240"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -175,9 +181,9 @@
     information about the swap device it supervises. A number of
     options that may be used in this section are shared with other
     unit types. These options are documented in
-    <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-    and
-    <citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+    <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
+    <citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry> and
+    <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
     The options specific to the [Swap] section of swap units are the
     following:</para>
 
@@ -185,7 +191,8 @@
 
       <varlistentry>
         <term><varname>What=</varname></term>
-        <listitem><para>Takes an absolute path of a device node or file to use for paging. See <citerefentry
+        <listitem><para>Takes an absolute path or a fstab-style identifier of a device node or file to use
+        for paging. See <citerefentry
         project='man-pages'><refentrytitle>swapon</refentrytitle><manvolnum>8</manvolnum></citerefentry> for
         details. If this refers to a device node, a dependency on the respective device unit is automatically
         created. (See
@@ -214,7 +221,9 @@
         options among other functionality, if the swap backing device supports the discard or trim operation. (See
         <citerefentry project='man-pages'><refentrytitle>swapon</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         for more information.) Note that the usual specifier expansion is applied to this setting, literal percent
-        characters should hence be written as <literal>%%</literal>.</para></listitem>
+        characters should hence be written as <literal>%%</literal>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v217"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -242,20 +251,20 @@
 
   <refsect1>
       <title>See Also</title>
-      <para>
-        <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd-system.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.device</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry project='man-pages'><refentrytitle>swapon</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd-fstab-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.directives</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-      </para>
+      <para><simplelist type="inline">
+        <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd-system.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.device</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry project='man-pages'><refentrytitle>swapon</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd-fstab-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.directives</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      </simplelist></para>
   </refsect1>
 
 </refentry>

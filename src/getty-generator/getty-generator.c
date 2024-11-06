@@ -94,9 +94,8 @@ static int verify_tty(const char *name) {
         if (fd < 0)
                 return -errno;
 
-        errno = 0;
-        if (isatty(fd) <= 0)
-                return errno_or_else(EIO);
+        if (!isatty_safe(fd))
+                return -errno;
 
         return 0;
 }
@@ -151,7 +150,7 @@ static int add_credential_gettys(void) {
         };
         int r;
 
-        FOREACH_ARRAY(t, table, ELEMENTSOF(table)) {
+        FOREACH_ELEMENT(t, table) {
                 _cleanup_free_ char *b = NULL;
                 size_t sz = 0;
 
@@ -168,9 +167,8 @@ static int add_credential_gettys(void) {
 
                 for (;;) {
                         _cleanup_free_ char *tty = NULL;
-                        char *s;
 
-                        r = read_line(f, PATH_MAX, &tty);
+                        r = read_stripped_line(f, PATH_MAX, &tty);
                         if (r == 0)
                                 break;
                         if (r < 0) {
@@ -178,11 +176,10 @@ static int add_credential_gettys(void) {
                                 break;
                         }
 
-                        s = strstrip(tty);
-                        if (startswith(s, "#"))
+                        if (startswith(tty, "#"))
                                 continue;
 
-                        r = t->func(s);
+                        r = t->func(tty);
                         if (r < 0)
                                 return r;
                 }

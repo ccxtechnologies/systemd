@@ -6,6 +6,7 @@
 
 #include "alloc-util.h"
 #include "conf-files.h"
+#include "env-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
@@ -193,7 +194,7 @@ static int trie_insert(struct trie *trie, struct trie_node *node, const char *se
 
         for (size_t i = 0;; i++) {
                 size_t p;
-                uint8_t c;
+                char c;
                 struct trie_node *child;
 
                 for (p = 0; (c = trie->strings->buf[node->prefix_off + p]); p++) {
@@ -483,7 +484,7 @@ static int import_file(struct trie *trie, const char *filename, uint16_t file_pr
                 if (r == 0)
                         break;
 
-                line_number ++;
+                line_number++;
 
                 /* comment line */
                 if (line[0] == '#')
@@ -709,4 +710,17 @@ bool hwdb_should_reload(sd_hwdb *hwdb) {
         if (timespec_load(&hwdb->st.st_mtim) != timespec_load(&st.st_mtim))
                 return true;
         return false;
+}
+
+int hwdb_bypass(void) {
+        int r;
+
+        r = getenv_bool("SYSTEMD_HWDB_UPDATE_BYPASS");
+        if (r < 0 && r != -ENXIO)
+                log_debug_errno(r, "Failed to parse $SYSTEMD_HWDB_UPDATE_BYPASS, assuming no.");
+        if (r <= 0)
+                return false;
+
+        log_debug("$SYSTEMD_HWDB_UPDATE_BYPASS is enabled, skipping execution.");
+        return true;
 }

@@ -30,7 +30,7 @@ static int spawn_getent(const char *database, const char *key, pid_t *rpid) {
 
         r = safe_fork_full("(getent)",
                            (int[]) { -EBADF, pipe_fds[1], -EBADF }, NULL, 0,
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_REARRANGE_STDIO|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
                            &pid);
         if (r < 0) {
                 safe_close_pair(pipe_fds);
@@ -56,6 +56,8 @@ int change_uid_gid_raw(
                 size_t n_supplementary_gids,
                 bool chown_stdio) {
 
+        int r;
+
         if (!uid_is_valid(uid))
                 uid = 0;
         if (!gid_is_valid(gid))
@@ -67,14 +69,9 @@ int change_uid_gid_raw(
                 (void) fchown(STDERR_FILENO, uid, gid);
         }
 
-        if (setgroups(n_supplementary_gids, supplementary_gids) < 0)
-                return log_error_errno(errno, "Failed to set auxiliary groups: %m");
-
-        if (setresgid(gid, gid, gid) < 0)
-                return log_error_errno(errno, "setresgid() failed: %m");
-
-        if (setresuid(uid, uid, uid) < 0)
-                return log_error_errno(errno, "setresuid() failed: %m");
+        r = fully_set_uid_gid(uid, gid, supplementary_gids, n_supplementary_gids);
+        if (r < 0)
+                return log_error_errno(r, "Changing privileges failed: %m");
 
         return 0;
 }

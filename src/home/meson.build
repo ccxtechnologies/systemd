@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-home_includes = [includes, include_directories('.')]
-
 systemd_homework_sources = files(
         'home-util.c',
+        'homework-blob.c',
         'homework-cifs.c',
         'homework-directory.c',
         'homework-fscrypt.c',
@@ -56,12 +55,81 @@ homectl_sources = files(
         'user-record-util.c',
 )
 
-pam_systemd_home_sym = 'src/home/pam_systemd_home.sym'
-pam_systemd_home_c = files(
+pam_systemd_home_sources = files(
         'home-util.c',
         'pam_systemd_home.c',
         'user-record-util.c',
 )
+
+executables += [
+        libexec_template + {
+                'name' : 'systemd-homework',
+                'conditions' : ['ENABLE_HOMED'],
+                'sources' : systemd_homework_sources,
+                'link_with' : [
+                        libshared,
+                        libshared_fdisk
+                ],
+                'dependencies' : [
+                        libblkid,
+                        libcrypt,
+                        libfdisk,
+                        libopenssl,
+                        libp11kit_cflags,
+                        threads,
+                ],
+        },
+        libexec_template + {
+                'name' : 'systemd-homed',
+                'dbus' : true,
+                'conditions' : ['ENABLE_HOMED'],
+                'sources' : systemd_homed_sources,
+                'include_directories' : includes +
+                                        include_directories('.'),
+                'dependencies' : [
+                        libcrypt,
+                        libm,
+                        libopenssl,
+                        threads,
+                ],
+        },
+        executable_template + {
+                'name' : 'homectl',
+                'public' : true,
+                'conditions' : ['ENABLE_HOMED'],
+                'sources' : homectl_sources,
+                'dependencies' : [
+                        libcrypt,
+                        libdl,
+                        libopenssl,
+                        libp11kit_cflags,
+                        threads,
+                ],
+        },
+        test_template + {
+                'sources' : files('test-homed-regression-31896.c'),
+                'conditions' : ['ENABLE_HOMED'],
+                'type' : 'manual',
+        },
+]
+
+modules += [
+        pam_template + {
+                'name' : 'pam_systemd_home',
+                'conditions' : [
+                        'ENABLE_HOMED',
+                        'HAVE_PAM',
+                ],
+                'sources' : pam_systemd_home_sources,
+                'dependencies' : [
+                        libcrypt,
+                        libpam_misc,
+                        libpam,
+                        threads,
+                ],
+                'version-script' : meson.current_source_dir() / 'pam_systemd_home.sym',
+        },
+]
 
 if conf.get('ENABLE_HOMED') == 1
         install_data('org.freedesktop.home1.conf',
@@ -73,6 +141,10 @@ if conf.get('ENABLE_HOMED') == 1
 
         if install_sysconfdir_samples
                 install_data('homed.conf',
-                             install_dir : pkgsysconfdir)
+                             install_dir : pkgconfigfiledir)
         endif
+
+        meson.add_install_script(sh, '-c',
+                                 ln_s.format(bindir / 'homectl',
+                                             bindir / 'systemd-home-fallback-shell'))
 endif

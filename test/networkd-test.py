@@ -87,6 +87,12 @@ def setUpModule():
     # Ensure the unit directory exists so tests can dump files into it.
     os.makedirs(NETWORK_UNITDIR, exist_ok=True)
 
+    # mask all default .network files
+    if os.path.exists('/usr/lib/systemd/network'):
+        for unit in os.listdir('/usr/lib/systemd/network'):
+            if unit.endswith('.network'):
+                os.symlink('/dev/null', os.path.join(NETWORK_UNITDIR, unit))
+
 
 def tearDownModule():
     global tmpmounts
@@ -188,36 +194,36 @@ class BridgeTest(NetworkdTestingUtilities, unittest.TestCase):
     """Provide common methods for testing networkd against servers."""
 
     def setUp(self):
-        self.write_network('port1.netdev', '''\
+        self.write_network('50-port1.netdev', '''\
 [NetDev]
 Name=port1
 Kind=dummy
 MACAddress=12:34:56:78:9a:bc
 ''')
-        self.write_network('port2.netdev', '''\
+        self.write_network('50-port2.netdev', '''\
 [NetDev]
 Name=port2
 Kind=dummy
 MACAddress=12:34:56:78:9a:bd
 ''')
-        self.write_network('mybridge.netdev', '''\
+        self.write_network('50-mybridge.netdev', '''\
 [NetDev]
 Name=mybridge
 Kind=bridge
 ''')
-        self.write_network('port1.network', '''\
+        self.write_network('50-port1.network', '''\
 [Match]
 Name=port1
 [Network]
 Bridge=mybridge
 ''')
-        self.write_network('port2.network', '''\
+        self.write_network('50-port2.network', '''\
 [Match]
 Name=port2
 [Network]
 Bridge=mybridge
 ''')
-        self.write_network('mybridge.network', '''\
+        self.write_network('50-mybridge.network', '''\
 [Match]
 Name=mybridge
 [Network]
@@ -243,7 +249,7 @@ Gateway=192.168.250.1
 
     def test_bridge_port_priority(self):
         self.assertEqual(self.read_attr('port1', 'brport/priority'), '32')
-        self.write_network_dropin('port1.network', 'priority', '''\
+        self.write_network_dropin('50-port1.network', 'priority', '''\
 [Bridge]
 Priority=28
 ''')
@@ -256,7 +262,7 @@ Priority=28
     def test_bridge_port_priority_set_zero(self):
         """It should be possible to set the bridge port priority to 0"""
         self.assertEqual(self.read_attr('port2', 'brport/priority'), '32')
-        self.write_network_dropin('port2.network', 'priority', '''\
+        self.write_network_dropin('50-port2.network', 'priority', '''\
 [Bridge]
 Priority=0
 ''')
@@ -269,7 +275,7 @@ Priority=0
     def test_bridge_port_property(self):
         """Test the "[Bridge]" section keys"""
         self.assertEqual(self.read_attr('port2', 'brport/priority'), '32')
-        self.write_network_dropin('port2.network', 'property', '''\
+        self.write_network_dropin('50-port2.network', 'property', '''\
 [Bridge]
 UnicastFlood=true
 HairPin=true
@@ -313,7 +319,7 @@ class ClientTestBase(NetworkdTestingUtilities):
         self.if_router = 'router_eth42'
         self.workdir_obj = tempfile.TemporaryDirectory()
         self.workdir = self.workdir_obj.name
-        self.config = 'test_eth42.network'
+        self.config = '50-test_eth42.network'
 
         # get current journal cursor
         subprocess.check_output(['journalctl', '--sync'])
@@ -505,13 +511,13 @@ DHCP={dhcp_mode}
         self.do_test(coldplug=False, ipv6=True)
 
     def test_route_only_dns(self):
-        self.write_network('myvpn.netdev', '''\
+        self.write_network('50-myvpn.netdev', '''\
 [NetDev]
 Name=dummy0
 Kind=dummy
 MACAddress=12:34:56:78:9a:bc
 ''')
-        self.write_network('myvpn.network', '''\
+        self.write_network('50-myvpn.network', '''\
 [Match]
 Name=dummy0
 [Network]
@@ -540,12 +546,12 @@ Domains= ~company
             self.assertNotIn('nameserver 192.168.42.1\n', contents)
 
     def test_route_only_dns_all_domains(self):
-        self.write_network('myvpn.netdev', '''[NetDev]
+        self.write_network('50-myvpn.netdev', '''[NetDev]
 Name=dummy0
 Kind=dummy
 MACAddress=12:34:56:78:9a:bc
 ''')
-        self.write_network('myvpn.network', '''[Match]
+        self.write_network('50-myvpn.network', '''[Match]
 Name=dummy0
 [Network]
 Address=192.168.42.100/24
@@ -646,7 +652,7 @@ class DnsmasqClientTest(ClientTestBase, unittest.TestCase):
         # create interface for generic connections; this will map all DNS names
         # to 192.168.42.1
         self.create_iface(dnsmasq_opts=['--address=/#/192.168.42.1'])
-        self.write_network('general.network', '''\
+        self.write_network('50-general.network', '''\
 [Match]
 Name={}
 [Network]
@@ -672,7 +678,7 @@ DNSSECNegativeTrustAnchors=search.example.com
         self.addCleanup(vpn_dnsmasq.wait)
         self.addCleanup(vpn_dnsmasq.kill)
 
-        self.write_network('vpn.network', '''\
+        self.write_network('50-vpn.network', '''\
 [Match]
 Name=testvpnclient
 [Network]
@@ -882,11 +888,13 @@ class NetworkdClientTest(ClientTestBase, unittest.TestCase):
 set -eu
 mkdir -p /run/systemd/network
 mkdir -p /run/systemd/netif
+mkdir -p /var/lib/systemd/network
 mount -t tmpfs none /run/systemd/network
 mount -t tmpfs none /run/systemd/netif
+mount -t tmpfs none /var/lib/systemd/network
 [ ! -e /run/dbus ] || mount -t tmpfs none /run/dbus
 # create router/client veth pair
-cat <<EOF >/run/systemd/network/test.netdev
+cat <<EOF >/run/systemd/network/50-test.netdev
 [NetDev]
 Name={ifr}
 Kind=veth
@@ -895,7 +903,7 @@ Kind=veth
 Name={ifc}
 EOF
 
-cat <<EOF >/run/systemd/network/test.network
+cat <<EOF >/run/systemd/network/50-test.network
 [Match]
 Name={ifr}
 
@@ -911,6 +919,10 @@ DNS=192.168.5.1
 {dhopts}
 EOF
 
+# For the networkd instance invoked below cannot support varlink connection.
+# Hence, 'networkctl persistent-storage yes' cannot be used.
+export SYSTEMD_NETWORK_PERSISTENT_STORAGE_READY=1
+
 # run networkd as in systemd-networkd.service
 exec $(systemctl cat systemd-networkd.service | sed -n '/^ExecStart=/ {{ s/^.*=//; s/^[@+-]//; s/^!*//; p}}')
 '''.format(ifr=self.if_router,
@@ -924,6 +936,7 @@ exec $(systemctl cat systemd-networkd.service | sed -n '/^ExecStart=/ {{ s/^.*=/
                                '-p', 'InaccessibleDirectories=-/etc/systemd/network',
                                '-p', 'InaccessibleDirectories=-/run/systemd/network',
                                '-p', 'InaccessibleDirectories=-/run/systemd/netif',
+                               '-p', 'InaccessibleDirectories=-/var/lib/systemd/network',
                                '--service-type=notify', script])
 
         # wait until devices got created
@@ -961,13 +974,13 @@ exec $(systemctl cat systemd-networkd.service | sed -n '/^ExecStart=/ {{ s/^.*=/
         # we don't use this interface for this test
         self.if_router = None
 
-        self.write_network('test.netdev', '''\
+        self.write_network('50-test.netdev', '''\
 [NetDev]
 Name=dummy0
 Kind=dummy
 MACAddress=12:34:56:78:9a:bc
 ''')
-        self.write_network('test.network', '''\
+        self.write_network('50-test.network', '''\
 [Match]
 Name=dummy0
 [Network]
@@ -990,20 +1003,20 @@ Domains= one two three four five six seven eight nine ten
         # we don't use this interface for this test
         self.if_router = None
 
-        self.write_network('test.netdev', '''\
+        self.write_network('50-test.netdev', '''\
 [NetDev]
 Name=dummy0
 Kind=dummy
 MACAddress=12:34:56:78:9a:bc
 ''')
-        self.write_network('test.network', '''\
+        self.write_network('50-test.network', '''\
 [Match]
 Name=dummy0
 [Network]
 Address=192.168.42.100/24
 DNS=192.168.42.1
 ''')
-        self.write_network_dropin('test.network', 'dns', '''\
+        self.write_network_dropin('50-test.network', 'dns', '''\
 [Network]
 DNS=127.0.0.1
 ''')
@@ -1011,17 +1024,19 @@ DNS=127.0.0.1
         self.start_unit('systemd-resolved')
         self.start_unit('systemd-networkd')
 
-        for timeout in range(50):
-            with open(RESOLV_CONF) as f:
-                contents = f.read()
-            if ' 127.0.0.1' in contents and '192.168.42.1' in contents:
-                break
-            time.sleep(0.1)
-        self.assertIn('nameserver 192.168.42.1\n', contents)
-        self.assertIn('nameserver 127.0.0.1\n', contents)
+        subprocess.check_call([NETWORKD_WAIT_ONLINE, '--interface', 'dummy0', '--timeout=10'])
 
         out = subprocess.check_output(['networkctl', 'status', 'dummy0'])
-        self.assertIn(b'test.network.d/dns.conf', out)
+        self.assertIn(b'50-test.network.d/dns.conf', out)
+
+        for _ in range(50):
+            with open(RESOLV_CONF) as f:
+                contents = f.read()
+            if 'nameserver 127.0.0.1\n' in contents and 'nameserver 192.168.42.1\n' in contents:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail(f'Expected DNS servers not found in resolv.conf: {contents}')
 
     def test_dhcp_timezone(self):
         '''networkd sets time zone from DHCP'''
@@ -1040,13 +1055,16 @@ DNS=127.0.0.1
         self.create_iface(dhcpserver_opts='EmitTimezone=yes\nTimezone=Pacific/Honolulu')
         self.do_test(coldplug=None, extra_opts='IPv6AcceptRA=false\n[DHCP]\nUseTimezone=true', dhcp_mode='ipv4')
 
-        # should have applied the received timezone
-        try:
-            self.assertEqual(get_tz(), 'Pacific/Honolulu')
-        except AssertionError:
+        # Should have applied the received timezone. This is asynchronous, so we need to wait for a while:
+        for _ in range(20):
+            tz = get_tz()
+            if tz == 'Pacific/Honolulu':
+                break
+            time.sleep(0.5)
+        else:
             self.show_journal('systemd-networkd.service')
-            self.show_journal('systemd-hostnamed.service')
-            raise
+            self.show_journal('systemd-timedated.service')
+            self.fail(f'Timezone: {tz}, expected: Pacific/Honolulu')
 
 
 class MatchClientTest(unittest.TestCase, NetworkdTestingUtilities):
@@ -1066,7 +1084,7 @@ class MatchClientTest(unittest.TestCase, NetworkdTestingUtilities):
     def test_basic_matching(self):
         """Verify the Name= line works throughout this class."""
         self.add_veth_pair('test_if1', 'fake_if2')
-        self.write_network('test.network', "[Match]\nName=test_*\n[Network]")
+        self.write_network('50-test.network', "[Match]\nName=test_*\n[Network]")
         subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
         self.assert_link_states(test_if1='managed', fake_if2='unmanaged')
 
@@ -1077,7 +1095,7 @@ class MatchClientTest(unittest.TestCase, NetworkdTestingUtilities):
         mac = '00:01:02:03:98:99'
         self.add_veth_pair('test_veth', 'test_peer',
                            ['addr', mac], ['addr', mac])
-        self.write_network('no-veth.network', """\
+        self.write_network('50-no-veth.network', """\
 [Match]
 MACAddress={}
 Name=!nonexistent *peer*
@@ -1140,7 +1158,7 @@ class UnmanagedClientTest(unittest.TestCase, NetworkdTestingUtilities):
     def test_catchall_config(self):
         """Verify link states with a catch-all config, hot-plug."""
         # Don't actually catch ALL interfaces.  It messes up the host.
-        self.write_network('all.network', "[Match]\nName=m[01]???\n")
+        self.write_network('50-all.network', "[Match]\nName=m[01]???\n")
         subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
         self.create_iface()
         self.assert_link_states(m1def='managed',
@@ -1151,7 +1169,7 @@ class UnmanagedClientTest(unittest.TestCase, NetworkdTestingUtilities):
     def test_catchall_config_coldplug(self):
         """Verify link states with a catch-all config, cold-plug."""
         # Don't actually catch ALL interfaces.  It messes up the host.
-        self.write_network('all.network', "[Match]\nName=m[01]???\n")
+        self.write_network('50-all.network', "[Match]\nName=m[01]???\n")
         self.create_iface()
         subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
         self.assert_link_states(m1def='managed',

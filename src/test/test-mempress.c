@@ -40,7 +40,7 @@ static void *fake_pressure_thread(void *p) {
         assert_se(cfd >= 0);
         char buf[STRLEN("hello")+1] = {};
         assert_se(read(cfd, buf, sizeof(buf)-1) == sizeof(buf)-1);
-        assert_se(streq(buf, "hello"));
+        ASSERT_STREQ(buf, "hello");
         assert_se(write(cfd, &(const char) { 'z' }, 1) == 1);
 
         return 0;
@@ -188,7 +188,7 @@ TEST(real_pressure) {
         _cleanup_(sd_event_source_unrefp) sd_event_source *es = NULL, *cs = NULL;
         _cleanup_(bus_wait_for_jobs_freep) BusWaitForJobs *w = NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_close_pair_ int pipe_fd[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pipe_fd[2] = EBADF_PAIR;
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
         _cleanup_free_ char *scope = NULL;
         const char *object;
@@ -220,20 +220,20 @@ TEST(real_pressure) {
 
         assert_se(sd_bus_message_read(reply, "o", &object) >= 0);
 
-        assert_se(bus_wait_for_jobs_one(w, object, /* quiet= */ false, /* extra_args= */ NULL) >= 0);
+        assert_se(bus_wait_for_jobs_one(w, object, /* flags= */ BUS_WAIT_JOBS_LOG_ERROR, /* extra_args= */ NULL) >= 0);
 
         assert_se(sd_event_default(&e) >= 0);
 
         assert_se(pipe2(pipe_fd, O_CLOEXEC) >= 0);
 
-        r = safe_fork("(eat-memory)", FORK_RESET_SIGNALS|FORK_DEATHSIG, &pid);
+        r = safe_fork("(eat-memory)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM, &pid);
         assert_se(r >= 0);
         if (r == 0) {
                 real_pressure_eat_memory(pipe_fd[0]);
                 _exit(EXIT_SUCCESS);
         }
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD, -1) >= 0);
+        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD) >= 0);
         assert_se(sd_event_add_child(e, &cs, pid, WEXITED, real_pressure_child_callback, NULL) >= 0);
         assert_se(sd_event_source_set_child_process_own(cs, true) >= 0);
 
@@ -260,7 +260,7 @@ TEST(real_pressure) {
         assert_se(sd_event_source_set_memory_pressure_period(es, 70 * USEC_PER_MSEC, USEC_PER_SEC) == 0);
         assert_se(sd_event_source_set_enabled(es, SD_EVENT_ONESHOT) >= 0);
 
-        _cleanup_free_ char *uo;
+        _cleanup_free_ char *uo = NULL;
         assert_se(uo = unit_dbus_path_from_name(scope));
 
         uint64_t mcurrent = UINT64_MAX;

@@ -6,6 +6,8 @@
 ***/
 
 #include "sd-device.h"
+
+#include "pidref.h"
 #include "unit.h"
 
 typedef struct Swap Swap;
@@ -68,12 +70,13 @@ struct Swap {
         CGroupContext cgroup_context;
 
         ExecRuntime *exec_runtime;
+        CGroupRuntime *cgroup_runtime;
 
         SwapState state, deserialized_state;
 
         ExecCommand* control_command;
         SwapExecCommand control_command_id;
-        pid_t control_pid;
+        PidRef control_pid;
 
         sd_event_source *timer_event_source;
 
@@ -88,6 +91,9 @@ extern const UnitVTable swap_vtable;
 
 int swap_process_device_new(Manager *m, sd_device *dev);
 int swap_process_device_remove(Manager *m, sd_device *dev);
+
+int swap_get_priority(const Swap *s);
+const char* swap_get_options(const Swap *s);
 
 const char* swap_exec_command_to_string(SwapExecCommand i) _const_;
 SwapExecCommand swap_exec_command_from_string(const char *s) _pure_;

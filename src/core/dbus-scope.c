@@ -3,6 +3,7 @@
 #include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-get-properties.h"
+#include "bus-util.h"
 #include "dbus-cgroup.h"
 #include "dbus-kill.h"
 #include "dbus-manager.h"
@@ -84,7 +85,7 @@ static int bus_scope_set_transient_property(
                 return bus_set_transient_oom_policy(u, name, &s->oom_policy, message, flags, error);
 
         if (streq(name, "PIDs")) {
-                _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
+                _cleanup_(pidref_done) PidRef sender_pidref = PIDREF_NULL;
                 unsigned n = 0;
 
                 r = sd_bus_message_enter_container(message, 'a', "u");
@@ -92,8 +93,9 @@ static int bus_scope_set_transient_property(
                         return r;
 
                 for (;;) {
+                        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
                         uint32_t upid;
-                        pid_t pid;
+                        PidRef *p;
 
                         r = sd_bus_message_read(message, "u", &upid);
                         if (r < 0)
@@ -102,24 +104,27 @@ static int bus_scope_set_transient_property(
                                 break;
 
                         if (upid == 0) {
-                                if (!creds) {
-                                        r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_PID, &creds);
+                                if (!pidref_is_set(&sender_pidref)) {
+                                        r = bus_query_sender_pidref(message, &sender_pidref);
                                         if (r < 0)
                                                 return r;
                                 }
 
-                                r = sd_bus_creds_get_pid(creds, &pid);
+                                p = &sender_pidref;
+                        } else {
+                                r = pidref_set_pid(&pidref, upid);
                                 if (r < 0)
                                         return r;
-                        } else
-                                pid = (uid_t) upid;
 
-                        r = unit_pid_attachable(u, pid, error);
+                                p = &pidref;
+                        }
+
+                        r = unit_pid_attachable(u, p, error);
                         if (r < 0)
                                 return r;
 
                         if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
-                                r = unit_watch_pid(u, pid, false);
+                                r = unit_watch_pidref(u, p, /* exclusive= */ false);
                                 if (r < 0 && r != -EEXIST)
                                         return r;
                         }
@@ -131,12 +136,51 @@ static int bus_scope_set_transient_property(
                 if (r < 0)
                         return r;
 
-                if (n <= 0)
-                        return -EINVAL;
+                return n <= 0 ? -EINVAL : 1;
+        }
 
-                return 1;
+        if (streq(name, "PIDFDs")) {
+                unsigned n = 0;
 
-        } else if (streq(name, "Controller")) {
+                r = sd_bus_message_enter_container(message, 'a', "h");
+                if (r < 0)
+                        return r;
+
+                for (;;) {
+                        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+                        int fd;
+
+                        r = sd_bus_message_read(message, "h", &fd);
+                        if (r < 0)
+                                return r;
+                        if (r == 0)
+                                break;
+
+                        r = pidref_set_pidfd(&pidref, fd);
+                        if (r < 0)
+                                return r;
+
+                        r = unit_pid_attachable(u, &pidref, error);
+                        if (r < 0)
+                                return r;
+
+                        if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                                r = unit_watch_pidref(u, &pidref, /* exclusive= */ false);
+                                if (r < 0 && r != -EEXIST)
+                                        return r;
+                        }
+
+                        n++;
+                }
+
+                r = sd_bus_message_exit_container(message);
+                if (r < 0)
+                        return r;
+
+                return n <= 0 ? -EINVAL : 1;
+        }
+
+        if (streq(name, "Controller")) {
                 const char *controller;
 
                 /* We can't support direct connections with this, as direct connections know no service or unique name

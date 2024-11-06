@@ -275,6 +275,7 @@ static int set_local_rtc(int argc, char **argv, void *userdata) {
 }
 
 static int set_ntp(int argc, char **argv, void *userdata) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
         int b, r;
@@ -285,7 +286,16 @@ static int set_ntp(int argc, char **argv, void *userdata) {
         if (b < 0)
                 return log_error_errno(b, "Failed to parse NTP setting '%s': %m", argv[1]);
 
-        r = bus_call_method(bus, bus_timedate, "SetNTP", &error, NULL, "bb", b, arg_ask_password);
+        r = bus_message_new_method_call(bus, &m, bus_timedate, "SetNTP");
+        if (r < 0)
+                return bus_log_create_error(r);
+                
+        r = sd_bus_message_append(m, "bb", b, arg_ask_password);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        /* Reloading the daemon may take long, hence set a longer timeout here */
+        r = sd_bus_call(bus, m, DAEMON_RELOAD_TIMEOUT_SEC, &error, NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to set ntp: %s", bus_error_message(&error, r));
 
@@ -863,6 +873,9 @@ static int help(void) {
                "\nsystemd-timesyncd Commands:\n"
                "  timesync-status          Show status of systemd-timesyncd\n"
                "  show-timesync            Show properties of systemd-timesyncd\n"
+               "  ntp-servers INTERFACE SERVER…\n"
+               "                           Set the interface specific NTP servers\n"
+               "  revert INTERFACE         Revert the interface specific NTP servers\n"
                "\nOptions:\n"
                "  -h --help                Show this help message\n"
                "     --version             Show package version\n"
@@ -875,6 +888,7 @@ static int help(void) {
                "  -p --property=NAME       Show only properties by this name\n"
                "  -a --all                 Show all properties, including empty ones\n"
                "     --value               When showing properties, only print the value\n"
+               "  -P NAME                  Equivalent to --value --property=NAME\n"
                "\nSee the %s for details.\n",
                program_invocation_short_name,
                ansi_highlight(),
@@ -889,7 +903,6 @@ static int verb_help(int argc, char **argv, void *userdata) {
 }
 
 static int parse_argv(int argc, char *argv[]) {
-
         enum {
                 ARG_VERSION = 0x100,
                 ARG_NO_PAGER,
@@ -909,8 +922,8 @@ static int parse_argv(int argc, char *argv[]) {
                 { "adjust-system-clock", no_argument,       NULL, ARG_ADJUST_SYSTEM_CLOCK },
                 { "monitor",             no_argument,       NULL, ARG_MONITOR             },
                 { "property",            required_argument, NULL, 'p'                     },
-                { "all",                 no_argument,       NULL, 'a'                     },
                 { "value",               no_argument,       NULL, ARG_VALUE               },
+                { "all",                 no_argument,       NULL, 'a'                     },
                 {}
         };
 
@@ -919,8 +932,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hH:M:p:a", options, NULL)) >= 0)
-
+        while ((c = getopt_long(argc, argv, "hH:M:p:P:a", options, NULL)) >= 0)
                 switch (c) {
 
                 case 'h':
@@ -955,24 +967,25 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_monitor = true;
                         break;
 
-                case 'p': {
+                case 'p':
+                case 'P':
                         r = strv_extend(&arg_property, optarg);
                         if (r < 0)
                                 return log_oom();
 
-                        /* If the user asked for a particular
-                         * property, show it to them, even if it is
-                         * empty. */
+                        /* If the user asked for a particular property, show it to them, even if empty. */
                         SET_FLAG(arg_print_flags, BUS_PRINT_PROPERTY_SHOW_EMPTY, true);
-                        break;
-                }
 
-                case 'a':
-                        SET_FLAG(arg_print_flags, BUS_PRINT_PROPERTY_SHOW_EMPTY, true);
-                        break;
+                        if (c == 'p')
+                                break;
+                        _fallthrough_;
 
                 case ARG_VALUE:
                         SET_FLAG(arg_print_flags, BUS_PRINT_PROPERTY_ONLY_VALUE, true);
+                        break;
+
+                case 'a':
+                        SET_FLAG(arg_print_flags, BUS_PRINT_PROPERTY_SHOW_EMPTY, true);
                         break;
 
                 case '?':

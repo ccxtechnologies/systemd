@@ -5,9 +5,12 @@
   Copyright © 2017 Intel Corporation. All rights reserved.
 ***/
 
+#include <netinet/icmp6.h>
+
 #include "sd-radv.h"
 
 #include "list.h"
+#include "ndisc-option.h"
 #include "network-common.h"
 #include "sparse-endian.h"
 #include "time-util.h"
@@ -39,6 +42,12 @@
 #define RADV_MIN_ROUTER_LIFETIME_USEC             RADV_MIN_MAX_TIMEOUT_USEC
 #define RADV_MAX_ROUTER_LIFETIME_USEC             (9000 * USEC_PER_SEC)
 #define RADV_DEFAULT_ROUTER_LIFETIME_USEC         (3 * RADV_DEFAULT_MAX_TIMEOUT_USEC)
+/* RFC 4861 section 4.2.
+ * Reachable Time and Retrans Timer
+ * 32-bit unsigned integer. The time, in milliseconds. */
+#define RADV_MAX_UINT32_MSEC_USEC                 (UINT32_MAX * USEC_PER_MSEC)
+#define RADV_MAX_REACHABLE_TIME_USEC              RADV_MAX_UINT32_MSEC_USEC
+#define RADV_MAX_RETRANSMIT_USEC                  RADV_MAX_UINT32_MSEC_USEC
 /* draft-ietf-6man-slaac-renum-02 section 4.1.1.
  * AdvPreferredLifetime: max(AdvDefaultLifetime, 3 * MaxRtrAdvInterval)
  * AdvValidLifetime: 2 * AdvPreferredLifetime */
@@ -55,16 +64,27 @@
 #define RADV_MAX_FINAL_RTR_ADVERTISEMENTS         3
 #define RADV_MIN_DELAY_BETWEEN_RAS                3
 #define RADV_MAX_RA_DELAY_TIME_USEC               (500 * USEC_PER_MSEC)
+/* From RFC 8781 section 4.1
+ * By default, the value of the Scaled Lifetime field SHOULD be set to the lesser of 3 x MaxRtrAdvInterval */
+#define RADV_PREF64_DEFAULT_LIFETIME_USEC         (3 * RADV_DEFAULT_MAX_TIMEOUT_USEC)
+
+#define RADV_RDNSS_MAX_LIFETIME_USEC              (UINT32_MAX * USEC_PER_SEC)
+#define RADV_DNSSL_MAX_LIFETIME_USEC              (UINT32_MAX * USEC_PER_SEC)
+/* rfc6275 7.4 Neighbor Discovery Home Agent Lifetime.
+ * The default value is the same as the Router Lifetime.
+ * The maximum value corresponds to 18.2 hours. 0 MUST NOT be used. */
+#define RADV_HOME_AGENT_MAX_LIFETIME_USEC         (UINT16_MAX * USEC_PER_SEC)
 
 #define RADV_OPT_ROUTE_INFORMATION                24
 #define RADV_OPT_RDNSS                            25
 #define RADV_OPT_DNSSL                            31
+/* Pref64 option type (RFC8781, section 4) */
+#define RADV_OPT_PREF64                           38
 
-enum RAdvState {
+typedef enum RAdvState {
         RADV_STATE_IDLE                      = 0,
         RADV_STATE_ADVERTISING               = 1,
-};
-typedef enum RAdvState RAdvState;
+} RAdvState;
 
 struct sd_radv_opt_dns {
         uint8_t type;
@@ -79,6 +99,7 @@ struct sd_radv {
 
         int ifindex;
         char *ifname;
+        struct in6_addr ipv6ll;
 
         sd_event *event;
         int event_priority;
@@ -86,7 +107,10 @@ struct sd_radv {
         struct ether_addr mac_addr;
         uint8_t hop_limit;
         uint8_t flags;
+        uint8_t preference;
         uint32_t mtu;
+        usec_t reachable_usec;
+        usec_t retransmit_usec;
         usec_t lifetime_usec; /* timespan */
 
         int fd;
@@ -100,9 +124,15 @@ struct sd_radv {
         unsigned n_route_prefixes;
         LIST_HEAD(sd_radv_route_prefix, route_prefixes);
 
+        unsigned n_pref64_prefixes;
+        LIST_HEAD(sd_radv_pref64_prefix, pref64_prefixes);
+
         size_t n_rdnss;
         struct sd_radv_opt_dns *rdnss;
         struct sd_radv_opt_dns *dnssl;
+
+        /* Mobile IPv6 extension: Home Agent Info.  */
+        struct nd_opt_home_agent_info home_agent;
 };
 
 #define radv_prefix_opt__contents {             \
@@ -169,6 +199,19 @@ struct sd_radv_route_prefix {
         usec_t lifetime_usec;
         /* This is a point in time specified with clock_boottime_or_monotonic(), NOT a timespan. */
         usec_t valid_until;
+};
+
+struct sd_radv_pref64_prefix {
+        unsigned n_ref;
+
+        struct nd_opt_prefix64_info opt;
+
+        struct in6_addr in6_addr;
+        uint8_t prefixlen;
+
+        usec_t lifetime_usec;
+
+        LIST_FIELDS(struct sd_radv_pref64_prefix, prefix);
 };
 
 #define log_radv_errno(radv, error, fmt, ...)           \

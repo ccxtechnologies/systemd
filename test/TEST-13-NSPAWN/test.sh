@@ -5,19 +5,26 @@ set -e
 TEST_DESCRIPTION="systemd-nspawn tests"
 IMAGE_NAME="nspawn"
 TEST_NO_NSPAWN=1
+IMAGE_ADDITIONAL_ROOT_SIZE=500
+TEST_FORCE_NEWIMAGE=1
 
 # shellcheck source=test/test-functions
 . "${TEST_BASE_DIR:?}/test-functions"
 
 test_append_files() {
     local workspace="${1:?}"
-    local container="$workspace/testsuite-13-container-template"
+    local container="$workspace/usr/share/TEST-13-NSPAWN-container-template"
+
+    # For virtual wlan interface.
+    instmods mac80211_hwsim
+    generate_module_dependencies
 
     # Create a dummy container "template" with a minimal toolset, which we can
     # then use as a base for our nspawn/machinectl tests
     initdir="$container" setup_basic_dirs
     initdir="$container" image_install \
         bash \
+        env \
         cat \
         hostname \
         grep \

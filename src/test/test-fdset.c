@@ -11,8 +11,8 @@
 #include "tmpfile-util.h"
 
 TEST(fdset_new_fill) {
-        int fd = -EBADF;
         _cleanup_fdset_free_ FDSet *fdset = NULL;
+        int fd = -EBADF, flags;
 
         log_close();
         log_set_open_when_needed(true);
@@ -50,6 +50,9 @@ TEST(fdset_new_fill) {
 
         assert_se(fdset_new_fill(/* filter_cloexec= */ 0, &fdset) >= 0);
         assert_se(fdset_contains(fdset, fd));
+        flags = fcntl(fd, F_GETFD);
+        assert_se(flags >= 0);
+        assert_se(FLAGS_SET(flags, FD_CLOEXEC));
         fdset = fdset_free(fdset);
         assert_se(fcntl(fd, F_GETFD) < 0);
         assert_se(errno == EBADF);
@@ -113,9 +116,18 @@ TEST(fdset_close_others) {
         copyfd = fdset_put_dup(fdset, fd);
         assert_se(copyfd >= 0);
 
+        /* fdset_close_others() will close any logging file descriptors as well, so close them beforehand
+         * and reopen them again afterwards. */
+        log_close();
         assert_se(fdset_close_others(fdset) >= 0);
+
         flags = fcntl(fd, F_GETFD);
         assert_se(flags < 0);
+
+        /* Open log again after checking that fd is invalid, since reopening the log might make fd a valid
+         * file descriptor again. */
+        (void) log_open();
+
         flags = fcntl(copyfd, F_GETFD);
         assert_se(flags >= 0);
 }

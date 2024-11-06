@@ -16,11 +16,13 @@ test_append_files() {
         instmods dm_verity =md
         instmods erofs
         generate_module_dependencies
+        image_install veritysetup
         image_install -o mksquashfs
         image_install -o mkfs.erofs
     fi
 
     inst_binary mcopy
+    image_install mkswap
     if command -v openssl >/dev/null 2>&1; then
         inst_binary openssl
     fi

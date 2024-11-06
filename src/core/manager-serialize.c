@@ -18,28 +18,17 @@
 #include "varlink-internal.h"
 
 int manager_open_serialization(Manager *m, FILE **ret_f) {
-        _cleanup_close_ int fd = -EBADF;
-        FILE *f;
-
         assert(ret_f);
 
-        fd = open_serialization_fd("systemd-state");
-        if (fd < 0)
-                return fd;
-
-        f = take_fdopen(&fd, "w+");
-        if (!f)
-                return -errno;
-
-        *ret_f = f;
-        return 0;
+        return open_serialization_file("systemd-state", ret_f);
 }
 
-static bool manager_timestamp_shall_serialize(ManagerTimestamp t) {
-        if (!in_initrd())
+static bool manager_timestamp_shall_serialize(ManagerObjective o, ManagerTimestamp t) {
+        if (!in_initrd() && o != MANAGER_SOFT_REBOOT)
                 return true;
 
-        /* The following timestamps only apply to the host system, hence only serialize them there */
+        /* The following timestamps only apply to the host system (or first boot in case of soft-reboot),
+         * hence only serialize them there. */
         return !IN_SET(t,
                        MANAGER_TIMESTAMP_USERSPACE, MANAGER_TIMESTAMP_FINISH,
                        MANAGER_TIMESTAMP_SECURITY_START, MANAGER_TIMESTAMP_SECURITY_FINISH,
@@ -101,7 +90,6 @@ int manager_serialize(
         (void) serialize_item_format(f, "current-job-id", "%" PRIu32, m->current_job_id);
         (void) serialize_item_format(f, "n-installed-jobs", "%u", m->n_installed_jobs);
         (void) serialize_item_format(f, "n-failed-jobs", "%u", m->n_failed_jobs);
-        (void) serialize_bool(f, "taint-usr", m->taint_usr);
         (void) serialize_bool(f, "ready-sent", m->ready_sent);
         (void) serialize_bool(f, "taint-logged", m->taint_logged);
         (void) serialize_bool(f, "service-watchdogs", m->service_watchdogs);
@@ -121,10 +109,13 @@ int manager_serialize(
         (void) serialize_usec(f, "pretimeout-watchdog-overridden", m->watchdog_overridden[WATCHDOG_PRETIMEOUT]);
         (void) serialize_item(f, "pretimeout-watchdog-governor-overridden", m->watchdog_pretimeout_governor_overridden);
 
+        (void) serialize_item(f, "previous-objective", manager_objective_to_string(m->objective));
+        (void) serialize_item_format(f, "soft-reboots-count", "%u", m->soft_reboots_count);
+
         for (ManagerTimestamp q = 0; q < _MANAGER_TIMESTAMP_MAX; q++) {
                 _cleanup_free_ char *joined = NULL;
 
-                if (!manager_timestamp_shall_serialize(q))
+                if (!manager_timestamp_shall_serialize(m->objective, q))
                         continue;
 
                 joined = strjoin(manager_timestamp_to_string(q), "-timestamp");
@@ -152,26 +143,19 @@ int manager_serialize(
         }
 
         if (m->user_lookup_fds[0] >= 0) {
-                int copy0, copy1;
-
-                copy0 = fdset_put_dup(fds, m->user_lookup_fds[0]);
-                if (copy0 < 0)
-                        return log_error_errno(copy0, "Failed to add user lookup fd to serialization: %m");
-
-                copy1 = fdset_put_dup(fds, m->user_lookup_fds[1]);
-                if (copy1 < 0)
-                        return log_error_errno(copy1, "Failed to add user lookup fd to serialization: %m");
-
-                (void) serialize_item_format(f, "user-lookup", "%i %i", copy0, copy1);
+                r = serialize_fd_many(f, fds, "user-lookup", m->user_lookup_fds, 2);
+                if (r < 0)
+                        return r;
         }
 
-        (void) serialize_item_format(f,
-                                     "dump-ratelimit",
-                                     USEC_FMT " " USEC_FMT " %u %u",
-                                     m->dump_ratelimit.begin,
-                                     m->dump_ratelimit.interval,
-                                     m->dump_ratelimit.num,
-                                     m->dump_ratelimit.burst);
+        if (m->handoff_timestamp_fds[0] >= 0) {
+                r = serialize_fd_many(f, fds, "handoff-timestamp-fds", m->handoff_timestamp_fds, 2);
+                if (r < 0)
+                        return r;
+        }
+
+        (void) serialize_ratelimit(f, "dump-ratelimit", &m->dump_ratelimit);
+        (void) serialize_ratelimit(f, "reload-reexec-ratelimit", &m->reload_reexec_ratelimit);
 
         bus_track_serialize(m->subscribed, f, "subscribed");
 
@@ -196,7 +180,7 @@ int manager_serialize(
                 if (u->id != t)
                         continue;
 
-                r = unit_serialize(u, f, fds, switching_root);
+                r = unit_serialize_state(u, f, fds, switching_root);
                 if (r < 0)
                         return r;
         }
@@ -223,7 +207,7 @@ static int manager_deserialize_one_unit(Manager *m, const char *name, FILE *f, F
                 return log_notice_errno(r, "Failed to load unit \"%s\", skipping deserialization: %m", name);
         }
 
-        r = unit_deserialize(u, f, fds);
+        r = unit_deserialize_state(u, f, fds);
         if (r < 0) {
                 if (r == -ENOMEM)
                         return r;
@@ -234,25 +218,23 @@ static int manager_deserialize_one_unit(Manager *m, const char *name, FILE *f, F
 }
 
 static int manager_deserialize_units(Manager *m, FILE *f, FDSet *fds) {
-        const char *unit_name;
         int r;
 
         for (;;) {
                 _cleanup_free_ char *line = NULL;
+
                 /* Start marker */
-                r = read_line(f, LONG_LINE_MAX, &line);
+                r = read_stripped_line(f, LONG_LINE_MAX, &line);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read serialization line: %m");
                 if (r == 0)
                         break;
 
-                unit_name = strstrip(line);
-
-                r = manager_deserialize_one_unit(m, unit_name, f, fds);
+                r = manager_deserialize_one_unit(m, line, f, fds);
                 if (r == -ENOMEM)
                         return r;
                 if (r < 0) {
-                        r = unit_deserialize_skip(f);
+                        r = unit_deserialize_state_skip(f);
                         if (r < 0)
                                 return r;
                 }
@@ -339,17 +321,13 @@ int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
         _cleanup_(manager_reloading_stopp) _unused_ Manager *reloading = manager_reloading_start(m);
 
         for (;;) {
-                _cleanup_free_ char *line = NULL;
-                const char *val, *l;
+                _cleanup_free_ char *l = NULL;
+                const char *val;
 
-                r = read_line(f, LONG_LINE_MAX, &line);
+                r = deserialize_read_line(f, &l);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to read serialization line: %m");
-                if (r == 0)
-                        break;
-
-                l = strstrip(line);
-                if (isempty(l)) /* end marker */
+                        return r;
+                if (r == 0) /* eof or end marker */
                         break;
 
                 if ((val = startswith(l, "current-job-id="))) {
@@ -375,15 +353,6 @@ int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
                                 log_notice("Failed to parse failed jobs counter '%s', ignoring.", val);
                         else
                                 m->n_failed_jobs += n;
-
-                } else if ((val = startswith(l, "taint-usr="))) {
-                        int b;
-
-                        b = parse_boolean(val);
-                        if (b < 0)
-                                log_notice("Failed to parse taint /usr flag '%s', ignoring.", val);
-                        else
-                                m->taint_usr = m->taint_usr || b;
 
                 } else if ((val = startswith(l, "ready-sent="))) {
                         int b;
@@ -476,20 +445,18 @@ int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
                         if (r < 0)
                                 return r;
 
-                } else if (startswith(l, "env=")) {
-                        r = deserialize_environment(l + 4, &m->client_environment);
+                } else if ((val = startswith(l, "env="))) {
+                        r = deserialize_environment(val, &m->client_environment);
                         if (r < 0)
-                                log_notice_errno(r, "Failed to parse environment entry: \"%s\", ignoring: %m", l);
+                                log_notice_errno(r, "Failed to parse environment entry: \"%s\", ignoring: %m", val);
 
                 } else if ((val = startswith(l, "notify-fd="))) {
                         int fd;
 
-                        if ((fd = parse_fd(val)) < 0 || !fdset_contains(fds, fd))
-                                log_notice("Failed to parse notify fd, ignoring: \"%s\"", val);
-                        else {
+                        fd = deserialize_fd(fds, val);
+                        if (fd >= 0) {
                                 m->notify_event_source = sd_event_source_disable_unref(m->notify_event_source);
-                                safe_close(m->notify_fd);
-                                m->notify_fd = fdset_remove(fds, fd);
+                                close_and_replace(m->notify_fd, fd);
                         }
 
                 } else if ((val = startswith(l, "notify-socket="))) {
@@ -500,28 +467,32 @@ int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
                 } else if ((val = startswith(l, "cgroups-agent-fd="))) {
                         int fd;
 
-                        if ((fd = parse_fd(val)) < 0 || !fdset_contains(fds, fd))
-                                log_notice("Failed to parse cgroups agent fd, ignoring.: %s", val);
-                        else {
+                        fd = deserialize_fd(fds, val);
+                        if (fd >= 0) {
                                 m->cgroups_agent_event_source = sd_event_source_disable_unref(m->cgroups_agent_event_source);
-                                safe_close(m->cgroups_agent_fd);
-                                m->cgroups_agent_fd = fdset_remove(fds, fd);
+                                close_and_replace(m->cgroups_agent_fd, fd);
                         }
 
                 } else if ((val = startswith(l, "user-lookup="))) {
-                        int fd0, fd1;
 
-                        if (sscanf(val, "%i %i", &fd0, &fd1) != 2 || fd0 < 0 || fd1 < 0 || fd0 == fd1 || !fdset_contains(fds, fd0) || !fdset_contains(fds, fd1))
-                                log_notice("Failed to parse user lookup fd, ignoring: %s", val);
-                        else {
-                                m->user_lookup_event_source = sd_event_source_disable_unref(m->user_lookup_event_source);
-                                safe_close_pair(m->user_lookup_fds);
-                                m->user_lookup_fds[0] = fdset_remove(fds, fd0);
-                                m->user_lookup_fds[1] = fdset_remove(fds, fd1);
-                        }
+                        m->user_lookup_event_source = sd_event_source_disable_unref(m->user_lookup_event_source);
+                        safe_close_pair(m->user_lookup_fds);
+
+                        r = deserialize_fd_many(fds, val, 2, m->user_lookup_fds);
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to parse user-lookup fds: \"%s\", ignoring: %m", val);
+
+                } else if ((val = startswith(l, "handoff-timestamp-fds="))) {
+
+                        m->handoff_timestamp_event_source = sd_event_source_disable_unref(m->handoff_timestamp_event_source);
+                        safe_close_pair(m->handoff_timestamp_fds);
+
+                        r = deserialize_fd_many(fds, val, 2, m->handoff_timestamp_fds);
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to parse handoff-timestamp fds: \"%s\", ignoring: %m", val);
 
                 } else if ((val = startswith(l, "dynamic-user=")))
-                        dynamic_user_deserialize_one(m, val, fds);
+                        dynamic_user_deserialize_one(m, val, fds, NULL);
                 else if ((val = startswith(l, "destroy-ipc-uid=")))
                         manager_deserialize_uid_refs_one(m, val);
                 else if ((val = startswith(l, "destroy-ipc-gid=")))
@@ -530,48 +501,45 @@ int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
                         (void) exec_shared_runtime_deserialize_one(m, val, fds);
                 else if ((val = startswith(l, "subscribed="))) {
 
-                        if (strv_extend(&m->deserialized_subscribed, val) < 0)
-                                return -ENOMEM;
+                        r = strv_extend(&m->deserialized_subscribed, val);
+                        if (r < 0)
+                                return r;
                 } else if ((val = startswith(l, "varlink-server-socket-address="))) {
                         if (!m->varlink_server && MANAGER_IS_SYSTEM(m)) {
-                                _cleanup_(varlink_server_unrefp) VarlinkServer *s = NULL;
-
-                                r = manager_setup_varlink_server(m, &s);
+                                r = manager_varlink_init(m);
                                 if (r < 0) {
                                         log_warning_errno(r, "Failed to setup varlink server, ignoring: %m");
                                         continue;
                                 }
 
-                                r = varlink_server_attach_event(s, m->event, SD_EVENT_PRIORITY_NORMAL);
-                                if (r < 0) {
-                                        log_warning_errno(r, "Failed to attach varlink connection to event loop, ignoring: %m");
-                                        continue;
-                                }
-
-                                m->varlink_server = TAKE_PTR(s);
                                 deserialize_varlink_sockets = true;
                         }
 
-                        /* To void unnecessary deserialization (i.e. during reload vs. reexec) we only deserialize
+                        /* To avoid unnecessary deserialization (i.e. during reload vs. reexec) we only deserialize
                          * the FDs if we had to create a new m->varlink_server. The deserialize_varlink_sockets flag
                          * is initialized outside of the loop, is flipped after the VarlinkServer is setup, and
                          * remains set until all serialized contents are handled. */
                         if (deserialize_varlink_sockets)
                                 (void) varlink_server_deserialize_one(m->varlink_server, val, fds);
-                } else if ((val = startswith(l, "dump-ratelimit="))) {
-                        usec_t begin, interval;
-                        unsigned num, burst;
+                } else if ((val = startswith(l, "dump-ratelimit=")))
+                        deserialize_ratelimit(&m->dump_ratelimit, "dump-ratelimit", val);
+                else if ((val = startswith(l, "reload-reexec-ratelimit=")))
+                        deserialize_ratelimit(&m->reload_reexec_ratelimit, "reload-reexec-ratelimit", val);
+                else if ((val = startswith(l, "soft-reboots-count="))) {
+                        unsigned n;
 
-                        if (sscanf(val, USEC_FMT " " USEC_FMT " %u %u", &begin, &interval, &num, &burst) != 4)
-                                log_notice("Failed to parse dump ratelimit, ignoring: %s", val);
-                        else {
-                                /* If we changed the values across versions, flush the counter */
-                                if (interval != m->dump_ratelimit.interval || burst != m->dump_ratelimit.burst)
-                                        m->dump_ratelimit.num = 0;
-                                else
-                                        m->dump_ratelimit.num = num;
-                                m->dump_ratelimit.begin = begin;
-                        }
+                        if (safe_atou(val, &n) < 0)
+                                log_notice("Failed to parse soft reboots counter '%s', ignoring.", val);
+                        else
+                                m->soft_reboots_count = n;
+                } else if ((val = startswith(l, "previous-objective="))) {
+                        ManagerObjective objective;
+
+                        objective = manager_objective_from_string(val);
+                        if (objective < 0)
+                                log_notice("Failed to parse previous objective '%s', ignoring.", val);
+                        else
+                                m->previous_objective = objective;
 
                 } else {
                         ManagerTimestamp q;

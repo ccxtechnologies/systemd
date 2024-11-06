@@ -1,9 +1,10 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
-<refentry id="systemd-journald.service">
+<refentry id="systemd-journald.service"
+          xmlns:xi="http://www.w3.org/2001/XInclude">
 
   <refentryinfo>
     <title>systemd-journald.service</title>
@@ -28,14 +29,16 @@
   </refnamediv>
 
   <refsynopsisdiv>
-    <para><filename>systemd-journald.service</filename></para>
-    <para><filename>systemd-journald.socket</filename></para>
-    <para><filename>systemd-journald-dev-log.socket</filename></para>
-    <para><filename>systemd-journald-audit.socket</filename></para>
-    <para><filename>systemd-journald@.service</filename></para>
-    <para><filename>systemd-journald@.socket</filename></para>
-    <para><filename>systemd-journald-varlink@.socket</filename></para>
-    <para><filename>/usr/lib/systemd/systemd-journald</filename></para>
+    <para><simplelist>
+      <member><filename>systemd-journald.service</filename></member>
+      <member><filename>systemd-journald.socket</filename></member>
+      <member><filename>systemd-journald-dev-log.socket</filename></member>
+      <member><filename>systemd-journald-audit.socket</filename></member>
+      <member><filename>systemd-journald@.service</filename></member>
+      <member><filename>systemd-journald@.socket</filename></member>
+      <member><filename>systemd-journald-varlink@.socket</filename></member>
+      <member><filename>/usr/lib/systemd/systemd-journald</filename></member>
+    </simplelist></para>
   </refsynopsisdiv>
 
   <refsect1>
@@ -190,7 +193,9 @@ systemd-tmpfiles --create --prefix /var/log/journal</programlisting>
         <command>journalctl --flush</command> command to request flushing of the journal files, and wait for
         the operation to complete. See
         <citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
-        details.</para></listitem>
+        details.</para>
+
+        <xi:include href="version-info.xml" xpointer="v186"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -198,7 +203,9 @@ systemd-tmpfiles --create --prefix /var/log/journal</programlisting>
 
         <listitem><para>Request immediate rotation of the journal files. Use the <command>journalctl
         --rotate</command> command to request journal file rotation, and wait for the operation to
-        complete.</para></listitem>
+        complete.</para>
+
+        <xi:include href="version-info.xml" xpointer="v186"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -206,7 +213,40 @@ systemd-tmpfiles --create --prefix /var/log/journal</programlisting>
 
         <listitem><para>Request that all unwritten log data is written to disk. Use the <command>journalctl
         --sync</command> command to trigger journal synchronization, and wait for the operation to
-        complete.</para></listitem>
+        complete.</para>
+
+        <xi:include href="version-info.xml" xpointer="v228"/></listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
+    <title>Credentials</title>
+
+    <para><command>systemd-journald</command> supports the service credentials logic as implemented by
+    <varname>ImportCredential=</varname>/<varname>LoadCredential=</varname>/<varname>SetCredential=</varname>
+    (see <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
+    details). The following credentials are used when passed in:</para>
+
+    <variablelist class='system-credentials'>
+      <varlistentry>
+        <term><varname>journal.forward_to_socket</varname></term>
+
+        <listitem><para>May contain a socket address to which logs should be forwarded. See
+        <varname>ForwardToSocket=</varname> in
+        <citerefentry><refentrytitle>journald.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v256"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>journal.storage</varname></term>
+
+        <listitem><para>May be used to specify where journal files should be stored. See
+        <varname>Storage=</varname> in
+        <citerefentry><refentrytitle>journald.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v256"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -233,8 +273,28 @@ systemd-tmpfiles --create --prefix /var/log/journal</programlisting>
         <para>See
         <citerefentry><refentrytitle>journald.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
         for information about these settings.</para>
+
+        <xi:include href="version-info.xml" xpointer="v186"/>
         </listitem>
 
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>systemd.journald.max_level_store=</varname></term>
+        <term><varname>systemd.journald.max_level_syslog=</varname></term>
+        <term><varname>systemd.journald.max_level_kmsg=</varname></term>
+        <term><varname>systemd.journald.max_level_console=</varname></term>
+        <term><varname>systemd.journald.max_level_wall=</varname></term>
+        <term><varname>systemd.journald.max_level_socket=</varname></term>
+
+        <listitem><para>Controls the maximum log level of messages that are stored in the journal, forwarded
+        to syslog, kmsg, the console, the wall, or a socket. This kernel command line options override the
+        settings of the same names in the
+        <citerefentry><refentrytitle>journald.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        file.</para>
+
+        <xi:include href="version-info.xml" xpointer="v232"/>
+        </listitem>
       </varlistentry>
     </variablelist>
 
@@ -281,7 +341,9 @@ systemd-tmpfiles --create --prefix /var/log/journal</programlisting>
 
         <listitem><para>Configure <command>systemd-journald</command> behavior. See
         <citerefentry><refentrytitle>journald.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v206"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -319,7 +381,9 @@ systemd-tmpfiles --create --prefix /var/log/journal</programlisting>
         archived journal files to limit disk use. See <varname>SystemMaxUse=</varname>
         and related settings in
         <citerefentry><refentrytitle>journald.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v206"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -334,7 +398,9 @@ systemd-tmpfiles --create --prefix /var/log/journal</programlisting>
         <command>systemd-journald</command> can listen for audit events using <citerefentry
         project='man-pages'><refentrytitle>netlink</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
         depending on whether <literal>systemd-journald-audit.socket</literal> is enabled or
-        not.</para></listitem>
+        not.</para>
+
+        <xi:include href="version-info.xml" xpointer="v228"/></listitem>
       </varlistentry>
     </variablelist>
 
@@ -343,17 +409,17 @@ systemd-tmpfiles --create --prefix /var/log/journal</programlisting>
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>journald.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-journal</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-coredump</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>setfacl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_journal_print</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <command>pydoc systemd.journal</command>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>journald.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-journal</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-coredump</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>setfacl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_journal_print</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><command>pydoc systemd.journal</command></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

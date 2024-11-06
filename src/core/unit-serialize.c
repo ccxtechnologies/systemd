@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "bpf-restrict-ifaces.h"
 #include "bpf-socket-bind.h"
 #include "bus-util.h"
 #include "dbus.h"
@@ -7,28 +8,10 @@
 #include "fileio.h"
 #include "format-util.h"
 #include "parse-util.h"
-#include "restrict-ifaces.h"
 #include "serialize.h"
 #include "string-table.h"
 #include "unit-serialize.h"
 #include "user-util.h"
-
-static int serialize_cgroup_mask(FILE *f, const char *key, CGroupMask mask) {
-        _cleanup_free_ char *s = NULL;
-        int r;
-
-        assert(f);
-        assert(key);
-
-        if (mask == 0)
-                return 0;
-
-        r = cg_mask_to_string(mask, &s);
-        if (r < 0)
-                return log_error_errno(r, "Failed to format cgroup mask: %m");
-
-        return serialize_item(f, key, s);
-}
 
 /* Make sure out values fit in the bitfield. */
 assert_cc(_UNIT_MARKER_MAX <= sizeof(((Unit){}).markers) * 8);
@@ -69,28 +52,7 @@ static int deserialize_markers(Unit *u, const char *value) {
         }
 }
 
-static const char *const ip_accounting_metric_field[_CGROUP_IP_ACCOUNTING_METRIC_MAX] = {
-        [CGROUP_IP_INGRESS_BYTES] = "ip-accounting-ingress-bytes",
-        [CGROUP_IP_INGRESS_PACKETS] = "ip-accounting-ingress-packets",
-        [CGROUP_IP_EGRESS_BYTES] = "ip-accounting-egress-bytes",
-        [CGROUP_IP_EGRESS_PACKETS] = "ip-accounting-egress-packets",
-};
-
-static const char *const io_accounting_metric_field_base[_CGROUP_IO_ACCOUNTING_METRIC_MAX] = {
-        [CGROUP_IO_READ_BYTES] = "io-accounting-read-bytes-base",
-        [CGROUP_IO_WRITE_BYTES] = "io-accounting-write-bytes-base",
-        [CGROUP_IO_READ_OPERATIONS] = "io-accounting-read-operations-base",
-        [CGROUP_IO_WRITE_OPERATIONS] = "io-accounting-write-operations-base",
-};
-
-static const char *const io_accounting_metric_field_last[_CGROUP_IO_ACCOUNTING_METRIC_MAX] = {
-        [CGROUP_IO_READ_BYTES] = "io-accounting-read-bytes-last",
-        [CGROUP_IO_WRITE_BYTES] = "io-accounting-write-bytes-last",
-        [CGROUP_IO_READ_OPERATIONS] = "io-accounting-read-operations-last",
-        [CGROUP_IO_WRITE_OPERATIONS] = "io-accounting-write-operations-last",
-};
-
-int unit_serialize(Unit *u, FILE *f, FDSet *fds, bool switching_root) {
+int unit_serialize_state(Unit *u, FILE *f, FDSet *fds, bool switching_root) {
         int r;
 
         assert(u);
@@ -127,6 +89,9 @@ int unit_serialize(Unit *u, FILE *f, FDSet *fds, bool switching_root) {
         (void) serialize_dual_timestamp(f, "condition-timestamp", &u->condition_timestamp);
         (void) serialize_dual_timestamp(f, "assert-timestamp", &u->assert_timestamp);
 
+        (void) serialize_ratelimit(f, "start-ratelimit", &u->start_ratelimit);
+        (void) serialize_ratelimit(f, "auto-start-stop-ratelimit", &u->auto_start_stop_ratelimit);
+
         if (dual_timestamp_is_set(&u->condition_timestamp))
                 (void) serialize_bool(f, "condition-result", u->condition_result);
 
@@ -142,40 +107,7 @@ int unit_serialize(Unit *u, FILE *f, FDSet *fds, bool switching_root) {
         (void) serialize_bool(f, "exported-log-rate-limit-interval", u->exported_log_ratelimit_interval);
         (void) serialize_bool(f, "exported-log-rate-limit-burst", u->exported_log_ratelimit_burst);
 
-        (void) serialize_item_format(f, "cpu-usage-base", "%" PRIu64, u->cpu_usage_base);
-        if (u->cpu_usage_last != NSEC_INFINITY)
-                (void) serialize_item_format(f, "cpu-usage-last", "%" PRIu64, u->cpu_usage_last);
-
-        if (u->managed_oom_kill_last > 0)
-                (void) serialize_item_format(f, "managed-oom-kill-last", "%" PRIu64, u->managed_oom_kill_last);
-
-        if (u->oom_kill_last > 0)
-                (void) serialize_item_format(f, "oom-kill-last", "%" PRIu64, u->oom_kill_last);
-
-        for (CGroupIOAccountingMetric im = 0; im < _CGROUP_IO_ACCOUNTING_METRIC_MAX; im++) {
-                (void) serialize_item_format(f, io_accounting_metric_field_base[im], "%" PRIu64, u->io_accounting_base[im]);
-
-                if (u->io_accounting_last[im] != UINT64_MAX)
-                        (void) serialize_item_format(f, io_accounting_metric_field_last[im], "%" PRIu64, u->io_accounting_last[im]);
-        }
-
-        if (u->cgroup_path)
-                (void) serialize_item(f, "cgroup", u->cgroup_path);
-
-        (void) serialize_bool(f, "cgroup-realized", u->cgroup_realized);
-        (void) serialize_cgroup_mask(f, "cgroup-realized-mask", u->cgroup_realized_mask);
-        (void) serialize_cgroup_mask(f, "cgroup-enabled-mask", u->cgroup_enabled_mask);
-        (void) serialize_cgroup_mask(f, "cgroup-invalidated-mask", u->cgroup_invalidated_mask);
-
-        (void) bpf_serialize_socket_bind(u, f, fds);
-
-        (void) bpf_program_serialize_attachment(f, fds, "ip-bpf-ingress-installed", u->ip_bpf_ingress_installed);
-        (void) bpf_program_serialize_attachment(f, fds, "ip-bpf-egress-installed", u->ip_bpf_egress_installed);
-        (void) bpf_program_serialize_attachment(f, fds, "bpf-device-control-installed", u->bpf_device_control_installed);
-        (void) bpf_program_serialize_attachment_set(f, fds, "ip-bpf-custom-ingress-installed", u->ip_bpf_custom_ingress_installed);
-        (void) bpf_program_serialize_attachment_set(f, fds, "ip-bpf-custom-egress-installed", u->ip_bpf_custom_egress_installed);
-
-        (void) serialize_restrict_network_interfaces(u, f, fds);
+        (void) cgroup_runtime_serialize(u, f, fds);
 
         if (uid_is_valid(u->ref_uid))
                 (void) serialize_item_format(f, "ref-uid", UID_FMT, u->ref_uid);
@@ -189,14 +121,6 @@ int unit_serialize(Unit *u, FILE *f, FDSet *fds, bool switching_root) {
         (void) serialize_markers(f, u->markers);
 
         bus_track_serialize(u->bus_track, f, "ref");
-
-        for (CGroupIPAccountingMetric m = 0; m < _CGROUP_IP_ACCOUNTING_METRIC_MAX; m++) {
-                uint64_t v;
-
-                r = unit_get_ip_accounting(u, m, &v);
-                if (r >= 0)
-                        (void) serialize_item_format(f, ip_accounting_metric_field[m], "%" PRIu64, v);
-        }
 
         if (!switching_root) {
                 if (u->job) {
@@ -264,7 +188,7 @@ static int unit_deserialize_job(Unit *u, FILE *f) {
                 _deserialize_matched;                                   \
         })
 
-int unit_deserialize(Unit *u, FILE *f, FDSet *fds) {
+int unit_deserialize_state(Unit *u, FILE *f, FDSet *fds) {
         int r;
 
         assert(u);
@@ -272,19 +196,14 @@ int unit_deserialize(Unit *u, FILE *f, FDSet *fds) {
         assert(fds);
 
         for (;;) {
-                _cleanup_free_ char *line = NULL;
-                char *l, *v;
-                ssize_t m;
+                _cleanup_free_ char *l  = NULL;
                 size_t k;
+                char *v;
 
-                r = read_line(f, LONG_LINE_MAX, &line);
+                r = deserialize_read_line(f, &l);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to read serialization line: %m");
-                if (r == 0) /* eof */
-                        break;
-
-                l = strstrip(line);
-                if (isempty(l)) /* End marker */
+                        return r;
+                if (r == 0) /* eof or end marker */
                         break;
 
                 k = strcspn(l, "=");
@@ -326,6 +245,13 @@ int unit_deserialize(Unit *u, FILE *f, FDSet *fds) {
                         (void) deserialize_dual_timestamp(v, &u->assert_timestamp);
                         continue;
 
+                } else if (streq(l, "start-ratelimit")) {
+                        deserialize_ratelimit(&u->start_ratelimit, l, v);
+                        continue;
+                } else if (streq(l, "auto-start-stop-ratelimit")) {
+                        deserialize_ratelimit(&u->auto_start_stop_ratelimit, l, v);
+                        continue;
+
                 } else if (MATCH_DESERIALIZE("condition-result", l, v, parse_boolean, u->condition_result))
                         continue;
 
@@ -353,89 +279,7 @@ int unit_deserialize(Unit *u, FILE *f, FDSet *fds) {
                 else if (MATCH_DESERIALIZE("exported-log-rate-limit-burst", l, v, parse_boolean, u->exported_log_ratelimit_burst))
                         continue;
 
-                else if (MATCH_DESERIALIZE_IMMEDIATE("cpu-usage-base", l, v, safe_atou64, u->cpu_usage_base) ||
-                         MATCH_DESERIALIZE_IMMEDIATE("cpuacct-usage-base", l, v, safe_atou64, u->cpu_usage_base))
-                        continue;
-
-                else if (MATCH_DESERIALIZE_IMMEDIATE("cpu-usage-last", l, v, safe_atou64, u->cpu_usage_last))
-                        continue;
-
-                else if (MATCH_DESERIALIZE_IMMEDIATE("managed-oom-kill-last", l, v, safe_atou64, u->managed_oom_kill_last))
-                        continue;
-
-                else if (MATCH_DESERIALIZE_IMMEDIATE("oom-kill-last", l, v, safe_atou64, u->oom_kill_last))
-                        continue;
-
-                else if (streq(l, "cgroup")) {
-                        r = unit_set_cgroup_path(u, v);
-                        if (r < 0)
-                                log_unit_debug_errno(u, r, "Failed to set cgroup path %s, ignoring: %m", v);
-
-                        (void) unit_watch_cgroup(u);
-                        (void) unit_watch_cgroup_memory(u);
-
-                        continue;
-
-                } else if (MATCH_DESERIALIZE("cgroup-realized", l, v, parse_boolean, u->cgroup_realized))
-                        continue;
-
-                else if (MATCH_DESERIALIZE_IMMEDIATE("cgroup-realized-mask", l, v, cg_mask_from_string, u->cgroup_realized_mask))
-                        continue;
-
-                else if (MATCH_DESERIALIZE_IMMEDIATE("cgroup-enabled-mask", l, v, cg_mask_from_string, u->cgroup_enabled_mask))
-                        continue;
-
-                else if (MATCH_DESERIALIZE_IMMEDIATE("cgroup-invalidated-mask", l, v, cg_mask_from_string, u->cgroup_invalidated_mask))
-                        continue;
-
-                else if (STR_IN_SET(l, "ipv4-socket-bind-bpf-link-fd", "ipv6-socket-bind-bpf-link-fd")) {
-                        int fd;
-
-                        if ((fd = parse_fd(v)) < 0 || !fdset_contains(fds, fd))
-                                log_unit_debug(u, "Failed to parse %s value: %s, ignoring.", l, v);
-                        else {
-                                if (fdset_remove(fds, fd) < 0) {
-                                        log_unit_debug(u, "Failed to remove %s value=%d from fdset", l, fd);
-                                        continue;
-                                }
-
-                                (void) bpf_socket_bind_add_initial_link_fd(u, fd);
-                        }
-                        continue;
-
-                } else if (streq(l, "ip-bpf-ingress-installed")) {
-                         (void) bpf_program_deserialize_attachment(v, fds, &u->ip_bpf_ingress_installed);
-                         continue;
-                } else if (streq(l, "ip-bpf-egress-installed")) {
-                         (void) bpf_program_deserialize_attachment(v, fds, &u->ip_bpf_egress_installed);
-                         continue;
-                } else if (streq(l, "bpf-device-control-installed")) {
-                         (void) bpf_program_deserialize_attachment(v, fds, &u->bpf_device_control_installed);
-                         continue;
-
-                } else if (streq(l, "ip-bpf-custom-ingress-installed")) {
-                         (void) bpf_program_deserialize_attachment_set(v, fds, &u->ip_bpf_custom_ingress_installed);
-                         continue;
-                } else if (streq(l, "ip-bpf-custom-egress-installed")) {
-                         (void) bpf_program_deserialize_attachment_set(v, fds, &u->ip_bpf_custom_egress_installed);
-                         continue;
-
-                } else if (streq(l, "restrict-ifaces-bpf-fd")) {
-                        int fd;
-
-                        if ((fd = parse_fd(v)) < 0 || !fdset_contains(fds, fd)) {
-                                log_unit_debug(u, "Failed to parse restrict-ifaces-bpf-fd value: %s", v);
-                                continue;
-                        }
-                        if (fdset_remove(fds, fd) < 0) {
-                                log_unit_debug(u, "Failed to remove restrict-ifaces-bpf-fd %d from fdset", fd);
-                                continue;
-                        }
-
-                        (void) restrict_network_interfaces_add_initial_link_fd(u, fd);
-                        continue;
-
-                } else if (streq(l, "ref-uid")) {
+                else if (streq(l, "ref-uid")) {
                         uid_t uid;
 
                         r = parse_uid(v, &uid);
@@ -485,43 +329,6 @@ int unit_deserialize(Unit *u, FILE *f, FDSet *fds) {
                         continue;
                 }
 
-                /* Check if this is an IP accounting metric serialization field */
-                m = string_table_lookup(ip_accounting_metric_field, ELEMENTSOF(ip_accounting_metric_field), l);
-                if (m >= 0) {
-                        uint64_t c;
-
-                        r = safe_atou64(v, &c);
-                        if (r < 0)
-                                log_unit_debug(u, "Failed to parse IP accounting value %s, ignoring.", v);
-                        else
-                                u->ip_accounting_extra[m] = c;
-                        continue;
-                }
-
-                m = string_table_lookup(io_accounting_metric_field_base, ELEMENTSOF(io_accounting_metric_field_base), l);
-                if (m >= 0) {
-                        uint64_t c;
-
-                        r = safe_atou64(v, &c);
-                        if (r < 0)
-                                log_unit_debug(u, "Failed to parse IO accounting base value %s, ignoring.", v);
-                        else
-                                u->io_accounting_base[m] = c;
-                        continue;
-                }
-
-                m = string_table_lookup(io_accounting_metric_field_last, ELEMENTSOF(io_accounting_metric_field_last), l);
-                if (m >= 0) {
-                        uint64_t c;
-
-                        r = safe_atou64(v, &c);
-                        if (r < 0)
-                                log_unit_debug(u, "Failed to parse IO accounting last value %s, ignoring.", v);
-                        else
-                                u->io_accounting_last[m] = c;
-                        continue;
-                }
-
                 r = exec_shared_runtime_deserialize_compat(u, l, v, fds);
                 if (r < 0) {
                         log_unit_warning(u, "Failed to deserialize runtime parameter '%s', ignoring.", l);
@@ -529,6 +336,13 @@ int unit_deserialize(Unit *u, FILE *f, FDSet *fds) {
                 } else if (r > 0)
                         /* Returns positive if key was handled by the call */
                         continue;
+
+                r = cgroup_runtime_deserialize_one(u, l, v, fds);
+                if (r < 0) {
+                        log_unit_warning(u, "Failed to deserialize cgroup runtime parameter '%s, ignoring.", l);
+                        continue;
+                } else if (r > 0)
+                        continue; /* was handled */
 
                 if (UNIT_VTABLE(u)->deserialize_item) {
                         r = UNIT_VTABLE(u)->deserialize_item(u, l, v, fds);
@@ -543,12 +357,14 @@ int unit_deserialize(Unit *u, FILE *f, FDSet *fds) {
          * reboots. */
 
         if (!dual_timestamp_is_set(&u->state_change_timestamp))
-                dual_timestamp_get(&u->state_change_timestamp);
+                dual_timestamp_now(&u->state_change_timestamp);
 
         /* Let's make sure that everything that is deserialized also gets any potential new cgroup settings
          * applied after we are done. For that we invalidate anything already realized, so that we can
          * realize it again. */
-        if (u->cgroup_realized) {
+        CGroupRuntime *crt;
+        crt = unit_get_cgroup_runtime(u);
+        if (crt && crt->cgroup_realized) {
                 unit_invalidate_cgroup(u, _CGROUP_MASK_ALL);
                 unit_invalidate_cgroup_bpf(u);
         }
@@ -556,26 +372,24 @@ int unit_deserialize(Unit *u, FILE *f, FDSet *fds) {
         return 0;
 }
 
-int unit_deserialize_skip(FILE *f) {
+int unit_deserialize_state_skip(FILE *f) {
         int r;
+
         assert(f);
 
         /* Skip serialized data for this unit. We don't know what it is. */
 
         for (;;) {
                 _cleanup_free_ char *line = NULL;
-                char *l;
 
-                r = read_line(f, LONG_LINE_MAX, &line);
+                r = read_stripped_line(f, LONG_LINE_MAX, &line);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read serialization line: %m");
                 if (r == 0)
                         return 0;
 
-                l = strstrip(line);
-
                 /* End marker */
-                if (isempty(l))
+                if (isempty(line))
                         return 1;
         }
 }
@@ -637,8 +451,8 @@ void unit_dump(Unit *u, FILE *f, const char *prefix) {
         prefix2 = strjoina(prefix, "\t");
 
         fprintf(f,
-                "%s-> Unit %s:\n",
-                prefix, u->id);
+                "%s%s Unit %s:\n",
+                prefix, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), u->id);
 
         SET_FOREACH(t, u->aliases)
                 fprintf(f, "%s\tAlias: %s\n", prefix, t);
@@ -683,23 +497,25 @@ void unit_dump(Unit *u, FILE *f, const char *prefix) {
         }
 
         if (UNIT_HAS_CGROUP_CONTEXT(u)) {
+                CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+
                 fprintf(f,
                         "%s\tSlice: %s\n"
                         "%s\tCGroup: %s\n"
                         "%s\tCGroup realized: %s\n",
                         prefix, strna(unit_slice_name(u)),
-                        prefix, strna(u->cgroup_path),
-                        prefix, yes_no(u->cgroup_realized));
+                        prefix, strna(crt ? crt->cgroup_path : NULL),
+                        prefix, yes_no(crt ? crt->cgroup_realized : false));
 
-                if (u->cgroup_realized_mask != 0) {
+                if (crt && crt->cgroup_realized_mask != 0) {
                         _cleanup_free_ char *s = NULL;
-                        (void) cg_mask_to_string(u->cgroup_realized_mask, &s);
+                        (void) cg_mask_to_string(crt->cgroup_realized_mask, &s);
                         fprintf(f, "%s\tCGroup realized mask: %s\n", prefix, strnull(s));
                 }
 
-                if (u->cgroup_enabled_mask != 0) {
+                if (crt && crt->cgroup_enabled_mask != 0) {
                         _cleanup_free_ char *s = NULL;
-                        (void) cg_mask_to_string(u->cgroup_enabled_mask, &s);
+                        (void) cg_mask_to_string(crt->cgroup_enabled_mask, &s);
                         fprintf(f, "%s\tCGroup enabled mask: %s\n", prefix, strnull(s));
                 }
 
@@ -807,21 +623,26 @@ void unit_dump(Unit *u, FILE *f, const char *prefix) {
                 }
         }
 
-        if (!hashmap_isempty(u->requires_mounts_for)) {
-                UnitDependencyInfo di;
-                const char *path;
+        for (UnitMountDependencyType type = 0; type < _UNIT_MOUNT_DEPENDENCY_TYPE_MAX; type++)
+                if (!hashmap_isempty(u->mounts_for[type])) {
+                        UnitDependencyInfo di;
+                        const char *path;
 
-                HASHMAP_FOREACH_KEY(di.data, path, u->requires_mounts_for) {
-                        bool space = false;
+                        HASHMAP_FOREACH_KEY(di.data, path, u->mounts_for[type]) {
+                                bool space = false;
 
-                        fprintf(f, "%s\tRequiresMountsFor: %s (", prefix, path);
+                                fprintf(f,
+                                        "%s\t%s: %s (",
+                                        prefix,
+                                        unit_mount_dependency_type_to_string(type),
+                                        path);
 
-                        print_unit_dependency_mask(f, "origin", di.origin_mask, &space);
-                        print_unit_dependency_mask(f, "destination", di.destination_mask, &space);
+                                print_unit_dependency_mask(f, "origin", di.origin_mask, &space);
+                                print_unit_dependency_mask(f, "destination", di.destination_mask, &space);
 
-                        fputs(")\n", f);
+                                fputs(")\n", f);
+                        }
                 }
-        }
 
         if (u->load_state == UNIT_LOADED) {
 
@@ -830,6 +651,7 @@ void unit_dump(Unit *u, FILE *f, const char *prefix) {
                         "%s\tRefuseManualStart: %s\n"
                         "%s\tRefuseManualStop: %s\n"
                         "%s\tDefaultDependencies: %s\n"
+                        "%s\tSurviveFinalKillSignal: %s\n"
                         "%s\tOnSuccessJobMode: %s\n"
                         "%s\tOnFailureJobMode: %s\n"
                         "%s\tIgnoreOnIsolate: %s\n",
@@ -837,6 +659,7 @@ void unit_dump(Unit *u, FILE *f, const char *prefix) {
                         prefix, yes_no(u->refuse_manual_start),
                         prefix, yes_no(u->refuse_manual_stop),
                         prefix, yes_no(u->default_dependencies),
+                        prefix, yes_no(u->survive_final_kill_signal),
                         prefix, job_mode_to_string(u->on_success_job_mode),
                         prefix, job_mode_to_string(u->on_failure_job_mode),
                         prefix, yes_no(u->ignore_on_isolate));

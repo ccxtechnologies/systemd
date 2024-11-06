@@ -6,43 +6,47 @@
 #include "graphics.h"
 #include "linux.h"
 #include "measure.h"
+#include "memory-util-fundamental.h"
 #include "part-discovery.h"
 #include "pe.h"
 #include "proto/shell-parameters.h"
 #include "random-seed.h"
+#include "sbat.h"
 #include "secure-boot.h"
 #include "shim.h"
 #include "splash.h"
-#include "tpm-pcr.h"
+#include "tpm2-pcr.h"
+#include "uki.h"
 #include "util.h"
 #include "version.h"
 #include "vmm.h"
 
 /* magic string to find in the binary image */
-_used_ _section_(".sdmagic") static const char magic[] = "#### LoaderInfo: systemd-stub " GIT_VERSION " ####";
+DECLARE_NOALLOC_SECTION(".sdmagic", "#### LoaderInfo: systemd-stub " GIT_VERSION " ####");
 
-static EFI_STATUS combine_initrd(
-                EFI_PHYSICAL_ADDRESS initrd_base, size_t initrd_size,
-                const void * const extra_initrds[], const size_t extra_initrd_sizes[], size_t n_extra_initrds,
+DECLARE_SBAT(SBAT_STUB_SECTION_TEXT);
+
+/* Combine initrds by concatenation in memory */
+static EFI_STATUS combine_initrds(
+                const void * const initrds[], const size_t initrd_sizes[], size_t n_initrds,
                 Pages *ret_initr_pages, size_t *ret_initrd_size) {
 
-        size_t n;
+        size_t n = 0;
 
         assert(ret_initr_pages);
         assert(ret_initrd_size);
 
-        /* Combines four initrds into one, by simple concatenation in memory */
-
-        n = ALIGN4(initrd_size); /* main initrd might not be padded yet */
-
-        for (size_t i = 0; i < n_extra_initrds; i++) {
-                if (!extra_initrds[i])
+        for (size_t i = 0; i < n_initrds; i++) {
+                if (!initrds[i])
                         continue;
 
-                if (n > SIZE_MAX - extra_initrd_sizes[i])
+                /* some initrds (the ones from UKI sections) need padding,
+                 * pad all to be safe */
+                size_t initrd_size = ALIGN4(initrd_sizes[i]);
+                if (n > SIZE_MAX - initrd_size)
                         return EFI_OUT_OF_RESOURCES;
 
-                n += extra_initrd_sizes[i];
+                n += initrd_size;
         }
 
         _cleanup_pages_ Pages pages = xmalloc_pages(
@@ -51,25 +55,19 @@ static EFI_STATUS combine_initrd(
                         EFI_SIZE_TO_PAGES(n),
                         UINT32_MAX /* Below 4G boundary. */);
         uint8_t *p = PHYSICAL_ADDRESS_TO_POINTER(pages.addr);
-        if (initrd_base != 0) {
-                size_t pad;
-
-                /* Order matters, the real initrd must come first, since it might include microcode updates
-                 * which the kernel only looks for in the first cpio archive */
-                p = mempcpy(p, PHYSICAL_ADDRESS_TO_POINTER(initrd_base), initrd_size);
-
-                pad = ALIGN4(initrd_size) - initrd_size;
-                if (pad > 0)  {
-                        memset(p, 0, pad);
-                        p += pad;
-                }
-        }
-
-        for (size_t i = 0; i < n_extra_initrds; i++) {
-                if (!extra_initrds[i])
+        for (size_t i = 0; i < n_initrds; i++) {
+                if (!initrds[i])
                         continue;
 
-                p = mempcpy(p, extra_initrds[i], extra_initrd_sizes[i]);
+                size_t pad;
+
+                p = mempcpy(p, initrds[i], initrd_sizes[i]);
+
+                pad = ALIGN4(initrd_sizes[i]) - initrd_sizes[i];
+                if (pad > 0)  {
+                        memzero(p, pad);
+                        p += pad;
+                }
         }
 
         assert(PHYSICAL_ADDRESS_TO_POINTER(pages.addr + n) == p);
@@ -86,10 +84,12 @@ static void export_variables(EFI_LOADED_IMAGE_PROTOCOL *loaded_image) {
                 EFI_STUB_FEATURE_REPORT_BOOT_PARTITION |    /* We set LoaderDevicePartUUID */
                 EFI_STUB_FEATURE_PICK_UP_CREDENTIALS |      /* We pick up credentials from the boot partition */
                 EFI_STUB_FEATURE_PICK_UP_SYSEXTS |          /* We pick up system extensions from the boot partition */
+                EFI_STUB_FEATURE_PICK_UP_CONFEXTS |         /* We pick up configuration extensions from the boot partition */
                 EFI_STUB_FEATURE_THREE_PCRS |               /* We can measure kernel image, parameters and sysext */
                 EFI_STUB_FEATURE_RANDOM_SEED |              /* We pass a random seed to the kernel */
                 EFI_STUB_FEATURE_CMDLINE_ADDONS |           /* We pick up .cmdline addons */
                 EFI_STUB_FEATURE_CMDLINE_SMBIOS |           /* We support extending kernel cmdline from SMBIOS Type #11 */
+                EFI_STUB_FEATURE_DEVICETREE_ADDONS |        /* We pick up .dtb addons */
                 0;
 
         assert(loaded_image);
@@ -147,8 +147,9 @@ static bool use_load_options(
         assert(ret);
 
         /* We only allow custom command lines if we aren't in secure boot or if no cmdline was baked into
-         * the stub image. */
-        if (secure_boot_enabled() && have_cmdline)
+         * the stub image.
+         * We also don't allow it if we are in confidential vms and secureboot is on. */
+        if (secure_boot_enabled() && (have_cmdline || is_confidential_vm()))
                 return false;
 
         /* We also do a superficial check whether first character of passed command line
@@ -245,31 +246,133 @@ static EFI_STATUS load_addons_from_dir(
         }
 
         return EFI_SUCCESS;
-
 }
 
-static EFI_STATUS cmdline_append_and_measure_addons(
+static void cmdline_append_and_measure_addons(
+                char16_t *cmdline_global,
+                char16_t *cmdline_uki,
+                char16_t **cmdline_append,
+                bool *ret_parameters_measured) {
+
+        _cleanup_free_ char16_t *tmp = NULL, *merged = NULL;
+        bool m = false;
+
+        assert(cmdline_append);
+        assert(ret_parameters_measured);
+
+        if (isempty(cmdline_global) && isempty(cmdline_uki))
+                return;
+
+        merged = xasprintf("%ls%ls%ls",
+                           strempty(cmdline_global),
+                           isempty(cmdline_global) || isempty(cmdline_uki) ? u"" : u" ",
+                           strempty(cmdline_uki));
+
+        mangle_stub_cmdline(merged);
+
+        if (isempty(merged))
+                return;
+
+        (void) tpm_log_load_options(merged, &m);
+        *ret_parameters_measured = m;
+
+        tmp = TAKE_PTR(*cmdline_append);
+        *cmdline_append = xasprintf("%ls%ls%ls", strempty(tmp), isempty(tmp) ? u"" : u" ", merged);
+}
+
+static void dtb_install_addons(
+                struct devicetree_state *dt_state,
+                void **dt_bases,
+                size_t *dt_sizes,
+                char16_t **dt_filenames,
+                size_t n_dts,
+                bool *ret_parameters_measured) {
+
+        int parameters_measured = -1;
+        EFI_STATUS err;
+
+        assert(dt_state);
+        assert(n_dts == 0 || (dt_bases && dt_sizes && dt_filenames));
+        assert(ret_parameters_measured);
+
+        for (size_t i = 0; i < n_dts; ++i) {
+                err = devicetree_install_from_memory(dt_state, dt_bases[i], dt_sizes[i]);
+                if (err != EFI_SUCCESS)
+                        log_error_status(err, "Error loading addon devicetree, ignoring: %m");
+                else {
+                        bool m = false;
+
+                        err = tpm_log_tagged_event(
+                                        TPM2_PCR_KERNEL_CONFIG,
+                                        POINTER_TO_PHYSICAL_ADDRESS(dt_bases[i]),
+                                        dt_sizes[i],
+                                        DEVICETREE_ADDON_EVENT_TAG_ID,
+                                        dt_filenames[i],
+                                        &m);
+                        if (err != EFI_SUCCESS)
+                                return (void) log_error_status(
+                                                err,
+                                                "Unable to add measurement of DTB addon #%zu to PCR %i: %m",
+                                                i,
+                                                TPM2_PCR_KERNEL_CONFIG);
+
+                        parameters_measured = parameters_measured < 0 ? m : (parameters_measured && m);
+                }
+        }
+
+        *ret_parameters_measured = parameters_measured;
+}
+
+static void dt_bases_free(void **dt_bases, size_t n_dt) {
+        assert(dt_bases || n_dt == 0);
+
+        for (size_t i = 0; i < n_dt; ++i)
+                free(dt_bases[i]);
+
+        free(dt_bases);
+}
+
+static void dt_filenames_free(char16_t **dt_filenames, size_t n_dt) {
+        assert(dt_filenames || n_dt == 0);
+
+        for (size_t i = 0; i < n_dt; ++i)
+                free(dt_filenames[i]);
+
+        free(dt_filenames);
+}
+
+static EFI_STATUS load_addons(
                 EFI_HANDLE stub_image,
                 EFI_LOADED_IMAGE_PROTOCOL *loaded_image,
                 const char16_t *prefix,
                 const char *uname,
-                bool *ret_parameters_measured,
-                char16_t **cmdline_append) {
+                char16_t **ret_cmdline,
+                void ***ret_dt_bases,
+                size_t **ret_dt_sizes,
+                char16_t ***ret_dt_filenames,
+                size_t *ret_n_dt) {
 
+        _cleanup_free_ size_t *dt_sizes = NULL;
         _cleanup_(strv_freep) char16_t **items = NULL;
         _cleanup_(file_closep) EFI_FILE *root = NULL;
-        _cleanup_free_ char16_t *buffer = NULL;
-        size_t n_items = 0, n_allocated = 0;
+        _cleanup_free_ char16_t *cmdline = NULL;
+        size_t n_items = 0, n_allocated = 0, n_dt = 0;
+        char16_t **dt_filenames = NULL;
+        void **dt_bases = NULL;
         EFI_STATUS err;
 
         assert(stub_image);
         assert(loaded_image);
         assert(prefix);
-        assert(ret_parameters_measured);
-        assert(cmdline_append);
+        assert(!!ret_dt_bases == !!ret_dt_sizes);
+        assert(!!ret_dt_bases == !!ret_n_dt);
+        assert(!!ret_dt_filenames == !!ret_n_dt);
 
         if (!loaded_image->DeviceHandle)
                 return EFI_SUCCESS;
+
+        CLEANUP_ARRAY(dt_bases, n_dt, dt_bases_free);
+        CLEANUP_ARRAY(dt_filenames, n_dt, dt_filenames_free);
 
         err = open_volume(loaded_image->DeviceHandle, &root);
         if (err == EFI_UNSUPPORTED)
@@ -320,11 +423,12 @@ static EFI_STATUS cmdline_append_and_measure_addons(
                         return log_error_status(err, "Failed to find protocol in %ls: %m", items[i]);
 
                 err = pe_memory_locate_sections(loaded_addon->ImageBase, unified_sections, addrs, szs);
-                if (err != EFI_SUCCESS || szs[UNIFIED_SECTION_CMDLINE] == 0) {
+                if (err != EFI_SUCCESS ||
+                    (szs[UNIFIED_SECTION_CMDLINE] == 0 && szs[UNIFIED_SECTION_DTB] == 0)) {
                         if (err == EFI_SUCCESS)
                                 err = EFI_NOT_FOUND;
                         log_error_status(err,
-                                         "Unable to locate embedded .cmdline section in %ls, ignoring: %m",
+                                         "Unable to locate embedded .cmdline/.dtb sections in %ls, ignoring: %m",
                                          items[i]);
                         continue;
                 }
@@ -345,39 +449,62 @@ static EFI_STATUS cmdline_append_and_measure_addons(
                         continue;
                 }
 
-                _cleanup_free_ char16_t *tmp = TAKE_PTR(buffer),
-                                        *extra16 = xstrn8_to_16((char *)loaded_addon->ImageBase + addrs[UNIFIED_SECTION_CMDLINE],
-                                                                szs[UNIFIED_SECTION_CMDLINE]);
-                buffer = xasprintf("%ls%ls%ls", strempty(tmp), isempty(tmp) ? u"" : u" ", extra16);
+                if (ret_cmdline && szs[UNIFIED_SECTION_CMDLINE] > 0) {
+                        _cleanup_free_ char16_t *tmp = TAKE_PTR(cmdline),
+                                                *extra16 = xstrn8_to_16((char *)loaded_addon->ImageBase + addrs[UNIFIED_SECTION_CMDLINE],
+                                                                        szs[UNIFIED_SECTION_CMDLINE]);
+                        cmdline = xasprintf("%ls%ls%ls", strempty(tmp), isempty(tmp) ? u"" : u" ", extra16);
+                }
+
+                if (ret_dt_bases && szs[UNIFIED_SECTION_DTB] > 0) {
+                        dt_sizes = xrealloc(dt_sizes,
+                                            n_dt * sizeof(size_t),
+                                            (n_dt + 1)  * sizeof(size_t));
+                        dt_sizes[n_dt] = szs[UNIFIED_SECTION_DTB];
+
+                        dt_bases = xrealloc(dt_bases,
+                                            n_dt * sizeof(void *),
+                                            (n_dt + 1) * sizeof(void *));
+                        dt_bases[n_dt] = xmemdup((uint8_t*)loaded_addon->ImageBase + addrs[UNIFIED_SECTION_DTB],
+                                                 dt_sizes[n_dt]);
+
+                        dt_filenames = xrealloc(dt_filenames,
+                                                n_dt * sizeof(char16_t *),
+                                                (n_dt + 1) * sizeof(char16_t *));
+                        dt_filenames[n_dt] = xstrdup16(items[i]);
+
+                        ++n_dt;
+                }
         }
 
-        mangle_stub_cmdline(buffer);
+        if (ret_cmdline && !isempty(cmdline))
+                *ret_cmdline = TAKE_PTR(cmdline);
 
-        if (!isempty(buffer)) {
-                _cleanup_free_ char16_t *tmp = TAKE_PTR(*cmdline_append);
-                bool m = false;
-
-                (void) tpm_log_load_options(buffer, &m);
-                *ret_parameters_measured = m;
-
-                *cmdline_append = xasprintf("%ls%ls%ls", strempty(tmp), isempty(tmp) ? u"" : u" ", buffer);
+        if (ret_n_dt && n_dt > 0) {
+                *ret_dt_filenames = TAKE_PTR(dt_filenames);
+                *ret_dt_bases = TAKE_PTR(dt_bases);
+                *ret_dt_sizes = TAKE_PTR(dt_sizes);
+                *ret_n_dt = n_dt;
         }
 
         return EFI_SUCCESS;
 }
 
 static EFI_STATUS run(EFI_HANDLE image) {
-        _cleanup_free_ void *credential_initrd = NULL, *global_credential_initrd = NULL, *sysext_initrd = NULL, *pcrsig_initrd = NULL, *pcrpkey_initrd = NULL;
-        size_t credential_initrd_size = 0, global_credential_initrd_size = 0, sysext_initrd_size = 0, pcrsig_initrd_size = 0, pcrpkey_initrd_size = 0;
-        size_t linux_size, initrd_size, dt_size;
-        EFI_PHYSICAL_ADDRESS linux_base, initrd_base, dt_base;
+        _cleanup_free_ void *credential_initrd = NULL, *global_credential_initrd = NULL, *sysext_initrd = NULL, *confext_initrd = NULL, *pcrsig_initrd = NULL, *pcrpkey_initrd = NULL;
+        size_t credential_initrd_size = 0, global_credential_initrd_size = 0, sysext_initrd_size = 0, confext_initrd_size = 0, pcrsig_initrd_size = 0, pcrpkey_initrd_size = 0;
+        void **dt_bases_addons_global = NULL, **dt_bases_addons_uki = NULL;
+        char16_t **dt_filenames_addons_global = NULL, **dt_filenames_addons_uki = NULL;
+        _cleanup_free_ size_t *dt_sizes_addons_global = NULL, *dt_sizes_addons_uki = NULL;
+        size_t linux_size, initrd_size, ucode_size, dt_size, n_dts_addons_global = 0, n_dts_addons_uki = 0;
+        EFI_PHYSICAL_ADDRESS linux_base, initrd_base, ucode_base, dt_base;
         _cleanup_(devicetree_cleanup) struct devicetree_state dt_state = {};
         EFI_LOADED_IMAGE_PROTOCOL *loaded_image;
         size_t addrs[_UNIFIED_SECTION_MAX] = {}, szs[_UNIFIED_SECTION_MAX] = {};
-        _cleanup_free_ char16_t *cmdline = NULL;
+        _cleanup_free_ char16_t *cmdline = NULL, *cmdline_addons_global = NULL, *cmdline_addons_uki = NULL;
         int sections_measured = -1, parameters_measured = -1;
         _cleanup_free_ char *uname = NULL;
-        bool sysext_measured = false, m;
+        bool sysext_measured = false, confext_measured = false, m;
         uint64_t loader_features = 0;
         EFI_STATUS err;
 
@@ -385,8 +512,9 @@ static EFI_STATUS run(EFI_HANDLE image) {
         if (err != EFI_SUCCESS)
                 return log_error_status(err, "Error getting a LoadedImageProtocol handle: %m");
 
-        if (efivar_get_uint64_le(MAKE_GUID_PTR(LOADER), u"LoaderFeatures", &loader_features) != EFI_SUCCESS ||
-            !FLAGS_SET(loader_features, EFI_LOADER_FEATURE_RANDOM_SEED)) {
+        if (loaded_image->DeviceHandle && /* Handle case, where bootloader doesn't support DeviceHandle. */
+            (efivar_get_uint64_le(MAKE_GUID_PTR(LOADER), u"LoaderFeatures", &loader_features) != EFI_SUCCESS ||
+            !FLAGS_SET(loader_features, EFI_LOADER_FEATURE_RANDOM_SEED))) {
                 _cleanup_(file_closep) EFI_FILE *esp_dir = NULL;
 
                 err = partition_open(MAKE_GUID_PTR(ESP), loaded_image->DeviceHandle, NULL, &esp_dir);
@@ -399,6 +527,47 @@ static EFI_STATUS run(EFI_HANDLE image) {
                 if (err == EFI_SUCCESS)
                         err = EFI_NOT_FOUND;
                 return log_error_status(err, "Unable to locate embedded .linux section: %m");
+        }
+
+        CLEANUP_ARRAY(dt_bases_addons_global, n_dts_addons_global, dt_bases_free);
+        CLEANUP_ARRAY(dt_bases_addons_uki, n_dts_addons_uki, dt_bases_free);
+        CLEANUP_ARRAY(dt_filenames_addons_global, n_dts_addons_global, dt_filenames_free);
+        CLEANUP_ARRAY(dt_filenames_addons_uki, n_dts_addons_uki, dt_filenames_free);
+
+        if (szs[UNIFIED_SECTION_UNAME] > 0)
+                uname = xstrndup8((char *)loaded_image->ImageBase + addrs[UNIFIED_SECTION_UNAME],
+                                  szs[UNIFIED_SECTION_UNAME]);
+
+        /* Now that we have the UKI sections loaded, also load global first and then local (per-UKI)
+         * addons. The data is loaded at once, and then used later. */
+        err = load_addons(
+                        image,
+                        loaded_image,
+                        u"\\loader\\addons",
+                        uname,
+                        &cmdline_addons_global,
+                        &dt_bases_addons_global,
+                        &dt_sizes_addons_global,
+                        &dt_filenames_addons_global,
+                        &n_dts_addons_global);
+        if (err != EFI_SUCCESS)
+                log_error_status(err, "Error loading global addons, ignoring: %m");
+
+        /* Some bootloaders always pass NULL in FilePath, so we need to check for it here. */
+        _cleanup_free_ char16_t *dropin_dir = get_extra_dir(loaded_image->FilePath);
+        if (dropin_dir) {
+                err = load_addons(
+                                image,
+                                loaded_image,
+                                dropin_dir,
+                                uname,
+                                &cmdline_addons_uki,
+                                &dt_bases_addons_uki,
+                                &dt_sizes_addons_uki,
+                                &dt_filenames_addons_uki,
+                                &n_dts_addons_uki);
+                if (err != EFI_SUCCESS)
+                        log_error_status(err, "Error loading UKI-specific addons, ignoring: %m");
         }
 
         /* Measure all "payload" of this PE image into a separate PCR (i.e. where nothing else is written
@@ -416,7 +585,7 @@ static EFI_STATUS run(EFI_HANDLE image) {
 
                 /* First measure the name of the section */
                 (void) tpm_log_event_ascii(
-                                TPM_PCR_INDEX_KERNEL_IMAGE,
+                                TPM2_PCR_KERNEL_BOOT,
                                 POINTER_TO_PHYSICAL_ADDRESS(unified_sections[section]),
                                 strsize8(unified_sections[section]), /* including NUL byte */
                                 unified_sections[section],
@@ -426,7 +595,7 @@ static EFI_STATUS run(EFI_HANDLE image) {
 
                 /* Then measure the data of the section */
                 (void) tpm_log_event_ascii(
-                                TPM_PCR_INDEX_KERNEL_IMAGE,
+                                TPM2_PCR_KERNEL_BOOT,
                                 POINTER_TO_PHYSICAL_ADDRESS(loaded_image->ImageBase) + addrs[section],
                                 szs[section],
                                 unified_sections[section],
@@ -438,14 +607,10 @@ static EFI_STATUS run(EFI_HANDLE image) {
         /* After we are done, set an EFI variable that tells userspace this was done successfully, and encode
          * in it which PCR was used. */
         if (sections_measured > 0)
-                (void) efivar_set_uint_string(MAKE_GUID_PTR(LOADER), u"StubPcrKernelImage", TPM_PCR_INDEX_KERNEL_IMAGE, 0);
+                (void) efivar_set_uint_string(MAKE_GUID_PTR(LOADER), u"StubPcrKernelImage", TPM2_PCR_KERNEL_BOOT, 0);
 
         /* Show splash screen as early as possible */
         graphics_splash((const uint8_t*) loaded_image->ImageBase + addrs[UNIFIED_SECTION_SPLASH], szs[UNIFIED_SECTION_SPLASH]);
-
-        if (szs[UNIFIED_SECTION_UNAME] > 0)
-                uname = xstrndup8((char *)loaded_image->ImageBase + addrs[UNIFIED_SECTION_UNAME],
-                                  szs[UNIFIED_SECTION_UNAME]);
 
         if (use_load_options(image, loaded_image, szs[UNIFIED_SECTION_CMDLINE] > 0, &cmdline)) {
                 /* Let's measure the passed kernel command line into the TPM. Note that this possibly
@@ -463,30 +628,10 @@ static EFI_STATUS run(EFI_HANDLE image) {
         }
 
         /* If we have any extra command line to add via PE addons, load them now and append, and
-         * measure the additions separately, after the embedded options, but before the smbios ones,
+         * measure the additions together, after the embedded options, but before the smbios ones,
          * so that the order is reversed from "most hardcoded" to "most dynamic". The global addons are
          * loaded first, and the image-specific ones later, for the same reason. */
-        err = cmdline_append_and_measure_addons(
-                        image,
-                        loaded_image,
-                        u"\\loader\\addons",
-                        uname,
-                        &m,
-                        &cmdline);
-        if (err != EFI_SUCCESS)
-                log_error_status(err, "Error loading global addons, ignoring: %m");
-        parameters_measured = parameters_measured < 0 ? m : (parameters_measured && m);
-
-        _cleanup_free_ char16_t *dropin_dir = get_extra_dir(loaded_image->FilePath);
-        err = cmdline_append_and_measure_addons(
-                        image,
-                        loaded_image,
-                        dropin_dir,
-                        uname,
-                        &m,
-                        &cmdline);
-        if (err != EFI_SUCCESS)
-                log_error_status(err, "Error loading UKI-specific addons, ignoring: %m");
+        cmdline_append_and_measure_addons(cmdline_addons_global, cmdline_addons_uki, &cmdline, &m);
         parameters_measured = parameters_measured < 0 ? m : (parameters_measured && m);
 
         /* SMBIOS OEM Strings data is controlled by the host admin and not covered
@@ -509,12 +654,13 @@ static EFI_STATUS run(EFI_HANDLE image) {
         export_variables(loaded_image);
 
         if (pack_cpio(loaded_image,
-                      NULL,
+                      /* dropin_dir= */ NULL,
                       u".cred",
+                      /* exclude_suffix= */ NULL,
                       ".extra/credentials",
                       /* dir_mode= */ 0500,
                       /* access_mode= */ 0400,
-                      /* tpm_pcr= */ TPM_PCR_INDEX_KERNEL_PARAMETERS,
+                      /* tpm_pcr= */ TPM2_PCR_KERNEL_CONFIG,
                       u"Credentials initrd",
                       &credential_initrd,
                       &credential_initrd_size,
@@ -524,10 +670,11 @@ static EFI_STATUS run(EFI_HANDLE image) {
         if (pack_cpio(loaded_image,
                       u"\\loader\\credentials",
                       u".cred",
+                      /* exclude_suffix= */ NULL,
                       ".extra/global_credentials",
                       /* dir_mode= */ 0500,
                       /* access_mode= */ 0400,
-                      /* tpm_pcr= */ TPM_PCR_INDEX_KERNEL_PARAMETERS,
+                      /* tpm_pcr= */ TPM2_PCR_KERNEL_CONFIG,
                       u"Global credentials initrd",
                       &global_credential_initrd,
                       &global_credential_initrd_size,
@@ -535,22 +682,65 @@ static EFI_STATUS run(EFI_HANDLE image) {
                 parameters_measured = parameters_measured < 0 ? m : (parameters_measured && m);
 
         if (pack_cpio(loaded_image,
-                      NULL,
-                      u".raw",
+                      /* dropin_dir= */ NULL,
+                      u".raw",         /* ideally we'd pick up only *.sysext.raw here, but for compat we pick up *.raw instead … */
+                      u".confext.raw", /* … but then exclude *.confext.raw again */
                       ".extra/sysext",
                       /* dir_mode= */ 0555,
                       /* access_mode= */ 0444,
-                      /* tpm_pcr= */ TPM_PCR_INDEX_INITRD_SYSEXTS,
+                      /* tpm_pcr= */ TPM2_PCR_SYSEXTS,
                       u"System extension initrd",
                       &sysext_initrd,
                       &sysext_initrd_size,
                       &m) == EFI_SUCCESS)
                 sysext_measured = m;
 
+        if (pack_cpio(loaded_image,
+                      /* dropin_dir= */ NULL,
+                      u".confext.raw",
+                      /* exclude_suffix= */ NULL,
+                      ".extra/confext",
+                      /* dir_mode= */ 0555,
+                      /* access_mode= */ 0444,
+                      /* tpm_pcr= */ TPM2_PCR_KERNEL_CONFIG,
+                      u"Configuration extension initrd",
+                      &confext_initrd,
+                      &confext_initrd_size,
+                      &m) == EFI_SUCCESS)
+                confext_measured = m;
+
+        dt_size = szs[UNIFIED_SECTION_DTB];
+        dt_base = dt_size != 0 ? POINTER_TO_PHYSICAL_ADDRESS(loaded_image->ImageBase) + addrs[UNIFIED_SECTION_DTB] : 0;
+
+        /* First load the base device tree, then fix it up using addons - global first, then per-UKI. */
+        if (dt_size > 0) {
+                err = devicetree_install_from_memory(
+                                &dt_state, PHYSICAL_ADDRESS_TO_POINTER(dt_base), dt_size);
+                if (err != EFI_SUCCESS)
+                        log_error_status(err, "Error loading embedded devicetree: %m");
+        }
+
+        dtb_install_addons(&dt_state,
+                           dt_bases_addons_global,
+                           dt_sizes_addons_global,
+                           dt_filenames_addons_global,
+                           n_dts_addons_global,
+                           &m);
+        parameters_measured = parameters_measured < 0 ? m : (parameters_measured && m);
+        dtb_install_addons(&dt_state,
+                           dt_bases_addons_uki,
+                           dt_sizes_addons_uki,
+                           dt_filenames_addons_uki,
+                           n_dts_addons_uki,
+                           &m);
+        parameters_measured = parameters_measured < 0 ? m : (parameters_measured && m);
+
         if (parameters_measured > 0)
-                (void) efivar_set_uint_string(MAKE_GUID_PTR(LOADER), u"StubPcrKernelParameters", TPM_PCR_INDEX_KERNEL_PARAMETERS, 0);
+                (void) efivar_set_uint_string(MAKE_GUID_PTR(LOADER), u"StubPcrKernelParameters", TPM2_PCR_KERNEL_CONFIG, 0);
         if (sysext_measured)
-                (void) efivar_set_uint_string(MAKE_GUID_PTR(LOADER), u"StubPcrInitRDSysExts", TPM_PCR_INDEX_INITRD_SYSEXTS, 0);
+                (void) efivar_set_uint_string(MAKE_GUID_PTR(LOADER), u"StubPcrInitRDSysExts", TPM2_PCR_SYSEXTS, 0);
+        if (confext_measured)
+                (void) efivar_set_uint_string(MAKE_GUID_PTR(LOADER), u"StubPcrInitRDConfExts", TPM2_PCR_KERNEL_CONFIG, 0);
 
         /* If the PCR signature was embedded in the PE image, then let's wrap it in a cpio and also pass it
          * to the kernel, so that it can be read from /.extra/tpm2-pcr-signature.json. Note that this section
@@ -595,29 +785,36 @@ static EFI_STATUS run(EFI_HANDLE image) {
         initrd_size = szs[UNIFIED_SECTION_INITRD];
         initrd_base = initrd_size != 0 ? POINTER_TO_PHYSICAL_ADDRESS(loaded_image->ImageBase) + addrs[UNIFIED_SECTION_INITRD] : 0;
 
-        dt_size = szs[UNIFIED_SECTION_DTB];
-        dt_base = dt_size != 0 ? POINTER_TO_PHYSICAL_ADDRESS(loaded_image->ImageBase) + addrs[UNIFIED_SECTION_DTB] : 0;
+        ucode_size = szs[UNIFIED_SECTION_UCODE];
+        ucode_base = ucode_size != 0 ? POINTER_TO_PHYSICAL_ADDRESS(loaded_image->ImageBase) + addrs[UNIFIED_SECTION_UCODE] : 0;
 
         _cleanup_pages_ Pages initrd_pages = {};
-        if (credential_initrd || global_credential_initrd || sysext_initrd || pcrsig_initrd || pcrpkey_initrd) {
-                /* If we have generated initrds dynamically, let's combine them with the built-in initrd. */
-                err = combine_initrd(
-                                initrd_base, initrd_size,
+        if (ucode_base || credential_initrd || global_credential_initrd || sysext_initrd || confext_initrd || pcrsig_initrd || pcrpkey_initrd) {
+                /* If we have generated initrds dynamically or there is a microcode initrd, combine them with the built-in initrd. */
+                err = combine_initrds(
                                 (const void*const[]) {
+                                        /* Microcode must always be first as kernel only scans uncompressed cpios
+                                         * and later initrds might be compressed. */
+                                        PHYSICAL_ADDRESS_TO_POINTER(ucode_base),
+                                        PHYSICAL_ADDRESS_TO_POINTER(initrd_base),
                                         credential_initrd,
                                         global_credential_initrd,
                                         sysext_initrd,
+                                        confext_initrd,
                                         pcrsig_initrd,
                                         pcrpkey_initrd,
                                 },
                                 (const size_t[]) {
+                                        ucode_size,
+                                        initrd_size,
                                         credential_initrd_size,
                                         global_credential_initrd_size,
                                         sysext_initrd_size,
+                                        confext_initrd_size,
                                         pcrsig_initrd_size,
                                         pcrpkey_initrd_size,
                                 },
-                                5,
+                                8,
                                 &initrd_pages, &initrd_size);
                 if (err != EFI_SUCCESS)
                         return err;
@@ -628,15 +825,9 @@ static EFI_STATUS run(EFI_HANDLE image) {
                 credential_initrd = mfree(credential_initrd);
                 global_credential_initrd = mfree(global_credential_initrd);
                 sysext_initrd = mfree(sysext_initrd);
+                confext_initrd = mfree(confext_initrd);
                 pcrsig_initrd = mfree(pcrsig_initrd);
                 pcrpkey_initrd = mfree(pcrpkey_initrd);
-        }
-
-        if (dt_size > 0) {
-                err = devicetree_install_from_memory(
-                                &dt_state, PHYSICAL_ADDRESS_TO_POINTER(dt_base), dt_size);
-                if (err != EFI_SUCCESS)
-                        log_error_status(err, "Error loading embedded devicetree: %m");
         }
 
         err = linux_exec(image, cmdline,

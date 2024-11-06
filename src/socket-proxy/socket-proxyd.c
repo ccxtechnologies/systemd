@@ -488,8 +488,8 @@ static int add_connection_socket(Context *context, int fd) {
                .context = context,
                .server_fd = fd,
                .client_fd = -EBADF,
-               .server_to_client_buffer = PIPE_EBADF,
-               .client_to_server_buffer = PIPE_EBADF,
+               .server_to_client_buffer = EBADF_PAIR,
+               .client_to_server_buffer = EBADF_PAIR,
         };
 
         r = set_ensure_put(&context->connections, NULL, c);
@@ -676,8 +676,7 @@ static int run(int argc, char *argv[]) {
         _unused_ _cleanup_(notify_on_cleanup) const char *notify_stop = NULL;
         int r, n, fd;
 
-        log_parse_environment();
-        log_open();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)

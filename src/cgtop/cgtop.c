@@ -139,7 +139,7 @@ static bool is_root_cgroup(const char *path) {
          *
          * Note that checking for a container environment is kinda ugly, since in theory people could use cgtop from
          * inside a container where cgroup namespacing is turned off to watch the host system. However, that's mostly a
-         * theoretic usecase, and if people actually try all they'll lose is accounting for the top-level cgroup. Which
+         * theoretic use case, and if people actually try all they'll lose is accounting for the top-level cgroup. Which
          * isn't too bad. */
 
         if (detect_container() > 0)
@@ -207,9 +207,9 @@ static int process(
                         return r;
 
                 g->n_tasks = 0;
-                while (cg_read_pid(f, &pid) > 0) {
+                while (cg_read_pid(f, &pid, CGROUP_DONT_SKIP_UNMAPPED) > 0) {
 
-                        if (arg_count == COUNT_USERSPACE_PROCESSES && is_kernel_thread(pid) > 0)
+                        if (arg_count == COUNT_USERSPACE_PROCESSES && pid_is_kernel_thread(pid) > 0)
                                 continue;
 
                         g->n_tasks++;
@@ -298,22 +298,21 @@ static int process(
                         uint64_t k, *q;
                         char *l;
 
-                        r = read_line(f, LONG_LINE_MAX, &line);
+                        r = read_stripped_line(f, LONG_LINE_MAX, &line);
                         if (r < 0)
                                 return r;
                         if (r == 0)
                                 break;
 
-                        /* Trim and skip the device */
-                        l = strstrip(line);
-                        l += strcspn(l, WHITESPACE);
+                        /* Skip the device */
+                        l = line + strcspn(line, WHITESPACE);
                         l += strspn(l, WHITESPACE);
 
                         if (all_unified) {
                                 while (!isempty(l)) {
-                                        if (sscanf(l, "rbytes=%" SCNu64, &k))
+                                        if (sscanf(l, "rbytes=%" SCNu64, &k) == 1)
                                                 rd += k;
-                                        else if (sscanf(l, "wbytes=%" SCNu64, &k))
+                                        else if (sscanf(l, "wbytes=%" SCNu64, &k) == 1)
                                                 wr += k;
 
                                         l += strcspn(l, WHITESPACE);

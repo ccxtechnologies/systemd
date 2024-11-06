@@ -96,7 +96,7 @@ static Manager* manager_unref(Manager *m) {
         sd_event_source_unref(m->nscd_cache_flush_event);
 #endif
 
-        bus_verify_polkit_async_registry_free(m->polkit_registry);
+        hashmap_free(m->polkit_registry);
 
         manager_varlink_done(m);
 
@@ -107,6 +107,7 @@ static Manager* manager_unref(Manager *m) {
 }
 
 static int manager_add_host_machine(Manager *m) {
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
         _cleanup_free_ char *rd = NULL, *unit = NULL;
         sd_id128_t mid;
         Machine *t;
@@ -127,11 +128,19 @@ static int manager_add_host_machine(Manager *m) {
         if (!unit)
                 return log_oom();
 
-        r = machine_new(m, MACHINE_HOST, ".host", &t);
+        r = pidref_set_pid(&pidref, 1);
+        if (r < 0)
+                return log_error_errno(r, "Failed to open reference to PID 1: %m");
+
+        r = machine_new(MACHINE_HOST, ".host", &t);
         if (r < 0)
                 return log_error_errno(r, "Failed to create machine: %m");
 
-        t->leader = 1;
+        r = machine_link(m, t);
+        if (r < 0)
+                return log_error_errno(r, "Failed to link machine to manager: %m");
+
+        t->leader = TAKE_PIDREF(pidref);
         t->id = mid;
 
         t->root_directory = TAKE_PTR(rd);
@@ -254,8 +263,7 @@ static void manager_gc(Manager *m, bool drop_not_started) {
 
         assert(m);
 
-        while ((machine = m->machine_gc_queue)) {
-                LIST_REMOVE(gc_queue, m->machine_gc_queue, machine);
+        while ((machine = LIST_POP(gc_queue, m->machine_gc_queue))) {
                 machine->in_gc_queue = false;
 
                 /* First, if we are not closing yet, initiate stopping */
@@ -308,23 +316,15 @@ static bool check_idle(void *userdata) {
         if (m->operations)
                 return false;
 
-        if (varlink_server_current_connections(m->varlink_server) > 0)
+        if (varlink_server_current_connections(m->varlink_userdb_server) > 0)
+                return false;
+
+        if (varlink_server_current_connections(m->varlink_machine_server) > 0)
                 return false;
 
         manager_gc(m, true);
 
         return hashmap_isempty(m->machines);
-}
-
-static int manager_run(Manager *m) {
-        assert(m);
-
-        return bus_event_loop_with_idle(
-                        m->event,
-                        m->bus,
-                        "org.freedesktop.machine1",
-                        DEFAULT_EXIT_USEC,
-                        check_idle, m);
 }
 
 static int run(int argc, char *argv[]) {
@@ -349,7 +349,7 @@ static int run(int argc, char *argv[]) {
          * make sure this check stays in. */
         (void) mkdir_label("/run/systemd/machines", 0755);
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD, SIGTERM, SIGINT, SIGRTMIN+18, -1) >= 0);
+        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD, SIGTERM, SIGINT, SIGRTMIN+18) >= 0);
 
         r = manager_new(&m);
         if (r < 0)
@@ -359,16 +359,20 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to fully start up daemon: %m");
 
-        log_debug("systemd-machined running as pid "PID_FMT, getpid_cached());
         r = sd_notify(false, NOTIFY_READY);
         if (r < 0)
                 log_warning_errno(r, "Failed to send readiness notification, ignoring: %m");
 
-        r = manager_run(m);
+        r = bus_event_loop_with_idle(
+                        m->event,
+                        m->bus,
+                        "org.freedesktop.machine1",
+                        DEFAULT_EXIT_USEC,
+                        check_idle, m);
+        if (r < 0)
+                return log_error_errno(r, "Failed to run main loop: %m");
 
-        (void) sd_notify(false, NOTIFY_STOPPING);
-        log_debug("systemd-machined stopped as pid "PID_FMT, getpid_cached());
-        return r;
+        return 0;
 }
 
 DEFINE_MAIN_FUNCTION(run);

@@ -66,12 +66,14 @@ int verb_enable(int argc, char *argv[], void *userdata) {
         const char *verb = argv[0];
         int carries_install_info = -1;
         bool ignore_carries_install_info = arg_quiet || arg_no_warn;
+        sd_bus *bus = NULL;
         int r;
 
         if (!argv[1])
                 return 0;
 
-        r = mangle_names("to enable", strv_skip(argv, 1), &names);
+        const char *operation = strjoina("to ", verb);
+        r = mangle_names(operation, strv_skip(argv, 1), &names);
         if (r < 0)
                 return r;
 
@@ -138,11 +140,11 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
                 bool expect_carries_install_info = false;
                 bool send_runtime = true, send_force = true, send_preset_mode = false;
-                const char *method;
-                sd_bus *bus;
+                const char *method, *warn_trigger_operation = NULL;
+                bool warn_trigger_ignore_masked = true; /* suppress "used uninitialized" warning */
 
                 if (STR_IN_SET(verb, "mask", "unmask")) {
-                        _cleanup_(lookup_paths_free) LookupPaths lp = {};
+                        _cleanup_(lookup_paths_done) LookupPaths lp = {};
 
                         r = lookup_paths_init_or_warn(&lp, arg_runtime_scope, 0, arg_root);
                         if (r < 0)
@@ -170,6 +172,9 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                         method = "DisableUnitFilesWithFlagsAndInstallInfo";
                         expect_carries_install_info = true;
                         send_force = false;
+
+                        warn_trigger_operation = "Disabling";
+                        warn_trigger_ignore_masked = true;
                 } else if (streq(verb, "reenable")) {
                         method = "ReenableUnitFiles";
                         expect_carries_install_info = true;
@@ -185,9 +190,12 @@ int verb_enable(int argc, char *argv[], void *userdata) {
 
                         expect_carries_install_info = true;
                         ignore_carries_install_info = true;
-                } else if (streq(verb, "mask"))
+                } else if (streq(verb, "mask")) {
                         method = "MaskUnitFiles";
-                else if (streq(verb, "unmask")) {
+
+                        warn_trigger_operation = "Masking";
+                        warn_trigger_ignore_masked = false;
+                } else if (streq(verb, "unmask")) {
                         method = "UnmaskUnitFiles";
                         send_force = false;
                 } else if (streq(verb, "revert")) {
@@ -245,6 +253,10 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                         if (r < 0)
                                 return r;
                 }
+
+                if (warn_trigger_operation && !arg_quiet && !arg_no_warn)
+                        STRV_FOREACH(unit, names)
+                                warn_triggering_units(bus, *unit, warn_trigger_operation, warn_trigger_ignore_masked);
         }
 
         if (carries_install_info == 0 && !ignore_carries_install_info)
@@ -252,9 +264,9 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                            "Also=, or Alias= settings in the [Install] section, and DefaultInstance= for\n"
                            "template units). This means they are not meant to be enabled or disabled using systemctl.\n"
                            " \n" /* trick: the space is needed so that the line does not get stripped from output */
-                           "Possible reasons for having this kind of units are:\n"
+                           "Possible reasons for having these kinds of units are:\n"
                            "%1$s A unit may be statically enabled by being symlinked from another unit's\n"
-                           "  .wants/ or .requires/ directory.\n"
+                           "  .wants/, .requires/, or .upholds/ directory.\n"
                            "%1$s A unit's purpose may be to act as a helper for some other unit which has\n"
                            "  a requirement dependency on it.\n"
                            "%1$s A unit may be started when needed via activation (socket, path, timer,\n"
@@ -267,7 +279,8 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                 /* If some of the units are disabled in user scope but still enabled in global scope,
                  * we emit a warning for that. */
 
-                _cleanup_strv_free_ char **enabled_in_global_scope = NULL;
+                /* No strv_free here, strings are owned by 'names' */
+                _cleanup_free_ char **enabled_in_global_scope = NULL;
 
                 STRV_FOREACH(name, names) {
                         UnitFileState state;
@@ -279,46 +292,72 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                                 return log_error_errno(r, "Failed to get unit file state for %s: %m", *name);
 
                         if (IN_SET(state, UNIT_FILE_ENABLED, UNIT_FILE_ENABLED_RUNTIME)) {
-                                r = strv_extend(&enabled_in_global_scope, *name);
+                                r = strv_push(&enabled_in_global_scope, *name);
                                 if (r < 0)
                                         return log_oom();
                         }
                 }
 
                 if (!strv_isempty(enabled_in_global_scope)) {
-                        _cleanup_free_ char *units = NULL;
+                        _cleanup_free_ char *joined = NULL;
 
-                        units = strv_join(enabled_in_global_scope, ", ");
-                        if (!units)
+                        joined = strv_join(enabled_in_global_scope, ", ");
+                        if (!joined)
                                 return log_oom();
 
                         log_notice("The following unit files have been enabled in global scope. This means\n"
                                    "they will still be started automatically after a successful disablement\n"
                                    "in user scope:\n"
                                    "%s",
-                                   units);
+                                   joined);
                 }
         }
 
-        if (arg_now && STR_IN_SET(argv[0], "enable", "disable", "mask")) {
-                sd_bus *bus;
-                size_t len, i;
+        if (arg_now) {
+                _cleanup_strv_free_ char **new_args = NULL;
 
-                r = acquire_bus(BUS_MANAGER, &bus);
-                if (r < 0)
-                        return r;
+                if (!STR_IN_SET(verb, "enable", "disable", "mask"))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--now can only be used with verb enable, disable, or mask.");
 
-                len = strv_length(names);
-                {
-                        char *new_args[len + 2];
+                if (install_client_side())
+                        return log_error_errno(SYNTHETIC_ERRNO(EREMOTE),
+                                               "--now cannot be used when systemd is not running or in conjunction with --root=/--global, refusing.");
 
-                        new_args[0] = (char*) (streq(argv[0], "enable") ? "start" : "stop");
-                        for (i = 0; i < len; i++)
-                                new_args[i + 1] = basename(names[i]);
-                        new_args[i + 1] = NULL;
+                assert(bus);
 
-                        r = verb_start(len + 1, new_args, userdata);
+                if (strv_extend(&new_args, streq(verb, "enable") ? "start" : "stop") < 0)
+                        return log_oom();
+
+                STRV_FOREACH(name, names) {
+                        if (streq(verb, "enable")) {
+                                char *fn;
+
+                                /* 'enable' accept path to unit files, so extract it first. Don't try to
+                                 * glob them though, as starting globbed unit seldom makes sense and
+                                 * actually changes the semantic (we're operating on DefaultInstance=
+                                 * when enabling). */
+
+                                r = path_extract_filename(*name, &fn);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to extract filename of '%s': %m", *name);
+
+                                r = strv_consume(&new_args, fn);
+                        } else if (unit_name_is_valid(*name, UNIT_NAME_TEMPLATE)) {
+                                char *globbed;
+
+                                r = unit_name_replace_instance_full(*name, "*", /* accept_glob = */ true, &globbed);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to glob unit name '%s': %m", *name);
+
+                                r = strv_consume(&new_args, globbed);
+                        } else
+                                r = strv_extend(&new_args, *name);
+                        if (r < 0)
+                                return log_oom();
                 }
+
+                return verb_start(strv_length(new_args), new_args, userdata);
         }
 
         return 0;

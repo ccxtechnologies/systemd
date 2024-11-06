@@ -54,7 +54,7 @@ static void start_target(const char *target, const char *mode) {
         log_info("Requesting %s/start/%s", target, mode);
 
         /* Start this unit only if we can replace basic.target with it */
-        r = bus_call_method(bus, bus_systemd_mgr, "StartUnitReplace", &error, NULL, "sss", "basic.target", target, mode);
+        r = bus_call_method(bus, bus_systemd_mgr, "StartUnitReplace", &error, NULL, "sss", SPECIAL_BASIC_TARGET, target, mode);
 
         /* Don't print a warning if we aren't called during startup */
         if (r < 0 && !sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_JOB))
@@ -177,7 +177,7 @@ static int process_progress(int fd, FILE* console) {
                         else if (feof(f))
                                 r = 0;
                         else
-                                r = log_warning_errno(SYNTHETIC_ERRNO(errno), "Failed to parse progress pipe data");
+                                r = log_warning_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse progress pipe data.");
 
                         break;
                 }
@@ -234,7 +234,7 @@ static int fsck_progress_socket(void) {
 }
 
 static int run(int argc, char *argv[]) {
-        _cleanup_close_pair_ int progress_pipe[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int progress_pipe[2] = EBADF_PAIR;
         _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
         _cleanup_free_ char *dpath = NULL;
         _cleanup_fclose_ FILE *console = NULL;
@@ -339,7 +339,7 @@ static int run(int argc, char *argv[]) {
             pipe(progress_pipe) < 0)
                 return log_error_errno(errno, "pipe(): %m");
 
-        r = safe_fork("(fsck)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE, &pid);
+        r = safe_fork("(fsck)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE, &pid);
         if (r < 0)
                 return r;
         if (r == 0) {

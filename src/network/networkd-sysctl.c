@@ -2,7 +2,9 @@
 
 #include <netinet/in.h>
 #include <linux/if.h>
+#include <linux/if_arp.h>
 
+#include "af-list.h"
 #include "missing_network.h"
 #include "networkd-link.h"
 #include "networkd-manager.h"
@@ -12,10 +14,65 @@
 #include "string-table.h"
 #include "sysctl-util.h"
 
+static void manager_set_ip_forwarding(Manager *manager, int family) {
+        int r, t;
+
+        assert(manager);
+        assert(IN_SET(family, AF_INET, AF_INET6));
+
+        if (family == AF_INET6 && !socket_ipv6_is_supported())
+                return;
+
+        t = manager->ip_forwarding[family == AF_INET6];
+        if (t < 0)
+                return; /* keep */
+
+        /* First, set the default value. */
+        r = sysctl_write_ip_property_boolean(family, "default", "forwarding", t);
+        if (r < 0)
+                log_warning_errno(r, "Failed to %s the default %s forwarding: %m",
+                                  enable_disable(t), af_to_ipv4_ipv6(family));
+
+        /* Then, set the value to all interfaces. */
+        r = sysctl_write_ip_property_boolean(family, "all", "forwarding", t);
+        if (r < 0)
+                log_warning_errno(r, "Failed to %s %s forwarding for all interfaces: %m",
+                                  enable_disable(t), af_to_ipv4_ipv6(family));
+}
+
+void manager_set_sysctl(Manager *manager) {
+        assert(manager);
+        assert(!manager->test_mode);
+
+        manager_set_ip_forwarding(manager, AF_INET);
+        manager_set_ip_forwarding(manager, AF_INET6);
+}
+
+static bool link_is_configured_for_family(Link *link, int family) {
+        assert(link);
+
+        if (!link->network)
+                return false;
+
+        if (link->flags & IFF_LOOPBACK)
+                return false;
+
+        /* CAN devices do not support IP layer. Most of the functions below are never called for CAN devices,
+         * but link_set_ipv6_mtu() may be called after setting interface MTU, and warn about the failure. For
+         * safety, let's unconditionally check if the interface is not a CAN device. */
+        if (IN_SET(family, AF_INET, AF_INET6) && link->iftype == ARPHRD_CAN)
+                return false;
+
+        if (family == AF_INET6 && !socket_ipv6_is_supported())
+                return false;
+
+        return true;
+}
+
 static int link_update_ipv6_sysctl(Link *link) {
         assert(link);
 
-        if (link->flags & IFF_LOOPBACK)
+        if (!link_is_configured_for_family(link, AF_INET6))
                 return 0;
 
         if (!link_ipv6_enabled(link))
@@ -27,10 +84,7 @@ static int link_update_ipv6_sysctl(Link *link) {
 static int link_set_proxy_arp(Link *link) {
         assert(link);
 
-        if (link->flags & IFF_LOOPBACK)
-                return 0;
-
-        if (!link->network)
+        if (!link_is_configured_for_family(link, AF_INET))
                 return 0;
 
         if (link->network->proxy_arp < 0)
@@ -39,54 +93,74 @@ static int link_set_proxy_arp(Link *link) {
         return sysctl_write_ip_property_boolean(AF_INET, link->ifname, "proxy_arp", link->network->proxy_arp > 0);
 }
 
-static bool link_ip_forward_enabled(Link *link, int family) {
+static int link_set_proxy_arp_pvlan(Link *link) {
+        assert(link);
+
+        if (!link_is_configured_for_family(link, AF_INET))
+                return 0;
+
+        if (link->network->proxy_arp_pvlan < 0)
+                return 0;
+
+        return sysctl_write_ip_property_boolean(AF_INET, link->ifname, "proxy_arp_pvlan", link->network->proxy_arp_pvlan > 0);
+}
+
+int link_get_ip_forwarding(Link *link, int family) {
+        assert(link);
+        assert(link->manager);
+        assert(link->network);
+        assert(IN_SET(family, AF_INET, AF_INET6));
+
+        /* If it is explicitly specified, then honor the setting. */
+        int t = link->network->ip_forwarding[family == AF_INET6];
+        if (t >= 0)
+                return t;
+
+        /* If IPMasquerade= is enabled, also enable IP forwarding. */
+        if (family == AF_INET && FLAGS_SET(link->network->ip_masquerade, ADDRESS_FAMILY_IPV4))
+                return true;
+        if (family == AF_INET6 && FLAGS_SET(link->network->ip_masquerade, ADDRESS_FAMILY_IPV6))
+                return true;
+
+        /* If IPv6SendRA= is enabled, also enable IPv6 forwarding. */
+        if (family == AF_INET6 && link_radv_enabled(link))
+                return true;
+
+        /* Otherwise, use the global setting. */
+        return link->manager->ip_forwarding[family == AF_INET6];
+}
+
+static int link_set_ip_forwarding(Link *link, int family) {
+        int r, t;
+
         assert(link);
         assert(IN_SET(family, AF_INET, AF_INET6));
 
-        if (family == AF_INET6 && !socket_ipv6_is_supported())
-                return false;
-
-        if (link->flags & IFF_LOOPBACK)
-                return false;
-
-        if (!link->network)
-                return false;
-
-        return link->network->ip_forward & (family == AF_INET ? ADDRESS_FAMILY_IPV4 : ADDRESS_FAMILY_IPV6);
-}
-
-static int link_set_ipv4_forward(Link *link) {
-        assert(link);
-
-        if (!link_ip_forward_enabled(link, AF_INET))
+        if (!link_is_configured_for_family(link, family))
                 return 0;
 
-        /* We propagate the forwarding flag from one interface to the
-         * global setting one way. This means: as long as at least one
-         * interface was configured at any time that had IP forwarding
-         * enabled the setting will stay on for good. We do this
-         * primarily to keep IPv4 and IPv6 packet forwarding behaviour
-         * somewhat in sync (see below). */
+        t = link_get_ip_forwarding(link, family);
+        if (t < 0)
+                return 0; /* keep */
 
-        return sysctl_write_ip_property(AF_INET, NULL, "ip_forward", "1");
+        r = sysctl_write_ip_property_boolean(family, link->ifname, "forwarding", t);
+        if (r < 0)
+                return log_link_warning_errno(link, r, "Failed to %s %s forwarding, ignoring: %m",
+                                              enable_disable(t), af_to_ipv4_ipv6(family));
+
+        return 0;
 }
 
-static int link_set_ipv6_forward(Link *link) {
+static int link_set_ipv4_rp_filter(Link *link) {
         assert(link);
 
-        if (!link_ip_forward_enabled(link, AF_INET6))
+        if (!link_is_configured_for_family(link, AF_INET))
                 return 0;
 
-        /* On Linux, the IPv6 stack does not know a per-interface
-         * packet forwarding setting: either packet forwarding is on
-         * for all, or off for all. We hence don't bother with a
-         * per-interface setting, but simply propagate the interface
-         * flag, if it is set, to the global flag, one-way. Note that
-         * while IPv4 would allow a per-interface flag, we expose the
-         * same behaviour there and also propagate the setting from
-         * one to all, to keep things simple (see above). */
+        if (link->network->ipv4_rp_filter < 0)
+                return 0;
 
-        return sysctl_write_ip_property(AF_INET6, "all", "forwarding", "1");
+        return sysctl_write_ip_property_int(AF_INET, link->ifname, "rp_filter", link->network->ipv4_rp_filter);
 }
 
 static int link_set_ipv6_privacy_extensions(Link *link) {
@@ -95,13 +169,7 @@ static int link_set_ipv6_privacy_extensions(Link *link) {
         assert(link);
         assert(link->manager);
 
-        if (!socket_ipv6_is_supported())
-                return 0;
-
-        if (link->flags & IFF_LOOPBACK)
-                return 0;
-
-        if (!link->network)
+        if (!link_is_configured_for_family(link, AF_INET6))
                 return 0;
 
         val = link->network->ipv6_privacy_extensions;
@@ -118,14 +186,7 @@ static int link_set_ipv6_privacy_extensions(Link *link) {
 static int link_set_ipv6_accept_ra(Link *link) {
         assert(link);
 
-        /* Make this a NOP if IPv6 is not available */
-        if (!socket_ipv6_is_supported())
-                return 0;
-
-        if (link->flags & IFF_LOOPBACK)
-                return 0;
-
-        if (!link->network)
+        if (!link_is_configured_for_family(link, AF_INET6))
                 return 0;
 
         return sysctl_write_ip_property(AF_INET6, link->ifname, "accept_ra", "0");
@@ -134,14 +195,7 @@ static int link_set_ipv6_accept_ra(Link *link) {
 static int link_set_ipv6_dad_transmits(Link *link) {
         assert(link);
 
-        /* Make this a NOP if IPv6 is not available */
-        if (!socket_ipv6_is_supported())
-                return 0;
-
-        if (link->flags & IFF_LOOPBACK)
-                return 0;
-
-        if (!link->network)
+        if (!link_is_configured_for_family(link, AF_INET6))
                 return 0;
 
         if (link->network->ipv6_dad_transmits < 0)
@@ -153,20 +207,31 @@ static int link_set_ipv6_dad_transmits(Link *link) {
 static int link_set_ipv6_hop_limit(Link *link) {
         assert(link);
 
-        /* Make this a NOP if IPv6 is not available */
-        if (!socket_ipv6_is_supported())
+        if (!link_is_configured_for_family(link, AF_INET6))
                 return 0;
 
-        if (link->flags & IFF_LOOPBACK)
-                return 0;
-
-        if (!link->network)
-                return 0;
-
-        if (link->network->ipv6_hop_limit < 0)
+        if (link->network->ipv6_hop_limit <= 0)
                 return 0;
 
         return sysctl_write_ip_property_int(AF_INET6, link->ifname, "hop_limit", link->network->ipv6_hop_limit);
+}
+
+static int link_set_ipv6_retransmission_time(Link *link) {
+        usec_t retrans_time_ms;
+
+        assert(link);
+
+        if (!link_is_configured_for_family(link, AF_INET6))
+                return 0;
+
+        if (!timestamp_is_set(link->network->ipv6_retransmission_time))
+                return 0;
+
+        retrans_time_ms = DIV_ROUND_UP(link->network->ipv6_retransmission_time, USEC_PER_MSEC);
+         if (retrans_time_ms <= 0 || retrans_time_ms > UINT32_MAX)
+                return 0;
+
+        return sysctl_write_ip_neighbor_property_uint32(AF_INET6, link->ifname, "retrans_time_ms", retrans_time_ms);
 }
 
 static int link_set_ipv6_proxy_ndp(Link *link) {
@@ -174,13 +239,7 @@ static int link_set_ipv6_proxy_ndp(Link *link) {
 
         assert(link);
 
-        if (!socket_ipv6_is_supported())
-                return 0;
-
-        if (link->flags & IFF_LOOPBACK)
-                return 0;
-
-        if (!link->network)
+        if (!link_is_configured_for_family(link, AF_INET6))
                 return 0;
 
         if (link->network->ipv6_proxy_ndp >= 0)
@@ -191,29 +250,28 @@ static int link_set_ipv6_proxy_ndp(Link *link) {
         return sysctl_write_ip_property_boolean(AF_INET6, link->ifname, "proxy_ndp", v);
 }
 
-int link_set_ipv6_mtu(Link *link) {
-        uint32_t mtu;
+int link_set_ipv6_mtu(Link *link, int log_level) {
+        uint32_t mtu = 0;
 
         assert(link);
 
-        /* Make this a NOP if IPv6 is not available */
-        if (!socket_ipv6_is_supported())
+        if (!link_is_configured_for_family(link, AF_INET6))
                 return 0;
 
-        if (link->flags & IFF_LOOPBACK)
+        assert(link->network);
+
+        if (link->network->ndisc_use_mtu)
+                mtu = link->ndisc_mtu;
+        if (mtu == 0)
+                mtu = link->network->ipv6_mtu;
+        if (mtu == 0)
                 return 0;
 
-        if (!link->network)
-                return 0;
-
-        if (link->network->ipv6_mtu == 0)
-                return 0;
-
-        mtu = link->network->ipv6_mtu;
-        if (mtu > link->max_mtu) {
-                log_link_warning(link, "Reducing requested IPv6 MTU %"PRIu32" to the interface's maximum MTU %"PRIu32".",
-                                 mtu, link->max_mtu);
-                mtu = link->max_mtu;
+        if (mtu > link->mtu) {
+                log_link_full(link, log_level,
+                              "Reducing requested IPv6 MTU %"PRIu32" to the interface's maximum MTU %"PRIu32".",
+                              mtu, link->mtu);
+                mtu = link->mtu;
         }
 
         return sysctl_write_ip_property_uint32(AF_INET6, link->ifname, "mtu", mtu);
@@ -222,7 +280,7 @@ int link_set_ipv6_mtu(Link *link) {
 static int link_set_ipv4_accept_local(Link *link) {
         assert(link);
 
-        if (link->flags & IFF_LOOPBACK)
+        if (!link_is_configured_for_family(link, AF_INET))
                 return 0;
 
         if (link->network->ipv4_accept_local < 0)
@@ -234,13 +292,27 @@ static int link_set_ipv4_accept_local(Link *link) {
 static int link_set_ipv4_route_localnet(Link *link) {
         assert(link);
 
-        if (link->flags & IFF_LOOPBACK)
+        if (!link_is_configured_for_family(link, AF_INET))
                 return 0;
 
         if (link->network->ipv4_route_localnet < 0)
                 return 0;
 
         return sysctl_write_ip_property_boolean(AF_INET, link->ifname, "route_localnet", link->network->ipv4_route_localnet > 0);
+}
+
+static int link_set_ipv4_promote_secondaries(Link *link) {
+        assert(link);
+
+        if (!link_is_configured_for_family(link, AF_INET))
+                return 0;
+
+        /* If promote_secondaries is not set, DHCP will work only as long as the IP address does not
+         * changes between leases. The kernel will remove all secondary IP addresses of an interface
+         * otherwise. The way systemd-networkd works is that the new IP of a lease is added as a
+         * secondary IP and when the primary one expires it relies on the kernel to promote the
+         * secondary IP. See also https://github.com/systemd/systemd/issues/7163 */
+        return sysctl_write_ip_property_boolean(AF_INET, link->ifname, "promote_secondaries", true);
 }
 
 int link_set_sysctl(Link *link) {
@@ -258,13 +330,12 @@ int link_set_sysctl(Link *link) {
         if (r < 0)
                log_link_warning_errno(link, r, "Cannot configure proxy ARP for interface, ignoring: %m");
 
-        r = link_set_ipv4_forward(link);
+        r = link_set_proxy_arp_pvlan(link);
         if (r < 0)
-                log_link_warning_errno(link, r, "Cannot turn on IPv4 packet forwarding, ignoring: %m");
+                log_link_warning_errno(link, r, "Cannot configure proxy ARP private VLAN for interface, ignoring: %m");
 
-        r = link_set_ipv6_forward(link);
-        if (r < 0)
-                log_link_warning_errno(link, r, "Cannot configure IPv6 packet forwarding, ignoring: %m");
+        (void) link_set_ip_forwarding(link, AF_INET);
+        (void) link_set_ip_forwarding(link, AF_INET6);
 
         r = link_set_ipv6_privacy_extensions(link);
         if (r < 0)
@@ -282,11 +353,15 @@ int link_set_sysctl(Link *link) {
         if (r < 0)
                 log_link_warning_errno(link, r, "Cannot set IPv6 hop limit for interface, ignoring: %m");
 
+        r = link_set_ipv6_retransmission_time(link);
+        if (r < 0)
+                log_link_warning_errno(link, r, "Cannot set IPv6 retransmission time for interface, ignoring: %m");
+
         r = link_set_ipv6_proxy_ndp(link);
         if (r < 0)
                 log_link_warning_errno(link, r, "Cannot set IPv6 proxy NDP, ignoring: %m");
 
-        r = link_set_ipv6_mtu(link);
+        r = link_set_ipv6_mtu(link, LOG_INFO);
         if (r < 0)
                 log_link_warning_errno(link, r, "Cannot set IPv6 MTU, ignoring: %m");
 
@@ -302,12 +377,11 @@ int link_set_sysctl(Link *link) {
         if (r < 0)
                 log_link_warning_errno(link, r, "Cannot set IPv4 route_localnet flag for interface, ignoring: %m");
 
-        /* If promote_secondaries is not set, DHCP will work only as long as the IP address does not
-         * changes between leases. The kernel will remove all secondary IP addresses of an interface
-         * otherwise. The way systemd-networkd works is that the new IP of a lease is added as a
-         * secondary IP and when the primary one expires it relies on the kernel to promote the
-         * secondary IP. See also https://github.com/systemd/systemd/issues/7163 */
-        r = sysctl_write_ip_property_boolean(AF_INET, link->ifname, "promote_secondaries", true);
+        r = link_set_ipv4_rp_filter(link);
+        if (r < 0)
+                log_link_warning_errno(link, r, "Cannot set IPv4 reverse path filtering for interface, ignoring: %m");
+
+        r = link_set_ipv4_promote_secondaries(link);
         if (r < 0)
                 log_link_warning_errno(link, r, "Cannot enable promote_secondaries for interface, ignoring: %m");
 
@@ -325,3 +399,34 @@ DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(ipv6_privacy_extensions, IPv6PrivacyExte
                                         IPV6_PRIVACY_EXTENSIONS_YES);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_ipv6_privacy_extensions, ipv6_privacy_extensions, IPv6PrivacyExtensions,
                          "Failed to parse IPv6 privacy extensions option");
+
+static const char* const ip_reverse_path_filter_table[_IP_REVERSE_PATH_FILTER_MAX] = {
+        [IP_REVERSE_PATH_FILTER_NO]     = "no",
+        [IP_REVERSE_PATH_FILTER_STRICT] = "strict",
+        [IP_REVERSE_PATH_FILTER_LOOSE]  = "loose",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(ip_reverse_path_filter, IPReversePathFilter);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_ip_reverse_path_filter, ip_reverse_path_filter, IPReversePathFilter,
+                         "Failed to parse IP reverse path filter option");
+
+int config_parse_ip_forward_deprecated(
+                const char* unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        assert(filename);
+
+        log_syntax(unit, LOG_WARNING, filename, line, 0,
+                   "IPForward= setting is deprecated. "
+                   "Please use IPv4Forwarding= and/or IPv6Forwarding= in networkd.conf for global setting, "
+                   "and the same settings in .network files for per-interface setting.");
+        return 0;
+}

@@ -6,6 +6,7 @@
 
 #include "alloc-util.h"
 #include "blockdev-util.h"
+#include "build-path.h"
 #include "chase.h"
 #include "device-util.h"
 #include "devnum-util.h"
@@ -69,30 +70,16 @@ static int resource_add_instance(
         return 0;
 }
 
-static int resource_load_from_directory(
+static int resource_load_from_directory_recursive(
                 Resource *rr,
+                DIR* d,
+                const char* relpath,
                 mode_t m) {
-
-        _cleanup_closedir_ DIR *d = NULL;
         int r;
-
-        assert(rr);
-        assert(IN_SET(rr->type, RESOURCE_TAR, RESOURCE_REGULAR_FILE, RESOURCE_DIRECTORY, RESOURCE_SUBVOLUME));
-        assert(IN_SET(m, S_IFREG, S_IFDIR));
-
-        d = opendir(rr->path);
-        if (!d) {
-                if (errno == ENOENT) {
-                        log_debug("Directory %s does not exist, not loading any resources.", rr->path);
-                        return 0;
-                }
-
-                return log_error_errno(errno, "Failed to open directory '%s': %m", rr->path);
-        }
 
         for (;;) {
                 _cleanup_(instance_metadata_destroy) InstanceMetadata extracted_fields = INSTANCE_METADATA_NULL;
-                _cleanup_free_ char *joined = NULL;
+                _cleanup_free_ char *joined = NULL, *rel_joined = NULL;
                 Instance *instance;
                 struct dirent *de;
                 struct stat st;
@@ -111,7 +98,7 @@ static int resource_load_from_directory(
                         break;
 
                 case DT_DIR:
-                        if (m != S_IFDIR)
+                        if (!IN_SET(m, S_IFDIR, S_IFREG))
                                 continue;
 
                         break;
@@ -132,16 +119,36 @@ static int resource_load_from_directory(
                         return log_error_errno(errno, "Failed to stat %s/%s: %m", rr->path, de->d_name);
                 }
 
-                if ((st.st_mode & S_IFMT) != m)
+                if (!(S_ISDIR(st.st_mode) && S_ISREG(m)) && ((st.st_mode & S_IFMT) != m))
                         continue;
 
-                r = pattern_match_many(rr->patterns, de->d_name, &extracted_fields);
-                if (r < 0)
+                rel_joined = path_join(relpath, de->d_name);
+                if (!rel_joined)
+                        return log_oom();
+
+                r = pattern_match_many(rr->patterns, rel_joined, &extracted_fields);
+                if (r == PATTERN_MATCH_RETRY) {
+                        _cleanup_closedir_ DIR *subdir = NULL;
+
+                        subdir = xopendirat(dirfd(d), rel_joined, 0);
+                        if (!subdir)
+                                continue;
+
+                        r = resource_load_from_directory_recursive(rr, subdir, rel_joined, m);
+                        if (r < 0)
+                                return r;
+                        if (r == 0)
+                                continue;
+                }
+                else if (r < 0)
                         return log_error_errno(r, "Failed to match pattern: %m");
-                if (r == 0)
+                else if (r == PATTERN_MATCH_NO)
                         continue;
 
-                joined = path_join(rr->path, de->d_name);
+                if (de->d_type == DT_DIR && m != S_IFDIR)
+                        continue;
+
+                joined = path_join(rr->path, rel_joined);
                 if (!joined)
                         return log_oom();
 
@@ -160,6 +167,28 @@ static int resource_load_from_directory(
         return 0;
 }
 
+static int resource_load_from_directory(
+                Resource *rr,
+                mode_t m) {
+        _cleanup_closedir_ DIR *d = NULL;
+
+        assert(rr);
+        assert(IN_SET(rr->type, RESOURCE_TAR, RESOURCE_REGULAR_FILE, RESOURCE_DIRECTORY, RESOURCE_SUBVOLUME));
+        assert(IN_SET(m, S_IFREG, S_IFDIR));
+
+        d = opendir(rr->path);
+        if (!d) {
+                if (errno == ENOENT) {
+                        log_debug_errno(errno, "Directory %s does not exist, not loading any resources: %m", rr->path);
+                        return 0;
+                }
+
+                return log_error_errno(errno, "Failed to open directory '%s': %m", rr->path);
+        }
+
+        return resource_load_from_directory_recursive(rr, d, NULL, m);
+}
+
 static int resource_load_from_blockdev(Resource *rr) {
         _cleanup_(fdisk_unref_contextp) struct fdisk_context *c = NULL;
         _cleanup_(fdisk_unref_tablep) struct fdisk_table *t = NULL;
@@ -168,13 +197,9 @@ static int resource_load_from_blockdev(Resource *rr) {
 
         assert(rr);
 
-        c = fdisk_new_context();
-        if (!c)
-                return log_oom();
-
-        r = fdisk_assign_device(c, rr->path, /* readonly= */ true);
+        r = fdisk_new_context_at(AT_FDCWD, rr->path, /* read_only= */ true, /* sector_size= */ UINT32_MAX, &c);
         if (r < 0)
-                return log_error_errno(r, "Failed to open device '%s': %m", rr->path);
+                return log_error_errno(r, "Failed to create fdisk context from '%s': %m", rr->path);
 
         if (!fdisk_is_labeltype(c, FDISK_DISKLABEL_GPT))
                 return log_error_errno(SYNTHETIC_ERRNO(EHWPOISON), "Disk %s has no GPT disk label, not suitable.", rr->path);
@@ -208,7 +233,7 @@ static int resource_load_from_blockdev(Resource *rr) {
                 r = pattern_match_many(rr->patterns, pinfo.label, &extracted_fields);
                 if (r < 0)
                         return log_error_errno(r, "Failed to match pattern: %m");
-                if (r == 0)
+                if (IN_SET(r, PATTERN_MATCH_NO, PATTERN_MATCH_RETRY))
                         continue;
 
                 r = resource_add_instance(rr, pinfo.device, &extracted_fields, &instance);
@@ -243,7 +268,7 @@ static int download_manifest(
                 size_t *ret_size) {
 
         _cleanup_free_ char *buffer = NULL, *suffixed_url = NULL;
-        _cleanup_close_pair_ int pfd[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pfd[2] = EBADF_PAIR;
         _cleanup_fclose_ FILE *manifest = NULL;
         size_t size = 0;
         pid_t pid;
@@ -268,7 +293,7 @@ static int download_manifest(
         r = safe_fork_full("(sd-pull)",
                            (int[]) { -EBADF, pfd[1], STDERR_FILENO },
                            NULL, 0,
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_REARRANGE_STDIO|FORK_LOG,
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG,
                            &pid);
         if (r < 0)
                 return r;
@@ -276,7 +301,7 @@ static int download_manifest(
                 /* Child */
 
                 const char *cmdline[] = {
-                        "systemd-pull",
+                        SYSTEMD_PULL_PATH,
                         "raw",
                         "--direct",                        /* just download the specified URL, don't download anything else */
                         "--verify", verify_signature ? "signature" : "no", /* verify the manifest file */
@@ -285,8 +310,8 @@ static int download_manifest(
                         NULL
                 };
 
-                execv(pull_binary_path(), (char *const*) cmdline);
-                log_error_errno(errno, "Failed to execute %s tool: %m", pull_binary_path());
+                r = invoke_callout_binary(SYSTEMD_PULL_PATH, (char *const*) cmdline);
+                log_error_errno(r, "Failed to execute %s tool: %m", SYSTEMD_PULL_PATH);
                 _exit(EXIT_FAILURE);
         };
 
@@ -374,7 +399,7 @@ static int resource_load_from_web(
                 if (p[0] == '\\')
                         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "File names with escapes not supported in manifest at line %zu, refusing.", line_nr);
 
-                r = unhexmem(p, 64, &h, &hlen);
+                r = unhexmem_full(p, 64, /* secure = */ false, &h, &hlen);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse digest at manifest line %zu, refusing.", line_nr);
 
@@ -406,7 +431,7 @@ static int resource_load_from_web(
                 r = pattern_match_many(rr->patterns, fn, &extracted_fields);
                 if (r < 0)
                         return log_error_errno(r, "Failed to match pattern: %m");
-                if (r > 0) {
+                if (r == PATTERN_MATCH_YES) {
                         _cleanup_free_ char *path = NULL;
 
                         r = import_url_append_component(rr->path, fn, &path);
@@ -507,7 +532,12 @@ Instance* resource_find_instance(Resource *rr, const char *version) {
                 .metadata.version = (char*) version,
         }, *k = &key;
 
-        return typesafe_bsearch(&k, rr->instances, rr->n_instances, instance_cmp);
+        Instance **found;
+        found = typesafe_bsearch(&k, rr->instances, rr->n_instances, instance_cmp);
+        if (!found)
+                return NULL;
+
+        return *found;
 }
 
 int resource_resolve_path(

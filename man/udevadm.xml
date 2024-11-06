@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="udevadm"
@@ -83,8 +83,8 @@
     </variablelist>
 
     <refsect2><title>udevadm info
-      <arg choice="opt"><replaceable>options</replaceable></arg>
-      <arg choice="opt" rep="repeat"><replaceable>devpath</replaceable>|<replaceable>file</replaceable>|<replaceable>unit</replaceable></arg>
+      <optional><replaceable>options</replaceable></optional>
+      <optional><replaceable>devpath</replaceable>|<replaceable>file</replaceable>|<replaceable>unit</replaceable></optional>
     </title>
 
       <para>Query the udev database for device information.</para>
@@ -116,6 +116,8 @@
             option, limit display to properties specified in the argument. The argument should
             be a comma-separated list of property names. If not specified, all known properties
             are shown.</para>
+
+          <xi:include href="version-info.xml" xpointer="v250"/>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -125,6 +127,8 @@
             option, print only their values, and skip the property name and <literal>=</literal>.</para>
             <para>Cannot be used together with <option>-x/--export</option> or
             <option>-P/--export-prefix</option>.</para>
+
+            <xi:include href="version-info.xml" xpointer="v250"/>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -172,6 +176,8 @@
             <para>Display a sysfs tree. This recursively iterates through the sysfs hierarchy and displays it
             in a tree structure. If a path is specified only the subtree below and its parent directories are
             shown. This will show both device and subsystem items.</para>
+
+            <xi:include href="version-info.xml" xpointer="v251"/>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -219,9 +225,86 @@
           <listitem>
             <para>Wait for device to be initialized. If argument <replaceable>SECONDS</replaceable>
             is not specified, the default is to wait forever.</para>
+
+          <xi:include href="version-info.xml" xpointer="v243"/>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term><option>--subsystem-match<optional>=SUBSYSTEM</optional></option></term>
+          <term><option>--subsystem-nomatch<optional>=SUBSYSTEM</optional></option></term>
+          <listitem>
+            <para>When used with <option>--export-db</option>, only show devices of or not of the given
+            subsystem respectively.</para>
+
+          <xi:include href="version-info.xml" xpointer="v255"/>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term><option>--attr-match<optional>=FILE[=VALUE]</optional></option></term>
+          <term><option>--attr-nomatch<optional>=FILE[=VALUE]</optional></option></term>
+          <listitem>
+            <para>When used with <option>--export-db</option>, only show devices matching or not matching the
+            given attribute respectively.</para>
+
+          <xi:include href="version-info.xml" xpointer="v255"/>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term><option>--property-match<optional>=KEY=VALUE</optional></option></term>
+          <listitem>
+            <para>When used with <option>--export-db</option>, only show devices matching the given property
+            and value.</para>
+
+          <xi:include href="version-info.xml" xpointer="v255"/>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term><option>--tag-match<optional>=TAG</optional></option></term>
+          <listitem>
+            <para>When used with <option>--export-db</option>, only show devices with the given tag.</para>
+
+          <xi:include href="version-info.xml" xpointer="v255"/>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term><option>--sysname-match<optional>=NAME</optional></option></term>
+          <listitem>
+            <para>When used with <option>--export-db</option>, only show devices with the given
+            <literal>/sys</literal> path.</para>
+
+          <xi:include href="version-info.xml" xpointer="v255"/>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term><option>--name-match<optional>=NAME</optional></option></term>
+          <listitem>
+            <para>When used with <option>--export-db</option>, only show devices with the given name in
+            <literal>/dev</literal>.</para>
+
+          <xi:include href="version-info.xml" xpointer="v255"/>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term><option>--parent-match<optional>=NAME</optional></option></term>
+          <listitem>
+            <para>When used with <option>--export-db</option>, only show devices with the given parent
+            device.</para>
+
+          <xi:include href="version-info.xml" xpointer="v255"/>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term><option>--initialized-match</option></term>
+          <term><option>--initialized-nomatch</option></term>
+          <listitem>
+            <para>When used with <option>--export-db</option>, only show devices that are initialized or not
+            initialized respectively.</para>
+
+          <xi:include href="version-info.xml" xpointer="v255"/>
           </listitem>
         </varlistentry>
 
+        <xi:include href="standard-options.xml" xpointer="json" />
         <xi:include href="standard-options.xml" xpointer="help" />
         <xi:include href="standard-options.xml" xpointer="no-pager" />
       </variablelist>
@@ -299,8 +382,8 @@
     </refsect2>
 
     <refsect2><title>udevadm trigger
-      <arg choice="opt"><replaceable>options</replaceable></arg>
-      <arg choice="opt"><replaceable>devpath</replaceable>|<replaceable>file</replaceable>|<replaceable>unit</replaceable></arg>
+      <optional><replaceable>options</replaceable></optional>
+      <optional><replaceable>devpath</replaceable>|<replaceable>file</replaceable>|<replaceable>unit</replaceable></optional>
       </title>
       <para>Request device events from the kernel. Primarily used to replay events at system coldplug time.</para>
 
@@ -327,6 +410,8 @@
           <term><option>--quiet</option></term>
           <listitem>
             <para>Suppress error logging in triggering events.</para>
+
+          <xi:include href="version-info.xml" xpointer="v248"/>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -361,6 +446,8 @@
             multiple times, and in that case the lists of the subsystems will be merged. That is,
             <option>--prioritized-subsystem=block --prioritized-subsystem=net</option> is equivalent to
             <option>--prioritized-subsystem=block,net</option>.</para>
+
+            <xi:include href="version-info.xml" xpointer="v251"/>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -438,6 +525,8 @@
           <listitem>
             <para>Trigger events for devices with a matching device path. When this option is specified more than once,
             then each matching result is ORed, that is, all specified devices are triggered.</para>
+
+            <xi:include href="version-info.xml" xpointer="v218"/>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -461,14 +550,18 @@
             <para>Typically, it is essential that applications which intend to use such a match, make
             sure a suitable udev rule is installed that sets at least one property on devices that
             shall be matched. See also Initialized Devices section below for more details.</para>
-            <para>WARNING: <option>--initialized-nomatch</option> can potentially save a significant
-            amount of time compared to re-triggering all devices in the system and e.g. can be used to
-            optimize boot time. However, this is not safe to be used in a boot sequence in general.
-            Especially, when udev rules for a device depend on its parent devices (e.g.
-            <literal>ATTRS</literal> or <literal>IMPORT{parent}</literal> keys, see
-            <citerefentry><refentrytitle>udev</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-            for more details), the final state of the device becomes easily unstable with this option.
-            </para>
+            <warning>
+              <para><option>--initialized-nomatch</option> can potentially save a significant
+              amount of time compared to re-triggering all devices in the system and e.g. can be used to
+              optimize boot time. However, this is not safe to be used in a boot sequence in general.
+              Especially, when udev rules for a device depend on its parent devices (e.g.
+              <literal>ATTRS</literal> or <literal>IMPORT{parent}</literal> keys, see
+              <citerefentry><refentrytitle>udev</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+              for more details), the final state of the device becomes easily unstable with this option.
+              </para>
+            </warning>
+
+            <xi:include href="version-info.xml" xpointer="v251"/>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -480,6 +573,8 @@
             settle</command>. <command>udevadm settle</command> waits for all
             events to finish. This option only waits for events triggered by
             the same command to finish.</para>
+
+            <xi:include href="version-info.xml" xpointer="v238"/>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -489,6 +584,8 @@
             are printed to standard output, one line for each event. These UUIDs are included in the uevent
             environment block (in the <literal>SYNTH_UUID=</literal> property) and may be used to track
             delivery of the generated events.</para>
+
+            <xi:include href="version-info.xml" xpointer="v249"/>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -497,6 +594,8 @@
             <para>Before triggering uevents, wait for systemd-udevd daemon to be initialized.
             Optionally takes timeout value. Default timeout is 5 seconds. This is equivalent to invoking
             <command>udevadm control --ping</command> before <command>udevadm trigger</command>.</para>
+
+            <xi:include href="version-info.xml" xpointer="v241"/>
           </listitem>
         </varlistentry>
 
@@ -510,7 +609,7 @@
     </refsect2>
 
     <refsect2><title>udevadm settle
-      <arg choice="opt"><replaceable>options</replaceable></arg>
+      <optional><replaceable>options</replaceable></optional>
     </title>
       <para>Watches the udev event queue, and exits if all current events are handled.</para>
       <variablelist>
@@ -605,10 +704,10 @@
         </varlistentry>
         <varlistentry>
           <term><option>-m</option></term>
-          <term><option>--children-max=</option><replaceable>value</replaceable></term>
+          <term><option>--children-max=<replaceable>value</replaceable></option></term>
           <listitem>
-            <para>Set the maximum number of events, systemd-udevd will handle at the
-            same time.</para>
+            <para>Set the maximum number of events, systemd-udevd will handle at the same time. When 0 is
+            specified, then the maximum is determined based on the system resources.</para>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -616,13 +715,56 @@
           <listitem>
             <para>Send a ping message to systemd-udevd and wait for the reply. This may be useful to check that
             systemd-udevd daemon is running.</para>
+
+            <xi:include href="version-info.xml" xpointer="v241"/>
           </listitem>
         </varlistentry>
         <varlistentry>
           <term><option>-t</option></term>
-          <term><option>--timeout=</option><replaceable>seconds</replaceable></term>
+          <term><option>--timeout=<replaceable>seconds</replaceable></option></term>
           <listitem>
             <para>The maximum number of seconds to wait for a reply from systemd-udevd.</para>
+          </listitem>
+        </varlistentry>
+
+        <varlistentry>
+          <term><option>--load-credentials</option></term>
+          <listitem>
+            <para>When specified, the following credentials are used when passed in:</para>
+
+            <variablelist>
+              <varlistentry>
+                <term><varname>udev.conf.*</varname></term>
+                <listitem>
+                  <para>These credentials should contain valid
+                  <citerefentry><refentrytitle>udev.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+                  configuration data. From each matching credential a separate file is created. Example: a
+                  passed credential <filename>udev.conf.50-foobar</filename> will be copied into a
+                  configuration file <filename>/run/udev/udev.conf.d/50-foobar.conf</filename>.</para>
+
+                  <xi:include href="version-info.xml" xpointer="v256"/>
+                </listitem>
+              </varlistentry>
+              <varlistentry>
+                <term><varname>udev.rules.*</varname></term>
+                <listitem>
+                  <para>These credentials should contain valid
+                  <citerefentry><refentrytitle>udev</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+                  rules. From each matching credential a separate file is created. Example: a passed credential
+                  <filename>udev.rules.50-foobar</filename> will be copied into a configuration file
+                  <filename>/run/udev/rules.d/50-foobar.rules</filename>.</para>
+
+                  <xi:include href="version-info.xml" xpointer="v256"/>
+                </listitem>
+              </varlistentry>
+            </variablelist>
+
+            <para>Note, this <emphasis>does not</emphasis> imply <option>--reload</option> option. So, if
+            <command>systemd-udevd</command> is already running, please consider to also specify
+            <option>-reload</option> to make the copied udev rules files used by
+            <command>systemd-udevd</command>.</para>
+
+            <xi:include href="version-info.xml" xpointer="v256"/>
           </listitem>
         </varlistentry>
 
@@ -631,7 +773,7 @@
     </refsect2>
 
     <refsect2><title>udevadm monitor
-      <arg choice="opt"><replaceable>options</replaceable></arg>
+      <optional><replaceable>options</replaceable></optional>
     </title>
       <para>Listens to the kernel uevents and events sent out by a udev rule
       and prints the devpath of the event to the console. It can be used to analyze the
@@ -683,8 +825,8 @@
     </refsect2>
 
     <refsect2><title>udevadm test
-      <arg choice="opt"><replaceable>options</replaceable></arg>
-      <arg choice="opt"><replaceable>devpath</replaceable>|<replaceable>file</replaceable>|<replaceable>unit</replaceable></arg>
+      <optional><replaceable>options</replaceable></optional>
+      <optional><replaceable>devpath</replaceable>|<replaceable>file</replaceable>|<replaceable>unit</replaceable></optional>
     </title>
       <para>Simulate a udev event run for the given device, and print debug output.</para>
       <variablelist>
@@ -710,6 +852,8 @@
             be resolved for every event. When set to
             <constant>never</constant>, names will never be resolved
             and all devices will be owned by root.</para>
+
+            <xi:include href="version-info.xml" xpointer="v209"/>
           </listitem>
         </varlistentry>
 
@@ -718,9 +862,9 @@
     </refsect2>
 
     <refsect2><title>udevadm test-builtin
-      <arg choice="opt"><replaceable>options</replaceable></arg>
-      <arg><replaceable>command</replaceable></arg>
-      <arg choice="opt"><replaceable>devpath</replaceable>|<replaceable>file</replaceable>|<replaceable>unit</replaceable></arg>
+      <optional><replaceable>options</replaceable></optional>
+      <replaceable>command</replaceable>
+      <optional><replaceable>devpath</replaceable>|<replaceable>file</replaceable>|<replaceable>unit</replaceable></optional>
     </title>
       <para>Run a built-in command <replaceable>COMMAND</replaceable>
       for device <replaceable>DEVPATH</replaceable>, and print debug
@@ -735,6 +879,8 @@
             <literal>online</literal>, <literal>offline</literal>, <literal>bind</literal>,
             and <literal>unbind</literal>. Also, the special value <literal>help</literal> can be used
             to list the possible actions. The default value is <literal>add</literal>.</para>
+
+          <xi:include href="version-info.xml" xpointer="v250"/>
           </listitem>
         </varlistentry>
 
@@ -745,8 +891,8 @@
 
     <refsect2>
       <title>udevadm verify
-      <arg choice="opt"><replaceable>options</replaceable></arg>
-      <arg choice="opt" rep="repeat"><replaceable>file</replaceable></arg>
+      <optional><replaceable>options</replaceable></optional>
+      <optional><replaceable>file</replaceable></optional>
       …
       </title>
 
@@ -770,6 +916,8 @@
             default), names will be resolved when the rules are
             parsed. When set to <constant>never</constant>, names will
             never be resolved.</para>
+
+            <xi:include href="version-info.xml" xpointer="v254"/>
           </listitem>
         </varlistentry>
 
@@ -778,6 +926,8 @@
           <listitem>
             <para>When looking for udev rules files located in udev/rules.d directories,
             operate on files underneath the specified root path <replaceable>PATH</replaceable>.</para>
+
+            <xi:include href="version-info.xml" xpointer="v254"/>
           </listitem>
         </varlistentry>
 
@@ -785,6 +935,8 @@
           <term><option>--no-summary</option></term>
           <listitem>
             <para>Do not show summary.</para>
+
+          <xi:include href="version-info.xml" xpointer="v254"/>
           </listitem>
         </varlistentry>
 
@@ -793,6 +945,8 @@
           <listitem>
             <para>Ignore style issues. When specified, even if style issues are found in udev rules files,
             the exit status is <constant>0</constant> if no syntactic or semantic errors are found.</para>
+
+            <xi:include href="version-info.xml" xpointer="v254"/>
           </listitem>
         </varlistentry>
 
@@ -802,8 +956,8 @@
 
     <refsect2>
       <title>udevadm wait
-      <arg choice="opt"><replaceable>options</replaceable></arg>
-      <arg choice="opt"><replaceable>device|syspath</replaceable></arg>
+      <optional><replaceable>options</replaceable></optional>
+      <optional><replaceable>device|syspath</replaceable></optional>
       …
       </title>
 
@@ -823,6 +977,8 @@
           <listitem>
             <para>Maximum number of seconds to wait for the specified devices or device symlinks being
             created, initialized, or removed. The default value is <literal>infinity</literal>.</para>
+
+            <xi:include href="version-info.xml" xpointer="v251"/>
           </listitem>
         </varlistentry>
 
@@ -833,6 +989,8 @@
             false, the command only checks if the specified devices exist. Set false to this setting if
             there is no udev rules for the specified devices, as the devices will never be considered
             as initialized in that case. See Initialized Devices section below for more details.</para>
+
+          <xi:include href="version-info.xml" xpointer="v251"/>
           </listitem>
         </varlistentry>
 
@@ -841,6 +999,8 @@
           <listitem>
             <para>When specified, the command wait for devices being removed instead of created or
             initialized. If this is specified, <option>--initialized=</option> will be ignored.</para>
+
+            <xi:include href="version-info.xml" xpointer="v251"/>
           </listitem>
         </varlistentry>
 
@@ -849,6 +1009,8 @@
           <listitem>
             <para>When specified, also watches the udev event queue, and wait for all queued events
             being processed by <command>systemd-udevd</command>.</para>
+
+            <xi:include href="version-info.xml" xpointer="v251"/>
           </listitem>
         </varlistentry>
 
@@ -858,8 +1020,8 @@
 
     <refsect2>
       <title>udevadm lock
-      <arg choice="opt"><replaceable>options</replaceable></arg>
-      <arg choice="opt"><replaceable>command</replaceable></arg>
+      <optional><replaceable>options</replaceable></optional>
+      <optional><replaceable>command</replaceable></optional>
       …
       </title>
 
@@ -893,7 +1055,9 @@
           in order.</para>
 
           <para>This switch must be used at least once, to specify at least one device to
-          lock. (Alternatively, use <option>--backing=</option>, see below.)</para></listitem>
+          lock. (Alternatively, use <option>--backing=</option>, see below.)</para>
+
+          <xi:include href="version-info.xml" xpointer="v251"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -904,7 +1068,9 @@
           <option>--device=</option>. However, this switch alternatively accepts a path to a regular file or
           directory, in which case the block device of the file system the file/directory resides on is
           automatically determined and used as if it was specified with
-          <option>--device=</option>.</para></listitem>
+          <option>--device=</option>.</para>
+
+          <xi:include href="version-info.xml" xpointer="v251"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -917,7 +1083,9 @@
           specified as zero the lock is attempted and if not successful the invocation will immediately
           fail. If passed as <literal>infinity</literal> (the default) the invocation will wait indefinitely
           until the lock can be acquired. If the lock cannot be taken in the specified time the specified
-          command will not be executed and the invocation will fail.</para></listitem>
+          command will not be executed and the invocation will fail.</para>
+
+          <xi:include href="version-info.xml" xpointer="v251"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -931,7 +1099,9 @@
           ordering key (i.e. they are shown in the order they'd be locked). Note that the number of lines
           printed here can be less than the number of <option>--device=</option> and
           <option>--backing=</option> switches specified in case these resolve to the same "whole"
-          devices.</para></listitem>
+          devices.</para>
+
+          <xi:include href="version-info.xml" xpointer="v251"/></listitem>
         </varlistentry>
 
         <xi:include href="standard-options.xml" xpointer="help" />
@@ -984,11 +1154,13 @@
 
   <refsect1>
     <title>See Also</title>
-    <para><citerefentry>
+    <para><simplelist type="inline">
+      <member><citerefentry>
         <refentrytitle>udev</refentrytitle><manvolnum>7</manvolnum>
-    </citerefentry>,
-    <citerefentry>
+      </citerefentry></member>
+      <member><citerefentry>
         <refentrytitle>systemd-udevd.service</refentrytitle><manvolnum>8</manvolnum>
-    </citerefentry></para>
+      </citerefentry></member>
+    </simplelist></para>
   </refsect1>
 </refentry>

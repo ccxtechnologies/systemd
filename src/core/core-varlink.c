@@ -5,6 +5,8 @@
 #include "strv.h"
 #include "user-util.h"
 #include "varlink.h"
+#include "varlink-io.systemd.UserDatabase.h"
+#include "varlink-io.systemd.ManagedOOM.h"
 
 typedef struct LookupParameters {
         const char *user_name;
@@ -67,6 +69,10 @@ static int build_managed_oom_json_array_element(Unit *u, const char *property, J
         if (!c)
                 return -EINVAL;
 
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return -EINVAL;
+
         if (UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(u)))
                 /* systemd-oomd should always treat inactive units as though they didn't enable any action since they
                  * should not have a valid cgroup */
@@ -81,19 +87,24 @@ static int build_managed_oom_json_array_element(Unit *u, const char *property, J
 
         return json_build(ret_v, JSON_BUILD_OBJECT(
                                  JSON_BUILD_PAIR("mode", JSON_BUILD_STRING(mode)),
-                                 JSON_BUILD_PAIR("path", JSON_BUILD_STRING(u->cgroup_path)),
+                                 JSON_BUILD_PAIR("path", JSON_BUILD_STRING(crt->cgroup_path)),
                                  JSON_BUILD_PAIR("property", JSON_BUILD_STRING(property)),
                                  JSON_BUILD_PAIR_CONDITION(use_limit, "limit", JSON_BUILD_UNSIGNED(c->moom_mem_pressure_limit))));
 }
 
 int manager_varlink_send_managed_oom_update(Unit *u) {
         _cleanup_(json_variant_unrefp) JsonVariant *arr = NULL, *v = NULL;
+        CGroupRuntime *crt;
         CGroupContext *c;
         int r;
 
         assert(u);
 
-        if (!UNIT_VTABLE(u)->can_set_managed_oom || !u->manager || !u->cgroup_path)
+        if (!UNIT_VTABLE(u)->can_set_managed_oom || !u->manager)
+                return 0;
+
+        crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return 0;
 
         if (MANAGER_IS_SYSTEM(u->manager)) {
@@ -117,10 +128,10 @@ int manager_varlink_send_managed_oom_update(Unit *u) {
         if (r < 0)
                 return r;
 
-        for (size_t i = 0; i < ELEMENTSOF(managed_oom_mode_properties); i++) {
+        FOREACH_ELEMENT(i, managed_oom_mode_properties) {
                 _cleanup_(json_variant_unrefp) JsonVariant *e = NULL;
 
-                r = build_managed_oom_json_array_element(u, managed_oom_mode_properties[i], &e);
+                r = build_managed_oom_json_array_element(u, *i, &e);
                 if (r < 0)
                         return r;
 
@@ -171,16 +182,16 @@ static int build_managed_oom_cgroups_json(Manager *m, JsonVariant **ret) {
                         if (!c)
                                 continue;
 
-                        for (size_t j = 0; j < ELEMENTSOF(managed_oom_mode_properties); j++) {
+                        FOREACH_ELEMENT(i, managed_oom_mode_properties) {
                                 _cleanup_(json_variant_unrefp) JsonVariant *e = NULL;
 
                                 /* For the initial varlink call we only care about units that enabled (i.e. mode is not
                                  * set to "auto") oomd properties. */
-                                if (!(streq(managed_oom_mode_properties[j], "ManagedOOMSwap") && c->moom_swap == MANAGED_OOM_KILL) &&
-                                    !(streq(managed_oom_mode_properties[j], "ManagedOOMMemoryPressure") && c->moom_mem_pressure == MANAGED_OOM_KILL))
+                                if (!(streq(*i, "ManagedOOMSwap") && c->moom_swap == MANAGED_OOM_KILL) &&
+                                    !(streq(*i, "ManagedOOMMemoryPressure") && c->moom_mem_pressure == MANAGED_OOM_KILL))
                                         continue;
 
-                                r = build_managed_oom_json_array_element(u, managed_oom_mode_properties[j], &e);
+                                r = build_managed_oom_json_array_element(u, *i, &e);
                                 if (r < 0)
                                         return r;
 
@@ -232,7 +243,7 @@ static int vl_method_subscribe_managed_oom_cgroups(
         /* We only take one subscriber for this method so return an error if there's already an existing one.
          * This shouldn't happen since systemd-oomd is the only client of this method. */
         if (FLAGS_SET(flags, VARLINK_METHOD_MORE) && m->managed_oom_varlink)
-                return varlink_error(link, VARLINK_ERROR_SUBSCRIPTION_TAKEN, NULL);
+                return varlink_error(link, "io.systemd.ManagedOOM.SubscriptionTaken", NULL);
 
         r = build_managed_oom_cgroups_json(m, &v);
         if (r < 0)
@@ -285,8 +296,8 @@ static int vl_method_get_user_record(Varlink *link, JsonVariant *parameters, Var
 
         assert(parameters);
 
-        r = json_dispatch(parameters, dispatch_table, NULL, 0, &p);
-        if (r < 0)
+        r = varlink_dispatch(link, parameters, dispatch_table, &p);
+        if (r != 0)
                 return r;
 
         if (!streq_ptr(p.service, "io.systemd.DynamicUser"))
@@ -357,7 +368,7 @@ static int build_group_json(const char *group_name, gid_t gid, JsonVariant **ret
                                        JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(gid)),
                                        JSON_BUILD_PAIR("service", JSON_BUILD_CONST_STRING("io.systemd.DynamicUser")),
                                        JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("dynamic"))))));
-    }
+}
 
 static bool group_match_lookup_parameters(LookupParameters *p, const char *name, gid_t gid) {
         assert(p);
@@ -392,8 +403,8 @@ static int vl_method_get_group_record(Varlink *link, JsonVariant *parameters, Va
 
         assert(parameters);
 
-        r = json_dispatch(parameters, dispatch_table, NULL, 0, &p);
-        if (r < 0)
+        r = varlink_dispatch(link, parameters, dispatch_table, &p);
+        if (r != 0)
                 return r;
 
         if (!streq_ptr(p.service, "io.systemd.DynamicUser"))
@@ -468,8 +479,8 @@ static int vl_method_get_memberships(Varlink *link, JsonVariant *parameters, Var
 
         assert(parameters);
 
-        r = json_dispatch(parameters, dispatch_table, NULL, 0, &p);
-        if (r < 0)
+        r = varlink_dispatch(link, parameters, dispatch_table, &p);
+        if (r != 0)
                 return r;
 
         if (!streq_ptr(p.service, "io.systemd.DynamicUser"))
@@ -487,6 +498,43 @@ static void vl_disconnect(VarlinkServer *s, Varlink *link, void *userdata) {
 
         if (link == m->managed_oom_varlink)
                 m->managed_oom_varlink = varlink_unref(link);
+}
+
+static int manager_setup_varlink_server(Manager *m, VarlinkServer **ret) {
+        _cleanup_(varlink_server_unrefp) VarlinkServer *s = NULL;
+        int r;
+
+        assert(m);
+        assert(ret);
+
+        r = varlink_server_new(&s, VARLINK_SERVER_ACCOUNT_UID|VARLINK_SERVER_INHERIT_USERDATA);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to allocate varlink server object: %m");
+
+        varlink_server_set_userdata(s, m);
+
+        r = varlink_server_add_interface_many(
+                        s,
+                        &vl_interface_io_systemd_UserDatabase,
+                        &vl_interface_io_systemd_ManagedOOM);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to add interfaces to varlink server: %m");
+
+        r = varlink_server_bind_method_many(
+                        s,
+                        "io.systemd.UserDatabase.GetUserRecord",  vl_method_get_user_record,
+                        "io.systemd.UserDatabase.GetGroupRecord", vl_method_get_group_record,
+                        "io.systemd.UserDatabase.GetMemberships", vl_method_get_memberships,
+                        "io.systemd.ManagedOOM.SubscribeManagedOOMCGroups", vl_method_subscribe_managed_oom_cgroups);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to register varlink methods: %m");
+
+        r = varlink_server_bind_disconnect(s, vl_disconnect);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to register varlink disconnect handler: %m");
+
+        *ret = TAKE_PTR(s);
+        return 0;
 }
 
 static int manager_varlink_init_system(Manager *m) {
@@ -508,16 +556,24 @@ static int manager_varlink_init_system(Manager *m) {
         if (!MANAGER_IS_TEST_RUN(m)) {
                 (void) mkdir_p_label("/run/systemd/userdb", 0755);
 
-                r = varlink_server_listen_address(s, "/run/systemd/userdb/io.systemd.DynamicUser", 0666);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to bind to varlink socket: %m");
+                FOREACH_STRING(address, "/run/systemd/userdb/io.systemd.DynamicUser", VARLINK_ADDR_PATH_MANAGED_OOM_SYSTEM) {
+                        if (MANAGER_IS_RELOADING(m)) {
+                                /* If manager is reloading, we skip listening on existing addresses, since
+                                 * the fd should be acquired later through deserialization. */
+                                if (access(address, F_OK) >= 0)
+                                        continue;
+                                if (errno != ENOENT)
+                                        return log_error_errno(errno,
+                                                               "Failed to check if varlink socket '%s' exists: %m", address);
+                        }
 
-                r = varlink_server_listen_address(s, VARLINK_ADDR_PATH_MANAGED_OOM_SYSTEM, 0666);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to bind to varlink socket: %m");
+                        r = varlink_server_listen_address(s, address, 0666);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to bind to varlink socket '%s': %m", address);
+                }
         }
 
-        r = varlink_server_attach_event(s, m->event, SD_EVENT_PRIORITY_NORMAL);
+        r = varlink_server_attach_event(s, m->event, EVENT_PRIORITY_IPC);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach varlink connection to event loop: %m");
 
@@ -561,12 +617,13 @@ static int manager_varlink_init_user(Manager *m) {
                 return 0;
 
         r = varlink_connect_address(&link, VARLINK_ADDR_PATH_MANAGED_OOM_USER);
-        if (r == -ENOENT || ERRNO_IS_DISCONNECT(r)) {
-                log_debug("systemd-oomd varlink unix socket not found, skipping user manager varlink setup");
-                return 0;
-        }
-        if (r < 0)
+        if (r < 0) {
+                if (r == -ENOENT || ERRNO_IS_DISCONNECT(r)) {
+                        log_debug("systemd-oomd varlink unix socket not found, skipping user manager varlink setup");
+                        return 0;
+                }
                 return log_error_errno(r, "Failed to connect to %s: %m", VARLINK_ADDR_PATH_MANAGED_OOM_USER);
+        }
 
         varlink_set_userdata(link, m);
 
@@ -574,7 +631,7 @@ static int manager_varlink_init_user(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = varlink_attach_event(link, m->event, SD_EVENT_PRIORITY_NORMAL);
+        r = varlink_attach_event(link, m->event, EVENT_PRIORITY_IPC);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach varlink connection to event loop: %m");
 
@@ -584,36 +641,6 @@ static int manager_varlink_init_user(Manager *m) {
         (void) manager_varlink_send_managed_oom_initial(m);
 
         return 1;
-}
-
-int manager_setup_varlink_server(Manager *m, VarlinkServer **ret) {
-        _cleanup_(varlink_server_unrefp) VarlinkServer *s = NULL;
-        int r;
-
-        assert(m);
-        assert(ret);
-
-        r = varlink_server_new(&s, VARLINK_SERVER_ACCOUNT_UID|VARLINK_SERVER_INHERIT_USERDATA);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to allocate varlink server object: %m");
-
-        varlink_server_set_userdata(s, m);
-
-        r = varlink_server_bind_method_many(
-                        s,
-                        "io.systemd.UserDatabase.GetUserRecord",  vl_method_get_user_record,
-                        "io.systemd.UserDatabase.GetGroupRecord", vl_method_get_group_record,
-                        "io.systemd.UserDatabase.GetMemberships", vl_method_get_memberships,
-                        "io.systemd.ManagedOOM.SubscribeManagedOOMCGroups",  vl_method_subscribe_managed_oom_cgroups);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to register varlink methods: %m");
-
-        r = varlink_server_bind_disconnect(s, vl_disconnect);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to register varlink disconnect handler: %m");
-
-        *ret = TAKE_PTR(s);
-        return 0;
 }
 
 int manager_varlink_init(Manager *m) {

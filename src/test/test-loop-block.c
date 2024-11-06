@@ -49,10 +49,10 @@ static void verify_dissected_image(DissectedImage *dissected) {
 static void verify_dissected_image_harder(DissectedImage *dissected) {
         verify_dissected_image(dissected);
 
-        assert_se(streq(dissected->partitions[PARTITION_ESP].fstype, "vfat"));
-        assert_se(streq(dissected->partitions[PARTITION_XBOOTLDR].fstype, "vfat"));
-        assert_se(streq(dissected->partitions[PARTITION_ROOT].fstype, "ext4"));
-        assert_se(streq(dissected->partitions[PARTITION_HOME].fstype, "ext4"));
+        ASSERT_STREQ(dissected->partitions[PARTITION_ESP].fstype, "vfat");
+        ASSERT_STREQ(dissected->partitions[PARTITION_XBOOTLDR].fstype, "vfat");
+        ASSERT_STREQ(dissected->partitions[PARTITION_ROOT].fstype, "ext4");
+        ASSERT_STREQ(dissected->partitions[PARTITION_HOME].fstype, "ext4");
 }
 
 static void* thread_func(void *ptr) {
@@ -101,7 +101,13 @@ static void* thread_func(void *ptr) {
 
                 verify_dissected_image(dissected);
 
-                r = dissected_image_mount(dissected, mounted, UID_INVALID, UID_INVALID, DISSECT_IMAGE_READ_ONLY);
+                r = dissected_image_mount(
+                                dissected,
+                                mounted,
+                                /* uid_shift= */ UID_INVALID,
+                                /* uid_range= */ UID_INVALID,
+                                /* userns_fd= */ -EBADF,
+                                DISSECT_IMAGE_READ_ONLY);
                 log_notice_errno(r, "Mounted %s → %s: %m", loop->node, mounted);
                 assert_se(r >= 0);
 
@@ -291,7 +297,13 @@ static int run(int argc, char *argv[]) {
         assert_se(detach_mount_namespace() >= 0);
 
         /* This first (writable) mount will initialize the mount point dirs, so that the subsequent read-only ones can work */
-        assert_se(dissected_image_mount(dissected, mounted, UID_INVALID, UID_INVALID, 0) >= 0);
+        assert_se(dissected_image_mount(
+                                  dissected,
+                                  mounted,
+                                  /* uid_shift= */ UID_INVALID,
+                                  /* uid_range= */ UID_INVALID,
+                                  /* usernfs_fd= */ -EBADF,
+                                  0) >= 0);
 
         /* Now we mounted everything, the partitions are pinned. Now it's fine to release the lock
          * fully. This means udev could now issue BLKRRPART again, but that's OK given this will fail because
@@ -316,7 +328,7 @@ static int run(int argc, char *argv[]) {
         log_notice("All threads started now.");
 
         if (arg_n_threads == 1)
-                assert_se(thread_func(FD_TO_PTR(fd)) == NULL);
+                ASSERT_NULL(thread_func(FD_TO_PTR(fd)));
         else
                 for (unsigned i = 0; i < arg_n_threads; i++) {
                         log_notice("Joining thread #%u.", i);

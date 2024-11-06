@@ -32,6 +32,21 @@
 
 /* ======================================================================= */
 
+#if !HAVE_FCHMODAT2
+static inline int missing_fchmodat2(int dirfd, const char *path, mode_t mode, int flags) {
+#  ifdef __NR_fchmodat2
+        return syscall(__NR_fchmodat2, dirfd, path, mode, flags);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define fchmodat2 missing_fchmodat2
+#endif
+
+/* ======================================================================= */
+
 #if !HAVE_PIVOT_ROOT
 static inline int missing_pivot_root(const char *new_root, const char *put_old) {
         return syscall(__NR_pivot_root, new_root, put_old);
@@ -397,23 +412,14 @@ static inline int missing_execveat(int dirfd, const char *pathname,
 /* ======================================================================= */
 
 #if !HAVE_CLOSE_RANGE
-static inline int missing_close_range(int first_fd, int end_fd, unsigned flags) {
+static inline int missing_close_range(unsigned first_fd, unsigned end_fd, unsigned flags) {
 #  ifdef __NR_close_range
         /* Kernel-side the syscall expects fds as unsigned integers (just like close() actually), while
-         * userspace exclusively uses signed integers for fds. We don't know just yet how glibc is going to
-         * wrap this syscall, but let's assume it's going to be similar to what they do for close(),
-         * i.e. make the same unsigned → signed type change from the raw kernel syscall compared to the
-         * userspace wrapper. There's only one caveat for this: unlike for close() there's the special
-         * UINT_MAX fd value for the 'end_fd' argument. Let's safely map that to -1 here. And let's refuse
-         * any other negative values. */
-        if ((first_fd < 0) || (end_fd < 0 && end_fd != -1)) {
-                errno = -EBADF;
-                return -1;
-        }
-
+         * userspace exclusively uses signed integers for fds. glibc chose to expose it 1:1 however, hence we
+         * do so here too, even if we end up passing signed fds to it most of the time. */
         return syscall(__NR_close_range,
-                       (unsigned) first_fd,
-                       end_fd == -1 ? UINT_MAX : (unsigned) end_fd, /* Of course, the compiler should figure out that this is the identity mapping IRL */
+                       first_fd,
+                       end_fd,
                        flags);
 #  else
         errno = ENOSYS;
@@ -538,6 +544,10 @@ static inline int missing_open_tree(
 #endif
 
 /* ======================================================================= */
+
+#ifndef MOVE_MOUNT_BENEATH
+#define MOVE_MOUNT_BENEATH 0x00000200
+#endif
 
 #if !HAVE_MOVE_MOUNT
 

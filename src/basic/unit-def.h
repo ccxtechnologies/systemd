@@ -53,8 +53,10 @@ typedef enum UnitActiveState {
 
 typedef enum FreezerState {
         FREEZER_RUNNING,
-        FREEZER_FREEZING,
+        FREEZER_FREEZING, /* freezing due to user request */
         FREEZER_FROZEN,
+        FREEZER_FREEZING_BY_PARENT, /* freezing as a result of parent slice freezing */
+        FREEZER_FROZEN_BY_PARENT,
         FREEZER_THAWING,
         _FREEZER_STATE_MAX,
         _FREEZER_STATE_INVALID = -EINVAL,
@@ -97,7 +99,6 @@ typedef enum MountState {
         MOUNT_REMOUNTING_SIGKILL,
         MOUNT_UNMOUNTING_SIGTERM,
         MOUNT_UNMOUNTING_SIGKILL,
-        MOUNT_UNMOUNTING_CATCHUP,
         MOUNT_FAILED,
         MOUNT_CLEANING,
         _MOUNT_STATE_MAX,
@@ -288,6 +289,8 @@ const char *unit_dbus_interface_from_name(const char *name);
 const char *unit_type_to_string(UnitType i) _const_;
 UnitType unit_type_from_string(const char *s) _pure_;
 
+const char* unit_type_to_capitalized_string(UnitType t);
+
 const char *unit_load_state_to_string(UnitLoadState i) _const_;
 UnitLoadState unit_load_state_from_string(const char *s) _pure_;
 
@@ -296,6 +299,7 @@ UnitActiveState unit_active_state_from_string(const char *s) _pure_;
 
 const char *freezer_state_to_string(FreezerState i) _const_;
 FreezerState freezer_state_from_string(const char *s) _pure_;
+FreezerState freezer_state_finish(FreezerState i) _const_;
 
 const char *unit_marker_to_string(UnitMarker m) _const_;
 UnitMarker unit_marker_from_string(const char *s) _pure_;

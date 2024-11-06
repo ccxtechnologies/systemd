@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_bus_message_open_container"
@@ -118,13 +118,17 @@
           <term><constant>-EINVAL</constant></term>
 
           <listitem><para><parameter>m</parameter> or <parameter>contents</parameter> are
-          <constant>NULL</constant> or <parameter>type</parameter> is invalid.</para></listitem>
+          <constant>NULL</constant> or <parameter>type</parameter> is invalid.</para>
+
+          <xi:include href="version-info.xml" xpointer="v246"/></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><constant>-EBADMSG</constant></term>
 
-          <listitem><para>Message <parameter>m</parameter> has invalid structure.</para></listitem>
+          <listitem><para>Message <parameter>m</parameter> has invalid structure.</para>
+
+          <xi:include href="version-info.xml" xpointer="v254"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -132,32 +136,42 @@
 
           <listitem><para>Message <parameter>m</parameter> does not have a container of type
           <parameter>type</parameter> at the current position, or the contents do not match
-          <parameter>contents</parameter>.</para></listitem>
+          <parameter>contents</parameter>.</para>
+
+          <xi:include href="version-info.xml" xpointer="v254"/></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><constant>-EPERM</constant></term>
 
-          <listitem><para>The message <parameter>m</parameter> is already sealed.</para></listitem>
+          <listitem><para>The message <parameter>m</parameter> is already sealed.</para>
+
+          <xi:include href="version-info.xml" xpointer="v246"/></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><constant>-ESTALE</constant></term>
 
-          <listitem><para>The message <parameter>m</parameter> is in an invalid state.</para></listitem>
+          <listitem><para>The message <parameter>m</parameter> is in an invalid state.</para>
+
+          <xi:include href="version-info.xml" xpointer="v246"/></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><constant>-ENOMEM</constant></term>
 
-          <listitem><para>Memory allocation failed.</para></listitem>
+          <listitem><para>Memory allocation failed.</para>
+
+          <xi:include href="version-info.xml" xpointer="v246"/></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><constant>-EBUSY</constant></term>
 
           <listitem><para><function>sd_bus_message_exit_container()</function> was called but there are
-          unread members left in the container.</para></listitem>
+          unread members left in the container.</para>
+
+          <xi:include href="version-info.xml" xpointer="v247"/></listitem>
         </varlistentry>
       </variablelist>
     </refsect2>
@@ -184,14 +198,14 @@
   <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_message_append</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_message_read</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_message_skip</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <ulink url="https://dbus.freedesktop.org/doc/dbus-specification.html">The D-Bus specification</ulink>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_message_append</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_message_read</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_message_skip</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><ulink url="https://dbus.freedesktop.org/doc/dbus-specification.html">The D-Bus specification</ulink></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

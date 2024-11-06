@@ -23,7 +23,14 @@
 #include "reboot-util.h"
 #include "string-util.h"
 #include "umask-util.h"
+#include "utf8.h"
 #include "virt.h"
+
+bool reboot_parameter_is_valid(const char *parameter) {
+        assert(parameter);
+
+        return ascii_is_valid(parameter) && strlen(parameter) <= NAME_MAX;
+}
 
 int update_reboot_parameter_and_warn(const char *parameter, bool keep) {
         int r;
@@ -41,6 +48,9 @@ int update_reboot_parameter_and_warn(const char *parameter, bool keep) {
 
                 return 0;
         }
+
+        if (!reboot_parameter_is_valid(parameter))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid reboot parameter '%s'.", parameter);
 
         WITH_UMASK(0022) {
                 r = write_string_file("/run/systemd/reboot-param", parameter,
@@ -109,15 +119,19 @@ int reboot_with_parameter(RebootFlags flags) {
         return log_full_errno(flags & REBOOT_LOG ? LOG_ERR : LOG_DEBUG, errno, "Failed to reboot: %m");
 }
 
-int shall_restore_state(void) {
-        bool ret;
+bool shall_restore_state(void) {
+        static int cached = -1;
+        bool b = true; /* If nothing specified or the check fails, then defaults to true. */
         int r;
 
-        r = proc_cmdline_get_bool("systemd.restore_state", &ret);
-        if (r < 0)
-                return r;
+        if (cached >= 0)
+                return cached;
 
-        return r > 0 ? ret : true;
+        r = proc_cmdline_get_bool("systemd.restore_state", PROC_CMDLINE_TRUE_WHEN_MISSING, &b);
+        if (r < 0)
+                log_debug_errno(r, "Failed to parse systemd.restore_state= kernel command line option, ignoring: %m");
+
+        return (cached = b);
 }
 
 static int xen_kexec_loaded(void) {

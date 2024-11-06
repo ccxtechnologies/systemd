@@ -155,6 +155,7 @@ bool json_variant_equal(JsonVariant *a, JsonVariant *b);
 
 void json_variant_sensitive(JsonVariant *v);
 bool json_variant_is_sensitive(JsonVariant *v);
+bool json_variant_is_sensitive_recursive(JsonVariant *v);
 
 struct json_variant_foreach_state {
         JsonVariant *variant;
@@ -185,17 +186,18 @@ struct json_variant_foreach_state {
 int json_variant_get_source(JsonVariant *v, const char **ret_source, unsigned *ret_line, unsigned *ret_column);
 
 typedef enum JsonFormatFlags {
-        JSON_FORMAT_NEWLINE     = 1 << 0, /* suffix with newline */
-        JSON_FORMAT_PRETTY      = 1 << 1, /* add internal whitespace to appeal to human readers */
-        JSON_FORMAT_PRETTY_AUTO = 1 << 2, /* same, but only if connected to a tty (and JSON_FORMAT_NEWLINE otherwise) */
-        JSON_FORMAT_COLOR       = 1 << 3, /* insert ANSI color sequences */
-        JSON_FORMAT_COLOR_AUTO  = 1 << 4, /* insert ANSI color sequences if colors_enabled() says so */
-        JSON_FORMAT_SOURCE      = 1 << 5, /* prefix with source filename/line/column */
-        JSON_FORMAT_SSE         = 1 << 6, /* prefix/suffix with W3C server-sent events */
-        JSON_FORMAT_SEQ         = 1 << 7, /* prefix/suffix with RFC 7464 application/json-seq */
-        JSON_FORMAT_FLUSH       = 1 << 8, /* call fflush() after dumping JSON */
-        JSON_FORMAT_EMPTY_ARRAY = 1 << 9, /* output "[]" for empty input */
-        JSON_FORMAT_OFF         = 1 << 10, /* make json_variant_format() fail with -ENOEXEC */
+        JSON_FORMAT_NEWLINE          = 1 << 0, /* suffix with newline */
+        JSON_FORMAT_PRETTY           = 1 << 1, /* add internal whitespace to appeal to human readers */
+        JSON_FORMAT_PRETTY_AUTO      = 1 << 2, /* same, but only if connected to a tty (and JSON_FORMAT_NEWLINE otherwise) */
+        JSON_FORMAT_COLOR            = 1 << 3, /* insert ANSI color sequences */
+        JSON_FORMAT_COLOR_AUTO       = 1 << 4, /* insert ANSI color sequences if colors_enabled() says so */
+        JSON_FORMAT_SOURCE           = 1 << 5, /* prefix with source filename/line/column */
+        JSON_FORMAT_SSE              = 1 << 6, /* prefix/suffix with W3C server-sent events */
+        JSON_FORMAT_SEQ              = 1 << 7, /* prefix/suffix with RFC 7464 application/json-seq */
+        JSON_FORMAT_FLUSH            = 1 << 8, /* call fflush() after dumping JSON */
+        JSON_FORMAT_EMPTY_ARRAY      = 1 << 9, /* output "[]" for empty input */
+        JSON_FORMAT_OFF              = 1 << 10, /* make json_variant_format() fail with -ENOEXEC */
+        JSON_FORMAT_CENSOR_SENSITIVE = 1 << 11, /* Replace all sensitive elements with the string "<sensitive data>" */
 } JsonFormatFlags;
 
 int json_variant_format(JsonVariant *v, JsonFormatFlags flags, char **ret);
@@ -204,18 +206,25 @@ int json_variant_dump(JsonVariant *v, JsonFormatFlags flags, FILE *f, const char
 int json_variant_filter(JsonVariant **v, char **to_remove);
 
 int json_variant_set_field(JsonVariant **v, const char *field, JsonVariant *value);
+int json_variant_set_fieldb(JsonVariant **v, const char *field, ...);
 int json_variant_set_field_string(JsonVariant **v, const char *field, const char *value);
 int json_variant_set_field_integer(JsonVariant **v, const char *field, int64_t value);
 int json_variant_set_field_unsigned(JsonVariant **v, const char *field, uint64_t value);
 int json_variant_set_field_boolean(JsonVariant **v, const char *field, bool b);
 int json_variant_set_field_strv(JsonVariant **v, const char *field, char **l);
 
+static inline int json_variant_set_field_non_null(JsonVariant **v, const char *field, JsonVariant *value) {
+        return value && !json_variant_is_null(value) ? json_variant_set_field(v, field, value) : 0;
+}
+
 JsonVariant *json_variant_find(JsonVariant *haystack, JsonVariant *needle);
 
 int json_variant_append_array(JsonVariant **v, JsonVariant *element);
+int json_variant_append_arrayb(JsonVariant **v, ...);
 int json_variant_append_array_nodup(JsonVariant **v, JsonVariant *element);
 
-int json_variant_merge(JsonVariant **v, JsonVariant *m);
+int json_variant_merge_object(JsonVariant **v, JsonVariant *m);
+int json_variant_merge_objectb(JsonVariant **v, ...);
 
 int json_variant_strv(JsonVariant *v, char ***ret);
 
@@ -259,14 +268,19 @@ enum {
         _JSON_BUILD_VARIANT_ARRAY,
         _JSON_BUILD_LITERAL,
         _JSON_BUILD_STRV,
+        _JSON_BUILD_STRV_ENV_PAIR,
         _JSON_BUILD_BASE64,
+        _JSON_BUILD_IOVEC_BASE64,
         _JSON_BUILD_BASE32HEX,
         _JSON_BUILD_HEX,
+        _JSON_BUILD_IOVEC_HEX,
         _JSON_BUILD_OCTESCAPE,
         _JSON_BUILD_ID128,
         _JSON_BUILD_UUID,
         _JSON_BUILD_BYTE_ARRAY,
         _JSON_BUILD_HW_ADDR,
+        _JSON_BUILD_STRING_SET,
+        _JSON_BUILD_CALLBACK,
         _JSON_BUILD_PAIR_UNSIGNED_NON_ZERO,
         _JSON_BUILD_PAIR_FINITE_USEC,
         _JSON_BUILD_PAIR_STRING_NON_EMPTY,
@@ -280,6 +294,8 @@ enum {
         _JSON_BUILD_PAIR_HW_ADDR_NON_NULL,
         _JSON_BUILD_MAX,
 };
+
+typedef int (*JsonBuildCallback)(JsonVariant **ret, const char *name, void *userdata);
 
 #define JSON_BUILD_STRING(s) _JSON_BUILD_STRING, (const char*) { s }
 #define JSON_BUILD_INTEGER(i) _JSON_BUILD_INTEGER, (int64_t) { i }
@@ -297,9 +313,12 @@ enum {
 #define JSON_BUILD_VARIANT_ARRAY(v, n) _JSON_BUILD_VARIANT_ARRAY, (JsonVariant **) { v }, (size_t) { n }
 #define JSON_BUILD_LITERAL(l) _JSON_BUILD_LITERAL, (const char*) { l }
 #define JSON_BUILD_STRV(l) _JSON_BUILD_STRV, (char**) { l }
+#define JSON_BUILD_STRV_ENV_PAIR(l) _JSON_BUILD_STRV_ENV_PAIR, (char**) { l }
 #define JSON_BUILD_BASE64(p, n) _JSON_BUILD_BASE64, (const void*) { p }, (size_t) { n }
+#define JSON_BUILD_IOVEC_BASE64(iov) _JSON_BUILD_IOVEC_BASE64, (const struct iovec*) { iov }
 #define JSON_BUILD_BASE32HEX(p, n) _JSON_BUILD_BASE32HEX, (const void*) { p }, (size_t) { n }
 #define JSON_BUILD_HEX(p, n) _JSON_BUILD_HEX, (const void*) { p }, (size_t) { n }
+#define JSON_BUILD_IOVEC_HEX(iov) _JSON_BUILD_IOVEC_HEX, (const struct iovec*) { iov }
 #define JSON_BUILD_OCTESCAPE(p, n) _JSON_BUILD_OCTESCAPE, (const void*) { p }, (size_t) { n }
 #define JSON_BUILD_ID128(id) _JSON_BUILD_ID128, (const sd_id128_t*) { &(id) }
 #define JSON_BUILD_UUID(id) _JSON_BUILD_UUID, (const sd_id128_t*) { &(id) }
@@ -310,6 +329,8 @@ enum {
 #define JSON_BUILD_IN_ADDR(v, f) JSON_BUILD_BYTE_ARRAY(((const union in_addr_union*) { v })->bytes, FAMILY_ADDRESS_SIZE_SAFE(f))
 #define JSON_BUILD_ETHER_ADDR(v) JSON_BUILD_BYTE_ARRAY(((const struct ether_addr*) { v })->ether_addr_octet, sizeof(struct ether_addr))
 #define JSON_BUILD_HW_ADDR(v) _JSON_BUILD_HW_ADDR, (const struct hw_addr_data*) { v }
+#define JSON_BUILD_STRING_SET(s) _JSON_BUILD_STRING_SET, (Set *) { s }
+#define JSON_BUILD_CALLBACK(c, u) _JSON_BUILD_CALLBACK, (JsonBuildCallback) { c }, (void*) { u }
 
 #define JSON_BUILD_PAIR_STRING(name, s) JSON_BUILD_PAIR(name, JSON_BUILD_STRING(s))
 #define JSON_BUILD_PAIR_INTEGER(name, i) JSON_BUILD_PAIR(name, JSON_BUILD_INTEGER(i))
@@ -326,7 +347,9 @@ enum {
 #define JSON_BUILD_PAIR_LITERAL(name, l) JSON_BUILD_PAIR(name, JSON_BUILD_LITERAL(l))
 #define JSON_BUILD_PAIR_STRV(name, l) JSON_BUILD_PAIR(name, JSON_BUILD_STRV(l))
 #define JSON_BUILD_PAIR_BASE64(name, p, n) JSON_BUILD_PAIR(name, JSON_BUILD_BASE64(p, n))
+#define JSON_BUILD_PAIR_IOVEC_BASE64(name, iov) JSON_BUILD_PAIR(name, JSON_BUILD_IOVEC_BASE64(iov))
 #define JSON_BUILD_PAIR_HEX(name, p, n) JSON_BUILD_PAIR(name, JSON_BUILD_HEX(p, n))
+#define JSON_BUILD_PAIR_IOVEC_HEX(name, iov) JSON_BUILD_PAIR(name, JSON_BUILD_IOVEC_HEX(iov))
 #define JSON_BUILD_PAIR_ID128(name, id) JSON_BUILD_PAIR(name, JSON_BUILD_ID128(id))
 #define JSON_BUILD_PAIR_UUID(name, id) JSON_BUILD_PAIR(name, JSON_BUILD_UUID(id))
 #define JSON_BUILD_PAIR_BYTE_ARRAY(name, v, n) JSON_BUILD_PAIR(name, JSON_BUILD_BYTE_ARRAY(v, n))
@@ -335,6 +358,8 @@ enum {
 #define JSON_BUILD_PAIR_IN_ADDR(name, v, f) JSON_BUILD_PAIR(name, JSON_BUILD_IN_ADDR(v, f))
 #define JSON_BUILD_PAIR_ETHER_ADDR(name, v) JSON_BUILD_PAIR(name, JSON_BUILD_ETHER_ADDR(v))
 #define JSON_BUILD_PAIR_HW_ADDR(name, v) JSON_BUILD_PAIR(name, JSON_BUILD_HW_ADDR(v))
+#define JSON_BUILD_PAIR_STRING_SET(name, s) JSON_BUILD_PAIR(name, JSON_BUILD_STRING_SET(s))
+#define JSON_BUILD_PAIR_CALLBACK(name, c, u) JSON_BUILD_PAIR(name, JSON_BUILD_CALLBACK(c, u))
 
 #define JSON_BUILD_PAIR_UNSIGNED_NON_ZERO(name, u) _JSON_BUILD_PAIR_UNSIGNED_NON_ZERO, (const char*) { name }, (uint64_t) { u }
 #define JSON_BUILD_PAIR_FINITE_USEC(name, u) _JSON_BUILD_PAIR_FINITE_USEC, (const char*) { name }, (usec_t) { u }
@@ -349,24 +374,22 @@ enum {
 
 int json_build(JsonVariant **ret, ...);
 int json_buildv(JsonVariant **ret, va_list ap);
- /* These two functions below are equivalent to json_build() (or json_buildv()) and json_variant_merge(). */
-int json_append(JsonVariant **v, ...);
-int json_appendv(JsonVariant **v, va_list ap);
 
 /* A bitmask of flags used by the dispatch logic. Note that this is a combined bit mask, that is generated from the bit
  * mask originally passed into json_dispatch(), the individual bitmask associated with the static JsonDispatch callout
  * entry, as well the bitmask specified for json_log() calls */
 typedef enum JsonDispatchFlags {
         /* The following three may be set in JsonDispatch's .flags field or the json_dispatch() flags parameter  */
-        JSON_PERMISSIVE = 1 << 0, /* Shall parsing errors be considered fatal for this property? */
-        JSON_MANDATORY  = 1 << 1, /* Should existence of this property be mandatory? */
-        JSON_LOG        = 1 << 2, /* Should the parser log about errors? */
-        JSON_SAFE       = 1 << 3, /* Don't accept "unsafe" strings in json_dispatch_string() + json_dispatch_string() */
-        JSON_RELAX      = 1 << 4, /* Use relaxed user name checking in json_dispatch_user_group_name */
+        JSON_PERMISSIVE       = 1 << 0, /* Shall parsing errors be considered fatal for this field or object? */
+        JSON_MANDATORY        = 1 << 1, /* Should existence of this property be mandatory? */
+        JSON_LOG              = 1 << 2, /* Should the parser log about errors? */
+        JSON_SAFE             = 1 << 3, /* Don't accept "unsafe" strings in json_dispatch_string() + json_dispatch_string() */
+        JSON_RELAX            = 1 << 4, /* Use relaxed user name checking in json_dispatch_user_group_name */
+        JSON_ALLOW_EXTENSIONS = 1 << 5, /* Subset of JSON_PERMISSIVE: allow additional fields, but no other permissive handling */
 
         /* The following two may be passed into log_json() in addition to those above */
-        JSON_DEBUG      = 1 << 5, /* Indicates that this log message is a debug message */
-        JSON_WARNING    = 1 << 6, /* Indicates that this log message is a warning message */
+        JSON_DEBUG            = 1 << 6, /* Indicates that this log message is a debug message */
+        JSON_WARNING          = 1 << 7, /* Indicates that this log message is a warning message */
 } JsonDispatchFlags;
 
 typedef int (*JsonDispatchCallback)(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
@@ -379,7 +402,11 @@ typedef struct JsonDispatch {
         JsonDispatchFlags flags;
 } JsonDispatch;
 
-int json_dispatch(JsonVariant *v, const JsonDispatch table[], JsonDispatchCallback bad, JsonDispatchFlags flags, void *userdata);
+int json_dispatch_full(JsonVariant *v, const JsonDispatch table[], JsonDispatchCallback bad, JsonDispatchFlags flags, void *userdata, const char **reterr_bad_field);
+
+static inline int json_dispatch(JsonVariant *v, const JsonDispatch table[], JsonDispatchFlags flags, void *userdata) {
+        return json_dispatch_full(v, table, NULL, flags, userdata, NULL);
+}
 
 int json_dispatch_string(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
 int json_dispatch_const_string(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
@@ -394,16 +421,44 @@ int json_dispatch_uint32(const char *name, JsonVariant *variant, JsonDispatchFla
 int json_dispatch_int32(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
 int json_dispatch_uint16(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
 int json_dispatch_int16(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
+int json_dispatch_int8(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
+int json_dispatch_uint8(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
 int json_dispatch_uid_gid(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
 int json_dispatch_user_group_name(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
+int json_dispatch_absolute_path(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
 int json_dispatch_id128(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
 int json_dispatch_unsupported(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
+int json_dispatch_unbase64_iovec(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
+int json_dispatch_byte_array_iovec(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
+int json_dispatch_in_addr(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
 
 assert_cc(sizeof(uint32_t) == sizeof(unsigned));
 #define json_dispatch_uint json_dispatch_uint32
 
 assert_cc(sizeof(int32_t) == sizeof(int));
 #define json_dispatch_int json_dispatch_int32
+
+#define JSON_DISPATCH_ENUM_DEFINE(name, type, func)                     \
+        int name(const char *n, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) { \
+                type *c = ASSERT_PTR(userdata);                         \
+                                                                        \
+                assert(variant);                                        \
+                                                                        \
+                if (json_variant_is_null(variant)) {                    \
+                        *c = (type) -EINVAL;                            \
+                        return 0;                                       \
+                }                                                       \
+                                                                        \
+                if (!json_variant_is_string(variant))                   \
+                        return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a string.", strna(n)); \
+                                                                        \
+                type cc = func(json_variant_string(variant));           \
+                if (cc < 0)                                             \
+                        return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Value of JSON field '%s' not recognized.", strna(n)); \
+                                                                        \
+                *c = cc;                                                \
+                return 0;                                               \
+        }
 
 static inline int json_dispatch_level(JsonDispatchFlags flags) {
 
@@ -447,6 +502,14 @@ int json_log_internal(JsonVariant *variant, int level, int error, const char *fi
 
 int json_variant_unbase64(JsonVariant *v, void **ret, size_t *ret_size);
 int json_variant_unhex(JsonVariant *v, void **ret, size_t *ret_size);
+
+static inline int json_variant_unbase64_iovec(JsonVariant *v, struct iovec *ret) {
+        return json_variant_unbase64(v, ret ? &ret->iov_base : NULL, ret ? &ret->iov_len : NULL);
+}
+
+static inline int json_variant_unhex_iovec(JsonVariant *v, struct iovec *ret) {
+        return json_variant_unhex(v, ret ? &ret->iov_base : NULL, ret ? &ret->iov_len : NULL);
+}
 
 const char *json_variant_type_to_string(JsonVariantType t);
 JsonVariantType json_variant_type_from_string(const char *s);

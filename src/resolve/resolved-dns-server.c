@@ -28,7 +28,8 @@ int dns_server_new(
                 const union in_addr_union *in_addr,
                 uint16_t port,
                 int ifindex,
-                const char *server_name) {
+                const char *server_name,
+                ResolveConfigSource config_source) {
 
         _cleanup_free_ char *name = NULL;
         DnsServer *s;
@@ -67,6 +68,7 @@ int dns_server_new(
                 .port = port,
                 .ifindex = ifindex,
                 .server_name = TAKE_PTR(name),
+                .config_source = config_source,
         };
 
         dns_server_reset_features(s);
@@ -751,10 +753,10 @@ size_t dns_server_get_mtu(DnsServer *s) {
 static void dns_server_hash_func(const DnsServer *s, struct siphash *state) {
         assert(s);
 
-        siphash24_compress(&s->family, sizeof(s->family), state);
-        siphash24_compress(&s->address, FAMILY_ADDRESS_SIZE(s->family), state);
-        siphash24_compress(&s->port, sizeof(s->port), state);
-        siphash24_compress(&s->ifindex, sizeof(s->ifindex), state);
+        siphash24_compress_typesafe(s->family, state);
+        in_addr_hash_func(&s->address, s->family, state);
+        siphash24_compress_typesafe(s->port, state);
+        siphash24_compress_typesafe(s->ifindex, state);
         siphash24_compress_string(s->server_name, state);
 }
 
@@ -792,6 +794,17 @@ void dns_server_unlink_all(DnsServer *first) {
         dns_server_unlink(first);
 
         dns_server_unlink_all(next);
+}
+
+void dns_server_unlink_on_reload(DnsServer *server) {
+        while (server) {
+                DnsServer *next = server->servers_next;
+
+                if (server->config_source == RESOLVE_CONFIG_SOURCE_FILE)
+                        dns_server_unlink(server);
+
+                server = next;
+        }
 }
 
 bool dns_server_unlink_marked(DnsServer *server) {
@@ -1095,3 +1108,28 @@ static const char* const dns_server_feature_level_table[_DNS_SERVER_FEATURE_LEVE
         [DNS_SERVER_FEATURE_LEVEL_TLS_DO]    = "TLS+EDNS0+DO",
 };
 DEFINE_STRING_TABLE_LOOKUP(dns_server_feature_level, DnsServerFeatureLevel);
+
+int dns_server_dump_state_to_json(DnsServer *server, JsonVariant **ret) {
+
+        assert(server);
+        assert(ret);
+
+        return json_build(ret,
+                          JSON_BUILD_OBJECT(
+                                        JSON_BUILD_PAIR_STRING("Server", strna(dns_server_string_full(server))),
+                                        JSON_BUILD_PAIR_STRING("Type", strna(dns_server_type_to_string(server->type))),
+                                        JSON_BUILD_PAIR_CONDITION(server->type == DNS_SERVER_LINK, "Interface", JSON_BUILD_STRING(server->link ? server->link->ifname : NULL)),
+                                        JSON_BUILD_PAIR_CONDITION(server->type == DNS_SERVER_LINK, "InterfaceIndex", JSON_BUILD_UNSIGNED(server->link ? server->link->ifindex : 0)),
+                                        JSON_BUILD_PAIR_STRING("VerifiedFeatureLevel", strna(dns_server_feature_level_to_string(server->verified_feature_level))),
+                                        JSON_BUILD_PAIR_STRING("PossibleFeatureLevel", strna(dns_server_feature_level_to_string(server->possible_feature_level))),
+                                        JSON_BUILD_PAIR_STRING("DNSSECMode", strna(dnssec_mode_to_string(dns_server_get_dnssec_mode(server)))),
+                                        JSON_BUILD_PAIR_BOOLEAN("DNSSECSupported", dns_server_dnssec_supported(server)),
+                                        JSON_BUILD_PAIR_UNSIGNED("ReceivedUDPFragmentMax", server->received_udp_fragment_max),
+                                        JSON_BUILD_PAIR_UNSIGNED("FailedUDPAttempts", server->n_failed_udp),
+                                        JSON_BUILD_PAIR_UNSIGNED("FailedTCPAttempts", server->n_failed_tcp),
+                                        JSON_BUILD_PAIR_BOOLEAN("PacketTruncated", server->packet_truncated),
+                                        JSON_BUILD_PAIR_BOOLEAN("PacketBadOpt", server->packet_bad_opt),
+                                        JSON_BUILD_PAIR_BOOLEAN("PacketRRSIGMissing", server->packet_rrsig_missing),
+                                        JSON_BUILD_PAIR_BOOLEAN("PacketInvalid", server->packet_invalid),
+                                        JSON_BUILD_PAIR_BOOLEAN("PacketDoOff", server->packet_do_off)));
+}

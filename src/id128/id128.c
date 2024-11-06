@@ -5,17 +5,22 @@
 
 #include "alloc-util.h"
 #include "build.h"
+#include "format-table.h"
 #include "gpt.h"
 #include "id128-print.h"
 #include "main-func.h"
+#include "parse-argument.h"
 #include "pretty-print.h"
 #include "strv.h"
-#include "format-table.h"
 #include "terminal-util.h"
 #include "verbs.h"
 
 static Id128PrettyPrintMode arg_mode = ID128_PRINT_ID128;
 static sd_id128_t arg_app = {};
+static bool arg_value = false;
+static PagerFlags arg_pager_flags = 0;
+static bool arg_legend = true;
+static JsonFormatFlags arg_json_format_flags = JSON_FORMAT_OFF;
 
 static int verb_new(int argc, char **argv, void *userdata) {
         return id128_print_new(arg_mode);
@@ -67,7 +72,15 @@ static int verb_invocation_id(int argc, char **argv, void *userdata) {
 }
 
 static int show_one(Table **table, const char *name, sd_id128_t uuid, bool first) {
+        sd_id128_t u;
         int r;
+
+        assert(table);
+
+        if (sd_id128_is_null(arg_app))
+                u = uuid;
+        else
+                assert_se(sd_id128_get_app_specific(uuid, arg_app, &u) == 0);
 
         if (arg_mode == ID128_PRINT_PRETTY) {
                 _cleanup_free_ char *id = NULL;
@@ -78,26 +91,28 @@ static int show_one(Table **table, const char *name, sd_id128_t uuid, bool first
 
                 ascii_strupper(id);
 
-                r = id128_pretty_print_sample(id, uuid);
+                r = id128_pretty_print_sample(id, u);
                 if (r < 0)
                         return r;
                 if (!first)
                         puts("");
                 return 0;
-
-        } else {
-                if (!*table) {
-                        *table = table_new("name", "id");
-                        if (!*table)
-                                return log_oom();
-                        table_set_width(*table, 0);
-                }
-
-                return table_add_many(*table,
-                                      TABLE_STRING, name,
-                                      arg_mode == ID128_PRINT_ID128 ? TABLE_ID128 : TABLE_UUID,
-                                      uuid);
         }
+
+        if (arg_value)
+                return id128_pretty_print(u, arg_mode);
+
+        if (!*table) {
+                *table = table_new("name", "id");
+                if (!*table)
+                        return log_oom();
+                table_set_width(*table, 0);
+        }
+
+        return table_add_many(*table,
+                              TABLE_STRING, name,
+                              arg_mode == ID128_PRINT_ID128 ? TABLE_ID128 : TABLE_UUID,
+                              u);
 }
 
 static int verb_show(int argc, char **argv, void *userdata) {
@@ -139,9 +154,9 @@ static int verb_show(int argc, char **argv, void *userdata) {
                 }
 
         if (table) {
-                r = table_print(table, NULL);
+                r = table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, arg_legend);
                 if (r < 0)
-                        return table_log_print_error(r);
+                        return r;
         }
 
         return 0;
@@ -162,11 +177,18 @@ static int help(void) {
                "  machine-id              Print the ID of current machine\n"
                "  boot-id                 Print the ID of current boot\n"
                "  invocation-id           Print the ID of current invocation\n"
-               "  show [NAME]             Print one or more well-known GPT partition type IDs\n"
+               "  show [NAME|UUID]        Print one or more UUIDs\n"
                "  help                    Show this help\n"
                "\nOptions:\n"
                "  -h --help               Show this help\n"
+               "     --no-pager           Do not pipe output into a pager\n"
+               "     --no-legend          Do not show the headers and footers\n"
+               "     --json=FORMAT        Output inspection data in JSON (takes one of\n"
+               "                          pretty, short, off)\n"
+               "  -j                      Equivalent to --json=pretty (on TTY) or\n"
+               "                          --json=short (otherwise)\n"
                "  -p --pretty             Generate samples of program code\n"
+               "  -P --value              Only print the value\n"
                "  -a --app-specific=ID    Generate app-specific IDs\n"
                "  -u --uuid               Output in UUID format\n"
                "\nSee the %s for details.\n",
@@ -185,12 +207,19 @@ static int verb_help(int argc, char **argv, void *userdata) {
 static int parse_argv(int argc, char *argv[]) {
         enum {
                 ARG_VERSION = 0x100,
+                ARG_NO_PAGER,
+                ARG_NO_LEGEND,
+                ARG_JSON,
         };
 
         static const struct option options[] = {
                 { "help",         no_argument,       NULL, 'h'              },
                 { "version",      no_argument,       NULL, ARG_VERSION      },
+                { "no-pager",     no_argument,       NULL, ARG_NO_PAGER     },
+                { "no-legend",    no_argument,       NULL, ARG_NO_LEGEND    },
+                { "json",         required_argument, NULL, ARG_JSON         },
                 { "pretty",       no_argument,       NULL, 'p'              },
+                { "value",        no_argument,       NULL, 'P'              },
                 { "app-specific", required_argument, NULL, 'a'              },
                 { "uuid",         no_argument,       NULL, 'u'              },
                 {},
@@ -201,7 +230,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hpa:u", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "hpa:uPj", options, NULL)) >= 0)
                 switch (c) {
 
                 case 'h':
@@ -210,12 +239,39 @@ static int parse_argv(int argc, char *argv[]) {
                 case ARG_VERSION:
                         return version();
 
+                case ARG_NO_PAGER:
+                        arg_pager_flags |= PAGER_DISABLE;
+                        break;
+
+                case ARG_NO_LEGEND:
+                        arg_legend = false;
+                        break;
+
+                case 'j':
+                        arg_json_format_flags = JSON_FORMAT_PRETTY_AUTO|JSON_FORMAT_COLOR_AUTO;
+                        break;
+
+                case ARG_JSON:
+                        r = parse_json_argument(optarg, &arg_json_format_flags);
+                        if (r <= 0)
+                                return r;
+
+                        break;
                 case 'p':
                         arg_mode = ID128_PRINT_PRETTY;
+                        arg_value = false;
+                        break;
+
+                case 'P':
+                        arg_value = true;
+                        if (arg_mode == ID128_PRINT_PRETTY)
+                                arg_mode = ID128_PRINT_ID128;
                         break;
 
                 case 'a':
-                        r = sd_id128_from_string(optarg, &arg_app);
+                        r = id128_from_string_nonzero(optarg, &arg_app);
+                        if (r == -ENXIO)
+                                return log_error_errno(r, "Application ID cannot be all zeros.");
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse \"%s\" as application-ID: %m", optarg);
                         break;

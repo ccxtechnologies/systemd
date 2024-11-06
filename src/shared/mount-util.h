@@ -10,6 +10,7 @@
 #include "dissect-image.h"
 #include "errno-util.h"
 #include "macro.h"
+#include "pidref.h"
 
 int repeat_unmount(const char *path, int flags);
 
@@ -25,6 +26,7 @@ static inline int bind_remount_recursive(const char *prefix, unsigned long new_f
 }
 
 int bind_remount_one_with_mountinfo(const char *path, unsigned long new_flags, unsigned long flags_mask, FILE *proc_self_mountinfo);
+int bind_remount_one(const char *path, unsigned long new_flags, unsigned long flags_mask);
 
 int mount_switch_root_full(const char *path, unsigned long mount_propagation_flag, bool force_ms_move);
 static inline int mount_switch_root(const char *path, unsigned long mount_propagation_flag) {
@@ -68,6 +70,8 @@ int umount_verbose(
                 const char *where,
                 int flags);
 
+int mount_exchange_graceful(int fsmount_fd, const char *dest, bool mount_beneath);
+
 int mount_option_mangle(
                 const char *options,
                 unsigned long mount_flags,
@@ -96,8 +100,8 @@ static inline char *umount_and_free(char *p) {
 }
 DEFINE_TRIVIAL_CLEANUP_FUNC(char*, umount_and_free);
 
-int bind_mount_in_namespace(pid_t target, const char *propagate_path, const char *incoming_path, const char *src, const char *dest, bool read_only, bool make_file_or_directory);
-int mount_image_in_namespace(pid_t target, const char *propagate_path, const char *incoming_path, const char *src, const char *dest, bool read_only, bool make_file_or_directory, const MountOptions *options, const ImagePolicy *image_policy);
+int bind_mount_in_namespace(PidRef *target, const char *propagate_path, const char *incoming_path, const char *src, const char *dest, bool read_only, bool make_file_or_directory);
+int mount_image_in_namespace(PidRef *target, const char *propagate_path, const char *incoming_path, const char *src, const char *dest, bool read_only, bool make_file_or_directory, const MountOptions *options, const ImagePolicy *image_policy);
 
 int make_mount_point(const char *path);
 int fd_make_mount_point(int fd);
@@ -113,24 +117,19 @@ typedef enum RemountIdmapping {
          * certain security implications defaults to off, and requires explicit opt-in. */
         REMOUNT_IDMAPPING_HOST_ROOT,
         /* Define a mapping from root user within the container to the owner of the bind mounted directory.
-         * This ensure no root-owned files will be written in a bind-mounted directory owned by a different
+         * This ensures no root-owned files will be written in a bind-mounted directory owned by a different
          * user. No other users are mapped. */
         REMOUNT_IDMAPPING_HOST_OWNER,
+        /* Define a mapping from bind-target owner within the container to the host owner of the bind mounted
+         * directory. No other users are mapped. */
+        REMOUNT_IDMAPPING_HOST_OWNER_TO_TARGET_OWNER,
         _REMOUNT_IDMAPPING_MAX,
         _REMOUNT_IDMAPPING_INVALID = -EINVAL,
 } RemountIdmapping;
 
-int make_userns(uid_t uid_shift, uid_t uid_range, uid_t owner, RemountIdmapping idmapping);
-int remount_idmap_fd(const char *p, int userns_fd);
-int remount_idmap(const char *p, uid_t uid_shift, uid_t uid_range, uid_t owner, RemountIdmapping idmapping);
-
-int remount_and_move_sub_mounts(
-                const char *what,
-                const char *where,
-                const char *type,
-                unsigned long flags,
-                const char *options);
-int remount_sysfs(const char *where);
+int make_userns(uid_t uid_shift, uid_t uid_range, uid_t host_owner, uid_t dest_owner, RemountIdmapping idmapping);
+int remount_idmap_fd(char **p, int userns_fd);
+int remount_idmap(char **p, uid_t uid_shift, uid_t uid_range, uid_t host_owner, uid_t dest_owner, RemountIdmapping idmapping);
 
 int bind_mount_submounts(
                 const char *source,
@@ -144,3 +143,5 @@ int trigger_automount_at(int dir_fd, const char *path);
 
 unsigned long credentials_fs_mount_flags(bool ro);
 int mount_credentials_fs(const char *path, size_t size, bool ro);
+
+int make_fsmount(int error_log_level, const char *what, const char *type, unsigned long flags, const char *options, int userns_fd);

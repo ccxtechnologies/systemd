@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 from argparse import ArgumentParser
 from pathlib import Path
-from subprocess import run, PIPE
+from subprocess import PIPE, run
+
 
 def extract_interfaces_xml(output_dir, executable):
     proc = run(
@@ -35,6 +36,8 @@ def main():
     args = parser.parse_args()
 
     args.output.mkdir(exist_ok=True)
+    # Make sure we don't inherit any setgid/setuid bit or such.
+    args.output.chmod(mode=0o755)
     for exe in args.executables:
         extract_interfaces_xml(args.output, exe)
 

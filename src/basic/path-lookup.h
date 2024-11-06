@@ -10,7 +10,7 @@
 typedef enum LookupPathsFlags {
         LOOKUP_PATHS_EXCLUDE_GENERATED   = 1 << 0,
         LOOKUP_PATHS_TEMPORARY_GENERATED = 1 << 1,
-        LOOKUP_PATHS_SPLIT_USR           = 1 << 2,
+        LOOKUP_PATHS_SPLIT_USR           = 1 << 2, /* Legacy, use ONLY for image payloads which might be old */
 } LookupPathsFlags;
 
 typedef struct LookupPaths {
@@ -59,12 +59,13 @@ int xdg_user_dirs(char ***ret_config_dirs, char ***ret_data_dirs);
 int xdg_user_runtime_dir(char **ret, const char *suffix);
 int xdg_user_config_dir(char **ret, const char *suffix);
 int xdg_user_data_dir(char **ret, const char *suffix);
+int runtime_directory(char **ret, RuntimeScope scope, const char *suffix);
 
 bool path_is_user_data_dir(const char *path);
 bool path_is_user_config_dir(const char *path);
 
 void lookup_paths_log(LookupPaths *p);
-void lookup_paths_free(LookupPaths *p);
+void lookup_paths_done(LookupPaths *p);
 
 char **generator_binary_paths(RuntimeScope scope);
 char **env_generator_binary_paths(RuntimeScope scope);

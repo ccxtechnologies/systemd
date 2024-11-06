@@ -98,6 +98,8 @@ REQUIREMENTS:
           CONFIG_SECCOMP_FILTER (required for seccomp support)
           CONFIG_KCMP (for the kcmp() syscall, used to be under
                        CONFIG_CHECKPOINT_RESTORE before ~5.12)
+          CONFIG_NET_SCHED
+          CONFIG_NET_SCH_FQ_CODEL
 
         Required for CPUShares= in resource control unit settings:
           CONFIG_CGROUP_SCHED
@@ -133,6 +135,10 @@ REQUIREMENTS:
           CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG_SECONDARY_KEYRING
           CONFIG_IMA_ARCH_POLICY
           CONFIG_INTEGRITY_MACHINE_KEYRING
+
+        Required for reading credentials from SMBIOS:
+          CONFIG_DMI
+          CONFIG_DMI_SYSFS
 
         Required for RestrictFileSystems= in service units:
           CONFIG_BPF
@@ -213,7 +219,7 @@ REQUIREMENTS:
         pyelftools (optional, required for systemd-boot)
         meson >= 0.60.0
         ninja
-        gcc >= 4.7
+        gcc >= 8.4
         awk, sed, grep, and similar tools
         clang >= 10.0, llvm >= 10.0 (optional, required to build BPF programs
                 from source code in C)
@@ -227,7 +233,6 @@ REQUIREMENTS:
         dbus >= 1.4.0 (strictly speaking optional, but recommended)
                 NOTE: If using dbus < 1.9.18, you should override the default
                 policy directory (--with-dbuspolicydir=/etc/dbus-1/system.d).
-        dracut (optional)
         polkit (optional)
 
         To build in directory build/:
@@ -259,13 +264,14 @@ REQUIREMENTS:
         make use of DynamicUser= now, hence enabling nss-systemd is not
         optional.
 
-        Note that the build prefix for systemd must be /usr. (Moreover, packages
+        Note that the build prefix for systemd must be /usr/. (Moreover, packages
         systemd relies on — such as D-Bus — really should use the same prefix,
-        otherwise you are on your own.) -Dsplit-usr=false (which is the default
-        and does not need to be specified) is the recommended setting.
-        -Dsplit-usr=true can be used to give a semblance of support for systems
-        with programs installed split between / and /usr. Moving everything
-        under /usr is strongly encouraged.
+        otherwise you are on your own.) Split-usr and unmerged-usr systems are no
+        longer supported, and moving everything under /usr/ is required. Systems
+        with a separate /usr/ partition must mount it before transitioning into it
+        (i.e.: from the initrd). For more information see:
+        https://systemd.io/SEPARATE_USR_IS_BROKEN
+        https://systemd.io/THE_CASE_FOR_THE_USR_MERGE
 
         Additional packages are necessary to run some tests:
         - nc                 (used by test/TEST-12-ISSUE-3171)
@@ -382,15 +388,16 @@ GLIBC NSS:
         DynamicUser= setting in unit files.)
 
         To make use of these NSS modules, please add them to the "hosts:",
-        "passwd:" and "group:" lines in /etc/nsswitch.conf. The "resolve" module
-        should replace the glibc "dns" module in this file (and don't worry, it
-        chain-loads the "dns" module if it can't talk to resolved).
+        "passwd:", "group:", "shadow:" and "gshadow:" lines in
+        /etc/nsswitch.conf.
 
         The four modules should be used in the following order:
 
-                passwd: compat systemd
-                group: compat systemd
-                hosts: files mymachines resolve [!UNAVAIL=return] dns myhostname
+                passwd: files systemd
+                group: files [SUCCESS=merge] systemd
+                shadow: files systemd
+                gshadow: files systemd
+                hosts: mymachines resolve [!UNAVAIL=return] files myhostname dns
 
 SYSV INIT.D SCRIPTS:
         When calling "systemctl enable/disable/is-enabled" on a unit which is a
@@ -404,28 +411,6 @@ SYSV INIT.D SCRIPTS:
         needs to look like, and provide an implementation at the marked places.
 
 WARNINGS and TAINT FLAGS:
-        systemd will warn during early boot if /usr is not already mounted at
-        this point (that means: either located on the same file system as / or
-        already mounted in the initrd). While in systemd itself very little
-        will break if /usr is on a separate late-mounted partition, many of its
-        dependencies very likely will break sooner or later in one form or
-        another. For example, udev rules tend to refer to binaries in /usr,
-        binaries that link to libraries in /usr, or binaries that refer to data
-        files in /usr. Since these breakages are not always directly visible,
-        systemd will warn about this. Such setups are not really supported by
-        the basic set of Linux OS components. Taint flag 'split-usr' will be
-        set when this condition is detected.
-
-        For more information on this issue consult
-        https://www.freedesktop.org/wiki/Software/systemd/separate-usr-is-broken
-
-        systemd will warn if the filesystem is not usr-merged (i.e.: /bin, /sbin
-        and /lib* are not symlinks to their counterparts under /usr). Taint flag
-        'unmerged-usr' will be set when this condition is detected.
-
-        For more information on this issue consult
-        https://www.freedesktop.org/wiki/Software/systemd/TheCaseForTheUsrMerge
-
         systemd requires that the /run mount point exists. systemd also
         requires that /var/run is a symlink to /run. Taint flag 'var-run-bad'
         will be set when this condition is detected.
@@ -461,5 +446,4 @@ STABLE BRANCHES AND BACKPORTS:
         Stable branches are started for certain releases of systemd and named
         after them, e.g. v238-stable. Stable branches are managed by
         distribution maintainers on an as needed basis. See
-        https://www.freedesktop.org/wiki/Software/systemd/Backports for some
-        more information and examples.
+        https://systemd.io/BACKPORTS for some more information and examples.

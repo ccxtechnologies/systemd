@@ -21,7 +21,7 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "format-util.h"
-#include "io-util.h"
+#include "iovec-util.h"
 #include "log.h"
 #include "macro.h"
 #include "missing_syscall.h"
@@ -49,10 +49,17 @@ static void *log_syntax_callback_userdata = NULL;
 
 static LogTarget log_target = LOG_TARGET_CONSOLE;
 static int log_max_level = LOG_INFO;
+static int log_target_max_level[] = {
+        [LOG_TARGET_CONSOLE] = INT_MAX,
+        [LOG_TARGET_KMSG]    = INT_MAX,
+        [LOG_TARGET_SYSLOG]  = INT_MAX,
+        [LOG_TARGET_JOURNAL] = INT_MAX,
+};
 static int log_facility = LOG_DAEMON;
 static bool ratelimit_kmsg = true;
 
 static int console_fd = STDERR_FILENO;
+static int console_fd_is_tty = -1; /* tri-state: -1 means don't know */
 static int syslog_fd = -EBADF;
 static int kmsg_fd = -EBADF;
 static int journal_fd = -EBADF;
@@ -68,6 +75,7 @@ static bool upgrade_syslog_to_journal = false;
 static bool always_reopen_console = false;
 static bool open_when_needed = false;
 static bool prohibit_ipc = false;
+static bool assert_return_is_critical = BUILD_MODE_DEVELOPER;
 
 /* Akin to glibc's __abort_msg; which is private and we hence cannot
  * use here. */
@@ -108,12 +116,14 @@ bool _log_message_dummy = false; /* Always false */
 static void log_close_console(void) {
         /* See comment in log_close_journal() */
         (void) safe_close_above_stdio(TAKE_FD(console_fd));
+        console_fd_is_tty = -1;
 }
 
 static int log_open_console(void) {
 
         if (!always_reopen_console) {
                 console_fd = STDERR_FILENO;
+                console_fd_is_tty = -1;
                 return 0;
         }
 
@@ -125,6 +135,7 @@ static int log_open_console(void) {
                         return fd;
 
                 console_fd = fd_move_above_stdio(fd);
+                console_fd_is_tty = true;
         }
 
         return 0;
@@ -245,7 +256,7 @@ fail:
         return r;
 }
 
-static bool stderr_is_journal(void) {
+bool stderr_is_journal(void) {
         _cleanup_free_ char *w = NULL;
         const char *e;
         uint64_t dev, ino;
@@ -381,10 +392,11 @@ void log_forget_fds(void) {
         /* Do not call from library code. */
 
         console_fd = kmsg_fd = syslog_fd = journal_fd = -EBADF;
+        console_fd_is_tty = -1;
 }
 
 void log_set_max_level(int level) {
-        assert(level == LOG_NULL || (level & LOG_PRIMASK) == level);
+        assert(level == LOG_NULL || LOG_PRI(level) == level);
 
         log_max_level = level;
 
@@ -404,6 +416,16 @@ void log_set_facility(int facility) {
         log_facility = facility;
 }
 
+static bool check_console_fd_is_tty(void) {
+        if (console_fd < 0)
+                return false;
+
+        if (console_fd_is_tty < 0)
+                console_fd_is_tty = isatty_safe(console_fd);
+
+        return console_fd_is_tty;
+}
+
 static int write_to_console(
                 int level,
                 int error,
@@ -411,6 +433,8 @@ static int write_to_console(
                 int line,
                 const char *func,
                 const char *buffer) {
+
+        static int dumb = -1;
 
         char location[256],
              header_time[FORMAT_TIMESTAMP_MAX],
@@ -421,6 +445,12 @@ static int write_to_console(
         size_t n = 0;
 
         if (console_fd < 0)
+                return 0;
+
+        if (dumb < 0)
+                dumb = getenv_terminal_is_dumb();
+
+        if (LOG_PRI(level) > log_target_max_level[LOG_TARGET_CONSOLE])
                 return 0;
 
         if (log_target == LOG_TARGET_CONSOLE_PREFIXED) {
@@ -462,7 +492,13 @@ static int write_to_console(
         iovec[n++] = IOVEC_MAKE_STRING(buffer);
         if (off)
                 iovec[n++] = IOVEC_MAKE_STRING(off);
-        iovec[n++] = IOVEC_MAKE_STRING("\n");
+
+        /* When writing to a TTY we output an extra '\r' (i.e. CR) first, to generate CRNL rather than just
+         * NL. This is a robustness thing in case the TTY is currently in raw mode (specifically: has the
+         * ONLCR flag off). We want that subsequent output definitely starts at the beginning of the line
+         * again, after all. If the TTY is not in raw mode the extra CR should not hurt. If we're writing to
+         * a dumb terminal, only write NL as CRNL might be interpreted as a double newline. */
+        iovec[n++] = IOVEC_MAKE_STRING(check_console_fd_is_tty() && !dumb ? "\r\n" : "\n");
 
         if (writev(console_fd, iovec, n) < 0) {
 
@@ -500,6 +536,9 @@ static int write_to_syslog(
         struct tm tm;
 
         if (syslog_fd < 0)
+                return 0;
+
+        if (LOG_PRI(level) > log_target_max_level[LOG_TARGET_SYSLOG])
                 return 0;
 
         xsprintf(header_priority, "<%i>", level);
@@ -541,7 +580,7 @@ static int write_to_syslog(
                 if (!syslog_is_stream)
                         break;
 
-                if (IOVEC_INCREMENT(iovec, ELEMENTSOF(iovec), n))
+                if (iovec_increment(iovec, ELEMENTSOF(iovec), n))
                         break;
         }
 
@@ -569,6 +608,9 @@ static int write_to_kmsg(
              header_pid[4 + DECIMAL_STR_MAX(pid_t) + 1];
 
         if (kmsg_fd < 0)
+                return 0;
+
+        if (LOG_PRI(level) > log_target_max_level[LOG_TARGET_KMSG])
                 return 0;
 
         if (ratelimit_kmsg && !ratelimit_below(&ratelimit)) {
@@ -698,6 +740,9 @@ static int write_to_journal(
         if (journal_fd < 0)
                 return 0;
 
+        if (LOG_PRI(level) > log_target_max_level[LOG_TARGET_JOURNAL])
+                return 0;
+
         iovec_len = MIN(6 + _log_context_num_fields * 2, IOVEC_MAX);
         iovec = newa(struct iovec, iovec_len);
 
@@ -743,7 +788,7 @@ int log_dispatch_internal(
                 return -ERRNO_VALUE(error);
 
         /* Patch in LOG_DAEMON facility if necessary */
-        if ((level & LOG_FACMASK) == 0)
+        if (LOG_FAC(level) == 0)
                 level |= log_facility;
 
         if (open_when_needed)
@@ -961,9 +1006,13 @@ void log_assert_failed_return(
                 const char *file,
                 int line,
                 const char *func) {
+
+        if (assert_return_is_critical)
+                log_assert_failed(text, file, line, func);
+
         PROTECT_ERRNO;
         log_assert(LOG_DEBUG, text, file, line, func,
-                   "Assertion '%s' failed at %s:%u, function %s(). Ignoring.");
+                   "Assertion '%s' failed at %s:%u, function %s(), ignoring.");
 }
 
 int log_oom_internal(int level, const char *file, int line, const char *func) {
@@ -1028,7 +1077,7 @@ int log_struct_internal(
             log_target == LOG_TARGET_NULL)
                 return -ERRNO_VALUE(error);
 
-        if ((level & LOG_FACMASK) == 0)
+        if (LOG_FAC(level) == 0)
                 level |= log_facility;
 
         if (IN_SET(log_target,
@@ -1131,7 +1180,7 @@ int log_struct_iovec_internal(
             log_target == LOG_TARGET_NULL)
                 return -ERRNO_VALUE(error);
 
-        if ((level & LOG_FACMASK) == 0)
+        if (LOG_FAC(level) == 0)
                 level |= log_facility;
 
         if (IN_SET(log_target, LOG_TARGET_AUTO,
@@ -1191,13 +1240,76 @@ int log_set_target_from_string(const char *e) {
 }
 
 int log_set_max_level_from_string(const char *e) {
-        int t;
+        int r;
 
-        t = log_level_from_string(e);
-        if (t < 0)
-                return t;
+        for (;;) {
+                _cleanup_free_ char *word = NULL, *prefix = NULL;
+                LogTarget target;
+                const char *colon;
 
-        log_set_max_level(t);
+                r = extract_first_word(&e, &word, ",", 0);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        break;
+
+                colon = strchr(word, ':');
+                if (!colon) {
+                        r = log_level_from_string(word);
+                        if (r < 0)
+                                return r;
+
+                        log_set_max_level(r);
+                        continue;
+                }
+
+                prefix = strndup(word, colon - word);
+                if (!prefix)
+                        return -ENOMEM;
+
+                target = log_target_from_string(prefix);
+                if (target < 0)
+                        return target;
+
+                if (target >= _LOG_TARGET_SINGLE_MAX)
+                        return -EINVAL;
+
+                r = log_level_from_string(colon + 1);
+                if (r < 0)
+                        return r;
+
+                log_target_max_level[target] = r;
+        }
+
+        return 0;
+}
+
+int log_max_levels_to_string(int level, char **ret) {
+        _cleanup_free_ char *s = NULL;
+        int r;
+
+        assert(ret);
+
+        r = log_level_to_string_alloc(level, &s);
+        if (r < 0)
+                return r;
+
+        for (LogTarget target = 0; target < _LOG_TARGET_SINGLE_MAX; target++) {
+                _cleanup_free_ char *l = NULL;
+
+                if (log_target_max_level[target] == INT_MAX)
+                        continue;
+
+                r = log_level_to_string_alloc(log_target_max_level[target], &l);
+                if (r < 0)
+                        return r;
+
+                r = strextendf_with_separator(&s, ",", "%s:%s", log_target_to_string(target), l);
+                if (r < 0)
+                        return r;
+        }
+
+        *ret = TAKE_PTR(s);
         return 0;
 }
 
@@ -1210,6 +1322,14 @@ static int log_set_ratelimit_kmsg_from_string(const char *e) {
 
         ratelimit_kmsg = r;
         return 0;
+}
+
+void log_set_assert_return_is_critical(bool b) {
+        assert_return_is_critical = b;
+}
+
+bool log_get_assert_return_is_critical(void) {
+        return assert_return_is_critical;
 }
 
 static int parse_proc_cmdline_item(const char *key, const char *value, void *data) {
@@ -1232,7 +1352,7 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                         return 0;
 
                 if (log_set_target_from_string(value) < 0)
-                        log_warning("Failed to parse log target '%s'. Ignoring.", value);
+                        log_warning("Failed to parse log target '%s', ignoring.", value);
 
         } else if (proc_cmdline_key_streq(key, "systemd.log_level")) {
 
@@ -1240,32 +1360,32 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                         return 0;
 
                 if (log_set_max_level_from_string(value) < 0)
-                        log_warning("Failed to parse log level '%s'. Ignoring.", value);
+                        log_warning("Failed to parse log level setting '%s', ignoring.", value);
 
         } else if (proc_cmdline_key_streq(key, "systemd.log_color")) {
 
                 if (log_show_color_from_string(value ?: "1") < 0)
-                        log_warning("Failed to parse log color setting '%s'. Ignoring.", value);
+                        log_warning("Failed to parse log color setting '%s', ignoring.", value);
 
         } else if (proc_cmdline_key_streq(key, "systemd.log_location")) {
 
                 if (log_show_location_from_string(value ?: "1") < 0)
-                        log_warning("Failed to parse log location setting '%s'. Ignoring.", value);
+                        log_warning("Failed to parse log location setting '%s', ignoring.", value);
 
         } else if (proc_cmdline_key_streq(key, "systemd.log_tid")) {
 
                 if (log_show_tid_from_string(value ?: "1") < 0)
-                        log_warning("Failed to parse log tid setting '%s'. Ignoring.", value);
+                        log_warning("Failed to parse log tid setting '%s', ignoring.", value);
 
         } else if (proc_cmdline_key_streq(key, "systemd.log_time")) {
 
                 if (log_show_time_from_string(value ?: "1") < 0)
-                        log_warning("Failed to parse log time setting '%s'. Ignoring.", value);
+                        log_warning("Failed to parse log time setting '%s', ignoring.", value);
 
         } else if (proc_cmdline_key_streq(key, "systemd.log_ratelimit_kmsg")) {
 
                 if (log_set_ratelimit_kmsg_from_string(value ?: "1") < 0)
-                        log_warning("Failed to parse log ratelimit kmsg boolean '%s'. Ignoring.", value);
+                        log_warning("Failed to parse log ratelimit kmsg boolean '%s', ignoring.", value);
         }
 
         return 0;
@@ -1276,7 +1396,7 @@ static bool should_parse_proc_cmdline(void) {
         if (getpid_cached() == 1)
                 return true;
 
-        /* Otherwise, parse the commandline if invoked directly by systemd. */
+        /* Otherwise, parse the command line if invoked directly by systemd. */
         return invoked_by_systemd();
 }
 
@@ -1285,31 +1405,31 @@ void log_parse_environment_variables(void) {
 
         e = getenv("SYSTEMD_LOG_TARGET");
         if (e && log_set_target_from_string(e) < 0)
-                log_warning("Failed to parse log target '%s'. Ignoring.", e);
+                log_warning("Failed to parse log target '%s', ignoring.", e);
 
         e = getenv("SYSTEMD_LOG_LEVEL");
         if (e && log_set_max_level_from_string(e) < 0)
-                log_warning("Failed to parse log level '%s'. Ignoring.", e);
+                log_warning("Failed to parse log level '%s', ignoring.", e);
 
         e = getenv("SYSTEMD_LOG_COLOR");
         if (e && log_show_color_from_string(e) < 0)
-                log_warning("Failed to parse log color '%s'. Ignoring.", e);
+                log_warning("Failed to parse log color '%s', ignoring.", e);
 
         e = getenv("SYSTEMD_LOG_LOCATION");
         if (e && log_show_location_from_string(e) < 0)
-                log_warning("Failed to parse log location '%s'. Ignoring.", e);
+                log_warning("Failed to parse log location '%s', ignoring.", e);
 
         e = getenv("SYSTEMD_LOG_TIME");
         if (e && log_show_time_from_string(e) < 0)
-                log_warning("Failed to parse log time '%s'. Ignoring.", e);
+                log_warning("Failed to parse log time '%s', ignoring.", e);
 
         e = getenv("SYSTEMD_LOG_TID");
         if (e && log_show_tid_from_string(e) < 0)
-                log_warning("Failed to parse log tid '%s'. Ignoring.", e);
+                log_warning("Failed to parse log tid '%s', ignoring.", e);
 
         e = getenv("SYSTEMD_LOG_RATELIMIT_KMSG");
         if (e && log_set_ratelimit_kmsg_from_string(e) < 0)
-                log_warning("Failed to parse log ratelimit kmsg boolean '%s'. Ignoring.", e);
+                log_warning("Failed to parse log ratelimit kmsg boolean '%s', ignoring.", e);
 }
 
 void log_parse_environment(void) {
@@ -1380,46 +1500,46 @@ bool log_get_show_tid(void) {
 }
 
 int log_show_color_from_string(const char *e) {
-        int t;
+        int r;
 
-        t = parse_boolean(e);
-        if (t < 0)
-                return t;
+        r = parse_boolean(e);
+        if (r < 0)
+                return r;
 
-        log_show_color(t);
+        log_show_color(r);
         return 0;
 }
 
 int log_show_location_from_string(const char *e) {
-        int t;
+        int r;
 
-        t = parse_boolean(e);
-        if (t < 0)
-                return t;
+        r = parse_boolean(e);
+        if (r < 0)
+                return r;
 
-        log_show_location(t);
+        log_show_location(r);
         return 0;
 }
 
 int log_show_time_from_string(const char *e) {
-        int t;
+        int r;
 
-        t = parse_boolean(e);
-        if (t < 0)
-                return t;
+        r = parse_boolean(e);
+        if (r < 0)
+                return r;
 
-        log_show_time(t);
+        log_show_time(r);
         return 0;
 }
 
 int log_show_tid_from_string(const char *e) {
-        int t;
+        int r;
 
-        t = parse_boolean(e);
-        if (t < 0)
-                return t;
+        r = parse_boolean(e);
+        if (r < 0)
+                return r;
 
-        log_show_tid(t);
+        log_show_tid(r);
         return 0;
 }
 
@@ -1451,7 +1571,7 @@ void log_received_signal(int level, const struct signalfd_siginfo *si) {
         if (pid_is_valid(si->ssi_pid)) {
                 _cleanup_free_ char *p = NULL;
 
-                (void) get_process_comm(si->ssi_pid, &p);
+                (void) pid_get_comm(si->ssi_pid, &p);
 
                 log_full(level,
                          "Received SIG%s from PID %"PRIu32" (%s).",
@@ -1641,7 +1761,7 @@ bool log_context_enabled(void) {
         if (saved_log_context_enabled >= 0)
                 return saved_log_context_enabled;
 
-        r = getenv_bool_secure("SYSTEMD_ENABLE_LOG_CONTEXT");
+        r = secure_getenv_bool("SYSTEMD_ENABLE_LOG_CONTEXT");
         if (r < 0 && r != -ENXIO)
                 log_debug_errno(r, "Failed to parse $SYSTEMD_ENABLE_LOG_CONTEXT, ignoring: %m");
 

@@ -17,27 +17,27 @@ static void test_acquire_data_fd_one(unsigned flags) {
         char rbuffer[sizeof(wbuffer)];
         int fd;
 
-        fd = acquire_data_fd("foo", 3, flags);
+        fd = acquire_data_fd_full("foo", 3, flags);
         assert_se(fd >= 0);
 
         zero(rbuffer);
         assert_se(read(fd, rbuffer, sizeof(rbuffer)) == 3);
-        assert_se(streq(rbuffer, "foo"));
+        ASSERT_STREQ(rbuffer, "foo");
 
         fd = safe_close(fd);
 
-        fd = acquire_data_fd("", 0, flags);
+        fd = acquire_data_fd_full("", SIZE_MAX, flags);
         assert_se(fd >= 0);
 
         zero(rbuffer);
         assert_se(read(fd, rbuffer, sizeof(rbuffer)) == 0);
-        assert_se(streq(rbuffer, ""));
+        ASSERT_STREQ(rbuffer, "");
 
         fd = safe_close(fd);
 
         random_bytes(wbuffer, sizeof(wbuffer));
 
-        fd = acquire_data_fd(wbuffer, sizeof(wbuffer), flags);
+        fd = acquire_data_fd_full(wbuffer, sizeof(wbuffer), flags);
         assert_se(fd >= 0);
 
         zero(rbuffer);
@@ -81,7 +81,7 @@ static void assert_equal_fd(int fd1, int fd2) {
 
 TEST(copy_data_fd) {
         _cleanup_close_ int fd1 = -EBADF, fd2 = -EBADF;
-        _cleanup_close_pair_ int sfd[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int sfd[2] = EBADF_PAIR;
         _cleanup_(sigkill_waitp) pid_t pid = -1;
         int r;
 
@@ -98,14 +98,14 @@ TEST(copy_data_fd) {
         fd1 = safe_close(fd1);
         fd2 = safe_close(fd2);
 
-        fd1 = acquire_data_fd("hallo", 6,  0);
+        fd1 = acquire_data_fd("hallo");
         assert_se(fd1 >= 0);
 
         fd2 = copy_data_fd(fd1);
         assert_se(fd2 >= 0);
 
         safe_close(fd1);
-        fd1 = acquire_data_fd("hallo", 6,  0);
+        fd1 = acquire_data_fd("hallo");
         assert_se(fd1 >= 0);
 
         assert_equal_fd(fd1, fd2);
@@ -115,7 +115,7 @@ TEST(copy_data_fd) {
 
         assert_se(socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0, sfd) >= 0);
 
-        r = safe_fork("(sd-pipe)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG, &pid);
+        r = safe_fork("(sd-pipe)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_LOG, &pid);
         assert_se(r >= 0);
 
         if (r == 0) {

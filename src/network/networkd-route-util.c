@@ -39,6 +39,12 @@ unsigned routes_max(void) {
         return cached;
 }
 
+bool route_type_is_reject(const Route *route) {
+        assert(route);
+
+        return IN_SET(route->type, RTN_UNREACHABLE, RTN_PROHIBIT, RTN_BLACKHOLE, RTN_THROW);
+}
+
 static bool route_lifetime_is_valid(const Route *route) {
         assert(route);
 
@@ -47,12 +53,16 @@ static bool route_lifetime_is_valid(const Route *route) {
                 route->lifetime_usec > now(CLOCK_BOOTTIME);
 }
 
-static Route *link_find_default_gateway(Link *link, int family, Route *gw) {
+bool link_find_default_gateway(Link *link, int family, Route **gw) {
+        bool found = false;
         Route *route;
 
         assert(link);
+        assert(link->manager);
 
-        SET_FOREACH(route, link->routes) {
+        SET_FOREACH(route, link->manager->routes) {
+                if (route->nexthop.ifindex != link->ifindex)
+                        continue;
                 if (!route_exists(route))
                         continue;
                 if (family != AF_UNSPEC && route->family != family)
@@ -67,18 +77,26 @@ static Route *link_find_default_gateway(Link *link, int family, Route *gw) {
                         continue;
                 if (route->scope != RT_SCOPE_UNIVERSE)
                         continue;
-                if (!in_addr_is_set(route->gw_family, &route->gw))
+                if (!in_addr_is_set(route->nexthop.family, &route->nexthop.gw))
                         continue;
-                if (gw) {
-                        if (route->gw_weight > gw->gw_weight)
+
+                /* Found a default gateway. */
+                if (!gw)
+                        return true;
+
+                /* If we have already found another gw, then let's compare their weight and priority. */
+                if (*gw) {
+                        if (route->nexthop.weight > (*gw)->nexthop.weight)
                                 continue;
-                        if (route->priority >= gw->priority)
+                        if (route->priority >= (*gw)->priority)
                                 continue;
                 }
-                gw = route;
+
+                *gw = route;
+                found = true;
         }
 
-        return gw;
+        return found;
 }
 
 int manager_find_uplink(Manager *m, int family, Link *exclude, Link **ret) {
@@ -98,18 +116,13 @@ int manager_find_uplink(Manager *m, int family, Link *exclude, Link **ret) {
                 if (link->state != LINK_STATE_CONFIGURED)
                         continue;
 
-                gw = link_find_default_gateway(link, family, gw);
+                link_find_default_gateway(link, family, &gw);
         }
 
         if (!gw)
                 return -ENOENT;
 
-        if (ret) {
-                assert(gw->link);
-                *ret = gw->link;
-        }
-
-        return 0;
+        return link_get_by_index(m, gw->nexthop.ifindex, ret);
 }
 
 bool gateway_is_ready(Link *link, bool onlink, int family, const union in_addr_union *gw) {
@@ -128,7 +141,9 @@ bool gateway_is_ready(Link *link, bool onlink, int family, const union in_addr_u
         if (family == AF_INET6 && in6_addr_is_link_local(&gw->in6))
                 return true;
 
-        SET_FOREACH(route, link->routes) {
+        SET_FOREACH(route, link->manager->routes) {
+                if (route->nexthop.ifindex != link->ifindex)
+                        continue;
                 if (!route_exists(route))
                         continue;
                 if (!route_lifetime_is_valid(route))
@@ -153,9 +168,9 @@ bool gateway_is_ready(Link *link, bool onlink, int family, const union in_addr_u
                         continue;
                 if (FLAGS_SET(a->flags, IFA_F_NOPREFIXROUTE))
                         continue;
-                if (in_addr_is_set(a->family, &a->in_addr_peer))
-                        continue;
-                if (in_addr_prefix_covers(family, &a->in_addr, a->prefixlen, gw) > 0)
+                if (in_addr_prefix_covers(a->family,
+                                          in_addr_is_set(a->family, &a->in_addr_peer) ? &a->in_addr_peer : &a->in_addr,
+                                          a->prefixlen, gw) > 0)
                         return true;
         }
 
@@ -172,10 +187,14 @@ static int link_address_is_reachable_internal(
         Route *route, *found = NULL;
 
         assert(link);
+        assert(link->manager);
         assert(IN_SET(family, AF_INET, AF_INET6));
         assert(address);
 
-        SET_FOREACH(route, link->routes) {
+        SET_FOREACH(route, link->manager->routes) {
+                if (route->nexthop.ifindex != link->ifindex)
+                        continue;
+
                 if (!route_exists(route))
                         continue;
 
@@ -289,7 +308,11 @@ int manager_address_is_reachable(
                 return 0;
         }
 
-        r = link_get_address(found->link, found->family, &found->prefsrc, 0, &a);
+        r = link_get_by_index(manager, found->nexthop.ifindex, &link);
+        if (r < 0)
+                return r;
+
+        r = link_get_address(link, found->family, &found->prefsrc, 0, &a);
         if (r < 0)
                 return r;
 

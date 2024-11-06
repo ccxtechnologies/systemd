@@ -1,26 +1,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
+/* Make sure the net/if.h header is included before any linux/ one */
 #include <net/if.h>
-#include <netinet/in.h>
+#include <errno.h>
 #include <linux/if_arp.h>
 #include <linux/veth.h>
+#include <netinet/in.h>
 
 #include "netlink-util.h"
 #include "veth.h"
 
 static int netdev_veth_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *m) {
-        struct hw_addr_data hw_addr;
-        Veth *v;
-        int r;
-
-        assert(netdev);
         assert(!link);
         assert(m);
 
-        v = VETH(netdev);
-
-        assert(v);
+        struct hw_addr_data hw_addr;
+        Veth *v = VETH(netdev);
+        int r;
 
         r = sd_netlink_message_open_container(m, VETH_INFO_PEER);
         if (r < 0)
@@ -57,14 +53,9 @@ static int netdev_veth_fill_message_create(NetDev *netdev, Link *link, sd_netlin
 }
 
 static int netdev_veth_verify(NetDev *netdev, const char *filename) {
-        Veth *v;
-
-        assert(netdev);
         assert(filename);
 
-        v = VETH(netdev);
-
-        assert(v);
+        Veth *v = VETH(netdev);
 
         if (!v->ifname_peer)
                 return log_netdev_warning_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
@@ -74,14 +65,8 @@ static int netdev_veth_verify(NetDev *netdev, const char *filename) {
         return 0;
 }
 
-static void veth_done(NetDev *n) {
-        Veth *v;
-
-        assert(n);
-
-        v = VETH(n);
-
-        assert(v);
+static void veth_done(NetDev *netdev) {
+        Veth *v = VETH(netdev);
 
         free(v->ifname_peer);
 }

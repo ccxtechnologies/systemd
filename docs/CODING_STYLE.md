@@ -132,6 +132,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   if (r < 0)
           return log_error_errno(r, "Some function failed: %m");
   /* → empty line here is good */
+  ```
 
 - In shell scripts, do not use whitespace after the redirection operator
   (`>some/file` instead of `> some/file`, `<<EOF` instead of `<< EOF`).
@@ -296,7 +297,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   t.bar = "bazz";
   ```
 
-- To implement an endless loop, use `for (;;)` rather than `while (1)`.  The
+- To implement an endless loop, use `for (;;)` rather than `while (1)`. The
   latter is a bit ugly anyway, since you probably really meant `while
   (true)`. To avoid the discussion what the right always-true expression for an
   infinite while loop is, our recommendation is to simply write it without any
@@ -620,7 +621,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   sure to imply `AT_EMPTY_PATH` if an empty or `NULL` path argument is
   specified (and convert that latter to an empty string). This differs from the
   underlying kernel semantics, where `AT_EMPTY_PATH` must always be specified
-  explicitly, and `NULL` is not acepted as path.
+  explicitly, and `NULL` is not accepted as path.
 
 ## Command Line
 
@@ -773,9 +774,19 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - A corollary of the above is: never use `clone()` where a `fork()` would do
   too. Also consider using `posix_spawn()` which combines `clone()` +
   `execve()` into one and has nice properties since it avoids becoming a CoW
-  trap by using `CLONE_VORK` and `CLONE_VM` together.
+  trap by using `CLONE_VFORK` and `CLONE_VM` together.
 
 - While we avoid forking off threads on our own, writing thread-safe code is a
   good idea where it might end up running inside of libsystemd.so or
   similar. Hence, use TLS (i.e. `thread_local`) where appropriate, and maybe
   the occasional `pthread_once()`.
+
+## Tests
+
+- Use the assertion macros from `tests.h` (`ASSERT_GE()`, `ASSERT_OK()`, ...) to
+  make sure a descriptive error is logged when an assertion fails. If no assertion
+  macro exists for your specific use case, please add a new assertion macro in a
+  separate commit.
+
+- When modifying existing tests, please convert the test to use the new assertion
+  macros from `tests.h` if it is not already using those.

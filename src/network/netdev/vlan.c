@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
+/* Make sure the net/if.h header is included before any linux/ one */
 #include <net/if.h>
+#include <errno.h>
 #include <linux/if_arp.h>
 #include <linux/if_vlan.h>
 
@@ -10,17 +11,12 @@
 #include "vlan.h"
 
 static int netdev_vlan_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *req) {
-        struct ifla_vlan_flags flags = {};
-        VLan *v;
-        int r;
-
-        assert(netdev);
         assert(link);
         assert(req);
 
-        v = VLAN(netdev);
-
-        assert(v);
+        struct ifla_vlan_flags flags = {};
+        VLan *v = VLAN(netdev);
+        int r;
 
         r = sd_netlink_message_append_u16(req, IFLA_VLAN_ID, v->id);
         if (r < 0)
@@ -96,8 +92,8 @@ static int netdev_vlan_fill_message_create(NetDev *netdev, Link *link, sd_netlin
 }
 
 static void vlan_qos_maps_hash_func(const struct ifla_vlan_qos_mapping *x, struct siphash *state) {
-        siphash24_compress(&x->from, sizeof(x->from), state);
-        siphash24_compress(&x->to, sizeof(x->to), state);
+        siphash24_compress_typesafe(x->from, state);
+        siphash24_compress_typesafe(x->to, state);
 }
 
 static int vlan_qos_maps_compare_func(const struct ifla_vlan_qos_mapping *a, const struct ifla_vlan_qos_mapping *b) {
@@ -180,14 +176,9 @@ int config_parse_vlan_qos_maps(
 }
 
 static int netdev_vlan_verify(NetDev *netdev, const char *filename) {
-        VLan *v;
-
-        assert(netdev);
         assert(filename);
 
-        v = VLAN(netdev);
-
-        assert(v);
+        VLan *v = VLAN(netdev);
 
         if (v->id == VLANID_INVALID) {
                 log_netdev_warning(netdev, "VLAN without valid Id (%"PRIu16") configured in %s.", v->id, filename);
@@ -197,12 +188,8 @@ static int netdev_vlan_verify(NetDev *netdev, const char *filename) {
         return 0;
 }
 
-static void vlan_done(NetDev *n) {
-        VLan *v;
-
-        v = VLAN(n);
-
-        assert(v);
+static void vlan_done(NetDev *netdev) {
+        VLan *v = VLAN(netdev);
 
         set_free(v->egress_qos_maps);
         set_free(v->ingress_qos_maps);
@@ -210,9 +197,6 @@ static void vlan_done(NetDev *n) {
 
 static void vlan_init(NetDev *netdev) {
         VLan *v = VLAN(netdev);
-
-        assert(netdev);
-        assert(v);
 
         v->id = VLANID_INVALID;
         v->protocol = -1;

@@ -1,26 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/* SPDX-License-Identifier: LGPL-2.0-or-later */
 
-/* Parts of this file are based on the GLIB utf8 validation functions. The
- * original license text follows. */
-
-/* gutf8.c - Operations on UTF-8 strings.
+/* Parts of this file are based on the GLIB utf8 validation functions. The original copyright follows.
  *
+ * gutf8.c - Operations on UTF-8 strings.
  * Copyright (C) 1999 Tom Tromey
  * Copyright (C) 2000 Red Hat, Inc.
- *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Library General Public
- * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Library General Public License for more details.
- *
- * You should have received a copy of the GNU Library General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
 #include <errno.h>
@@ -389,11 +373,23 @@ char *utf16_to_utf8(const char16_t *s, size_t length /* bytes! */) {
         const uint8_t *f;
         char *r, *t;
 
+        if (length == 0)
+                return new0(char, 1);
+
         assert(s);
+
+        if (length == SIZE_MAX) {
+                length = char16_strlen(s);
+
+                if (length > SIZE_MAX/2)
+                        return NULL; /* overflow */
+
+                length *= 2;
+        }
 
         /* Input length is in bytes, i.e. the shortest possible character takes 2 bytes. Each unicode character may
          * take up to 4 bytes in UTF-8. Let's also account for a trailing NUL byte. */
-        if (length * 2 < length)
+        if (length > (SIZE_MAX - 1) / 2)
                 return NULL; /* overflow */
 
         r = new(char, length * 2 + 1);
@@ -463,7 +459,16 @@ char16_t *utf8_to_utf16(const char *s, size_t length) {
         char16_t *n, *p;
         int r;
 
+        if (length == 0)
+                return new0(char16_t, 1);
+
         assert(s);
+
+        if (length == SIZE_MAX)
+                length = strlen(s);
+
+        if (length > SIZE_MAX - 1)
+                return NULL; /* overflow */
 
         n = new(char16_t, length + 1);
         if (!n)

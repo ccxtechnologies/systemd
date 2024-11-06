@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-2.1-or-later
+# pylint: disable=consider-using-with
 
 import ast
 import os
@@ -30,11 +31,13 @@ def render(filename, defines):
                                undefined=jinja2.StrictUndefined)
     return template.render(defines)
 
-if __name__ == '__main__':
+def main():
     defines = parse_config_h(sys.argv[1])
-    defines.update(parse_config_h(sys.argv[2]))
-    output = render(sys.argv[3], defines)
-    with open(sys.argv[4], 'w') as f:
+    output = render(sys.argv[2], defines)
+    with open(sys.argv[3], 'w') as f:
         f.write(output)
-    info = os.stat(sys.argv[3])
-    os.chmod(sys.argv[4], info.st_mode)
+    info = os.stat(sys.argv[2])
+    os.chmod(sys.argv[3], info.st_mode)
+
+if __name__ == '__main__':
+    main()

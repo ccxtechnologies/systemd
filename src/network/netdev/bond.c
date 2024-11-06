@@ -57,16 +57,11 @@ DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_arp_all_targets, bond_arp_all_targets
 DEFINE_CONFIG_PARSE_ENUM(config_parse_bond_primary_reselect, bond_primary_reselect, BondPrimaryReselect, "Failed to parse bond primary reselect");
 
 static int netdev_bond_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *m) {
-        Bond *b;
-        int r;
-
-        assert(netdev);
         assert(!link);
         assert(m);
 
-        b = BOND(netdev);
-
-        assert(b);
+        Bond *b = BOND(netdev);
+        int r;
 
         if (b->mode != _NETDEV_BOND_MODE_INVALID) {
                 r = sd_netlink_message_append_u8(m, IFLA_BOND_MODE, b->mode);
@@ -89,6 +84,12 @@ static int netdev_bond_fill_message_create(NetDev *netdev, Link *link, sd_netlin
 
         if (b->miimon != 0) {
                 r = sd_netlink_message_append_u32(m, IFLA_BOND_MIIMON, b->miimon / USEC_PER_MSEC);
+                if (r < 0)
+                        return r;
+        }
+
+        if (b->peer_notify_delay != 0) {
+                r = sd_netlink_message_append_u32(m, IFLA_BOND_PEER_NOTIF_DELAY, b->peer_notify_delay / USEC_PER_MSEC);
                 if (r < 0)
                         return r;
         }
@@ -203,6 +204,12 @@ static int netdev_bond_fill_message_create(NetDev *netdev, Link *link, sd_netlin
                         return r;
         }
 
+        if (b->arp_missed_max > 0) {
+                r = sd_netlink_message_append_u8(m, IFLA_BOND_MISSED_MAX, b->arp_missed_max);
+                if (r < 0)
+                        return r;
+        }
+
         if (b->arp_interval > 0 && !ordered_set_isempty(b->arp_ip_targets)) {
                 void *val;
                 int n = 0;
@@ -237,13 +244,13 @@ int config_parse_arp_ip_target_address(
                 void *data,
                 void *userdata) {
 
-        Bond *b = userdata;
-        int r;
-
         assert(filename);
         assert(lvalue);
         assert(rvalue);
         assert(data);
+
+        Bond *b = BOND(userdata);
+        int r;
 
         if (isempty(rvalue)) {
                 b->arp_ip_targets = ordered_set_free(b->arp_ip_targets);
@@ -303,32 +310,18 @@ int config_parse_ad_actor_sys_prio(
                 const char *rvalue,
                 void *data,
                 void *userdata) {
-        Bond *b = userdata;
-        uint16_t v;
-        int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
         assert(data);
 
-        r = safe_atou16(rvalue, &v);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse actor system priority '%s', ignoring: %m", rvalue);
-                return 0;
-        }
+        Bond *b = ASSERT_PTR(userdata);
 
-        if (v == 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Failed to parse actor system priority '%s'. Range is [1,65535], ignoring.",
-                           rvalue);
-                return 0;
-        }
-
-        b->ad_actor_sys_prio = v;
-
-        return 0;
+        return config_parse_uint16_bounded(
+                        unit, filename, line, section, section_line, lvalue, rvalue,
+                        1, UINT16_MAX, true,
+                        &b->ad_actor_sys_prio);
 }
 
 int config_parse_ad_user_port_key(
@@ -342,31 +335,18 @@ int config_parse_ad_user_port_key(
                 const char *rvalue,
                 void *data,
                 void *userdata) {
-        Bond *b = userdata;
-        uint16_t v;
-        int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
         assert(data);
 
-        r = safe_atou16(rvalue, &v);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse user port key '%s', ignoring: %m", rvalue);
-                return 0;
-        }
+        Bond *b = ASSERT_PTR(userdata);
 
-        if (v > 1023) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Failed to parse user port key '%s'. Range is [0…1023], ignoring.", rvalue);
-                return 0;
-        }
-
-        b->ad_user_port_key = v;
-
-        return 0;
+        return config_parse_uint16_bounded(
+                        unit, filename, line, section, section_line, lvalue, rvalue,
+                        0, 1023, /* ignoring= */ true,
+                        &b->ad_user_port_key);
 }
 
 int config_parse_ad_actor_system(
@@ -409,23 +389,13 @@ int config_parse_ad_actor_system(
 }
 
 static void bond_done(NetDev *netdev) {
-        Bond *b;
-
-        assert(netdev);
-        b = BOND(netdev);
-        assert(b);
+        Bond *b = BOND(netdev);
 
         ordered_set_free(b->arp_ip_targets);
 }
 
 static void bond_init(NetDev *netdev) {
-        Bond *b;
-
-        assert(netdev);
-
-        b = BOND(netdev);
-
-        assert(b);
+        Bond *b = BOND(netdev);
 
         b->mode = _NETDEV_BOND_MODE_INVALID;
         b->xmit_hash_policy = _NETDEV_BOND_XMIT_HASH_POLICY_INVALID;

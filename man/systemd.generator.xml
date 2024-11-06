@@ -1,12 +1,12 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd" [
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd" [
 <!ENTITY % entities SYSTEM "custom-entities.ent" >
 %entities;
 ]>
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
-<refentry id="systemd.generator">
+<refentry id="systemd.generator" xmlns:xi="http://www.w3.org/2001/XInclude">
   <refentryinfo>
     <title>systemd.generator</title>
     <productname>systemd</productname>
@@ -26,23 +26,23 @@
     <cmdsynopsis>
       <command index='false'>/path/to/generator</command>
       <arg choice="plain"><replaceable>normal-dir</replaceable></arg>
-      <arg choice="option"><replaceable>early-dir</replaceable></arg>
-      <arg choice="option"><replaceable>late-dir</replaceable></arg>
+      <arg choice="opt"><replaceable>early-dir</replaceable></arg>
+      <arg choice="opt"><replaceable>late-dir</replaceable></arg>
     </cmdsynopsis>
 
-    <para>
-      <literallayout><filename>/run/systemd/system-generators/*</filename>
-<filename>/etc/systemd/system-generators/*</filename>
-<filename>/usr/local/lib/systemd/system-generators/*</filename>
-<filename>&SYSTEM_GENERATOR_DIR;/*</filename></literallayout>
-    </para>
+    <para><simplelist>
+      <member><filename>/run/systemd/system-generators/*</filename></member>
+      <member><filename>/etc/systemd/system-generators/*</filename></member>
+      <member><filename>/usr/local/lib/systemd/system-generators/*</filename></member>
+      <member><filename>&SYSTEM_GENERATOR_DIR;/*</filename></member>
+    </simplelist></para>
 
-    <para>
-      <literallayout><filename>/run/systemd/user-generators/*</filename>
-<filename>/etc/systemd/user-generators/*</filename>
-<filename>/usr/local/lib/systemd/user-generators/*</filename>
-<filename>&USER_GENERATOR_DIR;/*</filename></literallayout>
-    </para>
+    <para><simplelist>
+      <member><filename>/run/systemd/user-generators/*</filename></member>
+      <member><filename>/etc/systemd/user-generators/*</filename></member>
+      <member><filename>/usr/local/lib/systemd/user-generators/*</filename></member>
+      <member><filename>&USER_GENERATOR_DIR;/*</filename></member>
+    </simplelist></para>
   </refsynopsisdiv>
 
   <refsect1>
@@ -77,10 +77,11 @@
     and user generators are loaded from directories with names ending in
     <filename>system-generators/</filename> and <filename>user-generators/</filename>,
     respectively. Generators found in directories listed earlier override the ones with the same name in
-    directories lower in the list. A symlink to <filename>/dev/null</filename> or an empty file can be used
-    to mask a generator, thereby preventing it from running. Please note that the order of the two
-    directories with the highest priority is reversed with respect to the unit load path, and generators in
-    <filename>/run/</filename> overwrite those in <filename>/etc/</filename>.</para>
+    directories lower in the list <xi:include href="standard-conf.xml" xpointer="usr-local-footnote" />.
+    A symlink to <filename>/dev/null</filename> or an empty file can be used to mask a generator, thereby
+    preventing it from running. Please note that the order of the two directories with the highest priority
+    is reversed with respect to the unit load path, and generators in <filename>/run/</filename> overwrite
+    those in <filename>/etc/</filename>.</para>
 
     <para>After installing new generators or updating the configuration, <command>systemctl
     daemon-reload</command> may be executed. This will delete the previous configuration created by
@@ -147,7 +148,9 @@
 
         <listitem><para>If the generator is invoked from the system service manager this variable is set to
         <literal>system</literal>; if invoked from the per-user service manager it is set to
-        <literal>user</literal>.</para></listitem>
+        <literal>user</literal>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -155,7 +158,9 @@
 
         <listitem><para>If the generator is run as part of an initrd this is set to <literal>1</literal>. If
         it is run from the regular host (i.e. after the transition from initrd to host) it is set to
-        <literal>0</literal>. This environment variable is only set for system generators.</para></listitem>
+        <literal>0</literal>. This environment variable is only set for system generators.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -165,7 +170,9 @@
         <literal>1</literal>; if it is a subsequent, regular boot it is set to <literal>0</literal>. For
         details see the documentation of <varname>ConditionFirstBoot=</varname> in
         <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>. This
-        environment variable is only set for system generators.</para></listitem>
+        environment variable is only set for system generators.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -179,7 +186,9 @@
         what
         <citerefentry><refentrytitle>systemd-detect-virt</refentrytitle><manvolnum>1</manvolnum></citerefentry>
         detects and reports, and uses the same vocabulary of virtualization implementation
-        identifiers.</para></listitem>
+        identifiers.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -188,7 +197,9 @@
         <listitem><para>This variable is set to a short identifier of the reported architecture of the
         system. For details about defined values, see documentation of
         <varname>ConditionArchitecture=</varname> in
-        <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para></listitem>
+        <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -201,7 +212,9 @@
         <varname>$ENCRYPTED_CREDENTIALS_DIRECTORY</varname>. Use the
         <citerefentry><refentrytitle>systemd-creds</refentrytitle><manvolnum>1</manvolnum></citerefentry>
         command to automatically decrypt/authenticate credentials passed in, if needed. Specifically, use the
-        <command>systemd-creds --system cat</command> command.</para></listitem>
+        <command>systemd-creds --system cat</command> command.</para>
+
+        <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -213,7 +226,9 @@
         detected this variable will not be set. This data is identical to what
         <citerefentry><refentrytitle>systemd-detect-virt</refentrytitle><manvolnum>1</manvolnum></citerefentry>
         detects and reports, and uses the same vocabulary of confidential virtualization
-        technology identifiers.</para></listitem>
+        technology identifiers.</para>
+
+        <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -366,24 +381,24 @@ find $dir</programlisting>
   </refsect1>
 
   <refsect1>
-    <title>See also</title>
+    <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-cryptsetup-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-debug-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-fstab-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>fstab</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-getty-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-gpt-auto-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-hibernate-resume-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-rc-local-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-system-update-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-sysv-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-xdg-autostart-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.environment-generator</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-cryptsetup-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-debug-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-fstab-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>fstab</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-getty-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-gpt-auto-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-hibernate-resume-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-rc-local-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-system-update-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-sysv-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-xdg-autostart-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.environment-generator</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 </refentry>

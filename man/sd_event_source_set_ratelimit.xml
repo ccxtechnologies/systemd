@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_event_source_set_ratelimit" xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -125,27 +125,35 @@
 
           <listitem><para><parameter>source</parameter> is not a valid pointer to an
           <structname>sd_event_source</structname> object.
-          </para></listitem>
+          </para>
+
+          <xi:include href="version-info.xml" xpointer="v248"/></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><constant>-ECHILD</constant></term>
 
-          <listitem><para>The event loop has been created in a different process, library or module instance.</para></listitem>
+          <listitem><para>The event loop has been created in a different process, library or module instance.</para>
+
+          <xi:include href="version-info.xml" xpointer="v248"/></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><constant>-EDOM</constant></term>
 
           <listitem><para>It was attempted to use the rate limiting feature on an event source type that does
-          not support rate limiting.</para></listitem>
+          not support rate limiting.</para>
+
+          <xi:include href="version-info.xml" xpointer="v248"/></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><constant>-ENOEXEC</constant></term>
 
           <listitem><para><function>sd_event_source_get_ratelimit()</function> was called on an event source
-          that doesn't have rate limiting configured.</para></listitem>
+          that doesn't have rate limiting configured.</para>
+
+          <xi:include href="version-info.xml" xpointer="v248"/></listitem>
         </varlistentry>
 
       </variablelist>
@@ -155,17 +163,26 @@
   <xi:include href="libsystemd-pkgconfig.xml" />
 
   <refsect1>
+    <title>History</title>
+    <para><function>sd_event_source_set_ratelimit()</function>,
+    <function>sd_event_source_get_ratelimit()</function>, and
+    <function>sd_event_source_is_ratelimited()</function> were added in version 248.</para>
+    <para><function>sd_event_source_set_ratelimit_expire_callback()</function> was added in version 250.</para>
+    <para><function>sd_event_source_leave_ratelimit()</function> was added in version 254.</para>
+  </refsect1>
+
+  <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>sd-event</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_add_io</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_add_time</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_add_signal</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_add_inotify</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_add_defer</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_source_set_enabled</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>sd-event</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_io</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_time</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_signal</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_inotify</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_defer</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_source_set_enabled</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

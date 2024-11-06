@@ -450,9 +450,8 @@ static int load_sysv(SysvStub *s) {
 
         for (;;) {
                 _cleanup_free_ char *l = NULL;
-                char *t;
 
-                r = read_line(f, LONG_LINE_MAX, &l);
+                r = read_stripped_line(f, LONG_LINE_MAX, &l);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read configuration file '%s': %m", s->path);
                 if (r == 0)
@@ -460,17 +459,16 @@ static int load_sysv(SysvStub *s) {
 
                 line++;
 
-                t = strstrip(l);
-                if (*t != '#') {
+                if (l[0] != '#') {
                         /* Try to figure out whether this init script supports
                          * the reload operation. This heuristic looks for
                          * "Usage" lines which include the reload option. */
                         if (state == USAGE_CONTINUATION ||
-                            (state == NORMAL && strcasestr(t, "usage"))) {
-                                if (usage_contains_reload(t)) {
+                            (state == NORMAL && strcasestr(l, "usage"))) {
+                                if (usage_contains_reload(l)) {
                                         supports_reload = true;
                                         state = NORMAL;
-                                } else if (t[strlen(t)-1] == '\\')
+                                } else if (endswith(l, "\\"))
                                         state = USAGE_CONTINUATION;
                                 else
                                         state = NORMAL;
@@ -479,18 +477,18 @@ static int load_sysv(SysvStub *s) {
                         continue;
                 }
 
-                if (state == NORMAL && streq(t, "### BEGIN INIT INFO")) {
+                if (state == NORMAL && streq(l, "### BEGIN INIT INFO")) {
                         state = LSB;
                         s->has_lsb = true;
                         continue;
                 }
 
-                if (IN_SET(state, LSB_DESCRIPTION, LSB) && streq(t, "### END INIT INFO")) {
+                if (IN_SET(state, LSB_DESCRIPTION, LSB) && streq(l, "### END INIT INFO")) {
                         state = NORMAL;
                         continue;
                 }
 
-                t++;
+                char *t = l + 1;
                 t += strspn(t, WHITESPACE);
 
                 if (state == NORMAL) {
@@ -809,7 +807,7 @@ static int set_dependencies_from_rcnd(const LookupPaths *lp, Hashmap *all_servic
                 return r;
 
         STRV_FOREACH(p, sysvrcnd_path)
-                for (unsigned i = 0; i < ELEMENTSOF(rcnd_table); i ++) {
+                for (unsigned i = 0; i < ELEMENTSOF(rcnd_table); i++) {
                         _cleanup_closedir_ DIR *d = NULL;
                         _cleanup_free_ char *path = NULL;
 
@@ -896,7 +894,7 @@ finish:
 
 static int run(const char *dest, const char *dest_early, const char *dest_late) {
         _cleanup_(free_sysvstub_hashmapp) Hashmap *all_services = NULL;
-        _cleanup_(lookup_paths_free) LookupPaths lp = {};
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
         SysvStub *service;
         int r;
 

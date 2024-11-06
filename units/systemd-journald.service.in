@@ -15,6 +15,14 @@ Requires=systemd-journald.socket
 After=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald-audit.socket syslog.socket
 Before=sysinit.target
 
+# To avoid journald SIGKILLed during soft-reboot and corrupting journals.
+# See https://github.com/systemd/systemd/issues/30195
+# Note, typically soft-reboot.target will be never reached,
+# and systemd-soft-reboot.service will trigger soft-reboot.
+# Hence, this must be stopped before systemd-soft-reboot.service.
+Before=soft-reboot.target systemd-soft-reboot.service
+Conflicts=soft-reboot.target
+
 # Mount and swap units need the journal socket units. If they were removed by
 # an isolate request the mount and swap units would be removed too, hence let's
 # exclude systemd-journald and its sockets from isolate requests.
@@ -22,8 +30,11 @@ IgnoreOnIsolate=yes
 
 [Service]
 DeviceAllow=char-* rw
-ExecStart={{ROOTLIBEXECDIR}}/systemd-journald
+ExecStart={{LIBEXECDIR}}/systemd-journald
 FileDescriptorStoreMax=4224
+# Ensure services using StandardOutput=journal do not break when journald is stopped
+FileDescriptorStorePreserve=yes
+ImportCredential=journal.*
 IPAddressDeny=any
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
@@ -32,7 +43,7 @@ OOMScoreAdjust=-250
 ProtectClock=yes
 Restart=always
 RestartSec=0
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_VSOCK AF_INET AF_INET6
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

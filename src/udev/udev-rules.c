@@ -11,6 +11,7 @@
 #include "device-private.h"
 #include "device-util.h"
 #include "dirent-util.h"
+#include "escape.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
@@ -23,15 +24,20 @@
 #include "parse-util.h"
 #include "path-util.h"
 #include "proc-cmdline.h"
+#include "socket-util.h"
 #include "stat-util.h"
+#include "string-table.h"
 #include "strv.h"
 #include "strxcpyx.h"
 #include "sysctl-util.h"
 #include "syslog-util.h"
 #include "udev-builtin.h"
 #include "udev-event.h"
+#include "udev-format.h"
 #include "udev-node.h"
 #include "udev-rules.h"
+#include "udev-spawn.h"
+#include "udev-trace.h"
 #include "udev-util.h"
 #include "user-util.h"
 #include "virt.h"
@@ -685,9 +691,7 @@ static int parse_token(UdevRuleLine *rule_line, const char *key, char *attr, Ude
                 }
 
                 if (!is_match) {
-                        if (STR_IN_SET(attr,
-                                       "ACTION", "DEVLINKS", "DEVNAME", "DEVPATH", "DEVTYPE", "DRIVER",
-                                       "IFINDEX", "MAJOR", "MINOR", "SEQNUM", "SUBSYSTEM", "TAGS"))
+                        if (!device_property_can_set(attr))
                                 return log_line_error_errno(rule_line, SYNTHETIC_ERRNO(EINVAL),
                                                             "Invalid ENV attribute. '%s' cannot be set.", attr);
 
@@ -1115,6 +1119,62 @@ static void check_token_delimiters(UdevRuleLine *rule_line, const char *line) {
         }
 }
 
+int udev_rule_parse_value(char *str, char **ret_value, char **ret_endpos) {
+        char *i, *j;
+        bool is_escaped;
+
+        /* value must be double quotated */
+        is_escaped = str[0] == 'e';
+        str += is_escaped;
+        if (str[0] != '"')
+                return -EINVAL;
+
+        if (!is_escaped) {
+                /* unescape double quotation '\"'->'"' */
+                for (j = str, i = str + 1; *i != '"'; i++, j++) {
+                        if (*i == '\0')
+                                return -EINVAL;
+                        if (i[0] == '\\' && i[1] == '"')
+                                i++;
+                        *j = *i;
+                }
+                j[0] = '\0';
+                /*
+                 * The return value must be terminated by two subsequent NULs
+                 * so it could be safely interpreted as nulstr.
+                 */
+                j[1] = '\0';
+        } else {
+                _cleanup_free_ char *unescaped = NULL;
+                ssize_t l;
+
+                /* find the end position of value */
+                for (i = str + 1; *i != '"'; i++) {
+                        if (i[0] == '\\')
+                                i++;
+                        if (*i == '\0')
+                                return -EINVAL;
+                }
+                i[0] = '\0';
+
+                l = cunescape_length(str + 1, i - (str + 1), 0, &unescaped);
+                if (l < 0)
+                        return l;
+
+                assert(l <= i - (str + 1));
+                memcpy(str, unescaped, l + 1);
+                /*
+                 * The return value must be terminated by two subsequent NULs
+                 * so it could be safely interpreted as nulstr.
+                 */
+                str[l + 1] = '\0';
+        }
+
+        *ret_value = str;
+        *ret_endpos = i + 1;
+        return 0;
+}
+
 static int parse_line(char **line, char **ret_key, char **ret_attr, UdevRuleOperatorType *ret_op, char **ret_value) {
         char *key_begin, *key_end, *attr, *tmp;
         UdevRuleOperatorType op;
@@ -1476,7 +1536,7 @@ int udev_rules_parse_file(UdevRules *rules, const char *filename, bool extra_che
 
         r = hashmap_put_stats_by_path(&rules->stats_by_path, filename, &st);
         if (r < 0)
-                return log_warning_errno(errno, "Failed to save stat for %s, ignoring: %m", filename);
+                return log_warning_errno(r, "Failed to save stat for %s, ignoring: %m", filename);
 
         (void) fd_warn_permissions(filename, fileno(f));
 
@@ -1847,13 +1907,26 @@ static int attr_subst_subdir(char attr[static UDEV_PATH_SIZE]) {
         return -ENOENT;
 }
 
+static size_t udev_replace_ifname(char *str) {
+        size_t replaced = 0;
+
+        assert(str);
+
+        /* See ifname_valid_full(). */
+
+        for (char *p = str; *p != '\0'; p++)
+                if (!ifname_valid_char(*p)) {
+                        *p = '_';
+                        replaced++;
+                }
+
+        return replaced;
+}
+
 static int udev_rule_apply_token_to_event(
                 UdevRuleToken *token,
                 sd_device *dev,
-                UdevEvent *event,
-                usec_t timeout_usec,
-                int timeout_signal,
-                Hashmap *properties_list) {
+                UdevEvent *event) {
 
         int r;
 
@@ -1903,10 +1976,9 @@ static int udev_rule_apply_token_to_event(
         case TK_M_NAME:
                 return token_match_string(token, event->name);
         case TK_M_ENV: {
-                const char *val;
+                const char *val = NULL;
 
-                if (sd_device_get_property_value(dev, token->data, &val) < 0)
-                        val = hashmap_get(properties_list, token->data);
+                (void) device_get_property_value_with_fallback(dev, token->data, event->worker ? event->worker->properties : NULL, &val);
 
                 return token_match_string(token, val);
         }
@@ -2028,9 +2100,9 @@ static int udev_rule_apply_token_to_event(
                         return false;
                 }
 
-                log_event_debug(dev, token, "Running PROGRAM '%s'", buf);
+                log_event_debug(dev, token, "Running PROGRAM=\"%s\"", buf);
 
-                r = udev_event_spawn(event, timeout_usec, timeout_signal, true, buf, result, sizeof(result), NULL);
+                r = udev_event_spawn(event, /* accept_failure = */ true, buf, result, sizeof(result), NULL);
                 if (r != 0) {
                         if (r < 0)
                                 log_event_warning_errno(dev, token, r, "Failed to execute \"%s\": %m", buf);
@@ -2113,7 +2185,7 @@ static int udev_rule_apply_token_to_event(
 
                 log_event_debug(dev, token, "Importing properties from results of '%s'", buf);
 
-                r = udev_event_spawn(event, timeout_usec, timeout_signal, true, buf, result, sizeof result, &truncated);
+                r = udev_event_spawn(event, /* accept_failure = */ true, buf, result, sizeof result, &truncated);
                 if (r != 0) {
                         if (r < 0)
                                 log_event_warning_errno(dev, token, r, "Failed to execute '%s', ignoring: %m", buf);
@@ -2192,7 +2264,7 @@ static int udev_rule_apply_token_to_event(
 
                 log_event_debug(dev, token, "Importing properties from results of builtin command '%s'", buf);
 
-                r = udev_builtin_run(event, cmd, buf, false);
+                r = udev_builtin_run(event, cmd, buf);
                 if (r < 0) {
                         /* remember failure */
                         log_event_debug_errno(dev, token, r, "Failed to run builtin '%s': %m", buf);
@@ -2442,7 +2514,7 @@ static int udev_rule_apply_token_to_event(
                 }
 
                 if (token->op == OP_ADD &&
-                    sd_device_get_property_value(dev, name, &val) >= 0) {
+                    device_get_property_value_with_fallback(dev, name, event->worker ? event->worker->properties : NULL, &val) >= 0) {
                         l = strpcpyl_full(&p, l, &truncated, val, " ", NULL);
                         if (truncated) {
                                 log_event_warning(dev, token,
@@ -2630,14 +2702,18 @@ static int udev_rule_apply_token_to_event(
                         break;
                 }
 
-                log_event_debug(dev, token, "ATTR '%s' writing '%s'", buf, value);
-                r = write_string_file(buf, value,
-                                      WRITE_STRING_FILE_VERIFY_ON_FAILURE |
-                                      WRITE_STRING_FILE_DISABLE_BUFFER |
-                                      WRITE_STRING_FILE_AVOID_NEWLINE |
-                                      WRITE_STRING_FILE_VERIFY_IGNORE_NEWLINE);
-                if (r < 0)
-                        log_event_error_errno(dev, token, r, "Failed to write ATTR{%s}, ignoring: %m", buf);
+                if (EVENT_MODE_DESTRUCTIVE(event)) {
+                        log_event_debug(dev, token, "Writing ATTR{'%s'}=\"%s\".", buf, value);
+                        r = write_string_file(buf, value,
+                                              WRITE_STRING_FILE_VERIFY_ON_FAILURE |
+                                              WRITE_STRING_FILE_DISABLE_BUFFER |
+                                              WRITE_STRING_FILE_AVOID_NEWLINE |
+                                              WRITE_STRING_FILE_VERIFY_IGNORE_NEWLINE);
+                        if (r < 0)
+                                log_event_error_errno(dev, token, r, "Failed to write ATTR{%s}=\"%s\", ignoring: %m", buf, value);
+                } else
+                        log_event_debug(dev, token, "Running in test mode, skipping writing ATTR{%s}=\"%s\".", buf, value);
+
                 break;
         }
         case TK_A_SYSCTL: {
@@ -2659,10 +2735,15 @@ static int udev_rule_apply_token_to_event(
                 }
 
                 sysctl_normalize(buf);
-                log_event_debug(dev, token, "SYSCTL '%s' writing '%s'", buf, value);
-                r = sysctl_write(buf, value);
-                if (r < 0)
-                        log_event_error_errno(dev, token, r, "Failed to write SYSCTL{%s}='%s', ignoring: %m", buf, value);
+
+                if (EVENT_MODE_DESTRUCTIVE(event)) {
+                        log_event_debug(dev, token, "Writing SYSCTL{%s}=\"%s\".", buf, value);
+                        r = sysctl_write(buf, value);
+                        if (r < 0)
+                                log_event_error_errno(dev, token, r, "Failed to write SYSCTL{%s}=\"%s\", ignoring: %m", buf, value);
+                } else
+                        log_event_debug(dev, token, "Running in test mode, skipping writing SYSCTL{%s}=\"%s\".", buf, value);
+
                 break;
         }
         case TK_A_RUN_BUILTIN:
@@ -2716,11 +2797,7 @@ static bool token_is_for_parents(UdevRuleToken *token) {
         return token->type >= TK_M_PARENTS_KERNEL && token->type <= TK_M_PARENTS_TAG;
 }
 
-static int udev_rule_apply_parent_token_to_event(
-                UdevRuleToken *head_token,
-                UdevEvent *event,
-                int timeout_signal) {
-
+static int udev_rule_apply_parent_token_to_event(UdevRuleToken *head_token, UdevEvent *event) {
         int r;
 
         assert(head_token);
@@ -2733,7 +2810,7 @@ static int udev_rule_apply_parent_token_to_event(
                         if (!token_is_for_parents(token))
                                 return true; /* All parent tokens match. */
 
-                        r = udev_rule_apply_token_to_event(token, event->dev_parent, event, 0, timeout_signal, NULL);
+                        r = udev_rule_apply_token_to_event(token, event->dev_parent, event);
                         if (r < 0)
                                 return r;
                         if (r == 0)
@@ -2753,9 +2830,6 @@ static int udev_rule_apply_parent_token_to_event(
 static int udev_rule_apply_line_to_event(
                 UdevRuleLine *line,
                 UdevEvent *event,
-                usec_t timeout_usec,
-                int timeout_signal,
-                Hashmap *properties_list,
                 UdevRuleLine **next_line) {
 
         UdevRuleLineType mask = LINE_HAS_GOTO | LINE_UPDATE_SOMETHING;
@@ -2791,7 +2865,7 @@ static int udev_rule_apply_line_to_event(
                         if (parents_done)
                                 continue;
 
-                        r = udev_rule_apply_parent_token_to_event(token, event, timeout_signal);
+                        r = udev_rule_apply_parent_token_to_event(token, event);
                         if (r <= 0)
                                 return r;
 
@@ -2799,7 +2873,7 @@ static int udev_rule_apply_line_to_event(
                         continue;
                 }
 
-                r = udev_rule_apply_token_to_event(token, event->dev, event, timeout_usec, timeout_signal, properties_list);
+                r = udev_rule_apply_token_to_event(token, event->dev, event);
                 if (r <= 0)
                         return r;
         }
@@ -2810,13 +2884,7 @@ static int udev_rule_apply_line_to_event(
         return 0;
 }
 
-int udev_rules_apply_to_event(
-                UdevRules *rules,
-                UdevEvent *event,
-                usec_t timeout_usec,
-                int timeout_signal,
-                Hashmap *properties_list) {
-
+int udev_rules_apply_to_event(UdevRules *rules, UdevEvent *event) {
         int r;
 
         assert(rules);
@@ -2824,7 +2892,7 @@ int udev_rules_apply_to_event(
 
         LIST_FOREACH(rule_files, file, rules->rule_files)
                 LIST_FOREACH_WITH_NEXT(rule_lines, line, next_line, file->rule_lines) {
-                        r = udev_rule_apply_line_to_event(line, event, timeout_usec, timeout_signal, properties_list, &next_line);
+                        r = udev_rule_apply_line_to_event(line, event, &next_line);
                         if (r < 0)
                                 return r;
                 }
@@ -2878,3 +2946,11 @@ int udev_rules_apply_static_dev_perms(UdevRules *rules) {
 
         return 0;
 }
+
+static const char* const resolve_name_timing_table[_RESOLVE_NAME_TIMING_MAX] = {
+        [RESOLVE_NAME_NEVER] = "never",
+        [RESOLVE_NAME_LATE]  = "late",
+        [RESOLVE_NAME_EARLY] = "early",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(resolve_name_timing, ResolveNameTiming);

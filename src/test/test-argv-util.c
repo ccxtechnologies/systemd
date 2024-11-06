@@ -35,13 +35,13 @@ static void test_rename_process_now(const char *p, int ret) {
                 return;
 #endif
 
-        assert_se(get_process_comm(0, &comm) >= 0);
+        assert_se(pid_get_comm(0, &comm) >= 0);
         log_debug("comm = <%s>", comm);
         assert_se(strneq(comm, p, TASK_COMM_LEN-1));
         /* We expect comm to be at most 16 bytes (TASK_COMM_LEN). The kernel may raise this limit in the
          * future. We'd only check the initial part, at least until we recompile, but this will still pass. */
 
-        r = get_process_cmdline(0, SIZE_MAX, 0, &cmdline);
+        r = pid_get_cmdline(0, SIZE_MAX, 0, &cmdline);
         assert_se(r >= 0);
         /* we cannot expect cmdline to be renamed properly without privileges */
         if (geteuid() == 0) {
@@ -122,6 +122,11 @@ TEST(argv_help) {
         assert_se(argv_looks_like_help(4, STRV_MAKE("program", "arg1", "arg2", "-h")));
         assert_se(!argv_looks_like_help(2, STRV_MAKE("program", "arg1")));
         assert_se(!argv_looks_like_help(4, STRV_MAKE("program", "arg1", "arg2", "--h")));
+        assert_se(!argv_looks_like_help(3, STRV_MAKE("program", "Help", "arg2")));
+        assert_se(argv_looks_like_help(5, STRV_MAKE("program", "--help", "arg1", "-h", "--help")));
+        assert_se(!argv_looks_like_help(4, STRV_MAKE("program","arg1", "arg2", "-H")));
+        assert_se(!argv_looks_like_help(3, STRV_MAKE("program", "--Help", "arg2")));
+
 }
 
 static int intro(void) {

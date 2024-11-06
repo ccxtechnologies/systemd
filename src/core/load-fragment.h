@@ -23,6 +23,7 @@ void unit_dump_config_items(FILE *f);
 CONFIG_PARSER_PROTOTYPE(config_parse_unit_deps);
 CONFIG_PARSER_PROTOTYPE(config_parse_obsolete_unit_deps);
 CONFIG_PARSER_PROTOTYPE(config_parse_unit_string_printf);
+CONFIG_PARSER_PROTOTYPE(config_parse_reboot_parameter);
 CONFIG_PARSER_PROTOTYPE(config_parse_unit_strv_printf);
 CONFIG_PARSER_PROTOTYPE(config_parse_unit_path_printf);
 CONFIG_PARSER_PROTOTYPE(config_parse_colon_separated_paths);
@@ -71,7 +72,7 @@ CONFIG_PARSER_PROTOTYPE(config_parse_unit_condition_string);
 CONFIG_PARSER_PROTOTYPE(config_parse_kill_mode);
 CONFIG_PARSER_PROTOTYPE(config_parse_notify_access);
 CONFIG_PARSER_PROTOTYPE(config_parse_emergency_action);
-CONFIG_PARSER_PROTOTYPE(config_parse_unit_requires_mounts_for);
+CONFIG_PARSER_PROTOTYPE(config_parse_unit_mounts_for);
 CONFIG_PARSER_PROTOTYPE(config_parse_syscall_filter);
 CONFIG_PARSER_PROTOTYPE(config_parse_syscall_archs);
 CONFIG_PARSER_PROTOTYPE(config_parse_syscall_errno);
@@ -158,6 +159,8 @@ CONFIG_PARSER_PROTOTYPE(config_parse_tty_size);
 CONFIG_PARSER_PROTOTYPE(config_parse_log_filter_patterns);
 CONFIG_PARSER_PROTOTYPE(config_parse_open_file);
 CONFIG_PARSER_PROTOTYPE(config_parse_memory_pressure_watch);
+CONFIG_PARSER_PROTOTYPE(config_parse_cgroup_nft_set);
+CONFIG_PARSER_PROTOTYPE(config_parse_mount_node);
 
 /* gperf prototypes */
 const struct ConfigPerfItem* load_fragment_gperf_lookup(const char *key, GPERF_LEN_TYPE length);

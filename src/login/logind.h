@@ -76,7 +76,7 @@ struct Manager {
         char *action_job;
         sd_event_source *inhibit_timeout_source;
 
-        const HandleActionData *scheduled_shutdown_action;
+        HandleAction scheduled_shutdown_action;
         usec_t scheduled_shutdown_timeout;
         sd_event_source *scheduled_shutdown_timeout_source;
         uid_t scheduled_shutdown_uid;
@@ -97,6 +97,8 @@ struct Manager {
         bool was_idle;
 
         usec_t stop_idle_session_usec;
+
+        HandleActionSleepMask handle_action_sleep_mask;
 
         HandleAction handle_power_key;
         HandleAction handle_power_key_long_press;
@@ -163,7 +165,7 @@ bool manager_shall_kill(Manager *m, const char *user);
 int manager_get_idle_hint(Manager *m, dual_timestamp *t);
 
 int manager_get_user_by_pid(Manager *m, pid_t pid, User **user);
-int manager_get_session_by_pid(Manager *m, pid_t pid, Session **session);
+int manager_get_session_by_pidref(Manager *m, const PidRef *pid, Session **ret);
 
 bool manager_is_lid_closed(Manager *m);
 bool manager_is_docked_or_external_displays(Manager *m);

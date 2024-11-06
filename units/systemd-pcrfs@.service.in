@@ -8,18 +8,17 @@
 #  (at your option) any later version.
 
 [Unit]
-Description=TPM2 PCR File System Measurement of %f
+Description=TPM PCR File System Measurement of %f
 Documentation=man:systemd-pcrfs@.service(8)
 DefaultDependencies=no
 BindsTo=%i.mount
 Conflicts=shutdown.target
-After=%i.mount systemd-pcrfs-root.service
+After=%i.mount tpm2.target systemd-pcrfs-root.service
 Before=shutdown.target
 ConditionPathExists=!/etc/initrd-release
-ConditionSecurity=tpm2
-ConditionPathExists=/sys/firmware/efi/efivars/StubPcrKernelImage-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+ConditionSecurity=measured-uki
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart={{ROOTLIBEXECDIR}}/systemd-pcrphase --graceful --file-system=%f
+ExecStart={{LIBEXECDIR}}/systemd-pcrextend --graceful --file-system=%f

@@ -818,7 +818,7 @@ static int feature_to_string_compare_func(const FeatureToString *a, const Featur
 }
 
 static void print_feature(Feature feature, const char *prefix) {
-        FeatureToString *found, in = {
+        const FeatureToString *found, in = {
                 .feature = feature,
         };
 
@@ -959,10 +959,8 @@ static int run(int argc, char *argv[]) {
         _cleanup_(context_clear) Context c = CONTEXT_EMPTY;
         int r;
 
-        log_set_target(LOG_TARGET_AUTO);
-        udev_parse_config();
-        log_parse_environment();
-        log_open();
+        (void) udev_parse_config();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)

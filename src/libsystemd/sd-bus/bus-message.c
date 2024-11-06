@@ -12,7 +12,7 @@
 #include "bus-signature.h"
 #include "bus-type.h"
 #include "fd-util.h"
-#include "io-util.h"
+#include "iovec-util.h"
 #include "memfd-util.h"
 #include "memory-util.h"
 #include "string-util.h"
@@ -373,6 +373,7 @@ static int message_from_header(
         if (!m)
                 return -ENOMEM;
 
+        m->creds = (sd_bus_creds) { SD_BUS_CREDS_INIT_FIELDS };
         m->sealed = true;
         m->header = buffer;
 
@@ -469,6 +470,7 @@ _public_ int sd_bus_message_new(
                 return -ENOMEM;
 
         t->n_ref = 1;
+        t->creds = (sd_bus_creds) { SD_BUS_CREDS_INIT_FIELDS };
         t->bus = sd_bus_ref(bus);
         t->header = (struct bus_header*) ((uint8_t*) t + ALIGN(sizeof(struct sd_bus_message)));
         t->header->endian = BUS_NATIVE_ENDIAN;
@@ -627,7 +629,7 @@ static int message_new_reply(
                         return r;
         }
 
-        t->dont_send = !!(call->header->flags & BUS_MESSAGE_NO_REPLY_EXPECTED);
+        t->dont_send = FLAGS_SET(call->header->flags, BUS_MESSAGE_NO_REPLY_EXPECTED);
         t->enforced_reply_signature = call->enforced_reply_signature;
 
         /* let's copy the sensitive flag over. Let's do that as a safety precaution to keep a transaction
@@ -1288,7 +1290,7 @@ static int message_push_fd(sd_bus_message *m, int fd) {
         if (copy < 0)
                 return -errno;
 
-        f = reallocarray(m->fds, sizeof(int), m->n_fds + 1);
+        f = reallocarray(m->fds, m->n_fds + 1, sizeof(int));
         if (!f) {
                 m->poisoned = true;
                 safe_close(copy);
@@ -1506,7 +1508,7 @@ _public_ int sd_bus_message_append_string_iovec(
         assert_return(iov || n == 0, -EINVAL);
         assert_return(!m->poisoned, -ESTALE);
 
-        size = IOVEC_TOTAL_SIZE(iov, n);
+        size = iovec_total_size(iov, n);
 
         r = sd_bus_message_append_string_space(m, size, &p);
         if (r < 0)
@@ -2027,6 +2029,8 @@ _public_ int sd_bus_message_appendv(
                         r = signature_element_length(t, &k);
                         if (r < 0)
                                 return r;
+                        if (k < 2)
+                                return -ERANGE;
 
                         {
                                 char s[k - 1];
@@ -2158,7 +2162,7 @@ _public_ int sd_bus_message_append_array_iovec(
         assert_return(iov || n == 0, -EINVAL);
         assert_return(!m->poisoned, -ESTALE);
 
-        size = IOVEC_TOTAL_SIZE(iov, n);
+        size = iovec_total_size(iov, n);
 
         r = sd_bus_message_append_array_space(m, type, size, &p);
         if (r < 0)
@@ -2488,6 +2492,8 @@ int bus_body_part_map(struct bus_body_part *part) {
 
         shift = PAGE_OFFSET(part->memfd_offset);
         psz = PAGE_ALIGN(part->size + shift);
+        if (psz >= SIZE_MAX)
+                return -EFBIG;
 
         if (part->memfd >= 0)
                 p = mmap(NULL, psz, PROT_READ, MAP_PRIVATE, part->memfd, part->memfd_offset - shift);
@@ -3470,6 +3476,8 @@ _public_ int sd_bus_message_readv(
                         r = signature_element_length(t, &k);
                         if (r < 0)
                                 return r;
+                        if (k < 2)
+                                return -ERANGE;
 
                         {
                                 char s[k - 1];
@@ -3650,6 +3658,8 @@ _public_ int sd_bus_message_skip(sd_bus_message *m, const char *types) {
                 r = signature_element_length(types, &k);
                 if (r < 0)
                         return r;
+                if (k < 2)
+                        return -ERANGE;
 
                 {
                         char s[k-1];

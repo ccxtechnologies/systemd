@@ -27,6 +27,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
+#include "hexdecoct.h"
 #include "inotify-util.h"
 #include "io-util.h"
 #include "log.h"
@@ -52,6 +53,18 @@ static volatile int cached_on_tty = -1;
 static volatile int cached_on_dev_null = -1;
 static volatile int cached_color_mode = _COLOR_INVALID;
 static volatile int cached_underline_enabled = -1;
+
+bool isatty_safe(int fd) {
+        assert(fd >= 0);
+
+        if (isatty(fd))
+                return true;
+
+        /* Be resilient if we're working on stdio, since they're set up by parent process. */
+        assert(errno != EBADF || IN_SET(fd, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO));
+
+        return false;
+}
 
 int chvt(int vt) {
         _cleanup_close_ int fd = -EBADF;
@@ -233,13 +246,13 @@ int ask_string(char **ret, const char *text, ...) {
 
 int reset_terminal_fd(int fd, bool switch_to_text) {
         struct termios termios;
-        int r = 0;
+        int r;
 
         /* Set terminal to some sane defaults */
 
         assert(fd >= 0);
 
-        if (isatty(fd) < 1)
+        if (!isatty_safe(fd))
                 return log_debug_errno(errno, "Asked to reset a terminal that actually isn't a terminal: %m");
 
         /* We leave locked terminal attributes untouched, so that Plymouth may set whatever it wants to set,
@@ -256,7 +269,9 @@ int reset_terminal_fd(int fd, bool switch_to_text) {
 
 
         /* Set default keyboard mode */
-        (void) vt_reset_keyboard(fd);
+        r = vt_reset_keyboard(fd);
+        if (r < 0)
+                log_debug_errno(r, "Failed to reset VT keyboard, ignoring: %m");
 
         if (tcgetattr(fd, &termios) < 0) {
                 r = log_debug_errno(errno, "Failed to get terminal parameters: %m");
@@ -271,7 +286,7 @@ int reset_terminal_fd(int fd, bool switch_to_text) {
         termios.c_iflag |= ICRNL | IMAXBEL | IUTF8;
         termios.c_oflag |= ONLCR | OPOST;
         termios.c_cflag |= CREAD;
-        termios.c_lflag = ISIG | ICANON | IEXTEN | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOPRT | ECHOKE;
+        termios.c_lflag = ISIG | ICANON | IEXTEN | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE;
 
         termios.c_cc[VINTR]    =   03;  /* ^C */
         termios.c_cc[VQUIT]    =  034;  /* ^\ */
@@ -290,8 +305,9 @@ int reset_terminal_fd(int fd, bool switch_to_text) {
         termios.c_cc[VTIME]  = 0;
         termios.c_cc[VMIN]   = 1;
 
-        if (tcsetattr(fd, TCSANOW, &termios) < 0)
-                r = -errno;
+        r = RET_NERRNO(tcsetattr(fd, TCSANOW, &termios));
+        if (r < 0)
+                log_debug_errno(r, "Failed to set terminal parameters: %m");
 
 finish:
         /* Just in case, flush all crap out */
@@ -345,7 +361,7 @@ int open_terminal(const char *name, int mode) {
                 c++;
         }
 
-        if (isatty(fd) < 1)
+        if (!isatty_safe(fd))
                 return negative_errno();
 
         return TAKE_FD(fd);
@@ -569,7 +585,7 @@ int vt_disallocate(const char *name) {
                           "\033[r"   /* clear scrolling region */
                           "\033[H"   /* move home */
                           "\033[3J", /* clear screen including scrollback, requires Linux 2.6.40 */
-                          10, false);
+                          10);
         return 0;
 }
 
@@ -683,18 +699,10 @@ int vtnr_from_tty(const char *tty) {
                 tty = active;
         }
 
-        if (tty == active)
-                *ret = TAKE_PTR(active);
-        else {
-                char *tmp;
+        if (tty != active)
+                return strdup_to(ret, tty);
 
-                tmp = strdup(tty);
-                if (!tmp)
-                        return -ENOMEM;
-
-                *ret = tmp;
-        }
-
+        *ret = TAKE_PTR(active);
         return 0;
 }
 
@@ -974,7 +982,7 @@ bool on_tty(void) {
 }
 
 int getttyname_malloc(int fd, char **ret) {
-        char path[PATH_MAX], *c; /* PATH_MAX is counted *with* the trailing NUL byte */
+        char path[PATH_MAX]; /* PATH_MAX is counted *with* the trailing NUL byte */
         int r;
 
         assert(fd >= 0);
@@ -987,12 +995,7 @@ int getttyname_malloc(int fd, char **ret) {
         if (r > 0)
                 return -r;
 
-        c = strdup(skip_dev_prefix(path));
-        if (!c)
-                return -ENOMEM;
-
-        *ret = c;
-        return 0;
+        return strdup_to(ret, skip_dev_prefix(path));
 }
 
 int getttyname_harder(int fd, char **ret) {
@@ -1097,13 +1100,9 @@ int get_ctty(pid_t pid, dev_t *ret_devnr, char **ret) {
                 return -EINVAL;
 
         if (ret) {
-                _cleanup_free_ char *b = NULL;
-
-                b = strdup(w);
-                if (!b)
-                        return -ENOMEM;
-
-                *ret = TAKE_PTR(b);
+                r = strdup_to(ret, w);
+                if (r < 0)
+                        return r;
         }
 
         if (ret_devnr)
@@ -1191,20 +1190,20 @@ static int ptsname_namespace(int pty, char **ret) {
 
 int openpt_allocate_in_namespace(pid_t pid, int flags, char **ret_slave) {
         _cleanup_close_ int pidnsfd = -EBADF, mntnsfd = -EBADF, usernsfd = -EBADF, rootfd = -EBADF, fd = -EBADF;
-        _cleanup_close_pair_ int pair[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         pid_t child;
         int r;
 
         assert(pid > 0);
 
-        r = namespace_open(pid, &pidnsfd, &mntnsfd, NULL, &usernsfd, &rootfd);
+        r = namespace_open(pid, &pidnsfd, &mntnsfd, /* ret_netns_fd = */ NULL, &usernsfd, &rootfd);
         if (r < 0)
                 return r;
 
         if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) < 0)
                 return -errno;
 
-        r = namespace_fork("(sd-openptns)", "(sd-openpt)", NULL, 0, FORK_RESET_SIGNALS|FORK_DEATHSIG,
+        r = namespace_fork("(sd-openptns)", "(sd-openpt)", NULL, 0, FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGKILL,
                            pidnsfd, mntnsfd, -1, usernsfd, rootfd, &child);
         if (r < 0)
                 return r;
@@ -1244,18 +1243,18 @@ int openpt_allocate_in_namespace(pid_t pid, int flags, char **ret_slave) {
 
 int open_terminal_in_namespace(pid_t pid, const char *name, int mode) {
         _cleanup_close_ int pidnsfd = -EBADF, mntnsfd = -EBADF, usernsfd = -EBADF, rootfd = -EBADF;
-        _cleanup_close_pair_ int pair[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         pid_t child;
         int r;
 
-        r = namespace_open(pid, &pidnsfd, &mntnsfd, NULL, &usernsfd, &rootfd);
+        r = namespace_open(pid, &pidnsfd, &mntnsfd, /* ret_netns_fd = */ NULL, &usernsfd, &rootfd);
         if (r < 0)
                 return r;
 
         if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) < 0)
                 return -errno;
 
-        r = namespace_fork("(sd-terminalns)", "(sd-terminal)", NULL, 0, FORK_RESET_SIGNALS|FORK_DEATHSIG,
+        r = namespace_fork("(sd-terminalns)", "(sd-terminal)", NULL, 0, FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGKILL,
                            pidnsfd, mntnsfd, -1, usernsfd, rootfd, &child);
         if (r < 0)
                 return r;
@@ -1299,7 +1298,7 @@ static bool on_dev_null(void) {
         return cached_on_dev_null;
 }
 
-static bool getenv_terminal_is_dumb(void) {
+bool getenv_terminal_is_dumb(void) {
         const char *e;
 
         e = getenv("TERM");
@@ -1445,38 +1444,33 @@ int vt_reset_keyboard(int fd) {
 }
 
 int vt_restore(int fd) {
+
         static const struct vt_mode mode = {
                 .mode = VT_AUTO,
         };
-        int r, q = 0;
 
-        if (isatty(fd) < 1)
+        int r, ret = 0;
+
+        assert(fd >= 0);
+
+        if (!isatty_safe(fd))
                 return log_debug_errno(errno, "Asked to restore the VT for an fd that does not refer to a terminal: %m");
 
         if (ioctl(fd, KDSETMODE, KD_TEXT) < 0)
-                q = log_debug_errno(errno, "Failed to set VT in text mode, ignoring: %m");
+                RET_GATHER(ret, log_debug_errno(errno, "Failed to set VT to text mode, ignoring: %m"));
 
         r = vt_reset_keyboard(fd);
-        if (r < 0) {
-                log_debug_errno(r, "Failed to reset keyboard mode, ignoring: %m");
-                if (q >= 0)
-                        q = r;
-        }
+        if (r < 0)
+                RET_GATHER(ret, log_debug_errno(r, "Failed to reset keyboard mode, ignoring: %m"));
 
-        if (ioctl(fd, VT_SETMODE, &mode) < 0) {
-                log_debug_errno(errno, "Failed to set VT_AUTO mode, ignoring: %m");
-                if (q >= 0)
-                        q = -errno;
-        }
+        if (ioctl(fd, VT_SETMODE, &mode) < 0)
+                RET_GATHER(ret, log_debug_errno(errno, "Failed to set VT_AUTO mode, ignoring: %m"));
 
         r = fchmod_and_chown(fd, TTY_MODE, 0, GID_INVALID);
-        if (r < 0) {
-                log_debug_errno(r, "Failed to chmod()/chown() VT, ignoring: %m");
-                if (q >= 0)
-                        q = r;
-        }
+        if (r < 0)
+                RET_GATHER(ret, log_debug_errno(r, "Failed to chmod()/chown() VT, ignoring: %m"));
 
-        return q;
+        return ret;
 }
 
 int vt_release(int fd, bool restore) {
@@ -1486,7 +1480,7 @@ int vt_release(int fd, bool restore) {
          * sent by the kernel and optionally reset the VT in text and auto
          * VT-switching modes. */
 
-        if (isatty(fd) < 1)
+        if (!isatty_safe(fd))
                 return log_debug_errno(errno, "Asked to release the VT for an fd that does not refer to a terminal: %m");
 
         if (ioctl(fd, VT_RELDISP, 1) < 0)
@@ -1534,4 +1528,280 @@ void get_log_colors(int priority, const char **on, const char **off, const char 
                 if (highlight)
                         *highlight = ansi_highlight_red();
         }
+}
+
+int set_terminal_cursor_position(int fd, unsigned int row, unsigned int column) {
+        int r;
+        char cursor_position[STRLEN("\x1B[") + DECIMAL_STR_MAX(int) * 2 + STRLEN(";H") + 1];
+
+        assert(fd >= 0);
+
+        xsprintf(cursor_position, "\x1B[%u;%uH", row, column);
+
+        r = loop_write(fd, cursor_position, SIZE_MAX);
+        if (r < 0)
+                return log_warning_errno(r, "Failed to set cursor position, ignoring: %m");
+
+        return 0;
+}
+
+int terminal_reset_ansi_seq(int fd) {
+        int r, k;
+
+        assert(fd >= 0);
+
+        if (getenv_terminal_is_dumb())
+                return 0;
+
+        r = fd_nonblock(fd, true);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to set terminal to non-blocking mode: %m");
+
+        k = loop_write_full(fd,
+                            "\033c"        /* reset to initial state */
+                            "\033[!p"      /* soft terminal reset */
+                            "\033]104\007" /* reset colors */
+                            "\033[?7h",    /* enable line-wrapping */
+                            SIZE_MAX,
+                            50 * USEC_PER_MSEC);
+        if (k < 0)
+                log_debug_errno(k, "Failed to write to terminal: %m");
+
+        if (r > 0) {
+                r = fd_nonblock(fd, false);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to set terminal back to blocking mode: %m");
+        }
+
+        return k < 0 ? k : r;
+}
+
+void termios_disable_echo(struct termios *termios) {
+        assert(termios);
+
+        termios->c_lflag &= ~(ICANON|ECHO);
+        termios->c_cc[VMIN] = 1;
+        termios->c_cc[VTIME] = 0;
+}
+
+typedef enum BackgroundColorState {
+        BACKGROUND_TEXT,
+        BACKGROUND_ESCAPE,
+        BACKGROUND_BRACKET,
+        BACKGROUND_FIRST_ONE,
+        BACKGROUND_SECOND_ONE,
+        BACKGROUND_SEMICOLON,
+        BACKGROUND_R,
+        BACKGROUND_G,
+        BACKGROUND_B,
+        BACKGROUND_RED,
+        BACKGROUND_GREEN,
+        BACKGROUND_BLUE,
+        BACKGROUND_STRING_TERMINATOR,
+} BackgroundColorState;
+
+typedef struct BackgroundColorContext {
+        BackgroundColorState state;
+        uint32_t red, green, blue;
+        unsigned red_bits, green_bits, blue_bits;
+} BackgroundColorContext;
+
+static int scan_background_color_response(
+                BackgroundColorContext *context,
+                const char *buf,
+                size_t size) {
+
+        assert(context);
+        assert(buf || size == 0);
+
+        for (size_t i = 0; i < size; i++) {
+                char c = buf[i];
+
+                switch (context->state) {
+
+                case BACKGROUND_TEXT:
+                        context->state = c == '\x1B' ? BACKGROUND_ESCAPE : BACKGROUND_TEXT;
+                        break;
+
+                case BACKGROUND_ESCAPE:
+                        context->state = c == ']' ? BACKGROUND_BRACKET : BACKGROUND_TEXT;
+                        break;
+
+                case BACKGROUND_BRACKET:
+                        context->state = c == '1' ? BACKGROUND_FIRST_ONE : BACKGROUND_TEXT;
+                        break;
+
+                case BACKGROUND_FIRST_ONE:
+                        context->state = c == '1' ? BACKGROUND_SECOND_ONE : BACKGROUND_TEXT;
+                        break;
+
+                case BACKGROUND_SECOND_ONE:
+                        context->state = c == ';' ? BACKGROUND_SEMICOLON : BACKGROUND_TEXT;
+                        break;
+
+                case BACKGROUND_SEMICOLON:
+                        context->state = c == 'r' ? BACKGROUND_R : BACKGROUND_TEXT;
+                        break;
+
+                case BACKGROUND_R:
+                        context->state = c == 'g' ? BACKGROUND_G : BACKGROUND_TEXT;
+                        break;
+
+                case BACKGROUND_G:
+                        context->state = c == 'b' ? BACKGROUND_B : BACKGROUND_TEXT;
+                        break;
+
+                case BACKGROUND_B:
+                        context->state = c == ':' ? BACKGROUND_RED : BACKGROUND_TEXT;
+                        break;
+
+                case BACKGROUND_RED:
+                        if (c == '/')
+                                context->state = context->red_bits > 0 ? BACKGROUND_GREEN : BACKGROUND_TEXT;
+                        else {
+                                int d = unhexchar(c);
+                                if (d < 0 || context->red_bits >= sizeof(context->red)*8)
+                                        context->state = BACKGROUND_TEXT;
+                                else {
+                                        context->red = (context->red << 4) | d;
+                                        context->red_bits += 4;
+                                }
+                        }
+                        break;
+
+                case BACKGROUND_GREEN:
+                        if (c == '/')
+                                context->state = context->green_bits > 0 ? BACKGROUND_BLUE : BACKGROUND_TEXT;
+                        else {
+                                int d = unhexchar(c);
+                                if (d < 0 || context->green_bits >= sizeof(context->green)*8)
+                                        context->state = BACKGROUND_TEXT;
+                                else {
+                                        context->green = (context->green << 4) | d;
+                                        context->green_bits += 4;
+                                }
+                        }
+                        break;
+
+                case BACKGROUND_BLUE:
+                        if (c == '\x07') {
+                                if (context->blue_bits > 0)
+                                        return 1; /* success! */
+
+                                context->state = BACKGROUND_TEXT;
+                        } else if (c == '\x1b')
+                                context->state = context->blue_bits > 0 ? BACKGROUND_STRING_TERMINATOR : BACKGROUND_TEXT;
+                        else {
+                                int d = unhexchar(c);
+                                if (d < 0 || context->blue_bits >= sizeof(context->blue)*8)
+                                        context->state = BACKGROUND_TEXT;
+                                else {
+                                        context->blue = (context->blue << 4) | d;
+                                        context->blue_bits += 4;
+                                }
+                        }
+                        break;
+
+                case BACKGROUND_STRING_TERMINATOR:
+                        if (c == '\\')
+                                return 1; /* success! */
+
+                        context->state = c == ']' ? BACKGROUND_ESCAPE : BACKGROUND_TEXT;
+                        break;
+
+                }
+
+                /* Reset any colors we might have picked up */
+                if (IN_SET(context->state, BACKGROUND_TEXT, BACKGROUND_ESCAPE)) {
+                        /* reset color */
+                        context->red = context->green = context->blue = 0;
+                        context->red_bits = context->green_bits = context->blue_bits = 0;
+                }
+        }
+
+        return 0; /* all good, but not enough data yet */
+}
+
+int get_default_background_color(double *ret_red, double *ret_green, double *ret_blue) {
+        int r;
+
+        assert(ret_red);
+        assert(ret_green);
+        assert(ret_blue);
+
+        if (!colors_enabled())
+                return -EOPNOTSUPP;
+
+        if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
+                return -EOPNOTSUPP;
+
+        if (streq_ptr(getenv("TERM"), "linux")) {
+                /* Linux console is black */
+                *ret_red = *ret_green = *ret_blue = 0.0;
+                return 0;
+        }
+
+        struct termios old_termios;
+        if (tcgetattr(STDIN_FILENO, &old_termios) < 0)
+                return -errno;
+
+        struct termios new_termios = old_termios;
+        termios_disable_echo(&new_termios);
+
+        if (tcsetattr(STDOUT_FILENO, TCSADRAIN, &new_termios) < 0)
+                return -errno;
+
+        r = loop_write(STDOUT_FILENO, "\x1B]11;?\x07", SIZE_MAX);
+        if (r < 0)
+                goto finish;
+
+        usec_t end = usec_add(now(CLOCK_MONOTONIC), 100 * USEC_PER_MSEC);
+        char buf[256];
+        size_t buf_full = 0;
+        BackgroundColorContext context = {};
+
+        for (;;) {
+                usec_t n = now(CLOCK_MONOTONIC);
+
+                if (n >= end) {
+                        r = -EOPNOTSUPP;
+                        goto finish;
+                }
+
+                r = fd_wait_for_event(STDIN_FILENO, POLLIN, usec_sub_unsigned(end, n));
+                if (r < 0)
+                        goto finish;
+                if (r == 0) {
+                        r = -EOPNOTSUPP;
+                        goto finish;
+                }
+
+                ssize_t l;
+                l = read(STDIN_FILENO, buf, sizeof(buf) - buf_full);
+                if (l < 0) {
+                        r = -errno;
+                        goto finish;
+                }
+
+                buf_full += l;
+                assert(buf_full <= sizeof(buf));
+
+                r = scan_background_color_response(&context, buf, buf_full);
+                if (r < 0)
+                        goto finish;
+                if (r > 0) {
+                        assert(context.red_bits > 0);
+                        *ret_red = (double) context.red / ((UINT64_C(1) << context.red_bits) - 1);
+                        assert(context.green_bits > 0);
+                        *ret_green = (double) context.green / ((UINT64_C(1) << context.green_bits) - 1);
+                        assert(context.blue_bits > 0);
+                        *ret_blue = (double) context.blue / ((UINT64_C(1) << context.blue_bits) - 1);
+                        r = 0;
+                        goto finish;
+                }
+        }
+
+finish:
+        (void) tcsetattr(STDOUT_FILENO, TCSADRAIN, &old_termios);
+        return r;
 }

@@ -18,7 +18,7 @@
 
 /* for libcryptsetup debug purpose */
 _public_ const char *cryptsetup_token_version(void) {
-        return TOKEN_VERSION_MAJOR "." TOKEN_VERSION_MINOR " systemd-v" STRINGIFY(PROJECT_VERSION) " (" GIT_VERSION ")";
+        return TOKEN_VERSION_MAJOR "." TOKEN_VERSION_MINOR " systemd-v" PROJECT_VERSION_FULL " (" GIT_VERSION ")";
 }
 
 _public_ int cryptsetup_token_open_pin(
@@ -34,7 +34,7 @@ _public_ int cryptsetup_token_open_pin(
         const char *json;
         _cleanup_(erase_and_freep) char *pin_string = NULL;
 
-        assert(!pin || pin_size);
+        assert(pin || pin_size == 0);
         assert(token >= 0);
 
         /* This must not fail at this moment (internal error) */
@@ -45,7 +45,7 @@ _public_ int cryptsetup_token_open_pin(
 
         r = crypt_normalize_pin(pin, pin_size, &pin_string);
         if (r < 0)
-                return crypt_log_debug_errno(cd, r, "Can not normalize PIN: %m");
+                return crypt_log_debug_errno(cd, r, "Cannot normalize PIN: %m");
 
         return acquire_luks2_key(cd, json, (const char *)usrptr, pin_string, password, password_len);
 }
@@ -87,7 +87,7 @@ _public_ void cryptsetup_token_buffer_free(void *buffer, size_t buffer_len) {
  */
 _public_ void cryptsetup_token_dump(
                 struct crypt_device *cd /* is always LUKS2 context */,
-                const char *json /* validated 'systemd-tpm2' token if cryptsetup_token_validate is defined */) {
+                const char *json /* validated 'systemd-fido2' token if cryptsetup_token_validate is defined */) {
 
         int r;
         Fido2EnrollFlags required;
@@ -104,11 +104,11 @@ _public_ void cryptsetup_token_dump(
 
         r = crypt_dump_buffer_to_hex_string(cid, cid_size, &cid_str);
         if (r < 0)
-                return (void) crypt_log_debug_errno(cd, r, "Can not dump " TOKEN_NAME " content: %m");
+                return (void) crypt_log_debug_errno(cd, r, "Cannot dump " TOKEN_NAME " content: %m");
 
         r = crypt_dump_buffer_to_hex_string(salt, salt_size, &salt_str);
         if (r < 0)
-                return (void) crypt_log_debug_errno(cd, r, "Can not dump " TOKEN_NAME " content: %m");
+                return (void) crypt_log_debug_errno(cd, r, "Cannot dump " TOKEN_NAME " content: %m");
 
         if (required & FIDO2ENROLL_PIN)
                 client_pin_req_str = "true";
@@ -154,7 +154,7 @@ _public_ void cryptsetup_token_dump(
  */
 _public_ int cryptsetup_token_validate(
                 struct crypt_device *cd, /* is always LUKS2 context */
-                const char *json /* contains valid 'type' and 'keyslots' fields. 'type' is 'systemd-tpm2' */) {
+                const char *json /* contains valid 'type' and 'keyslots' fields. 'type' is 'systemd-fido2' */) {
 
         int r;
         JsonVariant *w;
@@ -172,7 +172,7 @@ _public_ int cryptsetup_token_validate(
                 return 1;
         }
 
-        r = unbase64mem(json_variant_string(w), SIZE_MAX, NULL, NULL);
+        r = unbase64mem(json_variant_string(w), NULL, NULL);
         if (r < 0)
                 return crypt_log_debug_errno(cd, r, "Invalid base64 data in 'fido2-credential' field: %m");
 
@@ -182,7 +182,7 @@ _public_ int cryptsetup_token_validate(
                 return 1;
         }
 
-        r = unbase64mem(json_variant_string(w), SIZE_MAX, NULL, NULL);
+        r = unbase64mem(json_variant_string(w), NULL, NULL);
         if (r < 0)
                 return crypt_log_debug_errno(cd, r, "Failed to decode base64 encoded salt: %m.");
 

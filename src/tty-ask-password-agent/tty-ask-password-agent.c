@@ -41,7 +41,7 @@
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
-#include "utmp-wtmp.h"
+#include "wall.h"
 
 static enum {
         ACTION_LIST,
@@ -157,7 +157,11 @@ static int agent_ask_password_tty(
                 log_info("Starting password query on %s.", con);
         }
 
-        r = ask_password_tty(tty_fd, message, NULL, until, flags, flag_file, ret);
+        AskPasswordRequest req = {
+                .message = message,
+        };
+
+        r = ask_password_tty(tty_fd, &req, until, flags, flag_file, ret);
 
         if (arg_console) {
                 tty_fd = safe_close(tty_fd);
@@ -207,7 +211,7 @@ static int process_one_password_file(const char *filename) {
         if (not_after > 0 && now(CLOCK_MONOTONIC) > not_after)
                 return 0;
 
-        if (pid > 0 && !pid_is_alive(pid))
+        if (pid > 0 && pid_is_alive(pid) <= 0)
                 return 0;
 
         switch (arg_action) {
@@ -216,16 +220,16 @@ static int process_one_password_file(const char *filename) {
                 return 0;
 
         case ACTION_WALL: {
-                 _cleanup_free_ char *wall = NULL;
+                 _cleanup_free_ char *msg = NULL;
 
-                 if (asprintf(&wall,
+                 if (asprintf(&msg,
                               "Password entry required for \'%s\' (PID " PID_FMT ").\r\n"
                               "Please enter password with the systemd-tty-ask-password-agent tool.",
                               strna(message),
                               pid) < 0)
                          return log_oom();
 
-                 (void) utmp_wall(wall, NULL, NULL, wall_tty_match, NULL);
+                 (void) wall(msg, NULL, NULL, wall_tty_match, NULL);
                  return 0;
         }
         case ACTION_QUERY:
@@ -245,9 +249,13 @@ static int process_one_password_file(const char *filename) {
                 SET_FLAG(flags, ASK_PASSWORD_ECHO, echo);
                 SET_FLAG(flags, ASK_PASSWORD_SILENT, silent);
 
-                if (arg_plymouth)
-                        r = ask_password_plymouth(message, not_after, flags, filename, &passwords);
-                else
+                if (arg_plymouth) {
+                        AskPasswordRequest req = {
+                                .message = message,
+                        };
+
+                        r = ask_password_plymouth(&req, not_after, flags, filename, &passwords);
+                } else
                         r = agent_ask_password_tty(message, not_after, flags, filename, &passwords);
                 if (r < 0) {
                         /* If the query went away, that's OK */
@@ -348,7 +356,7 @@ static int process_and_watch_password_files(bool watch) {
         (void) mkdir_p_label("/run/systemd/ask-password", 0755);
 
         assert_se(sigemptyset(&mask) >= 0);
-        assert_se(sigset_add_many(&mask, SIGTERM, -1) >= 0);
+        assert_se(sigset_add_many(&mask, SIGTERM) >= 0);
         assert_se(sigprocmask(SIG_SETMASK, &mask, NULL) >= 0);
 
         if (watch) {
@@ -548,7 +556,7 @@ static int ask_on_this_console(const char *tty, pid_t *ret_pid, char **arguments
 
         assert_se(sigaction(SIGCHLD, &sigchld, NULL) >= 0);
         assert_se(sigaction(SIGHUP, &sighup, NULL) >= 0);
-        assert_se(sigprocmask_many(SIG_UNBLOCK, NULL, SIGHUP, SIGCHLD, -1) >= 0);
+        assert_se(sigprocmask_many(SIG_UNBLOCK, NULL, SIGHUP, SIGCHLD) >= 0);
 
         r = safe_fork("(sd-passwd)", FORK_RESET_SIGNALS|FORK_LOG, ret_pid);
         if (r < 0)

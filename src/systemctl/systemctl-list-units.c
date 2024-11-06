@@ -127,29 +127,44 @@ static int output_units_list(const UnitInfo *unit_infos, size_t c) {
         table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
 
         FOREACH_ARRAY(u, unit_infos, c) {
+                const char *on_loaded = NULL, *on_active = NULL, *on_sub = NULL, *on_circle = NULL;
                 _cleanup_free_ char *id = NULL;
-                const char *on_underline = "", *on_loaded = "", *on_active = "", *on_circle = "";
-                bool circle = false, underline = false;
+                bool circle = false, underline;
 
-                if (u + 1 < unit_infos + c &&
-                    !streq(unit_type_suffix(u->id), unit_type_suffix((u + 1)->id))) {
-                        on_underline = ansi_underline();
-                        underline = true;
+                underline = u + 1 < unit_infos + c && !streq(unit_type_suffix(u->id), unit_type_suffix((u + 1)->id));
+
+                if (streq(u->load_state, "not-found")) {
+                        on_circle = on_loaded = ansi_highlight_yellow();
+                        circle = true;
+                } else if (STR_IN_SET(u->load_state, "bad-setting", "error", "masked")) {
+                        on_loaded = ansi_highlight_red();
+                        on_circle = ansi_highlight_yellow();
+                        circle = true;
                 }
 
-                if (STR_IN_SET(u->load_state, "error", "not-found", "bad-setting", "masked") && !arg_plain) {
-                        on_circle = underline ? ansi_highlight_yellow_underline() : ansi_highlight_yellow();
+                if (streq(u->active_state, "failed")) {
+                        on_sub = on_active = ansi_highlight_red();
+
+                        /* Here override any load_state highlighting */
+                        on_circle = ansi_highlight_red();
                         circle = true;
-                        on_loaded = underline ? ansi_highlight_red_underline() : ansi_highlight_red();
-                } else if (streq(u->active_state, "failed") && !arg_plain) {
-                        on_circle = underline ? ansi_highlight_red_underline() : ansi_highlight_red();
-                        circle = true;
-                        on_active = underline ? ansi_highlight_red_underline() : ansi_highlight_red();
-                } else {
-                        on_circle = on_underline;
-                        on_active = on_underline;
-                        on_loaded = on_underline;
-                }
+                } else if (STR_IN_SET(u->active_state, "reloading", "activating", "maintenance", "deactivating")) {
+                        on_sub = on_active = ansi_highlight();
+
+                        if (!circle) { /* Here we let load_state highlighting win */
+                                on_circle = ansi_highlight();
+                                circle = true;
+                        }
+                } else if (streq(u->active_state, "inactive"))
+                        on_sub = on_active = ansi_grey();
+
+                /* As a special case, when this is a service which has not process running, let's grey out
+                 * its state, to highlight that a bit */
+                if (!on_sub && endswith(u->id, ".service") && streq(u->sub_state, "exited"))
+                        on_sub = ansi_grey();
+
+                if (arg_plain)
+                        circle = false;
 
                 id = format_unit_id(u->id, u->machine);
                 if (!id)
@@ -157,19 +172,24 @@ static int output_units_list(const UnitInfo *unit_infos, size_t c) {
 
                 r = table_add_many(table,
                                    TABLE_STRING, circle ? special_glyph(SPECIAL_GLYPH_BLACK_CIRCLE) : " ",
-                                   TABLE_SET_BOTH_COLORS, on_circle,
+                                   TABLE_SET_COLOR, on_circle,
+                                   TABLE_SET_BOTH_UNDERLINES, underline,
                                    TABLE_STRING, id,
-                                   TABLE_SET_BOTH_COLORS, on_active,
+                                   TABLE_SET_COLOR, on_active,
+                                   TABLE_SET_BOTH_UNDERLINES, underline,
                                    TABLE_STRING, u->load_state,
-                                   TABLE_SET_BOTH_COLORS, on_loaded,
+                                   TABLE_SET_COLOR, on_loaded,
+                                   TABLE_SET_BOTH_UNDERLINES, underline,
                                    TABLE_STRING, u->active_state,
-                                   TABLE_SET_BOTH_COLORS, on_active,
+                                   TABLE_SET_COLOR, on_active,
+                                   TABLE_SET_BOTH_UNDERLINES, underline,
                                    TABLE_STRING, u->sub_state,
-                                   TABLE_SET_BOTH_COLORS, on_active,
+                                   TABLE_SET_COLOR, on_sub,
+                                   TABLE_SET_BOTH_UNDERLINES, underline,
                                    TABLE_STRING, u->job_id ? u->job_type: "",
-                                   TABLE_SET_BOTH_COLORS, on_underline,
+                                   TABLE_SET_BOTH_UNDERLINES, underline,
                                    TABLE_STRING, u->description,
-                                   TABLE_SET_BOTH_COLORS, on_underline);
+                                   TABLE_SET_BOTH_UNDERLINES, underline);
                 if (r < 0)
                         return table_log_add_error(r);
 
@@ -193,25 +213,35 @@ static int output_units_list(const UnitInfo *unit_infos, size_t c) {
                 size_t records = table_get_rows(table) - 1;
 
                 if (records > 0) {
-                        puts("\n"
-                             "LOAD   = Reflects whether the unit definition was properly loaded.\n"
-                             "ACTIVE = The high-level unit activation state, i.e. generalization of SUB.\n"
-                             "SUB    = The low-level unit activation state, values depend on unit type.");
+                        printf("\n"
+                               "%1$sLegend: LOAD   %2$s Reflects whether the unit definition was properly loaded.%3$s\n"
+                               "%1$s        ACTIVE %2$s The high-level unit activation state, i.e. generalization of SUB.%3$s\n"
+                               "%1$s        SUB    %2$s The low-level unit activation state, values depend on unit type.%3$s\n",
+                               ansi_grey(),
+                               special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
+                               ansi_normal());
                         if (job_count > 0)
-                                puts("JOB    = Pending job for the unit.\n");
+                                printf("%s        JOB    %s Pending job for the unit.%s\n",
+                                       ansi_grey(),
+                                       special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
+                                       ansi_normal());
                 }
+
+                putchar('\n');
 
                 on = records > 0 ? ansi_highlight() : ansi_highlight_red();
                 off = ansi_normal();
 
                 if (arg_all || strv_contains(arg_states, "inactive"))
                         printf("%s%zu loaded units listed.%s\n"
-                               "To show all installed unit files use 'systemctl list-unit-files'.\n",
-                               on, records, off);
+                               "%sTo show all installed unit files use 'systemctl list-unit-files'.%s\n",
+                               on, records, off,
+                               ansi_grey(), ansi_normal());
                 else if (!arg_states)
-                        printf("%s%zu loaded units listed.%s Pass --all to see loaded but inactive units, too.\n"
-                               "To show all installed unit files use 'systemctl list-unit-files'.\n",
-                               on, records, off);
+                        printf("%s%zu loaded units listed.%s %sPass --all to see loaded but inactive units, too.%s\n"
+                               "%sTo show all installed unit files use 'systemctl list-unit-files'.%s\n",
+                               on, records, off,
+                               ansi_grey(), ansi_normal(), ansi_grey(), ansi_normal());
                 else
                         printf("%zu loaded units listed.\n", records);
         }
@@ -761,7 +791,7 @@ int verb_list_timers(int argc, char *argv[], void *userdata) {
                 if (n < 0)
                         return n;
 
-                dual_timestamp_get(&nw);
+                dual_timestamp_now(&nw);
 
                 FOREACH_ARRAY(u, unit_infos, n) {
                         r = add_timer_info(bus, u, &nw, &timers, &n_timers);

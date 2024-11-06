@@ -62,7 +62,7 @@ static void test_utf8_to_ascii_one(const char *s, int r_expected, const char *ex
         r = utf8_to_ascii(s, '*', &ans);
         log_debug("\"%s\" → %d/\"%s\" (expected %d/\"%s\")", s, r, strnull(ans), r_expected, strnull(expected));
         assert_se(r == r_expected);
-        assert_se(streq_ptr(ans, expected));
+        ASSERT_STREQ(ans, expected);
 }
 
 TEST(utf8_to_ascii) {
@@ -183,7 +183,7 @@ TEST(utf16_to_utf8) {
         assert_se(b);
 
         free(a);
-        a = utf16_to_utf8(b, char16_strlen(b) * 2);
+        a = utf16_to_utf8(b, SIZE_MAX);
         assert_se(a);
         assert_se(strlen(a) == sizeof(utf8));
         assert_se(memcmp(a, utf8, sizeof(utf8)) == 0);
@@ -218,12 +218,12 @@ TEST(utf8_to_utf16) {
                 _cleanup_free_ char16_t *a = NULL;
                 _cleanup_free_ char *b = NULL;
 
-                a = utf8_to_utf16(p, strlen(p));
+                a = utf8_to_utf16(p, SIZE_MAX);
                 assert_se(a);
 
-                b = utf16_to_utf8(a, char16_strlen(a) * 2);
+                b = utf16_to_utf8(a, SIZE_MAX);
                 assert_se(b);
-                assert_se(streq(p, b));
+                ASSERT_STREQ(p, b);
         }
 }
 

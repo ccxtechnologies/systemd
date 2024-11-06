@@ -2,7 +2,6 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <sys/inotify.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
@@ -11,114 +10,48 @@
 #include "device-util.h"
 #include "env-file.h"
 #include "errno-util.h"
-#include "escape.h"
 #include "fd-util.h"
 #include "id128-util.h"
 #include "log.h"
 #include "macro.h"
+#include "missing_threads.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "signal-util.h"
-#include "socket-util.h"
 #include "stat-util.h"
-#include "string-table.h"
 #include "string-util.h"
-#include "strxcpyx.h"
 #include "udev-util.h"
 #include "utf8.h"
 
-static const char* const resolve_name_timing_table[_RESOLVE_NAME_TIMING_MAX] = {
-        [RESOLVE_NAME_NEVER] = "never",
-        [RESOLVE_NAME_LATE]  = "late",
-        [RESOLVE_NAME_EARLY] = "early",
-};
-
-DEFINE_STRING_TABLE_LOOKUP(resolve_name_timing, ResolveNameTiming);
-
-int udev_parse_config_full(
-                unsigned *ret_children_max,
-                usec_t *ret_exec_delay_usec,
-                usec_t *ret_event_timeout_usec,
-                ResolveNameTiming *ret_resolve_name_timing,
-                int *ret_timeout_signal) {
-
-        _cleanup_free_ char *log_val = NULL, *children_max = NULL, *exec_delay = NULL, *event_timeout = NULL, *resolve_names = NULL, *timeout_signal = NULL;
+int udev_parse_config_full(const ConfigTableItem config_table[]) {
         int r;
 
-        r = parse_env_file(NULL, "/etc/udev/udev.conf",
-                           "udev_log", &log_val,
-                           "children_max", &children_max,
-                           "exec_delay", &exec_delay,
-                           "event_timeout", &event_timeout,
-                           "resolve_names", &resolve_names,
-                           "timeout_signal", &timeout_signal);
+        assert(config_table);
+
+        r = config_parse_standard_file_with_dropins(
+                        "udev/udev.conf",
+                        /* sections = */ NULL,
+                        config_item_table_lookup, config_table,
+                        CONFIG_PARSE_WARN,
+                        /* userdata = */ NULL);
         if (r == -ENOENT)
                 return 0;
+        return r;
+}
+
+int udev_parse_config(void) {
+        int r, log_val = -1;
+        const ConfigTableItem config_table[] = {
+                { NULL, "udev_log", config_parse_log_level, 0, &log_val },
+                {}
+        };
+
+        r = udev_parse_config_full(config_table);
         if (r < 0)
                 return r;
 
-        if (log_val) {
-                const char *log;
-                size_t n;
-
-                /* unquote */
-                n = strlen(log_val);
-                if (n >= 2 &&
-                    ((log_val[0] == '"' && log_val[n-1] == '"') ||
-                     (log_val[0] == '\'' && log_val[n-1] == '\''))) {
-                        log_val[n - 1] = '\0';
-                        log = log_val + 1;
-                } else
-                        log = log_val;
-
-                /* we set the udev log level here explicitly, this is supposed
-                 * to regulate the code in libudev/ and udev/. */
-                r = log_set_max_level_from_string(log);
-                if (r < 0)
-                        log_syntax(NULL, LOG_WARNING, "/etc/udev/udev.conf", 0, r,
-                                   "failed to set udev log level '%s', ignoring: %m", log);
-        }
-
-        if (ret_children_max && children_max) {
-                r = safe_atou(children_max, ret_children_max);
-                if (r < 0)
-                        log_syntax(NULL, LOG_WARNING, "/etc/udev/udev.conf", 0, r,
-                                   "failed to parse children_max=%s, ignoring: %m", children_max);
-        }
-
-        if (ret_exec_delay_usec && exec_delay) {
-                r = parse_sec(exec_delay, ret_exec_delay_usec);
-                if (r < 0)
-                        log_syntax(NULL, LOG_WARNING, "/etc/udev/udev.conf", 0, r,
-                                   "failed to parse exec_delay=%s, ignoring: %m", exec_delay);
-        }
-
-        if (ret_event_timeout_usec && event_timeout) {
-                r = parse_sec(event_timeout, ret_event_timeout_usec);
-                if (r < 0)
-                        log_syntax(NULL, LOG_WARNING, "/etc/udev/udev.conf", 0, r,
-                                   "failed to parse event_timeout=%s, ignoring: %m", event_timeout);
-        }
-
-        if (ret_resolve_name_timing && resolve_names) {
-                ResolveNameTiming t;
-
-                t = resolve_name_timing_from_string(resolve_names);
-                if (t < 0)
-                        log_syntax(NULL, LOG_WARNING, "/etc/udev/udev.conf", 0, r,
-                                   "failed to parse resolve_names=%s, ignoring.", resolve_names);
-                else
-                        *ret_resolve_name_timing = t;
-        }
-
-        if (ret_timeout_signal && timeout_signal) {
-                r = signal_from_string(timeout_signal);
-                if (r < 0)
-                        log_syntax(NULL, LOG_WARNING, "/etc/udev/udev.conf", 0, r,
-                                   "failed to parse timeout_signal=%s, ignoring: %m", timeout_signal);
-                else
-                        *ret_timeout_signal = r;
-        }
+        if (log_val >= 0)
+                log_set_max_level(log_val);
 
         return 0;
 }
@@ -206,7 +139,7 @@ static int device_wait_for_initialization_internal(
         }
 
         if (device) {
-                if (sd_device_get_is_initialized(device) > 0) {
+                if (device_is_processed(device) > 0) {
                         if (ret)
                                 *ret = sd_device_ref(device);
                         return 0;
@@ -269,7 +202,7 @@ static int device_wait_for_initialization_internal(
                 if (r < 0 && !ERRNO_IS_DEVICE_ABSENT(r))
                         return log_error_errno(r, "Failed to create sd-device object from %s: %m", devlink);
         }
-        if (device && sd_device_get_is_initialized(device) > 0) {
+        if (device && device_is_processed(device) > 0) {
                 if (ret)
                         *ret = sd_device_ref(device);
                 return 0;
@@ -297,13 +230,34 @@ int device_is_renaming(sd_device *dev) {
 
         assert(dev);
 
-        r = sd_device_get_property_value(dev, "ID_RENAMING", NULL);
+        r = device_get_property_bool(dev, "ID_RENAMING");
         if (r == -ENOENT)
-                return false;
+                return false; /* defaults to false */
+
+        return r;
+}
+
+int device_is_processed(sd_device *dev) {
+        int r;
+
+        assert(dev);
+
+        /* sd_device_get_is_initialized() only checks if the udev database file exists. However, even if the
+         * database file exist, systemd-udevd may be still processing the device, e.g. when the udev rules
+         * for the device have RUN tokens. See issue #30056. Hence, to check if the device is really
+         * processed by systemd-udevd, we also need to read ID_PROCESSING property. */
+
+        r = sd_device_get_is_initialized(dev);
+        if (r <= 0)
+                return r;
+
+        r = device_get_property_bool(dev, "ID_PROCESSING");
+        if (r == -ENOENT)
+                return true; /* If the property does not exist, then it means that the device is processed. */
         if (r < 0)
                 return r;
 
-        return true;
+        return !r;
 }
 
 bool device_for_action(sd_device *dev, sd_device_action_t a) {
@@ -336,62 +290,6 @@ void log_device_uevent(sd_device *device, const char *str) {
                          seqnum, strna(device_action_to_string(action)),
                          sd_id128_is_null(event_id) ? "" : ", UUID=",
                          sd_id128_is_null(event_id) ? "" : SD_ID128_TO_UUID_STRING(event_id));
-}
-
-int udev_rule_parse_value(char *str, char **ret_value, char **ret_endpos) {
-        char *i, *j;
-        bool is_escaped;
-
-        /* value must be double quotated */
-        is_escaped = str[0] == 'e';
-        str += is_escaped;
-        if (str[0] != '"')
-                return -EINVAL;
-
-        if (!is_escaped) {
-                /* unescape double quotation '\"'->'"' */
-                for (j = str, i = str + 1; *i != '"'; i++, j++) {
-                        if (*i == '\0')
-                                return -EINVAL;
-                        if (i[0] == '\\' && i[1] == '"')
-                                i++;
-                        *j = *i;
-                }
-                j[0] = '\0';
-                /*
-                 * The return value must be terminated by two subsequent NULs
-                 * so it could be safely interpreted as nulstr.
-                 */
-                j[1] = '\0';
-        } else {
-                _cleanup_free_ char *unescaped = NULL;
-                ssize_t l;
-
-                /* find the end position of value */
-                for (i = str + 1; *i != '"'; i++) {
-                        if (i[0] == '\\')
-                                i++;
-                        if (*i == '\0')
-                                return -EINVAL;
-                }
-                i[0] = '\0';
-
-                l = cunescape_length(str + 1, i - (str + 1), 0, &unescaped);
-                if (l < 0)
-                        return l;
-
-                assert(l <= i - (str + 1));
-                memcpy(str, unescaped, l + 1);
-                /*
-                 * The return value must be terminated by two subsequent NULs
-                 * so it could be safely interpreted as nulstr.
-                 */
-                str[l + 1] = '\0';
-        }
-
-        *ret_value = str;
-        *ret_endpos = i + 1;
-        return 0;
 }
 
 size_t udev_replace_whitespace(const char *str, char *to, size_t len) {
@@ -434,22 +332,6 @@ size_t udev_replace_whitespace(const char *str, char *to, size_t len) {
 
         to[j] = '\0';
         return j;
-}
-
-size_t udev_replace_ifname(char *str) {
-        size_t replaced = 0;
-
-        assert(str);
-
-        /* See ifname_valid_full(). */
-
-        for (char *p = str; *p != '\0'; p++)
-                if (!ifname_valid_char(*p)) {
-                        *p = '_';
-                        replaced++;
-                }
-
-        return replaced;
 }
 
 size_t udev_replace_chars(char *str, const char *allow) {
@@ -496,111 +378,80 @@ size_t udev_replace_chars(char *str, const char *allow) {
         return replaced;
 }
 
-int udev_resolve_subsys_kernel(const char *string, char *result, size_t maxsize, bool read_value) {
-        _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
-        _cleanup_free_ char *temp = NULL;
-        char *subsys, *sysname, *attr;
-        const char *val;
-        int r;
-
-        assert(string);
-        assert(result);
-
-        /* handle "[<SUBSYSTEM>/<KERNEL>]<attribute>" format */
-
-        if (string[0] != '[')
-                return -EINVAL;
-
-        temp = strdup(string);
-        if (!temp)
-                return -ENOMEM;
-
-        subsys = &temp[1];
-
-        sysname = strchr(subsys, '/');
-        if (!sysname)
-                return -EINVAL;
-        sysname[0] = '\0';
-        sysname = &sysname[1];
-
-        attr = strchr(sysname, ']');
-        if (!attr)
-                return -EINVAL;
-        attr[0] = '\0';
-        attr = &attr[1];
-        if (attr[0] == '/')
-                attr = &attr[1];
-        if (attr[0] == '\0')
-                attr = NULL;
-
-        if (read_value && !attr)
-                return -EINVAL;
-
-        r = sd_device_new_from_subsystem_sysname(&dev, subsys, sysname);
-        if (r < 0)
-                return r;
-
-        if (read_value) {
-                r = sd_device_get_sysattr_value(dev, attr, &val);
-                if (r < 0 && !ERRNO_IS_PRIVILEGE(r) && r != -ENOENT)
-                        return r;
-                if (r >= 0)
-                        strscpy(result, maxsize, val);
-                else
-                        result[0] = '\0';
-                log_debug("value '[%s/%s]%s' is '%s'", subsys, sysname, attr, result);
-        } else {
-                r = sd_device_get_syspath(dev, &val);
-                if (r < 0)
-                        return r;
-
-                strscpyl(result, maxsize, val, attr ? "/" : NULL, attr ?: NULL, NULL);
-                log_debug("path '[%s/%s]%s' is '%s'", subsys, sysname, strempty(attr), result);
-        }
-        return 0;
-}
-
-bool devpath_conflict(const char *a, const char *b) {
-        /* This returns true when two paths are equivalent, or one is a child of another. */
-
-        if (!a || !b)
-                return false;
-
-        for (; *a != '\0' && *b != '\0'; a++, b++)
-                if (*a != *b)
-                        return false;
-
-        return *a == '/' || *b == '/' || *a == *b;
-}
-
 int udev_queue_is_empty(void) {
         return access("/run/udev/queue", F_OK) < 0 ?
                 (errno == ENOENT ? true : -errno) : false;
 }
 
-int udev_queue_init(void) {
-        _cleanup_close_ int fd = -EBADF;
+static int cached_udev_availability = -1;
 
-        fd = inotify_init1(IN_CLOEXEC);
-        if (fd < 0)
-                return -errno;
-
-        if (inotify_add_watch(fd, "/run/udev" , IN_DELETE) < 0)
-                return -errno;
-
-        return TAKE_FD(fd);
+void reset_cached_udev_availability(void) {
+        cached_udev_availability = -1;
 }
 
 bool udev_available(void) {
-        static int cache = -1;
-
         /* The service systemd-udevd is started only when /sys is read write.
          * See systemd-udevd.service: ConditionPathIsReadWrite=/sys
          * Also, our container interface (http://systemd.io/CONTAINER_INTERFACE/) states that /sys must
          * be mounted in read-only mode in containers. */
 
-        if (cache >= 0)
-                return cache;
+        if (cached_udev_availability >= 0)
+                return cached_udev_availability;
 
-        return (cache = (path_is_read_only_fs("/sys/") <= 0));
+        return (cached_udev_availability = (path_is_read_only_fs("/sys/") <= 0));
+}
+
+int device_get_vendor_string(sd_device *device, const char **ret) {
+        int r;
+
+        assert(device);
+
+        FOREACH_STRING(field, "ID_VENDOR_FROM_DATABASE", "ID_VENDOR") {
+                r = sd_device_get_property_value(device, field, ret);
+                if (r != -ENOENT)
+                        return r;
+        }
+
+        return -ENOENT;
+}
+
+int device_get_model_string(sd_device *device, const char **ret) {
+        int r;
+
+        assert(device);
+
+        FOREACH_STRING(field, "ID_MODEL_FROM_DATABASE", "ID_MODEL") {
+                r = sd_device_get_property_value(device, field, ret);
+                if (r != -ENOENT)
+                        return r;
+        }
+
+        return -ENOENT;
+}
+
+int device_get_property_value_with_fallback(
+                sd_device *device,
+                const char *prop,
+                Hashmap *extra_props,
+                const char **ret) {
+        const char *value;
+        int r;
+
+        assert(device);
+        assert(prop);
+        assert(ret);
+
+        r = sd_device_get_property_value(device, prop, &value);
+        if (r < 0) {
+                if (r != -ENOENT)
+                        return r;
+
+                value = hashmap_get(extra_props, prop);
+                if (!value)
+                        return -ENOENT;
+        }
+
+        *ret = value;
+
+        return 1;
 }

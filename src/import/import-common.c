@@ -23,7 +23,7 @@
 #include "tmpfile-util.h"
 
 int import_fork_tar_x(const char *path, pid_t *ret) {
-        _cleanup_close_pair_ int pipefd[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
         bool use_selinux;
         pid_t pid;
         int r;
@@ -39,7 +39,7 @@ int import_fork_tar_x(const char *path, pid_t *ret) {
         r = safe_fork_full("(tar)",
                            (int[]) { pipefd[0], -EBADF, STDERR_FILENO },
                            NULL, 0,
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_REARRANGE_STDIO|FORK_LOG, &pid);
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG, &pid);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -92,7 +92,7 @@ int import_fork_tar_x(const char *path, pid_t *ret) {
 }
 
 int import_fork_tar_c(const char *path, pid_t *ret) {
-        _cleanup_close_pair_ int pipefd[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
         bool use_selinux;
         pid_t pid;
         int r;
@@ -108,7 +108,7 @@ int import_fork_tar_c(const char *path, pid_t *ret) {
         r = safe_fork_full("(tar)",
                            (int[]) { -EBADF, pipefd[1], STDERR_FILENO },
                            NULL, 0,
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_REARRANGE_STDIO|FORK_LOG, &pid);
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG, &pid);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -276,7 +276,7 @@ bool import_validate_local(const char *name, ImportFlags flags) {
         if (FLAGS_SET(flags, IMPORT_DIRECT))
                 return path_is_valid(name);
 
-        return hostname_is_valid(name, 0);
+        return image_name_is_valid(name);
 }
 
 static int interrupt_signal_handler(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata) {
@@ -295,9 +295,8 @@ int import_allocate_event_with_signals(sd_event **ret) {
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate event loop: %m");
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
-        (void) sd_event_add_signal(event, NULL, SIGTERM, interrupt_signal_handler,  NULL);
-        (void) sd_event_add_signal(event, NULL, SIGINT, interrupt_signal_handler, NULL);
+        (void) sd_event_add_signal(event, NULL, SIGTERM|SD_EVENT_SIGNAL_PROCMASK, interrupt_signal_handler,  NULL);
+        (void) sd_event_add_signal(event, NULL, SIGINT|SD_EVENT_SIGNAL_PROCMASK, interrupt_signal_handler, NULL);
 
         *ret = TAKE_PTR(event);
         return 0;

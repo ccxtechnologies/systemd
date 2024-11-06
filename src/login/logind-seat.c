@@ -25,13 +25,13 @@
 #include "terminal-util.h"
 #include "tmpfile-util.h"
 
-int seat_new(Seat** ret, Manager *m, const char *id) {
+int seat_new(Manager *m, const char *id, Seat **ret) {
         _cleanup_(seat_freep) Seat *s = NULL;
         int r;
 
-        assert(ret);
         assert(m);
         assert(id);
+        assert(ret);
 
         if (!seat_name_is_valid(id))
                 return -EINVAL;
@@ -42,13 +42,11 @@ int seat_new(Seat** ret, Manager *m, const char *id) {
 
         *s = (Seat) {
                 .manager = m,
+                .id = strdup(id),
+                .state_file = path_join("/run/systemd/seats/", id),
         };
-
-        s->state_file = path_join("/run/systemd/seats", id);
-        if (!s->state_file)
+        if (!s->id || !s->state_file)
                 return -ENOMEM;
-
-        s->id = basename(s->state_file);
 
         r = hashmap_put(m->seats, s->id, s);
         if (r < 0)
@@ -77,6 +75,7 @@ Seat* seat_free(Seat *s) {
 
         free(s->positions);
         free(s->state_file);
+        free(s->id);
 
         return mfree(s);
 }
@@ -225,8 +224,20 @@ int seat_set_active(Seat *s, Session *session) {
         assert(s);
         assert(!session || session->seat == s);
 
-        if (session == s->active)
+        /* When logind receives the SIGRTMIN signal from the kernel, it will
+         * execute session_leave_vt and stop all devices of the session; at
+         * this time, if the session is active and there is no change in the
+         * session, then the session does not have the permissions of the device,
+         * and the machine will have a black screen and suspended animation.
+         * Therefore, if the active session has executed session_leave_vt ,
+         * A resume is required here. */
+        if (session == s->active) {
+                if (session) {
+                        log_debug("Active session remains unchanged, resuming session devices.");
+                        session_device_resume_all(session);
+                }
                 return 0;
+        }
 
         old_active = s->active;
         s->active = session;

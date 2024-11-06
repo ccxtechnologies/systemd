@@ -1,6 +1,6 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd.mount" xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -82,7 +82,7 @@
     for kernel-to-userspace and userspace-to-userspace interfaces. Some
     of them may not be changed via mount units, and cannot be
     disabled. For a longer discussion see <ulink
-    url="https://www.freedesktop.org/wiki/Software/systemd/APIFileSystems">API
+    url="https://systemd.io/API_FILE_SYSTEMS">API
     File Systems</ulink>.</para>
 
     <para>The
@@ -104,19 +104,18 @@
         system hierarchy, both a requirement dependency and an ordering
         dependency between both units are created automatically.</para></listitem>
 
-        <listitem><para>Block device backed file systems automatically gain
-        <varname>BindsTo=</varname> and <varname>After=</varname> type
-        dependencies on the device unit encapsulating the block
-        device (see below).</para></listitem>
+        <listitem><para>Block device backed file systems automatically gain <varname>Requires=</varname>,
+        <varname>StopPropagatedFrom=</varname>, and <varname>After=</varname> type dependencies on the
+        device unit encapsulating the block device (see <varname>x-systemd.device-bound=</varname> for details).
+        </para></listitem>
 
-        <listitem><para>If traditional file system quota is enabled for a mount
-        unit, automatic <varname>Wants=</varname> and
-        <varname>Before=</varname> dependencies on
-        <filename>systemd-quotacheck.service</filename> and
-        <filename>quotaon.service</filename> are added.</para></listitem>
+        <listitem><para>If traditional file system quota is enabled for a mount unit, automatic
+        <varname>Wants=</varname> and <varname>Before=</varname> dependencies on
+        <filename>systemd-quotacheck.service</filename> and <filename>quotaon.service</filename>
+        are added.</para></listitem>
 
-        <listitem><para>Additional implicit dependencies may be added as result of
-        execution and resource control parameters as documented in
+        <listitem><para>Additional implicit dependencies may be added as result of execution and
+        resource control parameters as documented in
         <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>
         and
         <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
@@ -135,15 +134,20 @@
 
         <listitem><para>Mount units referring to local file systems automatically gain
         an <varname>After=</varname> dependency on <filename>local-fs-pre.target</filename>, and a
-        <varname>Before=</varname> dependency on <filename>local-fs.target</filename> unless
-        <option>nofail</option> mount option is set.</para></listitem>
+        <varname>Before=</varname> dependency on <filename>local-fs.target</filename> unless one or more
+        mount options among <option>nofail</option>, <option>x-systemd.wanted-by=</option>,
+        and <option>x-systemd.required-by=</option> is set. See below for detailed information.</para>
 
-        <listitem><para>Network mount units
-        automatically acquire <varname>After=</varname> dependencies on <filename>remote-fs-pre.target</filename>,
-        <filename>network.target</filename> and <filename>network-online.target</filename>, and gain a
-        <varname>Before=</varname> dependency on <filename>remote-fs.target</filename> unless
-        <option>nofail</option> mount option is set. Towards the latter a
-        <varname>Wants=</varname> unit is added as well.</para></listitem>
+        <para>Additionally, an <varname>After=</varname> dependency on <filename>swap.target</filename>
+        is added when the file system type is <literal>tmpfs</literal>.</para>
+        </listitem>
+
+        <listitem><para>Network mount units automatically acquire <varname>After=</varname> dependencies on
+        <filename>remote-fs-pre.target</filename>, <filename>network.target</filename>,
+        plus <varname>After=</varname> and <varname>Wants=</varname> dependencies on <filename>network-online.target</filename>,
+        and a <varname>Before=</varname> dependency on <filename>remote-fs.target</filename>, unless
+        one or more mount options among <option>nofail</option>, <option>x-systemd.wanted-by=</option>,
+        and <option>x-systemd.required-by=</option> is set.</para></listitem>
       </itemizedlist>
 
       <para>Mount units referring to local and network file systems are distinguished by their file system type
@@ -207,7 +211,9 @@
 
         <para>Note that this option always applies to the created mount unit
         only regardless whether <option>x-systemd.automount</option> has been
-        specified.</para></listitem>
+        specified.</para>
+
+        <xi:include href="version-info.xml" xpointer="v220"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -230,47 +236,55 @@
 
         <para>Note that these options always apply to the created mount unit
         only regardless whether <option>x-systemd.automount</option> has been
-        specified.</para></listitem>
+        specified.</para>
+
+        <xi:include href="version-info.xml" xpointer="v233"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>x-systemd.wanted-by=</option></term>
         <term><option>x-systemd.required-by=</option></term>
 
-        <listitem><para>In the created mount unit, configures a
-        <varname>WantedBy=</varname> or <varname>RequiredBy=</varname>
-        dependency on another unit.  This option may be
-        specified more than once. If this is specified, the normal
-        automatic dependencies on the created mount unit, e.g.,
-        <filename>local-fs.target</filename>, are not automatically
-        created. See <varname>WantedBy=</varname> and <varname>RequiredBy=</varname> in
+        <listitem><para>In the created mount unit, configures a <varname>WantedBy=</varname> or
+        <varname>RequiredBy=</varname> dependency on another unit. This option may be specified more than once.
+        If this is specified, the default dependencies (see above) other than <filename>umount.target</filename>
+        on the created mount unit, e.g. <filename>local-fs.target</filename>, are not automatically created.
+        Hence it is likely that some ordering dependencies need to be set up manually through
+        <option>x-systemd.before=</option> and <option>x-systemd.after=</option>. See <varname>WantedBy=</varname>
+        and <varname>RequiredBy=</varname> in
         <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-        for details.</para></listitem>
+        for details.</para>
+
+        <xi:include href="version-info.xml" xpointer="v245"/></listitem>
       </varlistentry>
 
       <varlistentry>
+        <term><option>x-systemd.wants-mounts-for=</option></term>
         <term><option>x-systemd.requires-mounts-for=</option></term>
 
         <listitem><para>Configures a
-        <varname>RequiresMountsFor=</varname> dependency between the
-        created mount unit and other mount units. The argument must be
-        an absolute path. This option may be specified more than once.
-        See <varname>RequiresMountsFor=</varname> in
+        <varname>RequiresMountsFor=</varname> or <varname>WantsMountsFor=</varname>
+        dependency between the created mount unit and other mount units. The
+        argument must be an absolute path. This option may be specified more than
+        once. See <varname>RequiresMountsFor=</varname> or <varname>WantsMountsFor=</varname> in
         <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-        for details.</para></listitem>
+        for details.</para>
+
+        <xi:include href="version-info.xml" xpointer="v220"/></listitem>
        </varlistentry>
 
       <varlistentry>
-        <term><option>x-systemd.device-bound</option></term>
+        <term><option>x-systemd.device-bound=</option></term>
 
-        <listitem><para>The block device backed file system will be upgraded
-        to <varname>BindsTo=</varname> dependency. This option is only useful
-        when mounting file systems manually with
-        <citerefentry project='man-pages'><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-        as the default dependency in this case is <varname>Requires=</varname>.
-        This option is already implied by entries in <filename>/etc/fstab</filename>
-        or by mount units.
-        </para></listitem>
+        <listitem><para>Takes a boolean argument. If true or no argument, a <varname>BindsTo=</varname> dependency
+        on the backing device is set. If false, the mount unit is not stopped no matter whether the backing device
+        is still present. This is useful when the file system is backed by volume managers. If not set, and the mount
+        comes from unit fragments, i.e. generated from <filename>/etc/fstab</filename> by <citerefentry>
+        <refentrytitle>systemd-fstab-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry> or loaded from
+        a manually configured mount unit, a combination of <varname>Requires=</varname> and <varname>StopPropagatedFrom=</varname>
+        dependencies is set on the backing device. If doesn't, only <varname>Requires=</varname> is used.</para>
+
+        <xi:include href="version-info.xml" xpointer="v233"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -279,7 +293,9 @@
         <listitem><para>An automount unit will be created for the file
         system. See
         <citerefentry><refentrytitle>systemd.automount</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-        for details.</para></listitem>
+        for details.</para>
+
+        <xi:include href="version-info.xml" xpointer="v215"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -288,7 +304,9 @@
         <listitem><para>Configures the idle timeout of the
         automount unit. See <varname>TimeoutIdleSec=</varname> in
         <citerefentry><refentrytitle>systemd.automount</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-        for details.</para></listitem>
+        for details.</para>
+
+        <xi:include href="version-info.xml" xpointer="v220"/></listitem>
       </varlistentry>
 
       <varlistentry id='device-timeout'>
@@ -305,6 +323,8 @@
         <filename>/etc/fstab</filename>, and will be
         ignored when part of the <varname>Options=</varname>
         setting in a unit file.</para>
+
+        <xi:include href="version-info.xml" xpointer="v215"/>
         </listitem>
       </varlistentry>
 
@@ -325,6 +345,8 @@
 
         <para>See <varname>TimeoutSec=</varname> below for
         details.</para>
+
+        <xi:include href="version-info.xml" xpointer="v233"/>
         </listitem>
       </varlistentry>
 
@@ -347,6 +369,8 @@
         <para><citerefentry project='man-pages'><refentrytitle>wipefs</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         may be used to remove any signatures from a block device to force
         <option>x-systemd.makefs</option> to reinitialize the device.</para>
+
+        <xi:include href="version-info.xml" xpointer="v236"/>
         </listitem>
       </varlistentry>
 
@@ -363,7 +387,9 @@
 
         <para>Note that this option can only be used in
         <filename>/etc/fstab</filename>, and will be ignored when part of the
-        <varname>Options=</varname> setting in a unit file.</para></listitem>
+        <varname>Options=</varname> setting in a unit file.</para>
+
+        <xi:include href="version-info.xml" xpointer="v236"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -377,7 +403,9 @@
         <para>Note that this option can only be used in <filename>/etc/fstab</filename>, and will be ignored
         when part of the <varname>Options=</varname> setting in a unit file. It is also implied for the root
         and <filename>/usr/</filename> partitions discovered by
-        <citerefentry><refentrytitle>systemd-gpt-auto-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para></listitem>
+        <citerefentry><refentrytitle>systemd-gpt-auto-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -388,6 +416,8 @@
         This option disables that behaviour, and causes the mount to fail
         immediately instead. This option is translated into the
         <varname>ReadWriteOnly=</varname> setting in a unit file.</para>
+
+        <xi:include href="version-info.xml" xpointer="v246"/>
         </listitem>
       </varlistentry>
 
@@ -404,6 +434,8 @@
         <filename>local-fs-pre.target</filename> and <filename>local-fs.target</filename>.
         They also pull in <filename>network-online.target</filename> and are ordered after
         it and <filename>network.target</filename>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v235"/>
         </listitem>
       </varlistentry>
 
@@ -419,6 +451,8 @@
         <para>Note that if <option>x-systemd.automount</option> (see above) is used, neither
         <option>auto</option> nor <option>noauto</option> have any effect. The matching automount unit will
         be added as a dependency to the appropriate target.</para>
+
+        <xi:include href="version-info.xml" xpointer="v215"/>
         </listitem>
       </varlistentry>
 
@@ -429,6 +463,8 @@
         <filename>local-fs.target</filename> or <filename>remote-fs.target</filename>. Moreover the mount unit is not
         ordered before these target units. This means that the boot will continue without waiting for the mount unit
         and regardless whether the mount point can be mounted successfully.</para>
+
+        <xi:include href="version-info.xml" xpointer="v215"/>
         </listitem>
       </varlistentry>
 
@@ -442,7 +478,9 @@
         leave the partition mounted until final shutdown. Or in other words, if this flag is set it is
         assumed the mount shall be active during the entire regular runtime of the system, i.e. established
         before the initrd transitions into the host all the way until the host transitions to the final
-        shutdown phase.</para></listitem>
+        shutdown phase.</para>
+
+        <xi:include href="version-info.xml" xpointer="v215"/></listitem>
       </varlistentry>
     </variablelist>
 
@@ -468,9 +506,9 @@
     information about the file system mount points it supervises. A
     number of options that may be used in this section are shared with
     other unit types. These options are documented in
-    <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-    and
-    <citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+    <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
+    <citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry> and
+    <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
     The options specific to the [Mount] section of mount units are the
     following:</para>
 
@@ -478,8 +516,8 @@
 
       <varlistentry>
         <term><varname>What=</varname></term>
-        <listitem><para>Takes an absolute path of a device node, file or other resource to mount. See
-        <citerefentry
+        <listitem><para>Takes an absolute path or a fstab-style identifier of a device node, file or
+        other resource to mount. See <citerefentry
         project='man-pages'><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry> for
         details. If this refers to a device node, a dependency on the respective device unit is automatically
         created. (See
@@ -504,7 +542,11 @@
         <term><varname>Type=</varname></term>
         <listitem><para>Takes a string for the file system type. See
         <citerefentry project='man-pages'><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-        for details. This setting is optional.</para></listitem>
+        for details. This setting is optional.</para>
+
+        <para>If the type is <literal>overlay</literal>, and <literal>upperdir=</literal> or
+        <literal>workdir=</literal> are specified as options and they don't exist, they will be created.
+        </para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -524,7 +566,9 @@
         corresponds with
         <citerefentry project='man-pages'><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry>'s
         <parameter>-s</parameter> switch. Defaults to
-        off.</para></listitem>
+        off.</para>
+
+        <xi:include href="version-info.xml" xpointer="v215"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -537,7 +581,9 @@
         This corresponds with
         <citerefentry project='man-pages'><refentrytitle>umount</refentrytitle><manvolnum>8</manvolnum></citerefentry>'s
         <parameter>-l</parameter> switch. Defaults to
-        off.</para></listitem>
+        off.</para>
+
+        <xi:include href="version-info.xml" xpointer="v232"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -550,7 +596,9 @@
         not succeed. This corresponds with
         <citerefentry project='man-pages'><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry>'s
         <parameter>-w</parameter> switch. Defaults to
-        off.</para></listitem>
+        off.</para>
+
+        <xi:include href="version-info.xml" xpointer="v246"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -561,7 +609,9 @@
         This corresponds with
         <citerefentry project='man-pages'><refentrytitle>umount</refentrytitle><manvolnum>8</manvolnum></citerefentry>'s
         <parameter>-f</parameter> switch. Defaults to
-        off.</para></listitem>
+        off.</para>
+
+        <xi:include href="version-info.xml" xpointer="v232"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -596,22 +646,22 @@
 
   <refsect1>
       <title>See Also</title>
-      <para>
-        <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd-system.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.device</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry project='man-pages'><refentrytitle>proc</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry project='man-pages'><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd-fstab-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.directives</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd-mount</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-      </para>
+      <para><simplelist type="inline">
+        <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd-system.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.device</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry project='man-pages'><refentrytitle>proc</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry project='man-pages'><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd-fstab-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.directives</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd-mount</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      </simplelist></para>
   </refsect1>
 
 </refentry>

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
+#include <sysexits.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 
@@ -83,7 +84,8 @@ TEST(tmpdir) {
 }
 
 static void test_shareable_ns(unsigned long nsflag) {
-        _cleanup_close_pair_ int s[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int s[2] = EBADF_PAIR;
+        bool permission_denied = false;
         pid_t pid1, pid2, pid3;
         int r, n = 0;
         siginfo_t si;
@@ -93,15 +95,15 @@ static void test_shareable_ns(unsigned long nsflag) {
                 return;
         }
 
-        assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, s) >= 0);
+        assert_se(socketpair(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, 0, s) >= 0);
 
         pid1 = fork();
         assert_se(pid1 >= 0);
 
         if (pid1 == 0) {
                 r = setup_shareable_ns(s, nsflag);
-                assert_se(r >= 0);
-                _exit(r);
+                assert_se(r >= 0 || ERRNO_IS_NEG_PRIVILEGE(r));
+                _exit(r >= 0 ? r : EX_NOPERM);
         }
 
         pid2 = fork();
@@ -109,8 +111,8 @@ static void test_shareable_ns(unsigned long nsflag) {
 
         if (pid2 == 0) {
                 r = setup_shareable_ns(s, nsflag);
-                assert_se(r >= 0);
-                exit(r);
+                assert_se(r >= 0 || ERRNO_IS_NEG_PRIVILEGE(r));
+                _exit(r >= 0 ? r : EX_NOPERM);
         }
 
         pid3 = fork();
@@ -118,24 +120,38 @@ static void test_shareable_ns(unsigned long nsflag) {
 
         if (pid3 == 0) {
                 r = setup_shareable_ns(s, nsflag);
-                assert_se(r >= 0);
-                exit(r);
+                assert_se(r >= 0 || ERRNO_IS_NEG_PRIVILEGE(r));
+                _exit(r >= 0 ? r : EX_NOPERM);
         }
 
         r = wait_for_terminate(pid1, &si);
         assert_se(r >= 0);
         assert_se(si.si_code == CLD_EXITED);
-        n += si.si_status;
+        if (si.si_status == EX_NOPERM)
+                permission_denied = true;
+        else
+                n += si.si_status;
 
         r = wait_for_terminate(pid2, &si);
         assert_se(r >= 0);
         assert_se(si.si_code == CLD_EXITED);
-        n += si.si_status;
+        if (si.si_status == EX_NOPERM)
+                permission_denied = true;
+        else
+                n += si.si_status;
 
         r = wait_for_terminate(pid3, &si);
         assert_se(r >= 0);
         assert_se(si.si_code == CLD_EXITED);
-        n += si.si_status;
+        if (si.si_status == EX_NOPERM)
+                permission_denied = true;
+        else
+                n += si.si_status;
+
+        /* LSMs can cause setup_shareable_ns() to fail with permission denied, do not fail the test in that
+         * case (e.g.: LXC with AppArmor on kernel < v6.2). */
+        if (permission_denied)
+                return (void) log_tests_skipped("insufficient privileges");
 
         assert_se(n == 1);
 }
@@ -149,11 +165,12 @@ TEST(ipcns) {
 }
 
 TEST(protect_kernel_logs) {
-        int r;
-        pid_t pid;
-        static const NamespaceInfo ns_info = {
+        static const NamespaceParameters p = {
+                .runtime_scope = RUNTIME_SCOPE_SYSTEM,
                 .protect_kernel_logs = true,
         };
+        pid_t pid;
+        int r;
 
         if (geteuid() > 0) {
                 (void) log_tests_skipped("not root");
@@ -175,38 +192,7 @@ TEST(protect_kernel_logs) {
                 fd = open("/dev/kmsg", O_RDONLY | O_CLOEXEC);
                 assert_se(fd > 0);
 
-                r = setup_namespace(NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    &ns_info,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL, 0,
-                                    NULL, 0,
-                                    NULL, 0,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    0,
-                                    NULL,
-                                    NULL,
-                                    0,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL);
+                r = setup_namespace(&p, NULL);
                 assert_se(r == 0);
 
                 assert_se(setresuid(UID_NOBODY, UID_NOBODY, UID_NOBODY) >= 0);

@@ -91,7 +91,7 @@ static int print_inhibitors(sd_bus *bus) {
                 if (arg_mode && !streq(mode, arg_mode))
                         continue;
 
-                (void) get_process_comm(pid, &comm);
+                (void) pid_get_comm(pid, &comm);
                 u = uid_to_name(uid);
 
                 r = table_add_many(table,
@@ -111,7 +111,7 @@ static int print_inhibitors(sd_bus *bus) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        if (table_get_rows(table) > 1) {
+        if (!table_isempty(table)) {
                 r = table_set_sort(table, (size_t) 1, (size_t) 0, (size_t) 5, (size_t) 6);
                 if (r < 0)
                         return table_log_sort_error(r);
@@ -124,10 +124,10 @@ static int print_inhibitors(sd_bus *bus) {
         }
 
         if (arg_legend) {
-                if (table_get_rows(table) > 1)
-                        printf("\n%zu inhibitors listed.\n", table_get_rows(table) - 1);
-                else
+                if (table_isempty(table))
                         printf("No inhibitors.\n");
+                else
+                        printf("\n%zu inhibitors listed.\n", table_get_rows(table) - 1);
         }
 
         return 0;
@@ -257,9 +257,7 @@ static int run(int argc, char *argv[]) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
-        log_show_color(true);
-        log_parse_environment();
-        log_open();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
@@ -300,7 +298,7 @@ static int run(int argc, char *argv[]) {
                 if (!arguments)
                         return log_oom();
 
-                r = safe_fork("(inhibit)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_CLOSE_ALL_FDS|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pid);
+                r = safe_fork("(inhibit)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_CLOSE_ALL_FDS|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pid);
                 if (r < 0)
                         return r;
                 if (r == 0) {

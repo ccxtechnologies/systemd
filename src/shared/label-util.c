@@ -81,22 +81,23 @@ int symlink_atomic_full_label(const char *from, const char *to, bool make_relati
         return mac_smack_fix(to, 0);
 }
 
-int mknod_label(const char *pathname, mode_t mode, dev_t dev) {
+int mknodat_label(int dirfd, const char *pathname, mode_t mode, dev_t dev) {
         int r;
 
+        assert(dirfd >= 0 || dirfd == AT_FDCWD);
         assert(pathname);
 
-        r = mac_selinux_create_file_prepare(pathname, mode);
+        r = mac_selinux_create_file_prepare_at(dirfd, pathname, mode);
         if (r < 0)
                 return r;
 
-        r = RET_NERRNO(mknod(pathname, mode, dev));
+        r = RET_NERRNO(mknodat(dirfd, pathname, mode, dev));
         mac_selinux_create_file_clear();
 
         if (r < 0)
                 return r;
 
-        return mac_smack_fix(pathname, 0);
+        return mac_smack_fix_full(dirfd, pathname, NULL, 0);
 }
 
 int btrfs_subvol_make_label(const char *path) {
@@ -108,7 +109,7 @@ int btrfs_subvol_make_label(const char *path) {
         if (r < 0)
                 return r;
 
-        r = btrfs_subvol_make(path);
+        r = btrfs_subvol_make(AT_FDCWD, path);
         mac_selinux_create_file_clear();
 
         if (r < 0)
@@ -117,14 +118,25 @@ int btrfs_subvol_make_label(const char *path) {
         return mac_smack_fix(path, 0);
 }
 
-int mac_init(void) {
+static int init_internal(bool lazy) {
         int r;
 
         assert(!(mac_selinux_use() && mac_smack_use()));
 
-        r = mac_selinux_init();
+        if (lazy)
+                r = mac_selinux_init_lazy();
+        else
+                r = mac_selinux_init();
         if (r < 0)
                 return r;
 
         return mac_smack_init();
+}
+
+int mac_init_lazy(void) {
+        return init_internal(/* lazy=*/ true);
+}
+
+int mac_init(void) {
+        return init_internal(/* lazy=*/ false);
 }

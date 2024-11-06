@@ -86,6 +86,11 @@ run_subtests_with_signals() {
     _trap_with_sig _handle_signal "$@"
 
     for subtest in "${subtests[@]}"; do
+        if [[ -n "${TEST_MATCH_SUBTEST:-}" ]] && ! [[ "$subtest" =~ $TEST_MATCH_SUBTEST ]]; then
+            echo "Skipping $subtest (not matching '$TEST_MATCH_SUBTEST')"
+            continue
+        fi
+
         : "--- $subtest BEGIN ---"
         SECONDS=0
         "./$subtest" &
@@ -102,7 +107,7 @@ run_subtests_with_signals() {
     _show_summary
 }
 
-# Run all subtests (i.e. files named as testsuite-<testid>.<subtest_name>.sh)
+# Run all subtests (i.e. files named as $TESTNAME.<subtest_name>.sh)
 run_subtests() {
     local subtests=("${0%.sh}".*.sh)
     local subtest

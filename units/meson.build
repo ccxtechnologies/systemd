@@ -7,6 +7,8 @@ units = [
         { 'file' : 'blockdev@.target' },
         { 'file' : 'bluetooth.target' },
         { 'file' : 'boot-complete.target' },
+        { 'file' : 'capsule@.service.in' },
+        { 'file' : 'capsule.slice' },
         { 'file' : 'console-getty.service.in' },
         { 'file' : 'container-getty@.service.in' },
         {
@@ -58,6 +60,11 @@ units = [
         {
           'file' : 'systemd-battery-check.service.in',
           'conditions' : ['ENABLE_INITRD'],
+          'symlinks' : ['initrd.target.wants/'],
+        },
+        {
+          'file' : 'systemd-bsod.service.in',
+          'conditions' : ['HAVE_QRENCODE', 'ENABLE_INITRD'],
           'symlinks' : ['initrd.target.wants/'],
         },
         {
@@ -156,7 +163,11 @@ units = [
           'conditions' : ['ENABLE_BINFMT'],
         },
         {
-          'file' : 'quotaon.service.in',
+          'file' : 'quotaon@.service.in',
+          'conditions' : ['ENABLE_QUOTACHECK'],
+        },
+        {
+          'file' : 'quotaon-root.service.in',
           'conditions' : ['ENABLE_QUOTACHECK'],
         },
         {
@@ -194,6 +205,7 @@ units = [
         { 'file' : 'sockets.target' },
         { 'file' : 'soft-reboot.target' },
         { 'file' : 'sound.target' },
+        { 'file' : 'ssh-access.target' },
         {
           'file' : 'suspend-then-hibernate.target',
           'conditions' : ['ENABLE_HIBERNATE'],
@@ -263,6 +275,15 @@ units = [
           'conditions' : ['ENABLE_BOOTLOADER'],
         },
         {
+          'file' : 'systemd-bootctl@.service',
+          'conditions' : ['ENABLE_BOOTLOADER'],
+        },
+        {
+          'file' : 'systemd-bootctl.socket',
+          'conditions' : ['ENABLE_BOOTLOADER'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
           'file' : 'systemd-confext.service',
           'conditions' : ['ENABLE_SYSEXT'],
         },
@@ -275,6 +296,11 @@ units = [
           'file' : 'systemd-coredump@.service.in',
           'conditions' : ['ENABLE_COREDUMP'],
         },
+        {
+          'file' : 'systemd-creds.socket',
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        { 'file' : 'systemd-creds@.service' },
         { 'file' : 'systemd-exit.service' },
         {
           'file' : 'systemd-firstboot.service',
@@ -287,11 +313,24 @@ units = [
         { 'file' : 'systemd-growfs@.service.in' },
         { 'file' : 'systemd-halt.service' },
         {
+          'file' : 'systemd-hibernate-clear.service.in',
+          'conditions' : ['ENABLE_HIBERNATE', 'ENABLE_EFI'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-hibernate-resume.service.in',
+          'conditions' : ['ENABLE_HIBERNATE'],
+        },
+        {
           'file' : 'systemd-hibernate.service.in',
           'conditions' : ['ENABLE_HIBERNATE'],
         },
         {
           'file' : 'systemd-homed-activate.service',
+          'conditions' : ['ENABLE_HOMED'],
+        },
+        {
+          'file' : 'systemd-homed-firstboot.service',
           'conditions' : ['ENABLE_HOMED'],
         },
         {
@@ -302,6 +341,11 @@ units = [
           'file' : 'systemd-hostnamed.service.in',
           'conditions' : ['ENABLE_HOSTNAMED'],
           'symlinks' : ['dbus-org.freedesktop.hostname1.service'],
+        },
+        {
+          'file' : 'systemd-hostnamed.socket',
+          'conditions' : ['ENABLE_HOSTNAMED'],
+          'symlinks' : ['sockets.target.wants/'],
         },
         {
           'file' : 'systemd-hwdb-update.service.in',
@@ -359,6 +403,7 @@ units = [
           'file' : 'systemd-journald-dev-log.socket',
           'symlinks' : ['sockets.target.wants/'],
         },
+        { 'file' : 'systemd-journald-sync@.service' },
         { 'file' : 'systemd-journald-varlink@.socket' },
         {
           'file' : 'systemd-journald.service.in',
@@ -397,6 +442,10 @@ units = [
         },
         { 'file' : 'systemd-network-generator.service.in' },
         {
+          'file' : 'systemd-networkd-persistent-storage.service',
+          'conditions' : ['ENABLE_NETWORKD'],
+        },
+        {
           'file' : 'systemd-networkd-wait-online.service.in',
           'conditions' : ['ENABLE_NETWORKD'],
         },
@@ -414,12 +463,25 @@ units = [
         },
         { 'file' : 'systemd-nspawn@.service.in' },
         {
+          'file' : 'systemd-vmspawn@.service.in',
+          'conditions' : ['ENABLE_VMSPAWN'],
+        },
+        {
           'file' : 'systemd-oomd.service.in',
           'conditions' : ['ENABLE_OOMD'],
         },
         {
           'file' : 'systemd-oomd.socket',
           'conditions' : ['ENABLE_OOMD'],
+        },
+        {
+          'file' : 'systemd-pcrextend@.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrextend.socket',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sockets.target.wants/'],
         },
         {
           'file' : 'systemd-pcrfs-root.service.in',
@@ -450,6 +512,53 @@ units = [
           'symlinks' : ['sysinit.target.wants/'],
         },
         {
+          'file' : 'systemd-tpm2-setup.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-tpm2-setup-early.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-pcrlock-make-policy.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock-secureboot-policy.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock-secureboot-authority.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock-file-system.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock-machine-id.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock-firmware-code.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock-firmware-config.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock@.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock.socket',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
           'file' : 'systemd-portabled.service.in',
           'conditions' : ['ENABLE_PORTABLED'],
           'symlinks' : ['dbus-org.freedesktop.portable1.service'],
@@ -460,7 +569,11 @@ units = [
           'conditions' : ['ENABLE_PSTORE'],
         },
         {
-          'file' : 'systemd-quotacheck.service.in',
+          'file' : 'systemd-quotacheck@.service.in',
+          'conditions' : ['ENABLE_QUOTACHECK'],
+        },
+        {
+          'file' : 'systemd-quotacheck-root.service.in',
           'conditions' : ['ENABLE_QUOTACHECK'],
         },
         {
@@ -471,7 +584,7 @@ units = [
         { 'file' : 'systemd-reboot.service' },
         { 'file' : 'systemd-remount-fs.service.in' },
         {
-          'file' : 'systemd-repart.service.in',
+          'file' : 'systemd-repart.service',
           'conditions' : ['ENABLE_REPART'],
           'symlinks' : ['sysinit.target.wants/', 'initrd-root-fs.target.wants/'],
         },
@@ -502,6 +615,15 @@ units = [
           'conditions' : ['ENABLE_SYSEXT'],
         },
         {
+          'file' : 'systemd-sysext.socket',
+          'conditions' : ['ENABLE_SYSEXT'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysext@.service',
+          'conditions' : ['ENABLE_SYSEXT'],
+        },
+        {
           'file' : 'systemd-sysupdate-reboot.service.in',
           'conditions' : ['ENABLE_SYSUPDATE'],
         },
@@ -521,6 +643,14 @@ units = [
           'file' : 'systemd-sysusers.service',
           'conditions' : ['ENABLE_SYSUSERS'],
           'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-storagetm.service.in',
+          'conditions' : ['ENABLE_STORAGETM'],
+        },
+        {
+          'file' : 'storage-target-mode.target',
+          'conditions' : ['ENABLE_STORAGETM'],
         },
         {
           'file' : 'systemd-time-wait-sync.service.in',
@@ -545,6 +675,11 @@ units = [
           'symlinks' : ['timers.target.wants/'],
         },
         {
+          'file' : 'systemd-tmpfiles-setup-dev-early.service',
+          'conditions' : ['ENABLE_TMPFILES'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
           'file' : 'systemd-tmpfiles-setup-dev.service',
           'conditions' : ['ENABLE_TMPFILES'],
           'symlinks' : ['sysinit.target.wants/'],
@@ -554,6 +689,7 @@ units = [
           'conditions' : ['ENABLE_TMPFILES'],
           'symlinks' : ['sysinit.target.wants/'],
         },
+        { 'file' : 'systemd-udev-load-credentials.service' },
         { 'file' : 'systemd-udev-settle.service' },
         {
           'file' : 'systemd-udev-trigger.service',
@@ -599,6 +735,22 @@ units = [
           'conditions' : ['ENABLE_USERDB'],
         },
         {
+          'file' : 'systemd-mountfsd.service.in',
+          'conditions' : ['ENABLE_MOUNTFSD'],
+        },
+        {
+          'file' : 'systemd-mountfsd.socket',
+          'conditions' : ['ENABLE_MOUNTFSD'],
+        },
+        {
+          'file' : 'systemd-nsresourced.service.in',
+          'conditions' : ['ENABLE_NSRESOURCED'],
+        },
+        {
+          'file' : 'systemd-nsresourced.socket',
+          'conditions' : ['ENABLE_NSRESOURCED'],
+        },
+        {
           'file' : 'systemd-vconsole-setup.service.in',
           'conditions' : ['ENABLE_VCONSOLE'],
         },
@@ -613,6 +765,7 @@ units = [
           'file' : 'tmp.mount',
           'symlinks' : ['local-fs.target.wants/'],
         },
+        { 'file' : 'tpm2.target' },
         { 'file' : 'umount.target' },
         { 'file' : 'usb-gadget.target' },
         { 'file' : 'user-runtime-dir@.service.in' },
@@ -633,8 +786,6 @@ units = [
           'symlinks' : ['sysinit.target.wants/'],
         },
 ]
-
-add_wants = []
 
 foreach unit : units
         source = unit.get('file')
@@ -672,12 +823,19 @@ foreach unit : units
 
         if install
                 foreach target : unit.get('symlinks', [])
-                        add_wants += [systemunitdir, target, name]
+                        if target.endswith('/')
+                                install_emptydir(systemunitdir / target)
+                                meson.add_install_script(sh, '-c',
+                                                         ln_s.format(systemunitdir / name,
+                                                                     systemunitdir / target / name))
+                        else
+                                meson.add_install_script(sh, '-c',
+                                                         ln_s.format(systemunitdir / name,
+                                                                     systemunitdir / target))
+                        endif
                 endforeach
         endif
 endforeach
-
-meson.add_install_script('meson-add-wants.sh', add_wants)
 
 install_data('user-.slice.d/10-defaults.conf',
              install_dir : systemunitdir + '/user-.slice.d')
@@ -689,19 +847,14 @@ install_data('user@0.service.d/10-login-barrier.conf',
 
 ############################################################
 
-if install_sysconfdir
-        meson.add_install_script(meson_make_symlink,
-                                 pkgsysconfdir / 'user',
-                                 sysconfdir / 'xdg/systemd/user')
-endif
-meson.add_install_script(meson_make_symlink,
-                         dbussystemservicedir / 'org.freedesktop.systemd1.service',
-                         dbussessionservicedir / 'org.freedesktop.systemd1.service')
+install_emptydir(dbussessionservicedir)
+meson.add_install_script(sh, '-c',
+                         ln_s.format(dbussystemservicedir / 'org.freedesktop.systemd1.service',
+                                     dbussessionservicedir / 'org.freedesktop.systemd1.service'))
+
 if conf.get('HAVE_SYSV_COMPAT') == 1
         foreach i : [1, 2, 3, 4, 5]
-                meson.add_install_script(
-                        'sh', '-c',
-                        mkdir_p.format(systemunitdir / 'runlevel@0@.target.wants'.format(i)))
+                install_emptydir(systemunitdir / 'runlevel@0@.target.wants'.format(i))
         endforeach
 endif
 

@@ -61,6 +61,34 @@ bool image_name_is_valid(const char *s) {
         return true;
 }
 
+int path_extract_image_name(const char *path, char **ret) {
+        _cleanup_free_ char *fn = NULL;
+        int r;
+
+        assert(path);
+        assert(ret);
+
+        /* Extract last component from path, without any "/" suffixes. */
+        r = path_extract_filename(path, &fn);
+        if (r < 0)
+                return r;
+        if (r != O_DIRECTORY) {
+                /* Chop off any image suffixes we recognize (unless we already know this must refer to some dir) */
+                char *m = ENDSWITH_SET(fn, ".sysext.raw", ".confext.raw", ".raw");
+                if (m)
+                        *m = 0;
+        }
+
+        /* Truncate the version/counting suffixes */
+        fn[strcspn(fn, "_+")] = 0;
+
+        if (!image_name_is_valid(fn))
+                return -EINVAL;
+
+        *ret = TAKE_PTR(fn);
+        return 0;
+}
+
 int path_is_extension_tree(ImageClass image_class, const char *path, const char *extension, bool relax_extension_release_check) {
         int r;
 
@@ -92,23 +120,15 @@ static int extension_release_strict_xattr_value(int extension_release_fd, const 
         assert(filename);
 
         /* No xattr or cannot parse it? Then skip this. */
-        _cleanup_free_ char *extension_release_xattr = NULL;
-        r = fgetxattr_malloc(extension_release_fd, "user.extension-release.strict", &extension_release_xattr);
-        if (r < 0) {
-                if (!ERRNO_IS_XATTR_ABSENT(r))
-                        return log_debug_errno(r,
-                                               "%s/%s: Failed to read 'user.extension-release.strict' extended attribute from file, ignoring: %m",
-                                               extension_release_dir_path, filename);
-
-                return log_debug_errno(r, "%s/%s does not have user.extension-release.strict xattr, ignoring.", extension_release_dir_path, filename);
-        }
+        r = getxattr_at_bool(extension_release_fd, /* path= */ NULL, "user.extension-release.strict", /* flags= */ 0);
+        if (ERRNO_IS_NEG_XATTR_ABSENT(r))
+                return log_debug_errno(r, "%s/%s does not have user.extension-release.strict xattr, ignoring.",
+                                       extension_release_dir_path, filename);
+        if (r < 0)
+                return log_debug_errno(r, "%s/%s: Failed to read 'user.extension-release.strict' extended attribute from file, ignoring: %m",
+                                       extension_release_dir_path, filename);
 
         /* Explicitly set to request strict matching? Skip it. */
-        r = parse_boolean(extension_release_xattr);
-        if (r < 0)
-                return log_debug_errno(r,
-                                       "%s/%s: Failed to parse 'user.extension-release.strict' extended attribute from file, ignoring: %m",
-                                       extension_release_dir_path, filename);
         if (r > 0) {
                 log_debug("%s/%s: 'user.extension-release.strict' attribute is true, ignoring file.",
                           extension_release_dir_path, filename);
@@ -238,9 +258,25 @@ int open_extension_release_at(
                         continue;
                 }
 
-                if (!relax_extension_release_check &&
-                    extension_release_strict_xattr_value(fd, dir_path, de->d_name) != 0)
-                        continue;
+                if (!relax_extension_release_check) {
+                        _cleanup_free_ char *base_image_name = NULL, *base_extension = NULL;
+
+                        r = path_extract_image_name(image_name, &base_image_name);
+                        if (r < 0) {
+                                log_debug_errno(r, "Failed to extract image name from %s/%s, ignoring: %m", dir_path, de->d_name);
+                                continue;
+                        }
+
+                        r = path_extract_image_name(extension, &base_extension);
+                        if (r < 0) {
+                                log_debug_errno(r, "Failed to extract image name from %s, ignoring: %m", extension);
+                                continue;
+                        }
+
+                        if (!streq(base_image_name, base_extension) &&
+                            extension_release_strict_xattr_value(fd, dir_path, image_name) != 0)
+                                continue;
+                }
 
                 /* We already found what we were looking for, but there's another candidate? We treat this as
                  * an error, as we want to enforce that there are no ambiguities in case we are in the

@@ -38,54 +38,59 @@ static void *dw_dl = NULL;
 static void *elf_dl = NULL;
 
 /* libdw symbols */
-Dwarf_Attribute *(*sym_dwarf_attr_integrate)(Dwarf_Die *, unsigned int, Dwarf_Attribute *);
-const char *(*sym_dwarf_diename)(Dwarf_Die *);
-const char *(*sym_dwarf_formstring)(Dwarf_Attribute *);
-int (*sym_dwarf_getscopes)(Dwarf_Die *, Dwarf_Addr, Dwarf_Die **);
-int (*sym_dwarf_getscopes_die)(Dwarf_Die *, Dwarf_Die **);
-Elf *(*sym_dwelf_elf_begin)(int);
+static DLSYM_FUNCTION(dwarf_attr_integrate);
+static DLSYM_FUNCTION(dwarf_diename);
+static DLSYM_FUNCTION(dwarf_formstring);
+static DLSYM_FUNCTION(dwarf_getscopes);
+static DLSYM_FUNCTION(dwarf_getscopes_die);
+static DLSYM_FUNCTION(dwelf_elf_begin);
 #if HAVE_DWELF_ELF_E_MACHINE_STRING
-const char *(*sym_dwelf_elf_e_machine_string)(int);
+static DLSYM_FUNCTION(dwelf_elf_e_machine_string);
 #endif
-ssize_t (*sym_dwelf_elf_gnu_build_id)(Elf *, const void **);
-int (*sym_dwarf_tag)(Dwarf_Die *);
-Dwfl_Module *(*sym_dwfl_addrmodule)(Dwfl *, Dwarf_Addr);
-Dwfl *(*sym_dwfl_begin)(const Dwfl_Callbacks *);
-int (*sym_dwfl_build_id_find_elf)(Dwfl_Module *, void **, const char *, Dwarf_Addr, char **, Elf **);
-int (*sym_dwfl_core_file_attach)(Dwfl *, Elf *);
-int (*sym_dwfl_core_file_report)(Dwfl *, Elf *, const char *);
-void (*sym_dwfl_end)(Dwfl *);
-const char *(*sym_dwfl_errmsg)(int);
-int (*sym_dwfl_errno)(void);
-bool (*sym_dwfl_frame_pc)(Dwfl_Frame *, Dwarf_Addr *, bool *);
-ptrdiff_t (*sym_dwfl_getmodules)(Dwfl *, int (*)(Dwfl_Module *, void **, const char *, Dwarf_Addr, void *), void *, ptrdiff_t);
-int (*sym_dwfl_getthreads)(Dwfl *, int (*)(Dwfl_Thread *, void *), void *);
-Dwarf_Die *(*sym_dwfl_module_addrdie)(Dwfl_Module *, Dwarf_Addr, Dwarf_Addr *);
-const char *(*sym_dwfl_module_addrname)(Dwfl_Module *, GElf_Addr);
-int (*sym_dwfl_module_build_id)(Dwfl_Module *, const unsigned char **, GElf_Addr *);
-Elf *(*sym_dwfl_module_getelf)(Dwfl_Module *, GElf_Addr *);
-const char *(*sym_dwfl_module_info)(Dwfl_Module *, void ***, Dwarf_Addr *, Dwarf_Addr *, Dwarf_Addr *, Dwarf_Addr *, const char **, const char **);
-int (*sym_dwfl_offline_section_address)(Dwfl_Module *, void **, const char *, Dwarf_Addr, const char *, GElf_Word, const GElf_Shdr *, Dwarf_Addr *);
-int (*sym_dwfl_report_end)(Dwfl *, int (*)(Dwfl_Module *, void *, const char *, Dwarf_Addr, void *), void *);
-int (*sym_dwfl_standard_find_debuginfo)(Dwfl_Module *, void **, const char *, Dwarf_Addr, const char *, const char *, GElf_Word, char **);
-int (*sym_dwfl_thread_getframes)(Dwfl_Thread *, int (*)(Dwfl_Frame *, void *), void *);
-pid_t (*sym_dwfl_thread_tid)(Dwfl_Thread *);
+static DLSYM_FUNCTION(dwelf_elf_gnu_build_id);
+static DLSYM_FUNCTION(dwarf_tag);
+static DLSYM_FUNCTION(dwfl_addrmodule);
+static DLSYM_FUNCTION(dwfl_begin);
+static DLSYM_FUNCTION(dwfl_build_id_find_elf);
+static DLSYM_FUNCTION(dwfl_core_file_attach);
+static DLSYM_FUNCTION(dwfl_core_file_report);
+static DLSYM_FUNCTION(dwfl_end);
+static DLSYM_FUNCTION(dwfl_errmsg);
+static DLSYM_FUNCTION(dwfl_errno);
+static DLSYM_FUNCTION(dwfl_frame_pc);
+static DLSYM_FUNCTION(dwfl_getmodules);
+static DLSYM_FUNCTION(dwfl_getthreads);
+static DLSYM_FUNCTION(dwfl_module_addrdie);
+static DLSYM_FUNCTION(dwfl_module_addrname);
+static DLSYM_FUNCTION(dwfl_module_build_id);
+static DLSYM_FUNCTION(dwfl_module_getelf);
+static DLSYM_FUNCTION(dwfl_module_info);
+static DLSYM_FUNCTION(dwfl_offline_section_address);
+static DLSYM_FUNCTION(dwfl_report_end);
+static DLSYM_FUNCTION(dwfl_standard_find_debuginfo);
+static DLSYM_FUNCTION(dwfl_thread_getframes);
+static DLSYM_FUNCTION(dwfl_thread_tid);
 
 /* libelf symbols */
-Elf *(*sym_elf_begin)(int, Elf_Cmd, Elf *);
-int (*sym_elf_end)(Elf *);
-Elf_Data *(*sym_elf_getdata_rawchunk)(Elf *, int64_t, size_t, Elf_Type);
-GElf_Ehdr *(*sym_gelf_getehdr)(Elf *, GElf_Ehdr *);
-int (*sym_elf_getphdrnum)(Elf *, size_t *);
-const char *(*sym_elf_errmsg)(int);
-int (*sym_elf_errno)(void);
-Elf *(*sym_elf_memory)(char *, size_t);
-unsigned int (*sym_elf_version)(unsigned int);
-GElf_Phdr *(*sym_gelf_getphdr)(Elf *, int, GElf_Phdr *);
-size_t (*sym_gelf_getnote)(Elf_Data *, size_t, GElf_Nhdr *, size_t *, size_t *);
+static DLSYM_FUNCTION(elf_begin);
+static DLSYM_FUNCTION(elf_end);
+static DLSYM_FUNCTION(elf_getdata_rawchunk);
+static DLSYM_FUNCTION(gelf_getehdr);
+static DLSYM_FUNCTION(elf_getphdrnum);
+static DLSYM_FUNCTION(elf_errmsg);
+static DLSYM_FUNCTION(elf_errno);
+static DLSYM_FUNCTION(elf_memory);
+static DLSYM_FUNCTION(elf_version);
+static DLSYM_FUNCTION(gelf_getphdr);
+static DLSYM_FUNCTION(gelf_getnote);
 
 int dlopen_dw(void) {
         int r;
+
+        ELF_NOTE_DLOPEN("dw",
+                        "Support for backtrace and ELF package metadata decoding from core files",
+                        ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
+                        "libdw.so.1");
 
         r = dlopen_many_sym_or_warn(
                         &dw_dl, "libdw.so.1", LOG_DEBUG,
@@ -129,6 +134,11 @@ int dlopen_dw(void) {
 
 int dlopen_elf(void) {
         int r;
+
+        ELF_NOTE_DLOPEN("elf",
+                        "Support for backtraces and reading ELF package metadata from core files",
+                        ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
+                        "libelf.so.1");
 
         r = dlopen_many_sym_or_warn(
                         &elf_dl, "libelf.so.1", LOG_DEBUG,
@@ -348,7 +358,7 @@ static int parse_package_metadata(const char *name, JsonVariant *id_json, Elf *e
 
                 /* Package metadata is in PT_NOTE headers. */
                 program_header = sym_gelf_getphdr(elf, i, &mem);
-                if (!program_header || (program_header->p_type != PT_NOTE && program_header->p_type != PT_INTERP))
+                if (!program_header || !IN_SET(program_header->p_type, PT_NOTE, PT_INTERP))
                         continue;
 
                 if (program_header->p_type == PT_INTERP) {
@@ -403,7 +413,7 @@ static int parse_package_metadata(const char *name, JsonVariant *id_json, Elf *e
                         /* If we have a build-id, merge it in the same JSON object so that it appears all
                          * nicely together in the logs/metadata. */
                         if (id_json) {
-                                r = json_variant_merge(&v, id_json);
+                                r = json_variant_merge_object(&v, id_json);
                                 if (r < 0)
                                         return log_error_errno(r, "json_variant_merge of package meta with buildId failed: %m");
                         }
@@ -419,7 +429,7 @@ static int parse_package_metadata(const char *name, JsonVariant *id_json, Elf *e
                         if (r < 0)
                                 return log_error_errno(r, "Failed to build JSON object: %m");
 
-                        r = json_variant_merge(c->package_metadata, w);
+                        r = json_variant_merge_object(c->package_metadata, w);
                         if (r < 0)
                                 return log_error_errno(r, "json_variant_merge of package meta with buildId failed: %m");
 
@@ -540,7 +550,7 @@ static int module_callback(Dwfl_Module *mod, void **userdata, const char *name, 
                         continue;
 
                 /* Check that the end of segment is a valid address. */
-                if (__builtin_add_overflow(program_header->p_vaddr, program_header->p_memsz, &end_of_segment)) {
+                if (!ADD_SAFE(&end_of_segment, program_header->p_vaddr, program_header->p_memsz)) {
                         log_error("Abort due to corrupted core dump, end of segment address %#zx + %#zx overflows", (size_t)program_header->p_vaddr, (size_t)program_header->p_memsz);
                         return DWARF_CB_ABORT;
                 }
@@ -588,7 +598,7 @@ static int parse_core(int fd, const char *executable, char **ret, JsonVariant **
 
         assert(fd >= 0);
 
-        if (lseek(fd, 0, SEEK_SET) == (off_t) -1)
+        if (lseek(fd, 0, SEEK_SET) < 0)
                 return log_warning_errno(errno, "Failed to seek to beginning of the core file: %m");
 
         if (ret && !memstream_init(&c.m))
@@ -644,7 +654,7 @@ static int parse_elf(int fd, const char *executable, char **ret, JsonVariant **r
 
         assert(fd >= 0);
 
-        if (lseek(fd, 0, SEEK_SET) == (off_t) -1)
+        if (lseek(fd, 0, SEEK_SET) < 0)
                 return log_warning_errno(errno, "Failed to seek to beginning of the ELF file: %m");
 
         if (ret && !memstream_init(&c.m))
@@ -712,7 +722,7 @@ static int parse_elf(int fd, const char *executable, char **ret, JsonVariant **r
                 if (r < 0)
                         return log_warning_errno(r, "Failed to build JSON object: %m");
 
-                r = json_variant_merge(&elf_metadata, json_architecture);
+                r = json_variant_merge_object(&elf_metadata, json_architecture);
                 if (r < 0)
                         return log_warning_errno(r, "Failed to merge JSON objects: %m");
 
@@ -722,7 +732,7 @@ static int parse_elf(int fd, const char *executable, char **ret, JsonVariant **r
 #endif
 
         /* We always at least have the ELF type, so merge that (and possibly the arch). */
-        r = json_variant_merge(&elf_metadata, package_metadata);
+        r = json_variant_merge_object(&elf_metadata, package_metadata);
         if (r < 0)
                 return log_warning_errno(r, "Failed to merge JSON objects: %m");
 
@@ -739,9 +749,9 @@ static int parse_elf(int fd, const char *executable, char **ret, JsonVariant **r
 }
 
 int parse_elf_object(int fd, const char *executable, bool fork_disable_dump, char **ret, JsonVariant **ret_package_metadata) {
-        _cleanup_close_pair_ int error_pipe[2] = PIPE_EBADF,
-                                 return_pipe[2] = PIPE_EBADF,
-                                 json_pipe[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int error_pipe[2] = EBADF_PAIR,
+                                 return_pipe[2] = EBADF_PAIR,
+                                 json_pipe[2] = EBADF_PAIR;
         _cleanup_(json_variant_unrefp) JsonVariant *package_metadata = NULL;
         _cleanup_free_ char *buf = NULL;
         int r;
@@ -826,7 +836,7 @@ int parse_elf_object(int fd, const char *executable, bool fork_disable_dump, cha
                          * Failure is ignored, because partial output is still useful. */
                         (void) fcntl(return_pipe[1], F_SETPIPE_SZ, len);
 
-                        r = loop_write(return_pipe[1], buf, len, false);
+                        r = loop_write(return_pipe[1], buf, len);
                         if (r == -EAGAIN)
                                 log_warning("Write failed, backtrace will be truncated.");
                         else if (r < 0)

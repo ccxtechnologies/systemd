@@ -50,6 +50,7 @@ static bool arg_now = false;
 static bool arg_no_block = false;
 static char **arg_extension_images = NULL;
 static bool arg_force = false;
+static bool arg_clean = false;
 
 STATIC_DESTRUCTOR_REGISTER(arg_extension_images, strv_freep);
 
@@ -91,12 +92,14 @@ static int determine_image(const char *image, bool permit_non_existing, char **r
         return 0;
 }
 
-static int attach_extensions_to_message(sd_bus_message *m, char **extensions) {
+static int attach_extensions_to_message(sd_bus_message *m, const char *method, char **extensions) {
         int r;
 
         assert(m);
+        assert(method);
 
-        if (strv_isempty(extensions))
+        /* The new methods also have flags parameters that are independent of the extensions */
+        if (strv_isempty(extensions) && !endswith(method, "WithExtensions"))
                 return 0;
 
         r = sd_bus_message_open_container(m, 'a', "s");
@@ -106,7 +109,10 @@ static int attach_extensions_to_message(sd_bus_message *m, char **extensions) {
         STRV_FOREACH(p, extensions) {
                 _cleanup_free_ char *resolved_extension_image = NULL;
 
-                r = determine_image(*p, false, &resolved_extension_image);
+                r = determine_image(
+                                *p,
+                                startswith_strv(method, STRV_MAKE("Get", "Detach")),
+                                &resolved_extension_image);
                 if (r < 0)
                         return r;
 
@@ -246,7 +252,7 @@ static int maybe_reload(sd_bus **bus) {
 static int get_image_metadata(sd_bus *bus, const char *image, char **matches, sd_bus_message **reply) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        uint64_t flags = arg_force ? PORTABLE_FORCE_SYSEXT : 0;
+        uint64_t flags = arg_force ? PORTABLE_FORCE_EXTENSION : 0;
         const char *method;
         int r;
 
@@ -263,7 +269,7 @@ static int get_image_metadata(sd_bus *bus, const char *image, char **matches, sd
         if (r < 0)
                 return bus_log_create_error(r);
 
-        r = attach_extensions_to_message(m, arg_extension_images);
+        r = attach_extensions_to_message(m, method, arg_extension_images);
         if (r < 0)
                 return r;
 
@@ -271,7 +277,7 @@ static int get_image_metadata(sd_bus *bus, const char *image, char **matches, sd
         if (r < 0)
                 return bus_log_create_error(r);
 
-        if (!strv_isempty(arg_extension_images)) {
+        if (streq(method, "GetImageMetadataWithExtensions")) {
                 r = sd_bus_message_append(m, "t", flags);
                 if (r < 0)
                         return bus_log_create_error(r);
@@ -382,9 +388,16 @@ static int inspect_image(int argc, char *argv[], void *userdata) {
                                 fflush(stdout);
                                 nl = true;
                         } else {
-                                _cleanup_free_ char *pretty_portable = NULL, *pretty_os = NULL, *sysext_level = NULL,
-                                        *sysext_id = NULL, *sysext_version_id = NULL, *sysext_scope = NULL, *portable_prefixes = NULL,
-                                        *id = NULL, *version_id = NULL, *image_id = NULL, *image_version = NULL, *build_id = NULL;
+                                _cleanup_free_ char *pretty_portable = NULL, *sysext_pretty_os = NULL,
+                                                    *sysext_level = NULL, *sysext_id = NULL,
+                                                    *sysext_version_id = NULL, *sysext_scope = NULL,
+                                                    *portable_prefixes = NULL, *id = NULL, *version_id = NULL,
+                                                    *sysext_image_id = NULL, *sysext_image_version = NULL,
+                                                    *sysext_build_id = NULL, *confext_pretty_os = NULL,
+                                                    *confext_level = NULL, *confext_id = NULL,
+                                                    *confext_version_id = NULL, *confext_scope = NULL,
+                                                    *confext_image_id = NULL, *confext_image_version = NULL,
+                                                    *confext_build_id = NULL;
                                 _cleanup_fclose_ FILE *f = NULL;
 
                                 f = fmemopen_unlocked((void*) data, sz, "r");
@@ -394,12 +407,20 @@ static int inspect_image(int argc, char *argv[], void *userdata) {
                                 r = parse_env_file(f, name,
                                                    "SYSEXT_ID", &sysext_id,
                                                    "SYSEXT_VERSION_ID", &sysext_version_id,
-                                                   "SYSEXT_BUILD_ID", &build_id,
-                                                   "SYSEXT_IMAGE_ID", &image_id,
-                                                   "SYSEXT_IMAGE_VERSION", &image_version,
-                                                   "SYSEXT_PRETTY_NAME", &pretty_os,
+                                                   "SYSEXT_BUILD_ID", &sysext_build_id,
+                                                   "SYSEXT_IMAGE_ID", &sysext_image_id,
+                                                   "SYSEXT_IMAGE_VERSION", &sysext_image_version,
                                                    "SYSEXT_SCOPE", &sysext_scope,
                                                    "SYSEXT_LEVEL", &sysext_level,
+                                                   "SYSEXT_PRETTY_NAME", &sysext_pretty_os,
+                                                   "CONFEXT_ID", &confext_id,
+                                                   "CONFEXT_VERSION_ID", &confext_version_id,
+                                                   "CONFEXT_BUILD_ID", &confext_build_id,
+                                                   "CONFEXT_IMAGE_ID", &confext_image_id,
+                                                   "CONFEXT_IMAGE_VERSION", &confext_image_version,
+                                                   "CONFEXT_SCOPE", &confext_scope,
+                                                   "CONFEXT_LEVEL", &confext_level,
+                                                   "CONFEXT_PRETTY_NAME", &confext_pretty_os,
                                                    "ID", &id,
                                                    "VERSION_ID", &version_id,
                                                    "PORTABLE_PRETTY_NAME", &pretty_portable,
@@ -416,18 +437,18 @@ static int inspect_image(int argc, char *argv[], void *userdata) {
                                        "\tPortable Prefixes:\n\t\t%s\n"
                                        "\tExtension Image:\n\t\t%s%s%s %s%s%s\n",
                                        name,
-                                       strna(sysext_scope),
-                                       strna(sysext_level),
+                                       strna(sysext_scope ?: confext_scope),
+                                       strna(sysext_level ?: confext_level),
                                        strna(id),
                                        strna(version_id),
                                        strna(pretty_portable),
                                        strna(portable_prefixes),
-                                       strempty(pretty_os),
-                                       pretty_os ? " (" : "ID: ",
-                                       strna(sysext_id ?: image_id),
-                                       pretty_os ? "" : "Version: ",
-                                       strna(sysext_version_id ?: image_version ?: build_id),
-                                       pretty_os ? ")" : "");
+                                       strempty(sysext_pretty_os ?: confext_pretty_os),
+                                       (sysext_pretty_os ?: confext_pretty_os) ? " (" : "ID: ",
+                                       strna(sysext_id ?: sysext_image_id ?: confext_id ?: confext_image_id),
+                                       (sysext_pretty_os ?: confext_pretty_os)  ? "" : "Version: ",
+                                       strna(sysext_version_id ?: sysext_image_version ?: sysext_build_id ?: confext_version_id ?: confext_image_version ?: confext_build_id),
+                                       (sysext_pretty_os ?: confext_pretty_os)  ? ")" : "");
                         }
 
                         r = sd_bus_message_exit_container(reply);
@@ -749,13 +770,49 @@ static int maybe_stop_enable_restart(sd_bus *bus, sd_bus_message *reply) {
         return 0;
 }
 
-static int maybe_stop_disable(sd_bus *bus, char *image, char *argv[]) {
-        _cleanup_(bus_wait_for_jobs_freep) BusWaitForJobs *wait = NULL;
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        _cleanup_strv_free_ char **matches = NULL;
+static int maybe_clean_units(sd_bus *bus, char **units) {
         int r;
 
-        if (!arg_enable && !arg_now)
+        assert(bus);
+
+        if (!arg_clean)
+                return 0;
+
+        STRV_FOREACH(name, units) {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+
+                r = bus_message_new_method_call(bus, &m, bus_systemd_mgr, "CleanUnit");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(m, "s", *name);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append_strv(m, STRV_MAKE("all", "fdstore"));
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_call(bus, m, 0, &error, NULL);
+                if (r < 0)
+                        return log_error_errno(
+                                        r,
+                                        "Failed to call CleanUnit on portable service %s: %s",
+                                        *name,
+                                        bus_error_message(&error, r));
+        }
+
+        return 0;
+}
+
+static int maybe_stop_disable_clean(sd_bus *bus, char *image, char *argv[]) {
+        _cleanup_(bus_wait_for_jobs_freep) BusWaitForJobs *wait = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_strv_free_ char **matches = NULL, **units = NULL;
+        int r;
+
+        if (!arg_enable && !arg_now && !arg_clean)
                 return 0;
 
         r = determine_matches(argv[1], argv + 2, true, &matches);
@@ -774,8 +831,9 @@ static int maybe_stop_disable(sd_bus *bus, char *image, char *argv[]) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        /* If we specified any extensions, we'll first an array of extension-release metadata. */
-        if (!strv_isempty(arg_extension_images)) {
+        /* If we specified any extensions or --force (which makes the request go through the new
+         * WithExtensions calls), we'll first get an array of extension-release metadata. */
+        if (!strv_isempty(arg_extension_images) || arg_force) {
                 r = sd_bus_message_skip(reply, "a{say}");
                 if (r < 0)
                         return bus_log_parse_error(r);
@@ -808,6 +866,10 @@ static int maybe_stop_disable(sd_bus *bus, char *image, char *argv[]) {
 
                 (void) maybe_start_stop_restart(bus, name, "StopUnit", wait);
                 (void) maybe_enable_disable(bus, name, false);
+
+                r = strv_extend(&units, name);
+                if (r < 0)
+                        return log_oom();
         }
 
         r = sd_bus_message_exit_container(reply);
@@ -818,6 +880,9 @@ static int maybe_stop_disable(sd_bus *bus, char *image, char *argv[]) {
         r = bus_wait_for_jobs(wait, arg_quiet, NULL);
         if (r < 0)
                 return r;
+
+        /* Need to ensure all units are stopped before calling CleanUnit, as files might be in use. */
+        (void) maybe_clean_units(bus, units);
 
         return 0;
 }
@@ -855,7 +920,7 @@ static int attach_reattach_image(int argc, char *argv[], const char *method) {
         if (r < 0)
                 return bus_log_create_error(r);
 
-        r = attach_extensions_to_message(m, arg_extension_images);
+        r = attach_extensions_to_message(m, method, arg_extension_images);
         if (r < 0)
                 return r;
 
@@ -868,7 +933,7 @@ static int attach_reattach_image(int argc, char *argv[], const char *method) {
                 return bus_log_create_error(r);
 
         if (STR_IN_SET(method, "AttachImageWithExtensions", "ReattachImageWithExtensions")) {
-                uint64_t flags = (arg_runtime ? PORTABLE_RUNTIME : 0) | (arg_force ? PORTABLE_FORCE_ATTACH | PORTABLE_FORCE_SYSEXT : 0);
+                uint64_t flags = (arg_runtime ? PORTABLE_RUNTIME : 0) | (arg_force ? PORTABLE_FORCE_ATTACH | PORTABLE_FORCE_EXTENSION : 0);
 
                 r = sd_bus_message_append(m, "st", arg_copy_mode, flags);
         } else
@@ -921,7 +986,7 @@ static int detach_image(int argc, char *argv[], void *userdata) {
 
         (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
-        (void) maybe_stop_disable(bus, image, argv);
+        (void) maybe_stop_disable_clean(bus, image, argv);
 
         method = strv_isempty(arg_extension_images) && !arg_force ? "DetachImage" : "DetachImageWithExtensions";
 
@@ -933,14 +998,14 @@ static int detach_image(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return bus_log_create_error(r);
 
-        r = attach_extensions_to_message(m, arg_extension_images);
+        r = attach_extensions_to_message(m, method, arg_extension_images);
         if (r < 0)
                 return r;
 
-        if (strv_isempty(arg_extension_images))
+        if (streq(method, "DetachImage"))
                 r = sd_bus_message_append(m, "b", arg_runtime);
         else {
-                uint64_t flags = (arg_runtime ? PORTABLE_RUNTIME : 0) | (arg_force ? PORTABLE_FORCE_ATTACH | PORTABLE_FORCE_SYSEXT : 0);
+                uint64_t flags = (arg_runtime ? PORTABLE_RUNTIME : 0) | (arg_force ? PORTABLE_FORCE_ATTACH | PORTABLE_FORCE_EXTENSION : 0);
 
                 r = sd_bus_message_append(m, "t", flags);
         }
@@ -1009,7 +1074,7 @@ static int list_images(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        if (table_get_rows(table) > 1) {
+        if (!table_isempty(table)) {
                 r = table_set_sort(table, (size_t) 0);
                 if (r < 0)
                         return table_log_sort_error(r);
@@ -1022,10 +1087,10 @@ static int list_images(int argc, char *argv[], void *userdata) {
         }
 
         if (arg_legend) {
-                if (table_get_rows(table) > 1)
-                        printf("\n%zu images listed.\n", table_get_rows(table) - 1);
-                else
+                if (table_isempty(table))
                         printf("No images.\n");
+                else
+                        printf("\n%zu images listed.\n", table_get_rows(table) - 1);
         }
 
         return 0;
@@ -1145,12 +1210,12 @@ static int is_image_attached(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return bus_log_create_error(r);
 
-        r = attach_extensions_to_message(m, arg_extension_images);
+        r = attach_extensions_to_message(m, method, arg_extension_images);
         if (r < 0)
                 return r;
 
         if (!strv_isempty(arg_extension_images)) {
-                r = sd_bus_message_append(m, "t", 0);
+                r = sd_bus_message_append(m, "t", UINT64_C(0));
                 if (r < 0)
                         return bus_log_create_error(r);
         }
@@ -1230,7 +1295,8 @@ static int help(int argc, char *argv[], void *userdata) {
                "  -M --machine=CONTAINER      Operate on local container\n"
                "  -q --quiet                  Suppress informational messages\n"
                "  -p --profile=PROFILE        Pick security profile for portable service\n"
-               "     --copy=copy|auto|symlink Prefer copying or symlinks if possible\n"
+               "     --copy=copy|auto|symlink|mixed\n"
+               "                              Pick copying or symlinking of resources\n"
                "     --runtime                Attach portable service until next reboot only\n"
                "     --no-reload              Don't reload the system and service manager\n"
                "     --cat                    When inspecting include unit and os-release file\n"
@@ -1243,6 +1309,9 @@ static int help(int argc, char *argv[], void *userdata) {
                "     --extension=PATH         Extend the image with an overlay\n"
                "     --force                  Skip 'already active' check when attaching or\n"
                "                              detaching an image (with extensions)\n"
+               "     --clean                  When detaching, also remove configuration, state,\n"
+               "                              cache, logs or runtime data of the portable\n"
+               "                              service(s)\n"
                "\nSee the %s for details.\n",
                program_invocation_short_name,
                ansi_highlight(),
@@ -1269,6 +1338,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_NO_BLOCK,
                 ARG_EXTENSION,
                 ARG_FORCE,
+                ARG_CLEAN,
         };
 
         static const struct option options[] = {
@@ -1290,6 +1360,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "no-block",        no_argument,       NULL, ARG_NO_BLOCK        },
                 { "extension",       required_argument, NULL, ARG_EXTENSION       },
                 { "force",           no_argument,       NULL, ARG_FORCE           },
+                { "clean",           no_argument,       NULL, ARG_CLEAN           },
                 {}
         };
 
@@ -1351,12 +1422,13 @@ static int parse_argv(int argc, char *argv[]) {
                 case ARG_COPY:
                         if (streq(optarg, "auto"))
                                 arg_copy_mode = NULL;
-                        else if (STR_IN_SET(optarg, "copy", "symlink"))
+                        else if (STR_IN_SET(optarg, "copy", "symlink", "mixed"))
                                 arg_copy_mode = optarg;
                         else if (streq(optarg, "help")) {
                                 puts("auto\n"
                                      "copy\n"
-                                     "symlink");
+                                     "symlink\n"
+                                     "mixed\n");
                                 return 0;
                         } else
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -1396,6 +1468,10 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_FORCE:
                         arg_force = true;
+                        break;
+
+                case ARG_CLEAN:
+                        arg_clean = true;
                         break;
 
                 case '?':

@@ -118,11 +118,7 @@ static int link_get_wiphy(Link *link, Wiphy **ret) {
         if (!link->dev)
                 return -ENODEV;
 
-        r = sd_device_get_devtype(link->dev, &s);
-        if (r < 0)
-                return r;
-
-        if (!streq_ptr(s, "wlan"))
+        if (!device_is_devtype(link->dev, "wlan"))
                 return -EOPNOTSUPP;
 
         r = sd_device_new_child(&phy, link->dev, "phy80211");
@@ -214,11 +210,10 @@ int link_rfkilled(Link *link) {
         assert(link);
 
         r = link_get_wiphy(link, &w);
-        if (r < 0) {
-                if (ERRNO_IS_NOT_SUPPORTED(r) || ERRNO_IS_DEVICE_ABSENT(r))
-                        return false; /* Typically, non-wifi interface or running in container */
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r) || ERRNO_IS_NEG_DEVICE_ABSENT(r))
+                return false; /* Typically, non-wifi interface or running in container */
+        if (r < 0)
                 return log_link_debug_errno(link, r, "Could not get phy: %m");
-        }
 
         return wiphy_rfkilled(w);
 }
@@ -339,20 +334,16 @@ static int wiphy_update(Wiphy *w) {
         assert(w);
 
         r = wiphy_update_device(w);
-        if (r < 0) {
-                if (ERRNO_IS_DEVICE_ABSENT(r))
-                        log_wiphy_debug_errno(w, r, "Failed to update wiphy device, ignoring: %m");
-                else
-                        return log_wiphy_warning_errno(w, r, "Failed to update wiphy device: %m");
-        }
+        if (ERRNO_IS_NEG_DEVICE_ABSENT(r))
+                log_wiphy_debug_errno(w, r, "Failed to update wiphy device, ignoring: %m");
+        else if (r < 0)
+                return log_wiphy_warning_errno(w, r, "Failed to update wiphy device: %m");
 
         r = wiphy_update_rfkill(w);
-        if (r < 0) {
-                if (ERRNO_IS_DEVICE_ABSENT(r))
-                        log_wiphy_debug_errno(w, r, "Failed to update rfkill device, ignoring: %m");
-                else
-                        return log_wiphy_warning_errno(w, r, "Failed to update rfkill device: %m");
-        }
+        if (ERRNO_IS_NEG_DEVICE_ABSENT(r))
+                log_wiphy_debug_errno(w, r, "Failed to update rfkill device, ignoring: %m");
+        else if (r < 0)
+                return log_wiphy_warning_errno(w, r, "Failed to update rfkill device: %m");
 
         return 0;
 }

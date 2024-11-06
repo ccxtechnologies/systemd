@@ -45,8 +45,11 @@ int journal_file_append_tag(JournalFile *f) {
         if (!JOURNAL_HEADER_SEALED(f->header))
                 return 0;
 
-        if (!f->hmac_running)
-                return 0;
+        if (!f->hmac_running) {
+                r = journal_file_hmac_start(f);
+                if (r < 0)
+                        return r;
+        }
 
         assert(f->hmac);
 
@@ -68,7 +71,7 @@ int journal_file_append_tag(JournalFile *f) {
                 return r;
 
         /* Get the HMAC tag and store it in the object */
-        memcpy(o->tag.tag, gcry_md_read(f->hmac, 0), TAG_LENGTH);
+        memcpy(o->tag.tag, sym_gcry_md_read(f->hmac, 0), TAG_LENGTH);
         f->hmac_running = false;
 
         return 0;
@@ -77,6 +80,7 @@ int journal_file_append_tag(JournalFile *f) {
 int journal_file_hmac_start(JournalFile *f) {
         uint8_t key[256 / 8]; /* Let's pass 256 bit from FSPRG to HMAC */
         gcry_error_t err;
+        int r;
 
         assert(f);
 
@@ -87,13 +91,17 @@ int journal_file_hmac_start(JournalFile *f) {
                 return 0;
 
         /* Prepare HMAC for next cycle */
-        gcry_md_reset(f->hmac);
-        FSPRG_GetKey(f->fsprg_state, key, sizeof(key), 0);
-        err = gcry_md_setkey(f->hmac, key, sizeof(key));
+        sym_gcry_md_reset(f->hmac);
+
+        r = FSPRG_GetKey(f->fsprg_state, key, sizeof(key), 0);
+        if (r < 0)
+                return r;
+
+        err = sym_gcry_md_setkey(f->hmac, key, sizeof(key));
         if (gcry_err_code(err) != GPG_ERR_NO_ERROR)
                 return log_debug_errno(SYNTHETIC_ERRNO(EIO),
-                                       "gcry_md_setkey() failed with error code: %s",
-                                       gcry_strerror(err));
+                                       "sym_gcry_md_setkey() failed with error code: %s",
+                                       sym_gcry_strerror(err));
 
         f->hmac_running = true;
 
@@ -164,14 +172,23 @@ int journal_file_fsprg_evolve(JournalFile *f, uint64_t realtime) {
                 if (epoch == goal)
                         return 0;
 
-                FSPRG_Evolve(f->fsprg_state);
+                r = FSPRG_Evolve(f->fsprg_state);
+                if (r < 0)
+                        return r;
+
                 epoch = FSPRG_GetEpoch(f->fsprg_state);
+                if (epoch < goal) {
+                        r = journal_file_append_tag(f);
+                        if (r < 0)
+                                return r;
+                }
         }
 }
 
 int journal_file_fsprg_seek(JournalFile *f, uint64_t goal) {
         void *msk;
         uint64_t epoch;
+        int r;
 
         assert(f);
 
@@ -187,10 +204,8 @@ int journal_file_fsprg_seek(JournalFile *f, uint64_t goal) {
                 if (goal == epoch)
                         return 0;
 
-                if (goal == epoch + 1) {
-                        FSPRG_Evolve(f->fsprg_state);
-                        return 0;
-                }
+                if (goal == epoch + 1)
+                        return FSPRG_Evolve(f->fsprg_state);
         } else {
                 f->fsprg_state_size = FSPRG_stateinbytes(FSPRG_RECOMMENDED_SECPAR);
                 f->fsprg_state = malloc(f->fsprg_state_size);
@@ -201,10 +216,12 @@ int journal_file_fsprg_seek(JournalFile *f, uint64_t goal) {
         log_debug("Seeking FSPRG key to %"PRIu64".", goal);
 
         msk = alloca_safe(FSPRG_mskinbytes(FSPRG_RECOMMENDED_SECPAR));
-        FSPRG_GenMK(msk, NULL, f->fsprg_seed, f->fsprg_seed_size, FSPRG_RECOMMENDED_SECPAR);
-        FSPRG_Seek(f->fsprg_state, goal, msk, f->fsprg_seed, f->fsprg_seed_size);
 
-        return 0;
+        r = FSPRG_GenMK(msk, NULL, f->fsprg_seed, f->fsprg_seed_size, FSPRG_RECOMMENDED_SECPAR);
+        if (r < 0)
+                return r;
+
+        return FSPRG_Seek(f->fsprg_state, goal, msk, f->fsprg_seed, f->fsprg_seed_size);
 }
 
 int journal_file_maybe_append_tag(JournalFile *f, uint64_t realtime) {
@@ -252,25 +269,25 @@ int journal_file_hmac_put_object(JournalFile *f, ObjectType type, Object *o, uin
         } else if (type > OBJECT_UNUSED && o->object.type != type)
                 return -EBADMSG;
 
-        gcry_md_write(f->hmac, o, offsetof(ObjectHeader, payload));
+        sym_gcry_md_write(f->hmac, o, offsetof(ObjectHeader, payload));
 
         switch (o->object.type) {
 
         case OBJECT_DATA:
                 /* All but hash and payload are mutable */
-                gcry_md_write(f->hmac, &o->data.hash, sizeof(o->data.hash));
-                gcry_md_write(f->hmac, journal_file_data_payload_field(f, o), le64toh(o->object.size) - journal_file_data_payload_offset(f));
+                sym_gcry_md_write(f->hmac, &o->data.hash, sizeof(o->data.hash));
+                sym_gcry_md_write(f->hmac, journal_file_data_payload_field(f, o), le64toh(o->object.size) - journal_file_data_payload_offset(f));
                 break;
 
         case OBJECT_FIELD:
                 /* Same here */
-                gcry_md_write(f->hmac, &o->field.hash, sizeof(o->field.hash));
-                gcry_md_write(f->hmac, o->field.payload, le64toh(o->object.size) - offsetof(Object, field.payload));
+                sym_gcry_md_write(f->hmac, &o->field.hash, sizeof(o->field.hash));
+                sym_gcry_md_write(f->hmac, o->field.payload, le64toh(o->object.size) - offsetof(Object, field.payload));
                 break;
 
         case OBJECT_ENTRY:
                 /* All */
-                gcry_md_write(f->hmac, &o->entry.seqnum, le64toh(o->object.size) - offsetof(Object, entry.seqnum));
+                sym_gcry_md_write(f->hmac, &o->entry.seqnum, le64toh(o->object.size) - offsetof(Object, entry.seqnum));
                 break;
 
         case OBJECT_FIELD_HASH_TABLE:
@@ -281,8 +298,8 @@ int journal_file_hmac_put_object(JournalFile *f, ObjectType type, Object *o, uin
 
         case OBJECT_TAG:
                 /* All but the tag itself */
-                gcry_md_write(f->hmac, &o->tag.seqnum, sizeof(o->tag.seqnum));
-                gcry_md_write(f->hmac, &o->tag.epoch, sizeof(o->tag.epoch));
+                sym_gcry_md_write(f->hmac, &o->tag.seqnum, sizeof(o->tag.seqnum));
+                sym_gcry_md_write(f->hmac, &o->tag.epoch, sizeof(o->tag.epoch));
                 break;
         default:
                 return -EINVAL;
@@ -310,10 +327,10 @@ int journal_file_hmac_put_header(JournalFile *f) {
          * tail_entry_monotonic, n_data, n_fields, n_tags,
          * n_entry_arrays. */
 
-        gcry_md_write(f->hmac, f->header->signature, offsetof(Header, state) - offsetof(Header, signature));
-        gcry_md_write(f->hmac, &f->header->file_id, offsetof(Header, tail_entry_boot_id) - offsetof(Header, file_id));
-        gcry_md_write(f->hmac, &f->header->seqnum_id, offsetof(Header, arena_size) - offsetof(Header, seqnum_id));
-        gcry_md_write(f->hmac, &f->header->data_hash_table_offset, offsetof(Header, tail_object_offset) - offsetof(Header, data_hash_table_offset));
+        sym_gcry_md_write(f->hmac, f->header->signature, offsetof(Header, state) - offsetof(Header, signature));
+        sym_gcry_md_write(f->hmac, &f->header->file_id, offsetof(Header, tail_entry_boot_id) - offsetof(Header, file_id));
+        sym_gcry_md_write(f->hmac, &f->header->seqnum_id, offsetof(Header, arena_size) - offsetof(Header, seqnum_id));
+        sym_gcry_md_write(f->hmac, &f->header->data_hash_table_offset, offsetof(Header, tail_object_offset) - offsetof(Header, data_hash_table_offset));
 
         return 0;
 }
@@ -379,7 +396,9 @@ int journal_file_fss_load(JournalFile *f) {
         if (le64toh(header->start_usec) <= 0 || le64toh(header->interval_usec) <= 0)
                 return -EBADMSG;
 
-        f->fss_file = mmap(NULL, PAGE_ALIGN(f->fss_file_size), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+        size_t sz = PAGE_ALIGN(f->fss_file_size);
+        assert(sz < SIZE_MAX);
+        f->fss_file = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
         if (f->fss_file == MAP_FAILED) {
                 f->fss_file = NULL;
                 return -errno;
@@ -396,13 +415,16 @@ int journal_file_fss_load(JournalFile *f) {
 
 int journal_file_hmac_setup(JournalFile *f) {
         gcry_error_t e;
+        int r;
 
         if (!JOURNAL_HEADER_SEALED(f->header))
                 return 0;
 
-        initialize_libgcrypt(true);
+        r = initialize_libgcrypt(true);
+        if (r < 0)
+                return r;
 
-        e = gcry_md_open(&f->hmac, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC);
+        e = sym_gcry_md_open(&f->hmac, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC);
         if (e != 0)
                 return -EOPNOTSUPP;
 

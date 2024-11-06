@@ -5,10 +5,12 @@
 #include <stdbool.h>
 #include <stdio.h>
 
-#include "sd-ipv4acd.h"
-
 #include "conf-parser.h"
+#include "firewall-util.h"
+#include "hash-funcs.h"
 #include "in-addr-util.h"
+#include "network-util.h"
+#include "networkd-address-generation.h"
 #include "networkd-link.h"
 #include "networkd-util.h"
 #include "time-util.h"
@@ -33,6 +35,8 @@ struct Address {
         NetworkConfigState state;
         union in_addr_union provider; /* DHCP server or router address */
 
+        unsigned n_ref;
+
         int family;
         unsigned char prefixlen;
         unsigned char scope;
@@ -54,15 +58,19 @@ struct Address {
         bool scope_set:1;
         bool ip_masquerade_done:1;
         bool requested_as_null:1;
+        bool used_by_dhcp_server:1;
 
         /* duplicate_address_detection is only used by static or IPv4 dynamic addresses.
          * To control DAD for IPv6 dynamic addresses, set IFA_F_NODAD to flags. */
         AddressFamily duplicate_address_detection;
-        sd_ipv4acd *acd;
-        bool acd_bound;
+
+        /* Used by address generator. */
+        IPv6Token *token;
 
         /* Called when address become ready */
         address_ready_callback_t callback;
+
+        NFTSetContext nft_set_context;
 };
 
 const char* format_lifetime(char *buf, size_t l, usec_t lifetime_usec) _warn_unused_result_;
@@ -74,20 +82,33 @@ const char* format_lifetime(char *buf, size_t l, usec_t lifetime_usec) _warn_unu
 
 int address_flags_to_string_alloc(uint32_t flags, int family, char **ret);
 
+void link_get_address_states(
+                Link *link,
+                LinkAddressState *ret_ipv4,
+                LinkAddressState *ret_ipv6,
+                LinkAddressState *ret_all);
+
+extern const struct hash_ops address_hash_ops;
+
+bool address_can_update(const Address *existing, const Address *requesting);
+
+Address* address_ref(Address *address);
+Address* address_unref(Address *address);
+
 int address_new(Address **ret);
-Address* address_free(Address *address);
+int address_new_static(Network *network, const char *filename, unsigned section_line, Address **ret);
 int address_get(Link *link, const Address *in, Address **ret);
+int address_get_harder(Link *link, const Address *in, Address **ret);
 int address_configure_handler_internal(sd_netlink *rtnl, sd_netlink_message *m, Link *link, const char *error_msg);
-int address_remove(Address *address);
-int address_remove_and_drop(Address *address);
+int address_remove(Address *address, Link *link);
+int address_remove_and_cancel(Address *address, Link *link);
 int address_dup(const Address *src, Address **ret);
 bool address_is_ready(const Address *a);
 bool link_check_addresses_ready(Link *link, NetworkConfigSource source);
-void address_set_broadcast(Address *a, Link *link);
 
-DEFINE_SECTION_CLEANUP_FUNCTIONS(Address, address_free);
+DEFINE_SECTION_CLEANUP_FUNCTIONS(Address, address_unref);
 
-int link_drop_managed_addresses(Link *link);
+int link_drop_static_addresses(Link *link);
 int link_drop_foreign_addresses(Link *link);
 int link_drop_ipv6ll_addresses(Link *link);
 void link_foreignize_addresses(Link *link);
@@ -102,25 +123,21 @@ static inline int link_get_ipv4_address(Link *link, const struct in_addr *addres
         return link_get_address(link, AF_INET, &(union in_addr_union) { .in = *address }, prefixlen, ret);
 }
 int manager_get_address(Manager *manager, int family, const union in_addr_union *address, unsigned char prefixlen, Address **ret);
-bool manager_has_address(Manager *manager, int family, const union in_addr_union *address, bool check_ready);
+bool manager_has_address(Manager *manager, int family, const union in_addr_union *address);
 
-void address_cancel_request(Address *address);
 int link_request_address(
                 Link *link,
-                Address *address,
-                bool consume_object,
+                const Address *address,
                 unsigned *message_counter,
                 address_netlink_handler_t netlink_handler,
                 Request **ret);
-int link_request_static_address(Link *link, Address *address, bool consume);
+int link_request_static_address(Link *link, const Address *address);
 int link_request_static_addresses(Link *link);
 
 int manager_rtnl_process_address(sd_netlink *nl, sd_netlink_message *message, Manager *m);
 
+int address_section_verify(Address *address);
 int network_drop_invalid_addresses(Network *network);
-
-int address_compare_func(const Address *a1, const Address *a2);
-int address_equal(const Address *a1, const Address *a2);
 
 DEFINE_NETWORK_CONFIG_STATE_FUNCTIONS(Address, address);
 
@@ -135,3 +152,4 @@ CONFIG_PARSER_PROTOTYPE(config_parse_address_scope);
 CONFIG_PARSER_PROTOTYPE(config_parse_address_route_metric);
 CONFIG_PARSER_PROTOTYPE(config_parse_duplicate_address_detection);
 CONFIG_PARSER_PROTOTYPE(config_parse_address_netlabel);
+CONFIG_PARSER_PROTOTYPE(config_parse_address_ip_nft_set);

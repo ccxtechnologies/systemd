@@ -12,6 +12,7 @@
 #include "env-file.h"
 #include "env-util.h"
 #include "errno-util.h"
+#include "escape.h"
 #include "exec-util.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -35,26 +36,34 @@
 /* Put this test here for a lack of better place */
 assert_cc(EAGAIN == EWOULDBLOCK);
 
-static int do_spawn(const char *path, char *argv[], int stdout_fd, pid_t *pid, bool set_systemd_exec_pid) {
-        pid_t _pid;
+static int do_spawn(
+                const char *path,
+                char *argv[],
+                int stdout_fd,
+                bool set_systemd_exec_pid,
+                pid_t *ret_pid) {
+
         int r;
+
+        assert(path);
+        assert(ret_pid);
 
         if (null_or_empty_path(path) > 0) {
                 log_debug("%s is empty (a mask).", path);
                 return 0;
         }
 
-        r = safe_fork("(direxec)", FORK_DEATHSIG|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE, &_pid);
+        pid_t pid;
+        r = safe_fork_full(
+                        "(direxec)",
+                        (const int[]) { STDIN_FILENO, stdout_fd < 0 ? STDOUT_FILENO : stdout_fd, STDERR_FILENO },
+                        /* except_fds= */ NULL, /* n_except_fds= */ 0,
+                        FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE|FORK_REARRANGE_STDIO|FORK_CLOSE_ALL_FDS,
+                        &pid);
         if (r < 0)
                 return r;
         if (r == 0) {
                 char *_argv[2];
-
-                if (stdout_fd >= 0) {
-                        r = rearrange_stdio(STDIN_FILENO, TAKE_FD(stdout_fd), STDERR_FILENO);
-                        if (r < 0)
-                                _exit(EXIT_FAILURE);
-                }
 
                 if (set_systemd_exec_pid) {
                         r = setenv_systemd_exec_pid(false);
@@ -74,7 +83,7 @@ static int do_spawn(const char *path, char *argv[], int stdout_fd, pid_t *pid, b
                 _exit(EXIT_FAILURE);
         }
 
-        *pid = _pid;
+        *ret_pid = pid;
         return 1;
 }
 
@@ -138,7 +147,15 @@ static int do_execute(
                                 return log_error_errno(fd, "Failed to open serialization file: %m");
                 }
 
-                r = do_spawn(t, argv, fd, &pid, FLAGS_SET(flags, EXEC_DIR_SET_SYSTEMD_EXEC_PID));
+                if (DEBUG_LOGGING) {
+                        _cleanup_free_ char *args = NULL;
+                        if (argv)
+                                args = quote_command_line(strv_skip(argv, 1), SHELL_ESCAPE_EMPTY);
+
+                        log_debug("About to execute %s%s%s", t, argv ? " " : "", argv ? strnull(args) : "");
+                }
+
+                r = do_spawn(t, argv, fd, FLAGS_SET(flags, EXEC_DIR_SET_SYSTEMD_EXEC_PID), &pid);
                 if (r <= 0)
                         continue;
 
@@ -241,7 +258,7 @@ int execute_strv(
          * them to finish. Optionally a timeout is applied. If a file with the same name
          * exists in more than one directory, the earliest one wins. */
 
-        r = safe_fork("(sd-executor)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG, &executor_pid);
+        r = safe_fork("(sd-exec-strv)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_LOG, &executor_pid);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -249,7 +266,7 @@ int execute_strv(
                 _exit(r < 0 ? EXIT_FAILURE : r);
         }
 
-        r = wait_for_terminate_and_check("(sd-executor)", executor_pid, 0);
+        r = wait_for_terminate_and_check("(sd-exec-strv)", executor_pid, 0);
         if (r < 0)
                 return r;
         if (!FLAGS_SET(flags, EXEC_DIR_IGNORE_ERRORS) && r > 0)
@@ -530,9 +547,9 @@ int fork_agent(const char *name, const int except[], size_t n_except, pid_t *ret
 
         r = safe_fork_full(name,
                            NULL,
-                           except,
+                           (int*) except, /* safe_fork_full only changes except if you pass in FORK_PACK_FDS, which we don't */
                            n_except,
-                           FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_CLOSE_ALL_FDS|FORK_REOPEN_LOG|FORK_RLIMIT_NOFILE_SAFE,
+                           FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_CLOSE_ALL_FDS|FORK_REOPEN_LOG|FORK_RLIMIT_NOFILE_SAFE,
                            ret_pid);
         if (r < 0)
                 return r;

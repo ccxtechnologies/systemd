@@ -13,6 +13,7 @@
 
 #include "alloc-util.h"
 #include "analyze.h"
+#include "analyze-architectures.h"
 #include "analyze-blame.h"
 #include "analyze-calendar.h"
 #include "analyze-capability.h"
@@ -25,6 +26,7 @@
 #include "analyze-exit-status.h"
 #include "analyze-fdstore.h"
 #include "analyze-filesystems.h"
+#include "analyze-image-policy.h"
 #include "analyze-inspect-elf.h"
 #include "analyze-log-control.h"
 #include "analyze-malloc.h"
@@ -32,6 +34,7 @@
 #include "analyze-plot.h"
 #include "analyze-security.h"
 #include "analyze-service-watchdogs.h"
+#include "analyze-srk.h"
 #include "analyze-syscall-filter.h"
 #include "analyze-time.h"
 #include "analyze-time-data.h"
@@ -40,7 +43,6 @@
 #include "analyze-unit-files.h"
 #include "analyze-unit-paths.h"
 #include "analyze-verify.h"
-#include "analyze-image-policy.h"
 #include "build.h"
 #include "bus-error.h"
 #include "bus-locator.h"
@@ -86,12 +88,12 @@
 #include "unit-name.h"
 #include "verb-log-control.h"
 #include "verbs.h"
-#include "version.h"
 
 DotMode arg_dot = DEP_ALL;
 char **arg_dot_from_patterns = NULL, **arg_dot_to_patterns = NULL;
 usec_t arg_fuzz = 0;
 PagerFlags arg_pager_flags = 0;
+CatFlags arg_cat_flags = 0;
 BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
 const char *arg_host = NULL;
 RuntimeScope arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
@@ -216,13 +218,14 @@ static int help(int argc, char *argv[], void *userdata) {
                "  dot [UNIT...]              Output dependency graph in %s format\n"
                "  dump [PATTERN...]          Output state serialization of service\n"
                "                             manager\n"
-               "  cat-config                 Show configuration file and drop-ins\n"
+               "  cat-config NAME|PATH...    Show configuration file and drop-ins\n"
                "  unit-files                 List files and symlinks for units\n"
                "  unit-paths                 List load directories for units\n"
                "  exit-status [STATUS...]    List exit status definitions\n"
                "  capability [CAP...]        List capability definitions\n"
                "  syscall-filter [NAME...]   List syscalls in seccomp filters\n"
                "  filesystems [NAME...]      List known filesystems\n"
+               "  architectures [NAME...]    List known architectures\n"
                "  condition CONDITION...     Evaluate conditions and asserts\n"
                "  compare-versions VERSION1 [OP] VERSION2\n"
                "                             Compare two version strings\n"
@@ -235,7 +238,9 @@ static int help(int argc, char *argv[], void *userdata) {
                "  inspect-elf FILE...        Parse and print ELF package metadata\n"
                "  malloc [D-BUS SERVICE...]  Dump malloc stats of a D-Bus service\n"
                "  fdstore SERVICE...         Show file descriptor store contents of service\n"
+               "  image-policy POLICY...     Analyze image policy string\n"
                "  pcrs [PCR...]              Show TPM2 PCRs and their names\n"
+               "  srk [>FILE]                Write TPM2 SRK (to FILE)\n"
                "\nOptions:\n"
                "     --recursive-errors=MODE Control which units are verified\n"
                "     --offline=BOOL          Perform a security review on unit file(s)\n"
@@ -267,10 +272,12 @@ static int help(int argc, char *argv[], void *userdata) {
                "                             specified time\n"
                "     --profile=name|PATH     Include the specified profile in the\n"
                "                             security review of the unit(s)\n"
+               "     --unit=UNIT             Evaluate conditions and asserts of unit\n"
                "     --table                 Output plot's raw time data as a table\n"
                "  -h --help                  Show this help\n"
                "     --version               Show package version\n"
                "  -q --quiet                 Do not emit hints\n"
+               "     --tldr                  Skip comments and empty lines\n"
                "     --root=PATH             Operate on an alternate filesystem root\n"
                "     --image=PATH            Operate on disk image as filesystem root\n"
                "     --image-policy=POLICY   Specify disk image dissection policy\n"
@@ -314,6 +321,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_PROFILE,
                 ARG_TABLE,
                 ARG_NO_LEGEND,
+                ARG_TLDR,
         };
 
         static const struct option options[] = {
@@ -347,6 +355,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "profile",          required_argument, NULL, ARG_PROFILE          },
                 { "table",            optional_argument, NULL, ARG_TABLE            },
                 { "no-legend",        optional_argument, NULL, ARG_NO_LEGEND        },
+                { "tldr",             no_argument,       NULL, ARG_TLDR             },
                 {}
         };
 
@@ -355,7 +364,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hH:M:U:", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "hH:M:U:q", options, NULL)) >= 0)
                 switch (c) {
 
                 case 'h':
@@ -536,6 +545,10 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_legend = false;
                         break;
 
+                case ARG_TLDR:
+                        arg_cat_flags = CAT_TLDR;
+                        break;
+
                 case '?':
                         return -EINVAL;
 
@@ -547,18 +560,21 @@ static int parse_argv(int argc, char *argv[]) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Option --offline= is only supported for security right now.");
 
-        if (arg_json_format_flags != JSON_FORMAT_OFF && !STRPTR_IN_SET(argv[optind], "security", "inspect-elf", "plot", "fdstore", "pcrs"))
+        if (arg_offline && optind >= argc - 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Option --json= is only supported for security, inspect-elf, plot, fdstore, pcrs right now.");
+                                       "Option --offline= requires one or more units to perform a security review.");
+
+        if (arg_json_format_flags != JSON_FORMAT_OFF && !STRPTR_IN_SET(argv[optind], "security", "inspect-elf", "plot", "fdstore", "pcrs", "architectures", "capability", "exit-status"))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Option --json= is only supported for security, inspect-elf, plot, fdstore, pcrs, architectures, capability, exit-status right now.");
 
         if (arg_threshold != 100 && !streq_ptr(argv[optind], "security"))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Option --threshold= is only supported for security right now.");
 
-        if (arg_runtime_scope == RUNTIME_SCOPE_GLOBAL &&
-            !STR_IN_SET(argv[optind] ?: "time", "dot", "unit-paths", "verify"))
+        if (arg_runtime_scope == RUNTIME_SCOPE_GLOBAL && !streq_ptr(argv[optind], "unit-paths"))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Option --global only makes sense with verbs dot, unit-paths, verify.");
+                                       "Option --global only makes sense with verb unit-paths.");
 
         if (streq_ptr(argv[optind], "cat-config") && arg_runtime_scope == RUNTIME_SCOPE_USER)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -586,7 +602,7 @@ static int parse_argv(int argc, char *argv[]) {
         if (streq_ptr(argv[optind], "condition") && arg_unit && optind < argc - 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No conditions can be passed if --unit= is used.");
 
-        if ((!arg_legend && !streq_ptr(argv[optind], "plot")) ||
+        if ((!arg_legend && !STRPTR_IN_SET(argv[optind], "plot", "architectures")) ||
            (streq_ptr(argv[optind], "plot") && !arg_legend && !arg_table && FLAGS_SET(arg_json_format_flags, JSON_FORMAT_OFF)))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Option --no-legend is only supported for plot with either --table or --json=.");
 
@@ -639,6 +655,8 @@ static int run(int argc, char *argv[]) {
                 { "fdstore",           2,        VERB_ANY, 0,            verb_fdstore           },
                 { "image-policy",      2,        2,        0,            verb_image_policy      },
                 { "pcrs",              VERB_ANY, VERB_ANY, 0,            verb_pcrs              },
+                { "srk",               VERB_ANY, 1,        0,            verb_srk               },
+                { "architectures",     VERB_ANY, VERB_ANY, 0,            verb_architectures     },
                 {}
         };
 
@@ -662,7 +680,8 @@ static int run(int argc, char *argv[]) {
                                 arg_image_policy,
                                 DISSECT_IMAGE_GENERIC_ROOT |
                                 DISSECT_IMAGE_RELAX_VAR_CHECK |
-                                DISSECT_IMAGE_READ_ONLY,
+                                DISSECT_IMAGE_READ_ONLY |
+                                DISSECT_IMAGE_ALLOW_USERSPACE_VERITY,
                                 &mounted_dir,
                                 /* ret_dir_fd= */ NULL,
                                 &loop_device);

@@ -77,7 +77,9 @@ typedef struct TableData {
         unsigned ellipsize_percent; /* 0 … 100, where to place the ellipsis when compression is needed */
         unsigned align_percent;     /* 0 … 100, where to pad with spaces when expanding is needed. 0: left-aligned, 100: right-aligned */
 
-        bool uppercase;             /* Uppercase string on display */
+        bool uppercase:1;           /* Uppercase string on display */
+        bool underline:1;
+        bool rgap_underline:1;
 
         const char *color;          /* ANSI color string to use for this cell. When written to terminal should not move cursor. Will automatically be reset after the cell */
         const char *rgap_color;     /* The ANSI color to use for the gap right of this cell. Usually used to underline entire rows in a gapless fashion */
@@ -318,6 +320,7 @@ static size_t table_data_size(TableDataType type, const void *data) {
 
         case TABLE_INT32:
         case TABLE_UINT32:
+        case TABLE_UINT32_HEX:
                 return sizeof(uint32_t);
 
         case TABLE_INT16:
@@ -400,7 +403,7 @@ static bool table_data_matches(
                 return false;
 
         /* If a color/url is set, refuse to merge */
-        if (d->color || d->rgap_color)
+        if (d->color || d->rgap_color || d->underline || d->rgap_underline)
                 return false;
         if (d->url)
                 return false;
@@ -616,6 +619,8 @@ static int table_dedup_cell(Table *t, TableCell *cell) {
 
         nd->color = od->color;
         nd->rgap_color = od->rgap_color;
+        nd->underline = od->underline;
+        nd->rgap_underline = od->rgap_underline;
         nd->url = TAKE_PTR(curl);
 
         table_data_unref(od);
@@ -758,6 +763,46 @@ int table_set_rgap_color(Table *t, TableCell *cell, const char *color) {
         return 0;
 }
 
+int table_set_underline(Table *t, TableCell *cell, bool b) {
+        TableData *d;
+        int r;
+
+        assert(t);
+        assert(cell);
+
+        r = table_dedup_cell(t, cell);
+        if (r < 0)
+                return r;
+
+        assert_se(d = table_get_data(t, cell));
+
+        if (d->underline == b)
+                return 0;
+
+        d->underline = b;
+        return 1;
+}
+
+int table_set_rgap_underline(Table *t, TableCell *cell, bool b) {
+        TableData *d;
+        int r;
+
+        assert(t);
+        assert(cell);
+
+        r = table_dedup_cell(t, cell);
+        if (r < 0)
+                return r;
+
+        assert_se(d = table_get_data(t, cell));
+
+        if (d->rgap_underline == b)
+                return 0;
+
+        d->rgap_underline = b;
+        return 1;
+}
+
 int table_set_url(Table *t, TableCell *cell, const char *url) {
         _cleanup_free_ char *copy = NULL;
         int r;
@@ -833,6 +878,8 @@ int table_update(Table *t, TableCell *cell, TableDataType type, const void *data
 
         nd->color = od->color;
         nd->rgap_color = od->rgap_color;
+        nd->underline = od->underline;
+        nd->rgap_underline = od->rgap_underline;
         nd->url = TAKE_PTR(curl);
 
         table_data_unref(od);
@@ -981,6 +1028,7 @@ int table_add_many_internal(Table *t, TableDataType first_type, ...) {
                 }
 
                 case TABLE_UINT32:
+                case TABLE_UINT32_HEX:
                         buffer.uint32 = va_arg(ap, uint32_t);
                         data = &buffer.uint32;
                         break;
@@ -1096,6 +1144,31 @@ int table_add_many_internal(Table *t, TableDataType first_type, ...) {
                         }
 
                         r = table_set_rgap_color(t, last_cell, c);
+                        goto check;
+                }
+
+                case TABLE_SET_UNDERLINE: {
+                        int u = va_arg(ap, int);
+                        r = table_set_underline(t, last_cell, u);
+                        goto check;
+                }
+
+                case TABLE_SET_RGAP_UNDERLINE: {
+                        int u = va_arg(ap, int);
+                        r = table_set_rgap_underline(t, last_cell, u);
+                        goto check;
+                }
+
+                case TABLE_SET_BOTH_UNDERLINES: {
+                        int u = va_arg(ap, int);
+
+                        r = table_set_underline(t, last_cell, u);
+                        if (r < 0) {
+                                va_end(ap);
+                                return r;
+                        }
+
+                        r = table_set_rgap_underline(t, last_cell, u);
                         goto check;
                 }
 
@@ -1365,6 +1438,7 @@ static int cell_data_compare(TableData *a, size_t index_a, TableData *b, size_t 
                         return CMP(a->uint16, b->uint16);
 
                 case TABLE_UINT32:
+                case TABLE_UINT32_HEX:
                         return CMP(a->uint32, b->uint32);
 
                 case TABLE_UINT64:
@@ -1586,9 +1660,7 @@ static const char *table_data_format(Table *t, TableData *d, bool avoid_uppercas
                 else if (d->type == TABLE_TIMESTAMP_DATE)
                         ret = format_timestamp_style(p, FORMAT_TIMESTAMP_MAX, d->timestamp, TIMESTAMP_DATE);
                 else if (d->type == TABLE_TIMESTAMP_RELATIVE_MONOTONIC)
-                        ret = format_timestamp_relative_full(p, FORMAT_TIMESTAMP_RELATIVE_MAX,
-                                                             d->timestamp, CLOCK_MONOTONIC,
-                                                             /* implicit_left = */ false);
+                        ret = format_timestamp_relative_monotonic(p, FORMAT_TIMESTAMP_RELATIVE_MAX, d->timestamp);
                 else
                         ret = format_timestamp_relative_full(p, FORMAT_TIMESTAMP_RELATIVE_MAX,
                                                              d->timestamp, CLOCK_REALTIME,
@@ -1640,7 +1712,7 @@ static const char *table_data_format(Table *t, TableData *d, bool avoid_uppercas
                 if (!p)
                         return NULL;
 
-                if (!format_bytes_full(p, FORMAT_BYTES_MAX, d->size, 0))
+                if (!format_bytes_full(p, FORMAT_BYTES_MAX, d->size, FORMAT_BYTES_BELOW_POINT))
                         return table_ersatz_string(t);
 
                 n = strlen(p);
@@ -1754,6 +1826,18 @@ static const char *table_data_format(Table *t, TableData *d, bool avoid_uppercas
                         return NULL;
 
                 sprintf(p, "%" PRIu32, d->uint32);
+                d->formatted = TAKE_PTR(p);
+                break;
+        }
+
+        case TABLE_UINT32_HEX: {
+                _cleanup_free_ char *p = NULL;
+
+                p = new(char, 8 + 1);
+                if (!p)
+                        return NULL;
+
+                sprintf(p, "%" PRIx32, d->uint32);
                 d->formatted = TAKE_PTR(p);
                 break;
         }
@@ -1919,7 +2003,7 @@ static const char *table_data_format(Table *t, TableData *d, bool avoid_uppercas
                 if (d->mode == MODE_INVALID)
                         return table_ersatz_string(t);
 
-                return inode_type_to_string(d->mode);
+                return inode_type_to_string(d->mode) ?: table_ersatz_string(t);
 
         case TABLE_DEVNUM:
                 if (devnum_is_zero(d->devnum))
@@ -2117,8 +2201,6 @@ static const char* table_data_color(TableData *d) {
 
         if (d->type == TABLE_FIELD)
                 return ansi_bright_blue();
-        if (d->type == TABLE_HEADER)
-                return ansi_underline();
 
         return NULL;
 }
@@ -2126,11 +2208,29 @@ static const char* table_data_color(TableData *d) {
 static const char* table_data_rgap_color(TableData *d) {
         assert(d);
 
-        if (d->rgap_color)
-                return d->rgap_color;
+        return d->rgap_color ?: d->rgap_color;
+}
+
+static const char* table_data_underline(TableData *d) {
+        assert(d);
+
+        if (d->underline)
+                return /* cescape( */ansi_add_underline_grey()/* ) */;
 
         if (d->type == TABLE_HEADER)
-                return ansi_underline();
+                return ansi_add_underline();
+
+        return NULL;
+}
+
+static const char* table_data_rgap_underline(TableData *d) {
+        assert(d);
+
+        if (d->rgap_underline)
+                return ansi_add_underline_grey();
+
+        if (d->type == TABLE_HEADER)
+                return ansi_add_underline();
 
         return NULL;
 }
@@ -2405,13 +2505,13 @@ int table_print(Table *t, FILE *f) {
                         row = t->data + i * t->n_columns;
 
                 do {
-                        const char *gap_color = NULL;
+                        const char *gap_color = NULL, *gap_underline = NULL;
                         more_sublines = false;
 
                         for (size_t j = 0; j < display_columns; j++) {
                                 _cleanup_free_ char *buffer = NULL, *extracted = NULL;
                                 bool lines_truncated = false;
-                                const char *field, *color = NULL;
+                                const char *field, *color = NULL, *underline = NULL;
                                 TableData *d;
                                 size_t l;
 
@@ -2477,6 +2577,7 @@ int table_print(Table *t, FILE *f) {
                                                 /* Drop trailing white spaces of last column when no cosmetics is set. */
                                                 if (j == display_columns - 1 &&
                                                     (!colors_enabled() || !table_data_color(d)) &&
+                                                    (!underline_enabled() || !table_data_underline(d)) &&
                                                     (!urlify_enabled() || !d->url))
                                                         delete_trailing_chars(aligned, NULL);
 
@@ -2498,31 +2599,40 @@ int table_print(Table *t, FILE *f) {
 
                                 if (colors_enabled() && gap_color)
                                         fputs(gap_color, f);
+                                if (underline_enabled() && gap_underline)
+                                        fputs(gap_underline, f);
 
                                 if (j > 0)
                                         fputc(' ', f); /* column separator left of cell */
 
+                                /* Undo gap color/underline */
+                                if ((colors_enabled() && gap_color) ||
+                                    (underline_enabled() && gap_underline))
+                                        fputs(ANSI_NORMAL, f);
+
                                 if (colors_enabled()) {
                                         color = table_data_color(d);
-
-                                        /* Undo gap color */
-                                        if (gap_color)
-                                                fputs(ANSI_NORMAL, f);
-
                                         if (color)
                                                 fputs(color, f);
                                 }
 
+                                if (underline_enabled()) {
+                                        underline = table_data_underline(d);
+                                        if (underline)
+                                                fputs(underline, f);
+                                }
+
                                 fputs(field, f);
 
-                                if (colors_enabled() && color)
+                                if (color || underline)
                                         fputs(ANSI_NORMAL, f);
 
                                 gap_color = table_data_rgap_color(d);
+                                gap_underline = table_data_rgap_underline(d);
                         }
 
                         fputc('\n', f);
-                        n_subline ++;
+                        n_subline++;
                 } while (more_sublines);
         }
 
@@ -2562,6 +2672,14 @@ size_t table_get_columns(Table *t) {
 
         assert(t->n_columns > 0);
         return t->n_columns;
+}
+
+size_t table_get_current_column(Table *t) {
+        if (!t)
+                return 0;
+
+        assert(t->n_columns > 0);
+        return t->n_cells % t->n_columns;
 }
 
 int table_set_reverse(Table *t, size_t column, bool b) {
@@ -2691,6 +2809,7 @@ static int table_data_to_json(TableData *d, JsonVariant **ret) {
                 return json_variant_new_unsigned(ret, d->uint16);
 
         case TABLE_UINT32:
+        case TABLE_UINT32_HEX:
                 return json_variant_new_unsigned(ret, d->uint32);
 
         case TABLE_UINT64:

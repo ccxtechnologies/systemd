@@ -104,7 +104,6 @@ static int mangle_fat_label(const char *s, char **ret) {
 static int do_mcopy(const char *node, const char *root) {
         _cleanup_free_ char *mcopy = NULL;
         _cleanup_strv_free_ char **argv = NULL;
-        _cleanup_close_ int rfd = -EBADF;
         _cleanup_free_ DirectoryEntries *de = NULL;
         int r;
 
@@ -128,11 +127,7 @@ static int do_mcopy(const char *node, const char *root) {
         /* mcopy copies the top level directory instead of everything in it so we have to pass all
          * the subdirectories to mcopy instead to end up with the correct directory structure. */
 
-        rfd = open(root, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-        if (rfd < 0)
-                return log_error_errno(errno, "Failed to open directory '%s': %m", root);
-
-        r = readdir_all(rfd, RECURSE_DIR_SORT|RECURSE_DIR_ENSURE_TYPE, &de);
+        r = readdir_all_at(AT_FDCWD, root, RECURSE_DIR_SORT|RECURSE_DIR_ENSURE_TYPE, &de);
         if (r < 0)
                 return log_error_errno(r, "Failed to read '%s' contents: %m", root);
 
@@ -155,13 +150,13 @@ static int do_mcopy(const char *node, const char *root) {
         if (strv_extend(&argv, "::") < 0)
                 return log_oom();
 
-        r = safe_fork("(mcopy)", FORK_RESET_SIGNALS|FORK_RLIMIT_NOFILE_SAFE|FORK_DEATHSIG|FORK_LOG|FORK_WAIT|FORK_STDOUT_TO_STDERR|FORK_CLOSE_ALL_FDS, NULL);
+        r = safe_fork("(mcopy)", FORK_RESET_SIGNALS|FORK_RLIMIT_NOFILE_SAFE|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT|FORK_STDOUT_TO_STDERR|FORK_CLOSE_ALL_FDS, NULL);
         if (r < 0)
                 return r;
         if (r == 0) {
                 /* Avoid failures caused by mismatch in expectations between mkfs.vfat and mcopy by disabling
                  * the stricter mcopy checks using MTOOLS_SKIP_CHECK. */
-                execve(mcopy, argv, STRV_MAKE("MTOOLS_SKIP_CHECK=1"));
+                execve(mcopy, argv, STRV_MAKE("MTOOLS_SKIP_CHECK=1", "TZ=UTC", strv_find_prefix(environ, "SOURCE_DATE_EPOCH=")));
 
                 log_error_errno(errno, "Failed to execute mcopy: %m");
 
@@ -222,12 +217,13 @@ static int protofile_print_item(
                 data->has_filename_with_spaces = true;
         }
 
-        fprintf(data->file, "%s %c%c%c%03o 0 0 ",
+        fprintf(data->file, "%s %c%c%c%03o "UID_FMT" "GID_FMT" ",
                 copy ?: de->d_name,
                 type,
                 sx->stx_mode & S_ISUID ? 'u' : '-',
                 sx->stx_mode & S_ISGID ? 'g' : '-',
-                (unsigned) (sx->stx_mode & 0777));
+                (unsigned) (sx->stx_mode & 0777),
+                sx->stx_uid, sx->stx_gid);
 
         if (S_ISREG(sx->stx_mode)) {
                 _cleanup_free_ char *p = NULL;
@@ -300,7 +296,8 @@ static int make_protofile(const char *root, char **ret_path, bool *ret_has_filen
               "0 0\n"
               "d--755 0 0\n", f);
 
-        r = recurse_dir_at(AT_FDCWD, root, STATX_TYPE|STATX_MODE, UINT_MAX, RECURSE_DIR_SORT, protofile_print_item, &data);
+        r = recurse_dir_at(AT_FDCWD, root, STATX_TYPE|STATX_MODE|STATX_UID|STATX_GID, UINT_MAX,
+                           RECURSE_DIR_SORT, protofile_print_item, &data);
         if (r < 0)
                 return log_error_errno(r, "Failed to recurse through %s: %m", root);
 
@@ -329,11 +326,13 @@ int make_filesystem(
                 char * const *extra_mkfs_args) {
 
         _cleanup_free_ char *mkfs = NULL, *mangled_label = NULL;
-        _cleanup_strv_free_ char **argv = NULL;
+        _cleanup_strv_free_ char **argv = NULL, **env = NULL;
         _cleanup_(rm_rf_physical_and_freep) char *protofile_tmpdir = NULL;
         _cleanup_(unlink_and_freep) char *protofile = NULL;
         char vol_id[CONST_MAX(SD_ID128_UUID_STRING_MAX, 8U + 1U)] = {};
         int stdio_fds[3] = { -EBADF, STDERR_FILENO, STDERR_FILENO};
+        ForkFlags flags = FORK_RESET_SIGNALS|FORK_RLIMIT_NOFILE_SAFE|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT|
+                        FORK_CLOSE_ALL_FDS|FORK_REARRANGE_STDIO|FORK_REOPEN_LOG;
         int r;
 
         assert(node);
@@ -426,11 +425,19 @@ int make_filesystem(
                                 "-T", "default",
                                 node);
 
-                if (root && strv_extend_strv(&argv, STRV_MAKE("-d", root), false) < 0)
+                if (root && strv_extend_many(&argv, "-d", root) < 0)
                         return log_oom();
 
                 if (quiet && strv_extend(&argv, "-q") < 0)
                         return log_oom();
+
+                if (sector_size > 0) {
+                        if (strv_extend(&env, "MKE2FS_DEVICE_SECTSIZE") < 0)
+                                        return log_oom();
+
+                        if (strv_extendf(&env, "%"PRIu64, sector_size) < 0)
+                                return log_oom();
+                }
 
         } else if (streq(fstype, "btrfs")) {
                 argv = strv_new(mkfs,
@@ -443,7 +450,7 @@ int make_filesystem(
                 if (!discard && strv_extend(&argv, "--nodiscard") < 0)
                         return log_oom();
 
-                if (root && strv_extend_strv(&argv, STRV_MAKE("-r", root), false) < 0)
+                if (root && strv_extend_many(&argv, "-r", root) < 0)
                         return log_oom();
 
                 if (quiet && strv_extend(&argv, "-q") < 0)
@@ -465,6 +472,14 @@ int make_filesystem(
 
                 if (quiet && strv_extend(&argv, "-q") < 0)
                         return log_oom();
+
+                if (sector_size > 0) {
+                        if (strv_extend(&argv, "-w") < 0)
+                                return log_oom();
+
+                        if (strv_extendf(&argv, "%"PRIu64, sector_size) < 0)
+                                return log_oom();
+                }
 
         } else if (streq(fstype, "xfs")) {
                 const char *j;
@@ -499,7 +514,7 @@ int make_filesystem(
                         if (!protofile_with_opt)
                                 return -ENOMEM;
 
-                        if (strv_extend_strv(&argv, STRV_MAKE("-p", protofile_with_opt), false) < 0)
+                        if (strv_extend_many(&argv, "-p", protofile_with_opt) < 0)
                                 return log_oom();
                 }
 
@@ -574,6 +589,16 @@ int make_filesystem(
         if (extra_mkfs_args && strv_extend_strv(&argv, extra_mkfs_args, false) < 0)
                 return log_oom();
 
+        if (streq(fstype, "btrfs")) {
+                struct stat st;
+
+                if (stat(node, &st) < 0)
+                        return log_error_errno(r, "Failed to stat '%s': %m", node);
+
+                if (S_ISBLK(st.st_mode))
+                        flags |= FORK_NEW_MOUNTNS;
+        }
+
         if (DEBUG_LOGGING) {
                 _cleanup_free_ char *j = NULL;
 
@@ -586,19 +611,25 @@ int make_filesystem(
                         stdio_fds,
                         /*except_fds=*/ NULL,
                         /*n_except_fds=*/ 0,
-                        FORK_RESET_SIGNALS|FORK_RLIMIT_NOFILE_SAFE|FORK_DEATHSIG|FORK_LOG|FORK_WAIT|
-                        FORK_CLOSE_ALL_FDS|FORK_REARRANGE_STDIO|FORK_NEW_MOUNTNS,
+                        flags,
                         /*ret_pid=*/ NULL);
         if (r < 0)
                 return r;
         if (r == 0) {
                 /* Child */
 
+                STRV_FOREACH_PAIR(k, v, env)
+                        if (setenv(*k, *v, /* replace = */ true) < 0) {
+                                log_error_errno(r, "Failed to set %s=%s environment variable: %m", *k, *v);
+                                _exit(EXIT_FAILURE);
+                        }
+
                 /* mkfs.btrfs refuses to operate on block devices with mounted partitions, even if operating
                  * on unformatted free space, so let's trick it and other mkfs tools into thinking no
                  * partitions are mounted. See https://github.com/kdave/btrfs-progs/issues/640 for more
                  ° information. */
-                (void) mount_nofollow_verbose(LOG_DEBUG, "/dev/null", "/proc/self/mounts", NULL, MS_BIND, NULL);
+                 if (flags & FORK_NEW_MOUNTNS)
+                        (void) mount_nofollow_verbose(LOG_DEBUG, "/dev/null", "/proc/self/mounts", NULL, MS_BIND, NULL);
 
                 execvp(mkfs, argv);
 

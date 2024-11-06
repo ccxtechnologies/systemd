@@ -4,11 +4,15 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "alloc-util.h"
-#include "fuzz.h"
-#include "sd-event.h"
-
 #include "sd-dhcp-client.c"
+
+#include "alloc-util.h"
+#include "dhcp-lease-internal.h"
+#include "dhcp-network.h"
+#include "fs-util.h"
+#include "fuzz.h"
+#include "network-internal.h"
+#include "tmpfile-util.h"
 
 int dhcp_network_bind_raw_socket(
                 int ifindex,
@@ -52,10 +56,14 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         uint8_t bcast_addr[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
         _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_dhcp_lease_unrefp) sd_dhcp_lease *lease = NULL;
+        _cleanup_(unlink_tempfilep) char lease_file[] = "/tmp/fuzz-dhcp-client.XXXXXX";
+        _cleanup_close_ int fd = -1;
         int res, r;
 
-        if (!getenv("SYSTEMD_LOG_LEVEL"))
-                log_set_max_level(LOG_CRIT);
+        assert_se(setenv("SYSTEMD_NETWORK_TEST_MODE", "1", 1) >= 0);
+
+        fuzz_setup_logging();
 
         r = sd_dhcp_client_new(&client, false);
         assert_se(r >= 0);
@@ -68,14 +76,25 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
         assert_se(sd_dhcp_client_set_ifindex(client, 42) >= 0);
         assert_se(sd_dhcp_client_set_mac(client, mac_addr, bcast_addr, ETH_ALEN, ARPHRD_ETHER) >= 0);
-        dhcp_client_set_test_mode(client, true);
 
         res = sd_dhcp_client_start(client);
         assert_se(IN_SET(res, 0, -EINPROGRESS));
         client->xid = 2;
+        client->state = DHCP_STATE_SELECTING;
 
-        (void) client_handle_offer(client, (DHCPMessage*) data, size);
+        if (client_handle_offer_or_rapid_ack(client, (DHCPMessage*) data, size, NULL) < 0)
+                goto end;
 
+        fd = mkostemp_safe(lease_file);
+        assert_se(fd >= 0);
+
+        r = dhcp_lease_save(client->lease, lease_file);
+        assert_se(r >= 0);
+
+        r = dhcp_lease_load(&lease, lease_file);
+        assert_se(r >= 0);
+
+end:
         assert_se(sd_dhcp_client_stop(client) >= 0);
 
         return 0;

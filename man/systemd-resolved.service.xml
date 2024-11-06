@@ -1,9 +1,10 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
-<refentry id="systemd-resolved.service" conditional='ENABLE_RESOLVE'>
+<refentry id="systemd-resolved.service" conditional='ENABLE_RESOLVE'
+          xmlns:xi="http://www.w3.org/2001/XInclude">
 
   <refentryinfo>
     <title>systemd-resolved.service</title>
@@ -35,7 +36,7 @@
     via three interfaces:</para>
 
     <itemizedlist>
-      <listitem><para>The native, fully-featured API <command>systemd-resolved</command> exposes on the bus,
+      <listitem><para>The native, fully-featured API <command>systemd-resolved</command> exposes via D-Bus,
       see
       <citerefentry><refentrytitle>org.freedesktop.resolve1</refentrytitle><manvolnum>5</manvolnum></citerefentry>
       and
@@ -43,6 +44,11 @@
       for details. Usage of this API is generally recommended to clients as it is asynchronous and fully
       featured (for example, properly returns DNSSEC validation status and interface scope for addresses as
       necessary for supporting link-local networking).</para></listitem>
+
+      <listitem><para>The native API <command>systemd-resolved</command> exposes via Varlink on the
+      <filename>/run/systemd/resolve/io.systemd.Resolve</filename> AF_UNIX socket. This provides similar
+      functionality as the D-Bus interface, but is available during the entire runtime, without requiring a
+      running D-Bus system bus broker service.</para></listitem>
 
       <listitem><para>The glibc
       <citerefentry project='man-pages'><refentrytitle>getaddrinfo</refentrytitle><manvolnum>3</manvolnum></citerefentry>
@@ -243,7 +249,7 @@
   <refsect1>
     <title>Compatibility with the traditional glibc stub resolver</title>
 
-    <para>This section provides a short summary of differences in the stub resolver implemented by
+    <para>This section provides a short summary of differences in the resolver implemented by
     <citerefentry><refentrytitle>nss-resolve</refentrytitle><manvolnum>8</manvolnum></citerefentry> together
     with <command>systemd-resolved</command> and the traditional stub resolver implemented in
     <filename>nss-dns</filename>.</para>
@@ -308,6 +314,19 @@ search foobar.com barbar.com
       <varname>$RES_OPTIONS</varname> described in
       <citerefentry project='man-pages'><refentrytitle>resolv.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
       are not supported currently.</para></listitem>
+
+      <listitem><para>The <filename>nss-dns</filename> resolver maintains little state between subsequent DNS
+      queries, and for each query always talks to the first listed DNS server from
+      <filename>/etc/resolv.conf</filename> first, and on failure continues with the next until reaching the
+      end of the list which is when the query fails. The resolver in
+      <filename>systemd-resolved.service</filename> however maintains state, and will continuously talk to
+      the same server for all queries on a particular lookup scope until some form of error is seen at which
+      point it switches to the next, and then continuously stays with it for all queries on the scope until
+      the next failure, and so on, eventually returning to the first configured server. This is done to
+      optimize lookup times, in particular given that the resolver typically must first probe server feature
+      sets when talking to a server, which is time consuming. This different behaviour implies that listed
+      DNS servers per lookup scope must be equivalent in the zones they serve, so that sending a query to one
+      of them will yield the same results as sending it to another configured DNS server.</para></listitem>
     </itemizedlist>
   </refsect1>
 
@@ -367,7 +386,9 @@ search foobar.com barbar.com
         <listitem><para>Upon reception of the <constant>SIGUSR1</constant> process signal
         <command>systemd-resolved</command> will dump the contents of all DNS resource record caches it
         maintains, as well as all feature level information it learnt about configured DNS servers into the
-        system logs.</para></listitem>
+        system logs.</para>
+
+        <xi:include href="version-info.xml" xpointer="v231"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -379,7 +400,9 @@ search foobar.com barbar.com
         <command>systemd-resolved</command> flushes the caches automatically anyway any time the host's
         network configuration changes. Sending this signal to <command>systemd-resolved</command> is
         equivalent to the <command>resolvectl flush-caches</command> command, however the latter is
-        recommended since it operates in a synchronous way.</para></listitem>
+        recommended since it operates in a synchronous way.</para>
+
+        <xi:include href="version-info.xml" xpointer="v231"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -394,7 +417,19 @@ search foobar.com barbar.com
         any time the DNS server configuration changes. Sending this signal to
         <command>systemd-resolved</command> is equivalent to the <command>resolvectl
         reset-server-features</command> command, however the latter is recommended since it operates in a
-        synchronous way.</para></listitem>
+        synchronous way.</para>
+
+        <xi:include href="version-info.xml" xpointer="v235"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><constant>SIGHUP</constant></term>
+
+        <listitem><para>Upon reception of the <constant>SIGHUP</constant> process signal
+        <command>systemd-resolved</command> will flush all caches it maintains, drop all open TCP
+        connections (if any), and reload its configuration files.</para>
+
+        <xi:include href="version-info.xml" xpointer="v256"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -404,7 +439,7 @@ search foobar.com barbar.com
 
     <para><command>systemd-resolved</command> supports the service credentials logic as implemented by
     <varname>ImportCredential=</varname>/<varname>LoadCredential=</varname>/<varname>SetCredential=</varname>
-    (see <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
+    (see <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
     details). The following credentials are used when passed in:</para>
 
     <variablelist class='system-credentials'>
@@ -415,7 +450,9 @@ search foobar.com barbar.com
         <listitem><para>May contain a space separated list of DNS server IP addresses and DNS search
         domains. This information is only used when no explicit configuration via
         <filename>/etc/systemd/resolved.conf</filename>, <filename>/etc/resolv.conf</filename> or the kernel
-        command line has been provided.</para></listitem>
+        command line has been provided.</para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -437,7 +474,9 @@ search foobar.com barbar.com
         <varname>Domains=</varname> settings of
         <citerefentry><refentrytitle>resolved.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
         will be ignored. These two kernel command line options hence override system
-        configuration.</para></listitem>
+        configuration.</para>
+
+        <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -465,17 +504,17 @@ search foobar.com barbar.com
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>resolved.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>dnssec-trust-anchors.d</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>nss-resolve</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>resolvectl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>resolv.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>hosts</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.network</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-networkd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>resolved.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>dnssec-trust-anchors.d</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>nss-resolve</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>resolvectl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>resolv.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>hosts</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.network</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-networkd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

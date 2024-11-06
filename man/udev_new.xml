@@ -1,6 +1,6 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd" [
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd" [
 <!ENTITY % entities SYSTEM "custom-entities.ent" >
 %entities;
 ]>
@@ -70,6 +70,13 @@
     is returned. <function>udev_ref()</function> returns the argument
     that it was passed, unmodified. <function>udev_unref()</function>
     always returns <constant>NULL</constant>.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>History</title>
+    <para><function>udev_new()</function>,
+    <function>udev_ref()</function>, and
+    <function>udev_unref()</function> were added in version 221.</para>
   </refsect1>
 
   <refsect1>

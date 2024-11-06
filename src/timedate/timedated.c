@@ -18,9 +18,11 @@
 #include "bus-log-control-api.h"
 #include "bus-map-properties.h"
 #include "bus-polkit.h"
+#include "bus-unit-util.h"
 #include "clock-util.h"
 #include "conf-files.h"
 #include "constants.h"
+#include "daemon-util.h"
 #include "fd-util.h"
 #include "fileio-label.h"
 #include "fileio.h"
@@ -44,6 +46,7 @@
 #define NULL_ADJTIME_LOCAL "0.0 0 0\n0\nLOCAL\n"
 
 #define UNIT_LIST_DIRS (const char* const*) CONF_PATHS_STRV("systemd/ntp-units.d")
+#define SET_NTP_IN_FLIGHT_MAX 16
 
 typedef struct UnitStatusInfo {
         char *name;
@@ -60,6 +63,7 @@ typedef struct Context {
         bool local_rtc;
         Hashmap *polkit_registry;
         sd_bus_message *cache;
+        Set *set_ntp_calls;
 
         sd_bus_slot *slot_job_removed;
 
@@ -115,20 +119,16 @@ static UnitStatusInfo *unit_status_info_free(UnitStatusInfo *p) {
 DEFINE_TRIVIAL_CLEANUP_FUNC(UnitStatusInfo*, unit_status_info_free);
 
 static void context_clear(Context *c) {
-        UnitStatusInfo *p;
-
         assert(c);
 
         free(c->zone);
-        bus_verify_polkit_async_registry_free(c->polkit_registry);
+        hashmap_free(c->polkit_registry);
         sd_bus_message_unref(c->cache);
+        set_free(c->set_ntp_calls);
 
         sd_bus_slot_unref(c->slot_job_removed);
 
-        while ((p = c->units)) {
-                LIST_REMOVE(units, c->units, p);
-                unit_status_info_free(p);
-        }
+        LIST_CLEAR(units, c->units, unit_status_info_free);
 }
 
 static int context_add_ntp_service(Context *c, const char *s, const char *source) {
@@ -215,9 +215,8 @@ static int context_parse_ntp_services_from_disk(Context *c) {
 
                 for (;;) {
                         _cleanup_free_ char *line = NULL;
-                        const char *word;
 
-                        r = read_line(file, LINE_MAX, &line);
+                        r = read_stripped_line(file, LINE_MAX, &line);
                         if (r < 0) {
                                 log_error_errno(r, "Failed to read %s, ignoring: %m", *f);
                                 continue;
@@ -225,13 +224,12 @@ static int context_parse_ntp_services_from_disk(Context *c) {
                         if (r == 0)
                                 break;
 
-                        word = strstrip(line);
-                        if (isempty(word) || startswith(word, "#"))
+                        if (isempty(line) || startswith(line, "#"))
                                 continue;
 
-                        r = context_add_ntp_service(c, word, *f);
+                        r = context_add_ntp_service(c, line, *f);
                         if (r < 0)
-                                log_warning_errno(r, "Failed to add NTP service \"%s\", ignoring: %m", word);
+                                log_warning_errno(r, "Failed to add NTP service \"%s\", ignoring: %m", line);
                 }
         }
 
@@ -467,11 +465,19 @@ static int match_job_removed(sd_bus_message *m, void *userdata, sd_bus_error *er
                         n += !!u->path;
 
         if (n == 0) {
+                sd_bus_message *cm;
+
                 c->slot_job_removed = sd_bus_slot_unref(c->slot_job_removed);
 
                 (void) sd_bus_emit_properties_changed(sd_bus_message_get_bus(m),
                                                       "/org/freedesktop/timedate1", "org.freedesktop.timedate1", "NTP",
                                                       NULL);
+                while ((cm = set_steal_first(c->set_ntp_calls))) {
+                        r = sd_bus_reply_method_return(cm, NULL);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to reply to SetNTP method call, ignoring: %m");
+                        sd_bus_message_unref(cm);
+                }
         }
 
         return 0;
@@ -550,7 +556,7 @@ static int unit_enable_or_disable(UnitStatusInfo *u, sd_bus *bus, sd_bus_error *
         if (r < 0)
                 return r;
 
-        r = bus_call_method(bus, bus_systemd_mgr, "Reload", error, NULL, NULL);
+        r = bus_service_manager_reload(bus);
         if (r < 0)
                 return r;
 
@@ -590,6 +596,8 @@ static int property_get_rtc_time(
                 log_warning("/dev/rtc is busy. Is somebody keeping it open continuously? That's not a good idea... Returning a bogus RTC timestamp.");
         else if (r == -ENOENT)
                 log_debug("/dev/rtc not found.");
+        else if (r == -ENODATA)
+                log_debug("/dev/rtc has no valid time, power loss probably occurred?");
         else if (r < 0)
                 return sd_bus_error_set_errnof(error, r, "Failed to read RTC: %m");
         else
@@ -671,13 +679,12 @@ static int method_set_timezone(sd_bus_message *m, void *userdata, sd_bus_error *
         if (streq_ptr(z, c->zone))
                 return sd_bus_reply_method_return(m, NULL);
 
-        r = bus_verify_polkit_async(
+        r = bus_verify_polkit_async_full(
                         m,
-                        CAP_SYS_TIME,
                         "org.freedesktop.timedate1.set-timezone",
-                        NULL,
-                        interactive,
-                        UID_INVALID,
+                        /* details= */ NULL,
+                        /* good_user= */ UID_INVALID,
+                        interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
                         error);
         if (r < 0)
@@ -746,13 +753,12 @@ static int method_set_local_rtc(sd_bus_message *m, void *userdata, sd_bus_error 
         if (lrtc == c->local_rtc && !fix_system)
                 return sd_bus_reply_method_return(m, NULL);
 
-        r = bus_verify_polkit_async(
+        r = bus_verify_polkit_async_full(
                         m,
-                        CAP_SYS_TIME,
                         "org.freedesktop.timedate1.set-local-rtc",
-                        NULL,
-                        interactive,
-                        UID_INVALID,
+                        /* details= */ NULL,
+                        /* good_user= */ UID_INVALID,
+                        interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
                         error);
         if (r < 0)
@@ -866,13 +872,12 @@ static int method_set_time(sd_bus_message *m, void *userdata, sd_bus_error *erro
         } else
                 timespec_store(&ts, (usec_t) utc);
 
-        r = bus_verify_polkit_async(
+        r = bus_verify_polkit_async_full(
                         m,
-                        CAP_SYS_TIME,
                         "org.freedesktop.timedate1.set-time",
-                        NULL,
-                        interactive,
-                        UID_INVALID,
+                        /* details= */ NULL,
+                        /* good_user= */ UID_INVALID,
+                        interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
                         error);
         if (r < 0)
@@ -930,13 +935,12 @@ static int method_set_ntp(sd_bus_message *m, void *userdata, sd_bus_error *error
         if (context_ntp_service_exists(c) <= 0)
                 return sd_bus_error_set(error, BUS_ERROR_NO_NTP_SUPPORT, "NTP not supported");
 
-        r = bus_verify_polkit_async(
+        r = bus_verify_polkit_async_full(
                         m,
-                        CAP_SYS_TIME,
                         "org.freedesktop.timedate1.set-ntp",
-                        NULL,
-                        interactive,
-                        UID_INVALID,
+                        /* details= */ NULL,
+                        /* good_user= */ UID_INVALID,
+                        interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
                         error);
         if (r < 0)
@@ -947,6 +951,9 @@ static int method_set_ntp(sd_bus_message *m, void *userdata, sd_bus_error *error
         /* This method may be called frequently. Forget the previous job if it has not completed yet. */
         LIST_FOREACH(units, u, c->units)
                 u->path = mfree(u->path);
+
+        if (set_size(c->set_ntp_calls) >= SET_NTP_IN_FLIGHT_MAX)
+                return sd_bus_error_set_errnof(error, EAGAIN, "Too many calls in flight.");
 
         if (!c->slot_job_removed) {
                 r = bus_match_signal_async(
@@ -1002,11 +1009,12 @@ static int method_set_ntp(sd_bus_message *m, void *userdata, sd_bus_error *error
                 c->slot_job_removed = TAKE_PTR(slot);
 
         if (selected)
-                log_info("Set NTP to enabled (%s).", selected->name);
+                log_info("Set NTP to be enabled (%s).", selected->name);
         else
-                log_info("Set NTP to disabled.");
+                log_info("Set NTP to be disabled.");
 
-        return sd_bus_reply_method_return(m, NULL);
+        /* Asynchronous reply to m in match_job_removed() */
+        return set_ensure_consume(&c->set_ntp_calls, &bus_message_hash_ops, sd_bus_message_ref(m));
 }
 
 static int method_list_timezones(sd_bus_message *m, void *userdata, sd_bus_error *error) {
@@ -1128,21 +1136,15 @@ static int run(int argc, char *argv[]) {
 
         umask(0022);
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
-
         r = sd_event_default(&event);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate event loop: %m");
 
         (void) sd_event_set_watchdog(event, true);
 
-        r = sd_event_add_signal(event, NULL, SIGINT, NULL, NULL);
+        r = sd_event_set_signal_exit(event, true);
         if (r < 0)
-                return log_error_errno(r, "Failed to install SIGINT handler: %m");
-
-        r = sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to install SIGTERM handler: %m");
+                return log_error_errno(r, "Failed to install SIGINT/SIGTERM handlers: %m");
 
         r = connect_bus(&context, event, &bus);
         if (r < 0)
@@ -1157,6 +1159,10 @@ static int run(int argc, char *argv[]) {
         r = context_parse_ntp_services(&context);
         if (r < 0)
                 return r;
+
+        r = sd_notify(false, NOTIFY_READY);
+        if (r < 0)
+                log_warning_errno(r, "Failed to send readiness notification, ignoring: %m");
 
         r = bus_event_loop_with_idle(event, bus, "org.freedesktop.timedate1", DEFAULT_EXIT_USEC, NULL, NULL);
         if (r < 0)

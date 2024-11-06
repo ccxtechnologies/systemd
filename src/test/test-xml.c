@@ -4,6 +4,7 @@
 
 #include "alloc-util.h"
 #include "string-util.h"
+#include "tests.h"
 #include "xml.h"
 
 static void test_one(const char *data, ...) {
@@ -28,13 +29,15 @@ static void test_one(const char *data, ...) {
                         break;
 
                 nn = va_arg(ap, const char *);
-                assert_se(streq_ptr(nn, name));
+                ASSERT_STREQ(nn, name);
         }
 
         va_end(ap);
 }
 
 int main(int argc, char *argv[]) {
+
+        test_setup_logging(LOG_DEBUG);
 
         test_one("", XML_END);
 

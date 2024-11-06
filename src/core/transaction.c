@@ -123,7 +123,7 @@ static void transaction_merge_and_delete_job(Transaction *tr, Job *j, Job *other
         transaction_delete_job(tr, other, true);
 }
 
-_pure_ static bool job_is_conflicted_by(Job *j) {
+static bool job_is_conflicted_by(Job *j) {
         assert(j);
 
         /* Returns true if this job is pulled in by a least one
@@ -308,7 +308,7 @@ static void transaction_drop_redundant(Transaction *tr) {
         } while (again);
 }
 
-_pure_ static bool job_matters_to_anchor(Job *job) {
+static bool job_matters_to_anchor(Job *job) {
         assert(job);
         assert(!job->transaction_prev);
 
@@ -446,10 +446,10 @@ static int transaction_verify_order_one(Transaction *tr, Job *j, Job *from, unsi
          * the graph over 'before' edges in the actual job execution order. We traverse over both unit
          * ordering dependencies and we test with job_compare() whether it is the 'before' edge in the job
          * execution ordering. */
-        for (size_t d = 0; d < ELEMENTSOF(directions); d++) {
+        FOREACH_ELEMENT(d, directions) {
                 Unit *u;
 
-                UNIT_FOREACH_DEPENDENCY(u, j->unit, directions[d]) {
+                UNIT_FOREACH_DEPENDENCY(u, j->unit, *d) {
                         Job *o;
 
                         /* Is there a job for this unit? */
@@ -463,7 +463,7 @@ static int transaction_verify_order_one(Transaction *tr, Job *j, Job *from, unsi
                         }
 
                         /* Cut traversing if the job j is not really *before* o. */
-                        if (job_compare(j, o, directions[d]) >= 0)
+                        if (job_compare(j, o, *d) >= 0)
                                 continue;
 
                         r = transaction_verify_order_one(tr, o, j, generation, e);
@@ -781,19 +781,11 @@ int transaction_activate(
 
         assert(hashmap_isempty(tr->jobs));
 
-        if (!hashmap_isempty(m->jobs)) {
-                /* Are there any jobs now? Then make sure we have the
-                 * idle pipe around. We don't really care too much
-                 * whether this works or not, as the idle pipe is a
-                 * feature for cosmetics, not actually useful for
-                 * anything beyond that. */
-
-                if (m->idle_pipe[0] < 0 && m->idle_pipe[1] < 0 &&
-                    m->idle_pipe[2] < 0 && m->idle_pipe[3] < 0) {
-                        (void) pipe2(m->idle_pipe, O_NONBLOCK|O_CLOEXEC);
-                        (void) pipe2(m->idle_pipe + 2, O_NONBLOCK|O_CLOEXEC);
-                }
-        }
+        /* Are there any jobs now? Then make sure we have the idle pipe around. We don't really care too much
+         * whether this works or not, as the idle pipe is a feature for cosmetics, not actually useful for
+         * anything beyond that. */
+        if (!hashmap_isempty(m->jobs))
+                (void) manager_allocate_idle_pipe(m);
 
         return 0;
 }
@@ -972,7 +964,7 @@ int transaction_add_job_and_dependencies(
 
         if (type != JOB_STOP) {
                 r = bus_unit_validate_load_state(unit, e);
-                /* The time-based cache allows to start new units without daemon-reload, but if they are
+                /* The time-based cache allows new units to be started without daemon-reload, but if they are
                  * already referenced (because of dependencies or ordering) then we have to force a load of
                  * the fragment. As an optimization, check first if anything in the usual paths was modified
                  * since the last time the cache was loaded. Also check if the last time an attempt to load

@@ -12,13 +12,13 @@
 #include "rm-rf.h"
 #include "sync-util.h"
 
-int fs_make_very_read_only(int fd) {
+static int fs_make_very_read_only(int fd) {
         struct stat st;
         int r;
 
         assert(fd >= 0);
 
-        /* Tries to make the specified fd "comprehensively" read-only. Primary usecase for this is OS images,
+        /* Tries to make the specified fd "comprehensively" read-only. Primary use case for this is OS images,
          * i.e. either loopback files or larger directory hierarchies. Depending on the inode type and
          * backing file system this means something different:
          *

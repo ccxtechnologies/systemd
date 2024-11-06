@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+/* Make sure the net/if.h header is included before any linux/ one */
 #include <net/if.h>
 #include <netinet/in.h>
 #include <linux/if_arp.h>
@@ -198,14 +199,6 @@ static void netdev_detach_from_manager(NetDev *netdev) {
 static NetDev *netdev_free(NetDev *netdev) {
         assert(netdev);
 
-        netdev_detach_from_manager(netdev);
-
-        free(netdev->filename);
-
-        free(netdev->description);
-        free(netdev->ifname);
-        condition_free_list(netdev->conditions);
-
         /* Invoke the per-kind done() destructor, but only if the state field is initialized. We conditionalize that
          * because we parse .netdev files twice: once to determine the kind (with a short, minimal NetDev structure
          * allocation, with no room for per-kind fields), and once to read the kind's properties (with a full,
@@ -217,6 +210,13 @@ static NetDev *netdev_free(NetDev *netdev) {
             NETDEV_VTABLE(netdev) &&
             NETDEV_VTABLE(netdev)->done)
                 NETDEV_VTABLE(netdev)->done(netdev);
+
+        netdev_detach_from_manager(netdev);
+
+        condition_free_list(netdev->conditions);
+        free(netdev->filename);
+        free(netdev->description);
+        free(netdev->ifname);
 
         return mfree(netdev);
 }
@@ -449,8 +449,7 @@ int netdev_generate_hw_addr(
                         memcpy(a.bytes, &result, a.length);
 
                         if (ether_addr_is_null(&a.ether) || ether_addr_is_broadcast(&a.ether)) {
-                                log_netdev_warning_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
-                                                         "Failed to generate persistent MAC address, ignoring: %m");
+                                log_netdev_warning(netdev, "Failed to generate persistent MAC address, ignoring.");
                                 a = HW_ADDR_NULL;
                                 goto finalize;
                         }
@@ -458,8 +457,7 @@ int netdev_generate_hw_addr(
                         break;
                 case ARPHRD_INFINIBAND:
                         if (result == 0) {
-                                log_netdev_warning_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
-                                                         "Failed to generate persistent MAC address: %m");
+                                log_netdev_warning(netdev, "Failed to generate persistent MAC address.");
                                 goto finalize;
                         }
 
@@ -702,7 +700,7 @@ int link_request_stacked_netdev(Link *link, NetDev *netdev) {
 
         link->stacked_netdevs_created = false;
         r = link_queue_request_full(link, REQUEST_TYPE_NETDEV_STACKED,
-                                    netdev_ref(netdev), (mfree_func_t) netdev_unref,
+                                    netdev, (mfree_func_t) netdev_unref,
                                     trivial_hash_func, trivial_compare_func,
                                     stacked_netdev_process_request,
                                     &link->create_stacked_netdev_messages,
@@ -710,9 +708,12 @@ int link_request_stacked_netdev(Link *link, NetDev *netdev) {
         if (r < 0)
                 return log_link_error_errno(link, r, "Failed to request stacked netdev '%s': %m",
                                             netdev->ifname);
+        if (r == 0)
+                return 0;
 
+        netdev_ref(netdev);
         log_link_debug(link, "Requested stacked netdev '%s'", netdev->ifname);
-        return 0;
+        return 1;
 }
 
 static int independent_netdev_process_request(Request *req, Link *link, void *userdata) {
@@ -736,6 +737,10 @@ static int netdev_request_to_create(NetDev *netdev) {
         int r;
 
         assert(netdev);
+        assert(netdev->manager);
+
+        if (netdev->manager->test_mode)
+                return 0;
 
         if (netdev_is_stacked(netdev))
                 return 0;

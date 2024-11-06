@@ -65,8 +65,8 @@ with open(sys.argv[1], "r") as f:
 print('''        {}
 }, symbols_from_source[] = {''')
 
-for dirpath, _, filenames in os.walk(sys.argv[2]):
-    for filename in filenames:
+for dirpath, _, filenames in sorted(os.walk(sys.argv[2])):
+    for filename in sorted(filenames):
         if not filename.endswith(".c") and not filename.endswith(".h"):
             continue
         with open(os.path.join(dirpath, filename), "r") as f:

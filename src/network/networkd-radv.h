@@ -12,6 +12,7 @@
 
 #include "in-addr-util.h"
 #include "conf-parser.h"
+#include "ndisc-option.h"
 #include "networkd-util.h"
 
 typedef struct Link Link;
@@ -30,13 +31,7 @@ typedef struct Prefix {
         Network *network;
         ConfigSection *section;
 
-        struct in6_addr prefix;
-        uint8_t prefixlen;
-        usec_t preferred_lifetime;
-        usec_t valid_lifetime;
-
-        bool onlink;
-        bool address_auto_configuration;
+        sd_ndisc_prefix prefix;
 
         bool assign;
         uint32_t route_metric;
@@ -47,19 +42,24 @@ typedef struct RoutePrefix {
         Network *network;
         ConfigSection *section;
 
-        struct in6_addr prefix;
-        uint8_t prefixlen;
-        usec_t lifetime;
+        sd_ndisc_route route;
 } RoutePrefix;
 
-Prefix *prefix_free(Prefix *prefix);
-RoutePrefix *route_prefix_free(RoutePrefix *prefix);
+typedef struct Prefix64 {
+        Network *network;
+        ConfigSection *section;
 
-void network_drop_invalid_prefixes(Network *network);
-void network_drop_invalid_route_prefixes(Network *network);
+        sd_ndisc_prefix64 prefix64;
+} Prefix64;
+
+Prefix* prefix_free(Prefix *prefix);
+RoutePrefix* route_prefix_free(RoutePrefix *prefix);
+Prefix64* prefix64_free(Prefix64 *prefix);
+
 void network_adjust_radv(Network *network);
 
 int link_request_radv_addresses(Link *link);
+int link_reconfigure_radv_address(Address *address, Link *link);
 
 bool link_radv_enabled(Link *link);
 int radv_start(Link *link);
@@ -74,6 +74,7 @@ RADVPrefixDelegation radv_prefix_delegation_from_string(const char *s) _pure_;
 
 CONFIG_PARSER_PROTOTYPE(config_parse_router_prefix_delegation);
 CONFIG_PARSER_PROTOTYPE(config_parse_router_lifetime);
+CONFIG_PARSER_PROTOTYPE(config_parse_router_uint32_msec_usec);
 CONFIG_PARSER_PROTOTYPE(config_parse_router_preference);
 CONFIG_PARSER_PROTOTYPE(config_parse_prefix);
 CONFIG_PARSER_PROTOTYPE(config_parse_prefix_boolean);
@@ -84,3 +85,6 @@ CONFIG_PARSER_PROTOTYPE(config_parse_radv_dns);
 CONFIG_PARSER_PROTOTYPE(config_parse_radv_search_domains);
 CONFIG_PARSER_PROTOTYPE(config_parse_route_prefix);
 CONFIG_PARSER_PROTOTYPE(config_parse_route_prefix_lifetime);
+CONFIG_PARSER_PROTOTYPE(config_parse_pref64_prefix);
+CONFIG_PARSER_PROTOTYPE(config_parse_pref64_prefix_lifetime);
+CONFIG_PARSER_PROTOTYPE(config_parse_router_home_agent_lifetime);

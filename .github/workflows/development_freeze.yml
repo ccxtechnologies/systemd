@@ -8,10 +8,6 @@ on:
     types:
       - completed
 
-env:
-  PULL_REQUEST_METADATA_DIR: pull_request
-  PULL_REQUEST_METADATA_FILE: metadata
-
 permissions:
   contents: read
 
@@ -21,54 +17,27 @@ jobs:
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.repository == 'systemd/systemd'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     permissions:
       pull-requests: write
 
     steps:
-      - name: Download Pull Request Metadata artifact
-        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+      - id: artifact
+        name: Download Pull Request Metadata artifact
+        uses: redhat-plumbers-in-action/download-artifact@463ae626ac2dd333491c7beccaa24c12c5c259b8
         with:
-          script: |
-            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
-               owner: context.repo.owner,
-               repo: context.repo.repo,
-               run_id: ${{ github.event.workflow_run.id }},
-            });
-
-            const matchArtifact = artifacts.data.artifacts.filter((artifact) => {
-              return artifact.name == "${{ env.PULL_REQUEST_METADATA_FILE }}"
-            })[0];
-
-            const download = await github.rest.actions.downloadArtifact({
-               owner: context.repo.owner,
-               repo: context.repo.repo,
-               artifact_id: matchArtifact.id,
-               archive_format: 'zip',
-            });
-
-            const fs = require('fs');
-            fs.writeFileSync('${{ github.workspace }}/${{ env.PULL_REQUEST_METADATA_FILE }}.zip', Buffer.from(download.data));
-
-      - run: unzip ${{ env.PULL_REQUEST_METADATA_FILE }}.zip
-
-      - name: 'Get Pull Request number'
-        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            const pr_number = Number(fs.readFileSync('./${{ env.PULL_REQUEST_METADATA_FILE }}'));
-            core.exportVariable('pr_number', pr_number);
+          name: Pull Request Metadata
 
       - name: Repository checkout
-        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9
+        uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29
         with:
           fetch-depth: 0
 
       - name: Development Freezer
-        uses: redhat-plumbers-in-action/devel-freezer@13b6551f19ade74ca79be4cab06b815a4ffffa64
+        uses: redhat-plumbers-in-action/devel-freezer@ad766eafd555b28d2cb8e27937835983f9c3d173
         with:
-          pr-number: ${{ env.pr_number }}
+          pr-number: ${{ fromJSON(steps.artifact.outputs.pr-metadata-json).number }}
+          # delay start of validation to allow for some milestone/labels tweaking
+          delay: 20
           token: ${{ secrets.GITHUB_TOKEN }}

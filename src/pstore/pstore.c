@@ -28,7 +28,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "io-util.h"
+#include "iovec-util.h"
 #include "journal-importer.h"
 #include "log.h"
 #include "macro.h"
@@ -56,9 +56,9 @@ typedef enum PStoreStorage {
 } PStoreStorage;
 
 static const char* const pstore_storage_table[_PSTORE_STORAGE_MAX] = {
-        [PSTORE_STORAGE_NONE] = "none",
+        [PSTORE_STORAGE_NONE]     = "none",
         [PSTORE_STORAGE_EXTERNAL] = "external",
-        [PSTORE_STORAGE_JOURNAL] = "journal",
+        [PSTORE_STORAGE_JOURNAL]  = "journal",
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP(pstore_storage, PStoreStorage);
@@ -77,9 +77,12 @@ static int parse_config(void) {
                 {}
         };
 
-        return config_parse_config_file("pstore.conf", "PStore\0",
-                                        config_item_table_lookup, items,
-                                        CONFIG_PARSE_WARN, NULL);
+        return config_parse_standard_file_with_dropins(
+                        "systemd/pstore.conf",
+                        "PStore\0",
+                        config_item_table_lookup, items,
+                        CONFIG_PARSE_WARN,
+                        /* userdata= */ NULL);
 }
 
 /* File list handling - PStoreEntry is the struct and
@@ -227,7 +230,9 @@ static int process_dmesg_files(PStoreList *list) {
                 if (!startswith(pe->dirent.d_name, "dmesg-"))
                         continue;
 
-                if ((p = startswith(pe->dirent.d_name, "dmesg-efi-"))) {
+                /* The linux kernel changed the prefix from dmesg-efi- to dmesg-efi_pstore-
+                 * so now we have to handle both cases. */
+                if ((p = STARTSWITH_SET(pe->dirent.d_name, "dmesg-efi-", "dmesg-efi_pstore-"))) {
                         /* For the EFI backend, the 3 least significant digits of record id encodes a
                          * "count" number, the next 2 least significant digits for the dmesg part
                          * (chunk) number, and the remaining digits as the timestamp.  See
@@ -277,6 +282,7 @@ static int process_dmesg_files(PStoreList *list) {
                 } else
                         log_debug("Unknown backend, ignoring \"%s\".", pe->dirent.d_name);
         }
+
         return 0;
 }
 

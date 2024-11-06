@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="portablectl" conditional='ENABLE_PORTABLED'
@@ -45,12 +45,12 @@
     within the file system context of the image.</para>
 
     <para>Portable service images are an efficient way to bundle multiple related services and other units together,
-    and transfer them as a whole between systems. When these images are attached the local system the contained units
+    and transfer them as a whole between systems. When these images are attached to the local system, the contained units
     may run in most ways like regular system-provided units, either with full privileges or inside strict sandboxing,
     depending on the selected configuration. For more details, see
     <ulink url="https://systemd.io/PORTABLE_SERVICES">Portable Services Documentation</ulink>.</para>
 
-    <para>Specifically portable service images may be of the following kind:</para>
+    <para>Portable service images may be of the following kinds:</para>
 
     <itemizedlist>
       <listitem><para>Directory trees containing an OS, including the top-level directories <filename>/usr/</filename>,
@@ -78,7 +78,9 @@
         in the portable image search paths (see below), along with brief metadata and state information. Note that many
         of the commands below may both operate on images inside and outside of the search paths. This command is hence
         mostly a convenience option, the commands are generally not restricted to what this list
-        shows.</para></listitem>
+        shows.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -138,6 +140,10 @@
         <para>If <option>--now</option> and/or <option>--enable</option> are passed, the portable services are
         immediately started (blocking operation unless <option>--no-block</option> is passed) and/or enabled after
         attaching the image.</para>
+
+        <xi:include href="vpick.xml" xpointer="image"/>
+        <xi:include href="vpick.xml" xpointer="directory"/>
+        <xi:include href="version-info.xml" xpointer="v239"/>
         </listitem>
       </varlistentry>
 
@@ -149,11 +155,13 @@
         again. This command expects an image name or path as parameter. Note that if a path is specified only the last
         component of it (i.e. the file or directory name itself, not the path to it) is used for finding matching unit
         files. This is a convenience feature to allow all arguments passed as <command>attach</command> also to
-        <command>detach</command>.</para></listitem>
+        <command>detach</command>.</para>
 
         <para>If <option>--now</option> and/or <option>--enable</option> are passed, the portable services are
         immediately stopped (blocking operation) and/or disabled before detaching the image. Prefix(es) are also accepted,
         to be used in case the unit names do not match the image name as described in the <command>attach</command>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -163,11 +171,13 @@
         This is useful in case the image was replaced. Running units are not stopped during the process. Partial matching,
         to allow for different versions in the image name, is allowed: only the part before the first <literal>_</literal>
         character has to match. If the new image doesn't exist, the existing one will not be detached. The parameters
-        follow the same syntax as the <command>attach</command> command.</para></listitem>
+        follow the same syntax as the <command>attach</command> command.</para>
 
         <para>If <option>--now</option> and/or <option>--enable</option> are passed, the portable services are
         immediately stopped if removed, started and/or enabled if added, or restarted if updated. Prefixes are also
         accepted, in the same way as described in the <command>attach</command> case.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -183,6 +193,8 @@
         command is useful to determine whether an image qualifies as portable service image, and which unit files are
         included. This command expects the path to the image as parameter, optionally followed by a list of unit file
         prefixes to consider, similar to the <command>attach</command> command described above.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/>
         </listitem>
       </varlistentry>
 
@@ -236,6 +248,8 @@
           </tgroup>
         </table>
 
+          <xi:include href="version-info.xml" xpointer="v239"/>
+
         </listitem>
       </varlistentry>
 
@@ -244,7 +258,9 @@
 
         <listitem><para>Marks or (unmarks) a portable service image read-only. Takes an image name, followed by a
         boolean as arguments. If the boolean is omitted, positive is implied, i.e. the image is marked
-        read-only.</para></listitem>
+        read-only.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -252,7 +268,9 @@
 
         <listitem><para>Removes one or more portable service images. Note that this command will only remove the
         specified image path itself — it refers to a symbolic link then the symbolic link is removed and not the
-        image it points to.</para></listitem>
+        image it points to.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -268,7 +286,9 @@
         <para>Note that per-image size limits are only supported on btrfs file systems. Also, depending on
         <varname>BindPaths=</varname> settings in the portable service's unit files directories from the host might be
         visible in the image environment during runtime which are not affected by this setting, as only the image
-        itself is counted against this limit.</para></listitem>
+        itself is counted against this limit.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
     </variablelist>
@@ -285,27 +305,35 @@
         <term><option>-q</option></term>
         <term><option>--quiet</option></term>
 
-        <listitem><para>Suppresses additional informational output while running.</para></listitem>
+        <listitem><para>Suppresses additional informational output while running.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>-p</option> <replaceable>PROFILE</replaceable></term>
-        <term><option>--profile=</option><replaceable>PROFILE</replaceable></term>
+        <term><option>--profile=<replaceable>PROFILE</replaceable></option></term>
 
         <listitem><para>When attaching an image, select the profile to use. By default the <literal>default</literal>
-        profile is used. For details about profiles, see below.</para></listitem>
+        profile is used. For details about profiles, see below.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--copy=</option></term>
 
-        <listitem><para>When attaching an image, select whether to prefer copying or symlinking of files installed into
-        the host system. Takes one of <literal>copy</literal> (to prefer copying of files), <literal>symlink</literal>
-        (to prefer creation of symbolic links) or <literal>auto</literal> for an intermediary mode where security
-        profile drop-ins are symlinked while unit files are copied. Note that this option expresses a preference only,
-        in cases where symbolic links cannot be created — for example when the image operated on is a raw disk image,
-        and hence not directly referentiable from the host file system — copying of files is used
-        unconditionally.</para></listitem>
+        <listitem><para>When attaching an image, select whether to prefer copying or symlinking of files
+        installed into the host system. Takes one of <literal>copy</literal> (files will be copied),
+        <literal>symlink</literal> (to prefer creation of symbolic links), <literal>auto</literal> for an
+        intermediary mode where security profile drop-ins and images are symlinked while unit files are
+        copied, or <literal>mixed</literal> (since v256) where security profile drop-ins are symlinked while
+        unit files and images are copied. Note that this option expresses a preference only, in cases where
+        symbolic links cannot be created — for example when the image operated on is a raw disk image, and
+        hence not directly referentiable from the host file system — copying of files is used
+        unconditionally.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -314,7 +342,9 @@
         <listitem><para>When specified the unit and drop-in files are placed in
         <filename>/run/systemd/system.attached/</filename> instead of
         <filename>/etc/systemd/system.attached/</filename>. Images attached with this option set hence remain attached
-        only until the next reboot, while they are normally attached persistently.</para></listitem>
+        only until the next reboot, while they are normally attached persistently.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -322,7 +352,9 @@
 
         <listitem><para>Don't reload the service manager after attaching or detaching a portable service
         image. Normally the service manager is reloaded to ensure it is aware of added or removed unit
-        files.</para></listitem>
+        files.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -331,37 +363,55 @@
         <listitem><para>When inspecting portable service images, show the (unprocessed) contents of the metadata files
         pulled from the image, instead of brief summaries. Specifically, this will show the
         <citerefentry><refentrytitle>os-release</refentrytitle><manvolnum>5</manvolnum></citerefentry> and unit file
-        contents of the image.</para></listitem>
+        contents of the image.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--enable</option></term>
 
-        <listitem><para>Immediately enable/disable the portable service after attaching/detaching.</para></listitem>
+        <listitem><para>Immediately enable/disable the portable service after attaching/detaching.</para>
+
+        <xi:include href="version-info.xml" xpointer="v245"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--now</option></term>
 
         <listitem><para>Immediately start/stop/restart the portable service after attaching/before
-        detaching/after upgrading.</para></listitem>
+        detaching/after upgrading.</para>
+
+        <xi:include href="version-info.xml" xpointer="v245"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--no-block</option></term>
 
-        <listitem><para>Don't block waiting for attach --now to complete.</para></listitem>
+        <listitem><para>Don't block waiting for attach --now to complete.</para>
+
+        <xi:include href="version-info.xml" xpointer="v245"/></listitem>
       </varlistentry>
 
       <varlistentry>
-        <term><option>--extension=</option><replaceable>PATH</replaceable></term>
+        <term><option>--clean</option></term>
+
+        <listitem><para>When detaching ensure the configuration, state, logs, cache, and runtime data
+        directories of the portable service are removed from the host system.</para>
+
+        <xi:include href="version-info.xml" xpointer="v256"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--extension=<replaceable>PATH</replaceable></option></term>
 
         <listitem><para>Add an additional image <replaceable>PATH</replaceable> as an overlay on
         top of <replaceable>IMAGE</replaceable> when attaching/detaching. This argument can be specified
         multiple times, in which case the order in which images are laid down follows the rules specified in
         <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>
         for the <varname>ExtensionImages=</varname> directive and for the
-        <citerefentry><refentrytitle>systemd-sysext</refentrytitle><manvolnum>8</manvolnum></citerefentry> tool.
+        <citerefentry><refentrytitle>systemd-sysext</refentrytitle><manvolnum>8</manvolnum></citerefentry> and
+        <citerefentry><refentrytitle>systemd-confext</refentrytitle><manvolnum>8</manvolnum></citerefentry> tools.
         The images must contain an <filename>extension-release</filename> file with metadata that matches
         what is defined in the <filename>os-release</filename> of <replaceable>IMAGE</replaceable>. See:
         <citerefentry><refentrytitle>os-release</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
@@ -371,7 +421,11 @@
         </para>
 
         <para>Note that the same extensions have to be specified, in the same order, when attaching
-        and detaching.</para></listitem>
+        and detaching.</para>
+
+        <xi:include href="vpick.xml" xpointer="image"/>
+        <xi:include href="vpick.xml" xpointer="directory"/>
+        <xi:include href="version-info.xml" xpointer="v249"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -380,7 +434,9 @@
         <listitem><para>Skip safety checks and attach or detach images (with extensions) without first ensuring
         that the units are not running, and do not insist that the
         <filename>extension-release.<replaceable>NAME</replaceable></filename> file in the extension image has
-        to match the image filename.</para></listitem>
+        to match the image filename.</para>
+
+        <xi:include href="version-info.xml" xpointer="v252"/></listitem>
       </varlistentry>
 
       <xi:include href="user-system-options.xml" xpointer="host" />
@@ -463,12 +519,13 @@
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-sysext</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>org.freedesktop.portable1</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-portabled.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-sysext</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>org.freedesktop.portable1</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-portabled.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>importctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

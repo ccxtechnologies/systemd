@@ -1,12 +1,12 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd" [
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd" [
 <!ENTITY % entities SYSTEM "custom-entities.ent" >
 %entities;
 ]>
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
-<refentry id="systemd-journal-remote" conditional='HAVE_MICROHTTPD'
+<refentry id="systemd-journal-remote" conditional='ENABLE_REMOTE HAVE_MICROHTTPD'
           xmlns:xi="http://www.w3.org/2001/XInclude">
 
   <refentryinfo>
@@ -87,12 +87,14 @@
 
     <variablelist>
       <varlistentry>
-        <term><arg choice="opt" rep="repeat">SOURCES</arg></term>
+        <term><optional>SOURCES</optional></term>
 
         <listitem><para>When <option>-</option> is given as a
         positional argument, events will be read from standard input.
         Other positional arguments will be treated as filenames
-        to open and read from.</para></listitem>
+        to open and read from.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -105,11 +107,13 @@
         root of a remote
         <citerefentry><refentrytitle>systemd-journal-gatewayd</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         instance, e.g. http://some.host:19531/ or
-        https://some.host:19531/.</para></listitem>
+        https://some.host:19531/.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
-        <term><option>--getter='<replaceable>PROG</replaceable> <arg choice="opt" rep="repeat">OPTIONS</arg>'</option></term>
+        <term><option>--getter='<replaceable>PROG</replaceable> <optional>OPTIONS</optional>'</option></term>
 
         <listitem><para>Program to invoke to retrieve data. The journal
         event stream must be generated on standard output.</para>
@@ -119,6 +123,8 @@
         <programlisting>--getter='curl "-HAccept: application/vnd.fdo.journal" https://some.host:19531/'</programlisting>
 
         <programlisting>--getter='wget --header="Accept: application/vnd.fdo.journal" -O- https://some.host:19531/'</programlisting>
+
+        <xi:include href="version-info.xml" xpointer="v239"/>
         </listitem>
       </varlistentry>
     </variablelist>
@@ -136,6 +142,8 @@
         <command>systemd-journal-remote</command> will listen on this
         socket for connections. Each connection is expected to be a
         stream of journal events.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/>
         </listitem>
       </varlistentry>
 
@@ -156,6 +164,8 @@
         <option>--listen-https=</option>. Currently, only POST requests
         to <filename>/upload</filename> with <literal>Content-Type:
         application/vnd.fdo.journal</literal> are supported.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/>
         </listitem>
       </varlistentry>
 
@@ -174,6 +184,8 @@
         above. In the latter case, an HTTP or HTTPS server will be
         spawned using this descriptor and connections must be made
         over the HTTP protocol.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/>
         </listitem>
       </varlistentry>
 
@@ -183,7 +195,9 @@
         <listitem><para>Takes a path to a SSL secret key file in PEM format. Defaults to
         <filename>&CERTIFICATE_ROOT;/private/journal-remote.pem</filename>. This option can be used with
         <option>--listen-https=</option>. If the path refers to an <constant>AF_UNIX</constant> stream socket
-        in the file system a connection is made to it and the key read from it.</para></listitem>
+        in the file system a connection is made to it and the key read from it.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -192,7 +206,9 @@
         <listitem><para> Takes a path to a SSL certificate file in PEM format. Defaults to
         <filename>&CERTIFICATE_ROOT;/certs/journal-remote.pem</filename>. This option can be used with
         <option>--listen-https=</option>. If the path refers to an <constant>AF_UNIX</constant> stream socket
-        in the file system a connection is made to it and the certificate read from it.</para></listitem>
+        in the file system a connection is made to it and the certificate read from it.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -202,7 +218,9 @@
         <option>all</option> is set, then certificate checking will be disabled. Defaults to
         <filename>&CERTIFICATE_ROOT;/ca/trusted.pem</filename>. This option can be used with
         <option>--listen-https=</option>. If the path refers to an <constant>AF_UNIX</constant> stream socket
-        in the file system a connection is made to it and the certificate read from it.</para></listitem>
+        in the file system a connection is made to it and the certificate read from it.</para>
+
+ <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -212,7 +230,9 @@
           Takes a comma separated list of gnutls logging categories.
           This option can be used with <option>--listen-http=</option> or
           <option>--listen-https=</option>.
-        </para></listitem>
+        </para>
+
+          <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
     </variablelist>
@@ -235,7 +255,9 @@
         created if it does not exist. If necessary (journal file full,
         or corrupted), the file will be renamed following normal
         journald rules and a new journal file will be created in its
-        stead.</para></listitem>
+        stead.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -247,7 +269,9 @@
         necessary (journal files over size, or corrupted), journal
         files will be rotated following normal journald rules. Names
         of files underneath <replaceable>DIR</replaceable> will be
-        generated using the rules described below.</para></listitem>
+        generated using the rules described below.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
     </variablelist>
 
@@ -284,7 +308,9 @@
         <para>In the case that "active" sources are given by the positional
         arguments or <option>--getter=</option> option, the output file name must
         always be given explicitly and only <constant>none</constant>
-        is allowed.</para></listitem>
+        is allowed.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -292,7 +318,9 @@
 
         <listitem><para>If this is set to <literal>yes</literal> then compress
         the data in the journal using XZ. The default is <literal>yes</literal>.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -300,7 +328,9 @@
 
         <listitem><para>If this is set to <literal>yes</literal> then
         periodically sign the data in the journal using Forward Secure Sealing.
-        The default is <literal>no</literal>.</para></listitem>
+        The default is <literal>no</literal>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="help" />
@@ -337,12 +367,12 @@ systemd-journal-remote --url http://some.host:19531/entries?boot&amp;follow
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>journal-remote.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-journal-gatewayd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-journal-upload.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>journal-remote.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-journal-gatewayd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-journal-upload.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 </refentry>

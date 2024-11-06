@@ -20,6 +20,7 @@
 #define ID128_WALDI SD_ID128_MAKE(01, 02, 03, 04, 05, 06, 07, 08, 09, 0a, 0b, 0c, 0d, 0e, 0f, 10)
 #define STR_WALDI "0102030405060708090a0b0c0d0e0f10"
 #define UUID_WALDI "01020304-0506-0708-090a-0b0c0d0e0f10"
+#define STR_NULL "00000000000000000000000000000000"
 
 TEST(id128) {
         sd_id128_t id, id2;
@@ -49,19 +50,19 @@ TEST(id128) {
         }
 
         printf("waldi: %s\n", sd_id128_to_string(ID128_WALDI, t));
-        assert_se(streq(t, STR_WALDI));
+        ASSERT_STREQ(t, STR_WALDI);
 
         assert_se(asprintf(&b, SD_ID128_FORMAT_STR, SD_ID128_FORMAT_VAL(ID128_WALDI)) == 32);
         printf("waldi2: %s\n", b);
-        assert_se(streq(t, b));
+        ASSERT_STREQ(t, b);
 
         printf("waldi3: %s\n", sd_id128_to_uuid_string(ID128_WALDI, q));
-        assert_se(streq(q, UUID_WALDI));
+        ASSERT_STREQ(q, UUID_WALDI);
 
         b = mfree(b);
         assert_se(asprintf(&b, SD_ID128_UUID_FORMAT_STR, SD_ID128_FORMAT_VAL(ID128_WALDI)) == 36);
         printf("waldi4: %s\n", b);
-        assert_se(streq(q, b));
+        ASSERT_STREQ(q, b);
 
         assert_se(sd_id128_from_string(STR_WALDI, &id) >= 0);
         assert_se(sd_id128_equal(id, ID128_WALDI));
@@ -74,6 +75,13 @@ TEST(id128) {
         assert_se(sd_id128_from_string("01020304-0506-0708-090a-0b0c0d0e0f10-", &id) < 0);
         assert_se(sd_id128_from_string("01020304-0506-0708-090a0b0c0d0e0f10", &id) < 0);
         assert_se(sd_id128_from_string("010203040506-0708-090a-0b0c0d0e0f10", &id) < 0);
+
+        assert_se(id128_from_string_nonzero(STR_WALDI, &id) == 0);
+        assert_se(id128_from_string_nonzero(STR_NULL, &id) == -ENXIO);
+        assert_se(id128_from_string_nonzero("01020304-0506-0708-090a-0b0c0d0e0f101", &id) < 0);
+        assert_se(id128_from_string_nonzero("01020304-0506-0708-090a-0b0c0d0e0f10-", &id) < 0);
+        assert_se(id128_from_string_nonzero("01020304-0506-0708-090a0b0c0d0e0f10", &id) < 0);
+        assert_se(id128_from_string_nonzero("010203040506-0708-090a-0b0c0d0e0f10", &id) < 0);
 
         assert_se(id128_is_valid(STR_WALDI));
         assert_se(id128_is_valid(UUID_WALDI));
@@ -172,6 +180,11 @@ TEST(id128) {
         assert_se(lseek(fd, 0, SEEK_SET) == 0);
         assert_se(id128_read_fd(fd, ID128_FORMAT_ANY, NULL) == -EUCLEAN);
 
+        /* build/systemd-id128 -a f03daaeb1c334b43a732172944bf772e show 51df0b4bc3b04c9780e299b98ca373b8 */
+        assert_se(sd_id128_get_app_specific(SD_ID128_MAKE(51,df,0b,4b,c3,b0,4c,97,80,e2,99,b9,8c,a3,73,b8),
+                                            SD_ID128_MAKE(f0,3d,aa,eb,1c,33,4b,43,a7,32,17,29,44,bf,77,2e), &id) >= 0);
+        assert_se(sd_id128_equal(id, SD_ID128_MAKE(1d,ee,59,54,e7,5c,4d,6f,b9,6c,c6,c0,4c,a1,8a,86)));
+
         if (sd_booted() > 0 && sd_id128_get_machine(NULL) >= 0) {
                 assert_se(sd_id128_get_machine_app_specific(SD_ID128_MAKE(f0,3d,aa,eb,1c,33,4b,43,a7,32,17,29,44,bf,77,2e), &id) >= 0);
                 assert_se(sd_id128_get_machine_app_specific(SD_ID128_MAKE(f0,3d,aa,eb,1c,33,4b,43,a7,32,17,29,44,bf,77,2e), &id2) >= 0);
@@ -179,10 +192,14 @@ TEST(id128) {
                 assert_se(sd_id128_get_machine_app_specific(SD_ID128_MAKE(51,df,0b,4b,c3,b0,4c,97,80,e2,99,b9,8c,a3,73,b8), &id2) >= 0);
                 assert_se(!sd_id128_equal(id, id2));
         }
+
+        /* Check return values */
+        ASSERT_RETURN_EXPECTED_SE(sd_id128_get_app_specific(SD_ID128_ALLF, SD_ID128_NULL, &id) == -ENXIO);
+        ASSERT_RETURN_EXPECTED_SE(sd_id128_get_app_specific(SD_ID128_NULL, SD_ID128_ALLF, &id) == 0);
 }
 
 TEST(sd_id128_get_invocation) {
-        sd_id128_t id;
+        sd_id128_t id = SD_ID128_NULL;
         int r;
 
         /* Query the invocation ID */
@@ -191,6 +208,36 @@ TEST(sd_id128_get_invocation) {
                 log_warning_errno(r, "Failed to get invocation ID, ignoring: %m");
         else
                 log_info("Invocation ID: " SD_ID128_FORMAT_STR, SD_ID128_FORMAT_VAL(id));
+
+        sd_id128_t appid = SD_ID128_NULL;
+        r = sd_id128_get_invocation_app_specific(SD_ID128_MAKE(59,36,e9,92,fd,11,42,fe,87,c9,e9,b5,6c,9e,4f,04), &appid);
+        if (r < 0)
+                log_warning_errno(r, "Failed to get invocation ID, ignoring: %m");
+        else {
+                assert(!sd_id128_equal(id, appid));
+                log_info("Per-App Invocation ID: " SD_ID128_FORMAT_STR, SD_ID128_FORMAT_VAL(appid));
+        }
+
+        sd_id128_t appid2 = SD_ID128_NULL;
+        r = sd_id128_get_invocation_app_specific(SD_ID128_MAKE(59,36,e9,92,fd,11,42,fe,87,c9,e9,b5,6c,9e,4f,05), &appid2); /* slightly different appid */
+        if (r < 0)
+                log_warning_errno(r, "Failed to get invocation ID, ignoring: %m");
+        else {
+                assert(!sd_id128_equal(id, appid2));
+                assert(!sd_id128_equal(appid, appid2));
+                log_info("Per-App Invocation ID 2: " SD_ID128_FORMAT_STR, SD_ID128_FORMAT_VAL(appid2));
+        }
+
+        sd_id128_t appid3 = SD_ID128_NULL;
+        r = sd_id128_get_invocation_app_specific(SD_ID128_MAKE(59,36,e9,92,fd,11,42,fe,87,c9,e9,b5,6c,9e,4f,04), &appid3); /* same appid as before */
+        if (r < 0)
+                log_warning_errno(r, "Failed to get invocation ID, ignoring: %m");
+        else {
+                assert(!sd_id128_equal(id, appid3));
+                assert(sd_id128_equal(appid, appid3));
+                assert(!sd_id128_equal(appid2, appid3));
+                log_info("Per-App Invocation ID 3: " SD_ID128_FORMAT_STR, SD_ID128_FORMAT_VAL(appid3));
+        }
 }
 
 TEST(benchmark_sd_id128_get_machine_app_specific) {

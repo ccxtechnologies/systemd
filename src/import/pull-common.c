@@ -7,6 +7,7 @@
 #include "capability-util.h"
 #include "copy.h"
 #include "dirent-util.h"
+#include "discover-image.h"
 #include "escape.h"
 #include "fd-util.h"
 #include "hostname-util.h"
@@ -37,10 +38,8 @@ int pull_find_old_etags(
         int r;
 
         assert(url);
+        assert(image_root);
         assert(etags);
-
-        if (!image_root)
-                image_root = "/var/lib/machines";
 
         _cleanup_free_ char *escaped_url = xescape(url, FILENAME_ESCAPE);
         if (!escaped_url)
@@ -128,10 +127,8 @@ int pull_make_path(const char *url, const char *etag, const char *image_root, co
         char *path;
 
         assert(url);
+        assert(image_root);
         assert(ret);
-
-        if (!image_root)
-                image_root = "/var/lib/machines";
 
         escaped_url = xescape(url, FILENAME_ESCAPE);
         if (!escaped_url)
@@ -380,7 +377,7 @@ static int verify_gpg(
                 const void *payload, size_t payload_size,
                 const void *signature, size_t signature_size) {
 
-        _cleanup_close_pair_ int gpg_pipe[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int gpg_pipe[2] = EBADF_PAIR;
         char sig_file_path[] = "/tmp/sigXXXXXX", gpg_home[] = "/tmp/gpghomeXXXXXX";
         _cleanup_(sigkill_waitp) pid_t pid = 0;
         bool gpg_home_created = false;
@@ -400,7 +397,7 @@ static int verify_gpg(
                 if (sig_file < 0)
                         return log_error_errno(errno, "Failed to create temporary file: %m");
 
-                r = loop_write(sig_file, signature, signature_size, false);
+                r = loop_write(sig_file, signature, signature_size);
                 if (r < 0) {
                         log_error_errno(r, "Failed to write to temporary file: %m");
                         goto finish;
@@ -417,7 +414,7 @@ static int verify_gpg(
         r = safe_fork_full("(gpg)",
                            (int[]) { gpg_pipe[0], -EBADF, STDERR_FILENO },
                            NULL, 0,
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_REARRANGE_STDIO|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
                            &pid);
         if (r < 0)
                 return r;
@@ -465,7 +462,7 @@ static int verify_gpg(
 
         gpg_pipe[0] = safe_close(gpg_pipe[0]);
 
-        r = loop_write(gpg_pipe[1], payload, payload_size, false);
+        r = loop_write(gpg_pipe[1], payload, payload_size);
         if (r < 0) {
                 log_error_errno(r, "Failed to write to pipe: %m");
                 goto finish;
@@ -550,7 +547,6 @@ int pull_verify(ImportVerify verify,
                 log_debug("Main download is a checksum file, can't validate its checksum with itself, skipping.");
                 verify_job = main_job;
         } else {
-                PullJob *j;
                 assert(main_job->calc_checksum);
                 assert(main_job->checksum);
                 assert(checksum_job);
@@ -560,7 +556,8 @@ int pull_verify(ImportVerify verify,
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
                                                "Checksum is empty, cannot verify.");
 
-                FOREACH_POINTER(j, main_job, settings_job, roothash_job, roothash_signature_job, verity_job) {
+                PullJob *j;
+                FOREACH_ARGUMENT(j, main_job, settings_job, roothash_job, roothash_signature_job, verity_job) {
                         r = verify_one(checksum_job, j);
                         if (r < 0)
                                 return r;
@@ -643,12 +640,12 @@ int pull_job_restart_with_sha256sum(PullJob *j, char **ret) {
         return 1;
 }
 
-bool pull_validate_local(const char *name, PullFlags flags) {
+bool pull_validate_local(const char *name, ImportFlags flags) {
 
-        if (FLAGS_SET(flags, PULL_DIRECT))
+        if (FLAGS_SET(flags, IMPORT_DIRECT))
                 return path_is_valid(name);
 
-        return hostname_is_valid(name, 0);
+        return image_name_is_valid(name);
 }
 
 int pull_url_needs_checksum(const char *url) {

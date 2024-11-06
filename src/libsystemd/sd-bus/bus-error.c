@@ -277,14 +277,16 @@ _public_ int sd_bus_error_setf(sd_bus_error *e, const char *name, const char *fo
 
                 va_start(ap, format);
                 r = sd_bus_error_setfv(e, name, format, ap);
-                assert(!name || r < 0);
+                if (name)
+                        assert(r < 0);
                 va_end(ap);
 
                 return r;
         }
 
         r = sd_bus_error_set(e, name, NULL);
-        assert(!name || r < 0);
+        if (name)
+                assert(r < 0);
         return r;
 }
 
@@ -599,7 +601,7 @@ const char* _bus_error_message(const sd_bus_error *e, int error, char buf[static
 
 static bool map_ok(const sd_bus_error_map *map) {
         for (; map->code != BUS_ERROR_MAP_END_MARKER; map++)
-                if (!map->name || map->code <=0)
+                if (!map->name || map->code <= 0)
                         return false;
         return true;
 }

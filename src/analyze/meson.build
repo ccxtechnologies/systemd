@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 systemd_analyze_sources = files(
+        'analyze-architectures.c',
         'analyze-blame.c',
         'analyze-calendar.c',
         'analyze-capability.c',
@@ -21,6 +22,7 @@ systemd_analyze_sources = files(
         'analyze-plot.c',
         'analyze-security.c',
         'analyze-service-watchdogs.c',
+        'analyze-srk.c',
         'analyze-syscall-filter.c',
         'analyze-time.c',
         'analyze-time-data.c',
@@ -33,12 +35,23 @@ systemd_analyze_sources = files(
         'analyze.c',
 )
 
-tests += [
-        {
+executables += [
+        executable_template + {
+                'name' : 'systemd-analyze',
+                'public' : conf.get('ENABLE_ANALYZE') == 1,
+                'sources' : systemd_analyze_sources,
+                'include_directories' : core_includes,
+                'link_with' : [
+                        libcore,
+                        libshared,
+                ],
+                'dependencies' : libseccomp,
+                'install' : conf.get('ENABLE_ANALYZE') == 1,
+        },
+        core_test_template + {
                 'sources' : files(
                         'test-verify.c',
                         'analyze-verify-util.c',
                 ),
-                'base' : test_core_base,
         },
 ]

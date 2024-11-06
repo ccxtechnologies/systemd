@@ -10,28 +10,87 @@
 #include "networkd-queue.h"
 #include "set.h"
 
-Neighbor *neighbor_free(Neighbor *neighbor) {
-        if (!neighbor)
-                return NULL;
+static Neighbor* neighbor_detach_impl(Neighbor *neighbor) {
+        assert(neighbor);
+        assert(!neighbor->link || !neighbor->network);
 
         if (neighbor->network) {
                 assert(neighbor->section);
-                hashmap_remove(neighbor->network->neighbors_by_section, neighbor->section);
+                ordered_hashmap_remove(neighbor->network->neighbors_by_section, neighbor->section);
+                neighbor->network = NULL;
+                return neighbor;
         }
 
-        config_section_free(neighbor->section);
-
-        if (neighbor->link)
+        if (neighbor->link) {
                 set_remove(neighbor->link->neighbors, neighbor);
+                neighbor->link = NULL;
+                return neighbor;
+        }
 
+        return NULL;
+}
+
+static void neighbor_detach(Neighbor *neighbor) {
+        neighbor_unref(neighbor_detach_impl(neighbor));
+}
+
+static Neighbor* neighbor_free(Neighbor *neighbor) {
+        if (!neighbor)
+                return NULL;
+
+        neighbor_detach_impl(neighbor);
+
+        config_section_free(neighbor->section);
         return mfree(neighbor);
 }
 
-DEFINE_SECTION_CLEANUP_FUNCTIONS(Neighbor, neighbor_free);
+DEFINE_TRIVIAL_REF_UNREF_FUNC(Neighbor, neighbor, neighbor_free);
+DEFINE_SECTION_CLEANUP_FUNCTIONS(Neighbor, neighbor_unref);
+
+static void neighbor_hash_func(const Neighbor *neighbor, struct siphash *state);
+static int neighbor_compare_func(const Neighbor *a, const Neighbor *b);
+
+DEFINE_PRIVATE_HASH_OPS_WITH_KEY_DESTRUCTOR(
+        neighbor_hash_ops_detach,
+        Neighbor,
+        neighbor_hash_func,
+        neighbor_compare_func,
+        neighbor_detach);
+
+DEFINE_PRIVATE_HASH_OPS(
+        neighbor_hash_ops,
+        Neighbor,
+        neighbor_hash_func,
+        neighbor_compare_func);
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+        neighbor_section_hash_ops,
+        ConfigSection,
+        config_section_hash_func,
+        config_section_compare_func,
+        Neighbor,
+        neighbor_detach);
+
+static int neighbor_new(Neighbor **ret) {
+        Neighbor *neighbor;
+
+        assert(ret);
+
+        neighbor = new(Neighbor, 1);
+        if (!neighbor)
+                return -ENOMEM;
+
+        *neighbor = (Neighbor) {
+                .n_ref = 1,
+        };
+
+        *ret = TAKE_PTR(neighbor);
+        return 0;
+}
 
 static int neighbor_new_static(Network *network, const char *filename, unsigned section_line, Neighbor **ret) {
         _cleanup_(config_section_freep) ConfigSection *n = NULL;
-        _cleanup_(neighbor_freep) Neighbor *neighbor = NULL;
+        _cleanup_(neighbor_unrefp) Neighbor *neighbor = NULL;
         int r;
 
         assert(network);
@@ -43,24 +102,21 @@ static int neighbor_new_static(Network *network, const char *filename, unsigned 
         if (r < 0)
                 return r;
 
-        neighbor = hashmap_get(network->neighbors_by_section, n);
+        neighbor = ordered_hashmap_get(network->neighbors_by_section, n);
         if (neighbor) {
                 *ret = TAKE_PTR(neighbor);
                 return 0;
         }
 
-        neighbor = new(Neighbor, 1);
-        if (!neighbor)
-                return -ENOMEM;
+        r = neighbor_new(&neighbor);
+        if (r < 0)
+                return r;
 
-        *neighbor = (Neighbor) {
-                .network = network,
-                .family = AF_UNSPEC,
-                .section = TAKE_PTR(n),
-                .source = NETWORK_CONFIG_SOURCE_STATIC,
-        };
+        neighbor->network = network;
+        neighbor->section = TAKE_PTR(n);
+        neighbor->source = NETWORK_CONFIG_SOURCE_STATIC;
 
-        r = hashmap_ensure_put(&network->neighbors_by_section, &config_section_hash_ops, neighbor->section, neighbor);
+        r = ordered_hashmap_ensure_put(&network->neighbors_by_section, &neighbor_section_hash_ops, neighbor->section, neighbor);
         if (r < 0)
                 return r;
 
@@ -69,7 +125,7 @@ static int neighbor_new_static(Network *network, const char *filename, unsigned 
 }
 
 static int neighbor_dup(const Neighbor *neighbor, Neighbor **ret) {
-        _cleanup_(neighbor_freep) Neighbor *dest = NULL;
+        _cleanup_(neighbor_unrefp) Neighbor *dest = NULL;
 
         assert(neighbor);
         assert(ret);
@@ -78,7 +134,8 @@ static int neighbor_dup(const Neighbor *neighbor, Neighbor **ret) {
         if (!dest)
                 return -ENOMEM;
 
-        /* Unset all pointers */
+        /* Clear the reference counter and all pointers */
+        dest->n_ref = 1;
         dest->link = NULL;
         dest->network = NULL;
         dest->section = NULL;
@@ -90,20 +147,15 @@ static int neighbor_dup(const Neighbor *neighbor, Neighbor **ret) {
 static void neighbor_hash_func(const Neighbor *neighbor, struct siphash *state) {
         assert(neighbor);
 
-        siphash24_compress(&neighbor->family, sizeof(neighbor->family), state);
+        siphash24_compress_typesafe(neighbor->family, state);
 
-        switch (neighbor->family) {
-        case AF_INET:
-        case AF_INET6:
-                /* Equality of neighbors are given by the pair (addr,lladdr) */
-                siphash24_compress(&neighbor->in_addr, FAMILY_ADDRESS_SIZE(neighbor->family), state);
-                break;
-        default:
+        if (!IN_SET(neighbor->family, AF_INET, AF_INET6))
                 /* treat any other address family as AF_UNSPEC */
-                break;
-        }
+                return;
 
-        hw_addr_hash_func(&neighbor->ll_addr, state);
+        /* Equality of neighbors are given by the destination address.
+         * See neigh_lookup() in the kernel. */
+        in_addr_hash_func(&neighbor->in_addr, neighbor->family, state);
 }
 
 static int neighbor_compare_func(const Neighbor *a, const Neighbor *b) {
@@ -113,20 +165,38 @@ static int neighbor_compare_func(const Neighbor *a, const Neighbor *b) {
         if (r != 0)
                 return r;
 
-        switch (a->family) {
-        case AF_INET:
-        case AF_INET6:
-                r = memcmp(&a->in_addr, &b->in_addr, FAMILY_ADDRESS_SIZE(a->family));
-                if (r != 0)
-                        return r;
-        }
+        if (!IN_SET(a->family, AF_INET, AF_INET6))
+                /* treat any other address family as AF_UNSPEC */
+                return 0;
 
-        return hw_addr_compare(&a->ll_addr, &b->ll_addr);
+        return memcmp(&a->in_addr, &b->in_addr, FAMILY_ADDRESS_SIZE(a->family));
 }
 
-DEFINE_PRIVATE_HASH_OPS_WITH_KEY_DESTRUCTOR(neighbor_hash_ops, Neighbor, neighbor_hash_func, neighbor_compare_func, neighbor_free);
+static int neighbor_get_request(Link *link, const Neighbor *neighbor, Request **ret) {
+        Request *req;
 
-static int neighbor_get(Link *link, const Neighbor *in, Neighbor **ret) {
+        assert(link);
+        assert(link->manager);
+        assert(neighbor);
+
+        req = ordered_set_get(
+                        link->manager->request_queue,
+                        &(Request) {
+                                .link = link,
+                                .type = REQUEST_TYPE_NEIGHBOR,
+                                .userdata = (void*) neighbor,
+                                .hash_func = (hash_func_t) neighbor_hash_func,
+                                .compare_func = (compare_func_t) neighbor_compare_func,
+                        });
+        if (!req)
+                return -ENOENT;
+
+        if (ret)
+                *ret = req;
+        return 0;
+}
+
+int neighbor_get(Link *link, const Neighbor *in, Neighbor **ret) {
         Neighbor *existing;
 
         assert(link);
@@ -141,19 +211,21 @@ static int neighbor_get(Link *link, const Neighbor *in, Neighbor **ret) {
         return 0;
 }
 
-static int neighbor_add(Link *link, Neighbor *neighbor) {
+static int neighbor_attach(Link *link, Neighbor *neighbor) {
         int r;
 
         assert(link);
         assert(neighbor);
+        assert(!neighbor->link);
 
-        r = set_ensure_put(&link->neighbors, &neighbor_hash_ops, neighbor);
+        r = set_ensure_put(&link->neighbors, &neighbor_hash_ops_detach, neighbor);
         if (r < 0)
                 return r;
         if (r == 0)
                 return -EEXIST;
 
         neighbor->link = link;
+        neighbor_ref(neighbor);
         return 0;
 }
 
@@ -175,24 +247,6 @@ static void log_neighbor_debug(const Neighbor *neighbor, const char *str, const 
                        IN_ADDR_TO_STRING(neighbor->family, &neighbor->in_addr));
 }
 
-static int neighbor_configure_message(Neighbor *neighbor, Link *link, sd_netlink_message *req) {
-        int r;
-
-        r = sd_rtnl_message_neigh_set_state(req, NUD_PERMANENT);
-        if (r < 0)
-                return r;
-
-        r = netlink_message_append_hw_addr(req, NDA_LLADDR, &neighbor->ll_addr);
-        if (r < 0)
-                return r;
-
-        r = netlink_message_append_in_addr_union(req, NDA_DST, neighbor->family, &neighbor->in_addr);
-        if (r < 0)
-                return r;
-
-        return 0;
-}
-
 static int neighbor_configure(Neighbor *neighbor, Link *link, Request *req) {
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
         int r;
@@ -211,7 +265,15 @@ static int neighbor_configure(Neighbor *neighbor, Link *link, Request *req) {
         if (r < 0)
                 return r;
 
-        r = neighbor_configure_message(neighbor, link, m);
+        r = sd_rtnl_message_neigh_set_state(m, NUD_PERMANENT);
+        if (r < 0)
+                return r;
+
+        r = netlink_message_append_hw_addr(m, NDA_LLADDR, &neighbor->ll_addr);
+        if (r < 0)
+                return r;
+
+        r = netlink_message_append_in_addr_union(m, NDA_DST, neighbor->family, &neighbor->in_addr);
         if (r < 0)
                 return r;
 
@@ -219,6 +281,7 @@ static int neighbor_configure(Neighbor *neighbor, Link *link, Request *req) {
 }
 
 static int neighbor_process_request(Request *req, Link *link, Neighbor *neighbor) {
+        Neighbor *existing;
         int r;
 
         assert(req);
@@ -233,6 +296,9 @@ static int neighbor_process_request(Request *req, Link *link, Neighbor *neighbor
                 return log_link_warning_errno(link, r, "Failed to configure neighbor: %m");
 
         neighbor_enter_configuring(neighbor);
+        if (neighbor_get(link, neighbor, &existing) >= 0)
+                neighbor_enter_configuring(existing);
+
         return 1;
 }
 
@@ -259,31 +325,36 @@ static int static_neighbor_configure_handler(sd_netlink *rtnl, sd_netlink_messag
 }
 
 static int link_request_neighbor(Link *link, const Neighbor *neighbor) {
-        Neighbor *existing;
+        _cleanup_(neighbor_unrefp) Neighbor *tmp = NULL;
+        Neighbor *existing = NULL;
         int r;
 
         assert(link);
         assert(neighbor);
         assert(neighbor->source != NETWORK_CONFIG_SOURCE_FOREIGN);
 
-        if (neighbor_get(link, neighbor, &existing) < 0) {
-                _cleanup_(neighbor_freep) Neighbor *tmp = NULL;
+        if (neighbor->ll_addr.length != link->hw_addr.length) {
+                log_link_debug(link,
+                               "The link layer address length (%zu) for neighbor %s does not match with "
+                               "the hardware address length (%zu), ignoring the setting.",
+                               neighbor->ll_addr.length,
+                               IN_ADDR_TO_STRING(neighbor->family, &neighbor->in_addr),
+                               link->hw_addr.length);
+                return 0;
+        }
 
-                r = neighbor_dup(neighbor, &tmp);
-                if (r < 0)
-                        return r;
+        r = neighbor_dup(neighbor, &tmp);
+        if (r < 0)
+                return r;
 
-                r = neighbor_add(link, tmp);
-                if (r < 0)
-                        return r;
+        if (neighbor_get(link, neighbor, &existing) >= 0)
+                /* Copy state for logging below. */
+                tmp->state = existing->state;
 
-                existing = TAKE_PTR(tmp);
-        } else
-                existing->source = neighbor->source;
-
-        log_neighbor_debug(existing, "Requesting", link);
+        log_neighbor_debug(tmp, "Requesting", link);
         r = link_queue_request_safe(link, REQUEST_TYPE_NEIGHBOR,
-                                    existing, NULL,
+                                    tmp,
+                                    neighbor_unref,
                                     neighbor_hash_func,
                                     neighbor_compare_func,
                                     neighbor_process_request,
@@ -293,7 +364,11 @@ static int link_request_neighbor(Link *link, const Neighbor *neighbor) {
         if (r <= 0)
                 return r;
 
-        neighbor_enter_requesting(existing);
+        neighbor_enter_requesting(tmp);
+        if (existing)
+                neighbor_enter_requesting(existing);
+
+        TAKE_PTR(tmp);
         return 1;
 }
 
@@ -307,7 +382,7 @@ int link_request_static_neighbors(Link *link) {
 
         link->static_neighbors_configured = false;
 
-        HASHMAP_FOREACH(neighbor, link->network->neighbors_by_section) {
+        ORDERED_HASHMAP_FOREACH(neighbor, link->network->neighbors_by_section) {
                 r = link_request_neighbor(link, neighbor);
                 if (r < 0)
                         return log_link_warning_errno(link, r, "Could not request neighbor: %m");
@@ -324,52 +399,66 @@ int link_request_static_neighbors(Link *link) {
         return 0;
 }
 
-static int neighbor_remove_handler(sd_netlink *rtnl, sd_netlink_message *m, Link *link) {
+static int neighbor_remove_handler(sd_netlink *rtnl, sd_netlink_message *m, RemoveRequest *rreq) {
         int r;
 
         assert(m);
-        assert(link);
+        assert(rreq);
 
-        if (IN_SET(link->state, LINK_STATE_FAILED, LINK_STATE_LINGER))
-                return 1;
+        Link *link = ASSERT_PTR(rreq->link);
+        Neighbor *neighbor = ASSERT_PTR(rreq->userdata);
+
+        if (link->state == LINK_STATE_LINGER)
+                return 0;
 
         r = sd_netlink_message_get_errno(m);
-        if (r < 0 && r != -ESRCH)
+        if (r < 0) {
                 /* Neighbor may not exist because it already got deleted, ignore that. */
-                log_link_message_warning_errno(link, m, r, "Could not remove neighbor");
+                log_link_message_full_errno(link, m,
+                                            (r == -ESRCH || !neighbor->link) ? LOG_DEBUG : LOG_WARNING,
+                                            r, "Could not remove neighbor");
+
+                if (neighbor->link) {
+                        /* If the neighbor cannot be removed, then assume the neighbor is already removed. */
+                        log_neighbor_debug(neighbor, "Forgetting", link);
+
+                        Request *req;
+                        if (neighbor_get_request(link, neighbor, &req) >= 0)
+                                neighbor_enter_removed(req->userdata);
+
+                        neighbor_detach(neighbor);
+                }
+        }
 
         return 1;
 }
 
-static int neighbor_remove(Neighbor *neighbor) {
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req = NULL;
-        Link *link;
+int neighbor_remove(Neighbor *neighbor, Link *link) {
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
         int r;
 
         assert(neighbor);
-        assert(neighbor->link);
-        assert(neighbor->link->manager);
-        assert(neighbor->link->manager->rtnl);
+        assert(link);
+        assert(link->manager);
+        assert(link->manager->rtnl);
 
-        link = neighbor->link;
+        /* If the neighbor is remembered, then use the remembered object. */
+        (void) neighbor_get(link, neighbor, &neighbor);
 
         log_neighbor_debug(neighbor, "Removing", link);
 
-        r = sd_rtnl_message_new_neigh(link->manager->rtnl, &req, RTM_DELNEIGH,
+        r = sd_rtnl_message_new_neigh(link->manager->rtnl, &m, RTM_DELNEIGH,
                                       link->ifindex, neighbor->family);
         if (r < 0)
                 return log_link_error_errno(link, r, "Could not allocate RTM_DELNEIGH message: %m");
 
-        r = netlink_message_append_in_addr_union(req, NDA_DST, neighbor->family, &neighbor->in_addr);
+        r = netlink_message_append_in_addr_union(m, NDA_DST, neighbor->family, &neighbor->in_addr);
         if (r < 0)
                 return log_link_error_errno(link, r, "Could not append NDA_DST attribute: %m");
 
-        r = netlink_call_async(link->manager->rtnl, NULL, req, neighbor_remove_handler,
-                               link_netlink_destroy_callback, link);
+        r = link_remove_request_add(link, neighbor, neighbor, link->manager->rtnl, m, neighbor_remove_handler);
         if (r < 0)
-                return log_link_error_errno(link, r, "Could not send rtnetlink message: %m");
-
-        link_ref(link);
+                return log_link_error_errno(link, r, "Could not queue rtnetlink message: %m");
 
         neighbor_enter_removing(neighbor);
         return 0;
@@ -377,7 +466,7 @@ static int neighbor_remove(Neighbor *neighbor) {
 
 int link_drop_foreign_neighbors(Link *link) {
         Neighbor *neighbor;
-        int k, r = 0;
+        int r = 0;
 
         assert(link);
         assert(link->network);
@@ -396,7 +485,7 @@ int link_drop_foreign_neighbors(Link *link) {
         }
 
         /* Next, unmark requested neighbors. They will be configured later. */
-        HASHMAP_FOREACH(neighbor, link->network->neighbors_by_section) {
+        ORDERED_HASHMAP_FOREACH(neighbor, link->network->neighbors_by_section) {
                 Neighbor *existing;
 
                 if (neighbor_get(link, neighbor, &existing) >= 0)
@@ -407,32 +496,28 @@ int link_drop_foreign_neighbors(Link *link) {
                 if (!neighbor_is_marked(neighbor))
                         continue;
 
-                k = neighbor_remove(neighbor);
-                if (k < 0 && r >= 0)
-                        r = k;
+                RET_GATHER(r, neighbor_remove(neighbor, link));
         }
 
         return r;
 }
 
-int link_drop_managed_neighbors(Link *link) {
+int link_drop_static_neighbors(Link *link) {
         Neighbor *neighbor;
-        int k, r = 0;
+        int r = 0;
 
         assert(link);
 
         SET_FOREACH(neighbor, link->neighbors) {
                 /* Do not touch nexthops managed by kernel or other tools. */
-                if (neighbor->source == NETWORK_CONFIG_SOURCE_FOREIGN)
+                if (neighbor->source != NETWORK_CONFIG_SOURCE_STATIC)
                         continue;
 
                 /* Ignore neighbors not assigned yet or already removing. */
                 if (!neighbor_exists(neighbor))
                         continue;
 
-                k = neighbor_remove(neighbor);
-                if (k < 0 && r >= 0)
-                        r = k;
+                RET_GATHER(r, neighbor_remove(neighbor, link));
         }
 
         return r;
@@ -448,9 +533,11 @@ void link_foreignize_neighbors(Link *link) {
 }
 
 int manager_rtnl_process_neighbor(sd_netlink *rtnl, sd_netlink_message *message, Manager *m) {
-        _cleanup_(neighbor_freep) Neighbor *tmp = NULL;
+        _cleanup_(neighbor_unrefp) Neighbor *tmp = NULL;
         Neighbor *neighbor = NULL;
+        Request *req = NULL;
         uint16_t type, state;
+        bool is_new = false;
         int ifindex, r;
         Link *link;
 
@@ -479,10 +566,9 @@ int manager_rtnl_process_neighbor(sd_netlink *rtnl, sd_netlink_message *message,
         if (r < 0) {
                 log_warning_errno(r, "rtnl: received neighbor message with invalid state, ignoring: %m");
                 return 0;
-        } else if (!FLAGS_SET(state, NUD_PERMANENT)) {
-                log_debug("rtnl: received non-static neighbor, ignoring.");
+        } else if (!FLAGS_SET(state, NUD_PERMANENT))
+                /* Currently, we are interested in only static neighbors. */
                 return 0;
-        }
 
         r = sd_rtnl_message_neigh_get_ifindex(message, &ifindex);
         if (r < 0) {
@@ -494,20 +580,24 @@ int manager_rtnl_process_neighbor(sd_netlink *rtnl, sd_netlink_message *message,
         }
 
         r = link_get_by_index(m, ifindex, &link);
-        if (r < 0 || !link) {
+        if (r < 0)
                 /* when enumerating we might be out of sync, but we will get the neighbor again. Also,
                  * kernel sends messages about neighbors after a link is removed. So, just ignore it. */
-                log_debug("rtnl: received neighbor for link '%d' we don't know about, ignoring.", ifindex);
                 return 0;
-        }
 
-        tmp = new0(Neighbor, 1);
+        r = neighbor_new(&tmp);
+        if (r < 0)
+                return log_oom();
 
+        /* First, retrieve the fundamental information about the neighbor. */
         r = sd_rtnl_message_neigh_get_family(message, &tmp->family);
         if (r < 0) {
                 log_link_warning(link, "rtnl: received neighbor message without family, ignoring.");
                 return 0;
-        } else if (!IN_SET(tmp->family, AF_INET, AF_INET6)) {
+        }
+        if (tmp->family == AF_BRIDGE) /* Currently, we do not support it. */
+                return 0;
+        if (!IN_SET(tmp->family, AF_INET, AF_INET6)) {
                 log_link_debug(link, "rtnl: received neighbor message with invalid family '%i', ignoring.", tmp->family);
                 return 0;
         }
@@ -518,49 +608,52 @@ int manager_rtnl_process_neighbor(sd_netlink *rtnl, sd_netlink_message *message,
                 return 0;
         }
 
-        r = netlink_message_read_hw_addr(message, NDA_LLADDR, &tmp->ll_addr);
-        if (r < 0) {
-                log_link_warning_errno(link, r, "rtnl: received neighbor message without valid link layer address, ignoring: %m");
-                return 0;
-        }
-
+        /* Then, find the managed Neighbor and Request objects corresponding to the netlink notification. */
         (void) neighbor_get(link, tmp, &neighbor);
+        (void) neighbor_get_request(link, tmp, &req);
 
-        switch (type) {
-        case RTM_NEWNEIGH:
-                if (neighbor) {
-                        neighbor_enter_configured(neighbor);
-                        log_neighbor_debug(neighbor, "Received remembered", link);
-                } else {
-                        neighbor_enter_configured(tmp);
-                        log_neighbor_debug(tmp, "Remembering", link);
-                        r = neighbor_add(link, tmp);
-                        if (r < 0) {
-                                log_link_warning_errno(link, r, "Failed to remember foreign neighbor, ignoring: %m");
-                                return 0;
-                        }
-                        TAKE_PTR(tmp);
-                }
-
-                break;
-
-        case RTM_DELNEIGH:
+        if (type == RTM_DELNEIGH) {
                 if (neighbor) {
                         neighbor_enter_removed(neighbor);
-                        if (neighbor->state == 0) {
-                                log_neighbor_debug(neighbor, "Forgetting", link);
-                                neighbor_free(neighbor);
-                        } else
-                                log_neighbor_debug(neighbor, "Removed", link);
+                        log_neighbor_debug(neighbor, "Forgetting removed", link);
+                        neighbor_detach(neighbor);
                 } else
                         log_neighbor_debug(tmp, "Kernel removed unknown", link);
 
-                break;
+                if (req)
+                        neighbor_enter_removed(req->userdata);
 
-        default:
-                assert_not_reached();
+                return 0;
         }
 
+        /* If we did not know the neighbor, then save it. */
+        if (!neighbor) {
+                r = neighbor_attach(link, tmp);
+                if (r < 0) {
+                        log_link_warning_errno(link, r, "Failed to save received neighbor, ignoring: %m");
+                        return 0;
+                }
+                neighbor = tmp;
+                is_new = true;
+        }
+
+        /* Also update information that cannot be obtained through netlink notification. */
+        if (req && req->waiting_reply) {
+                Neighbor *n = ASSERT_PTR(req->userdata);
+
+                neighbor->source = n->source;
+        }
+
+        /* Then, update miscellaneous info. */
+        r = netlink_message_read_hw_addr(message, NDA_LLADDR, &neighbor->ll_addr);
+        if (r < 0 && r != -ENODATA)
+                log_link_debug_errno(link, r, "rtnl: received neighbor message without valid link layer address, ignoring: %m");
+
+        neighbor_enter_configured(neighbor);
+        if (req)
+                neighbor_enter_configured(req->userdata);
+
+        log_neighbor_debug(neighbor, is_new ? "Remembering" : "Received remembered", link);
         return 1;
 }
 
@@ -574,6 +667,13 @@ static int neighbor_section_verify(Neighbor *neighbor) {
                                          "Ignoring [Neighbor] section from line %u.",
                                          neighbor->section->filename, neighbor->section->line);
 
+        if (neighbor->family == AF_INET6 && !socket_ipv6_is_supported())
+                return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
+                                         "%s: Neighbor section with an IPv6 destination address configured, "
+                                         "but the kernel does not support IPv6. "
+                                         "Ignoring [Neighbor] section from line %u.",
+                                         neighbor->section->filename, neighbor->section->line);
+
         if (neighbor->ll_addr.length == 0)
                 return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
                                          "%s: Neighbor section without LinkLayerAddress= configured. "
@@ -583,14 +683,45 @@ static int neighbor_section_verify(Neighbor *neighbor) {
         return 0;
 }
 
-void network_drop_invalid_neighbors(Network *network) {
+int network_drop_invalid_neighbors(Network *network) {
+        _cleanup_set_free_ Set *neighbors = NULL;
         Neighbor *neighbor;
+        int r;
 
         assert(network);
 
-        HASHMAP_FOREACH(neighbor, network->neighbors_by_section)
-                if (neighbor_section_verify(neighbor) < 0)
-                        neighbor_free(neighbor);
+        ORDERED_HASHMAP_FOREACH(neighbor, network->neighbors_by_section) {
+                Neighbor *dup;
+
+                if (neighbor_section_verify(neighbor) < 0) {
+                        /* Drop invalid [Neighbor] sections. Note that neighbor_detach() will drop the
+                         * neighbor from neighbors_by_section. */
+                        neighbor_detach(neighbor);
+                        continue;
+                }
+
+                /* Always use the setting specified later. So, remove the previously assigned setting. */
+                dup = set_remove(neighbors, neighbor);
+                if (dup) {
+                        log_warning("%s: Duplicated neighbor settings for %s is specified at line %u and %u, "
+                                    "dropping the neighbor setting specified at line %u.",
+                                    dup->section->filename,
+                                    IN_ADDR_TO_STRING(neighbor->family, &neighbor->in_addr),
+                                    neighbor->section->line,
+                                    dup->section->line, dup->section->line);
+                        /* neighbor_detach() will drop the neighbor from neighbors_by_section. */
+                        neighbor_detach(dup);
+                }
+
+                /* Use neighbor_hash_ops, instead of neighbor_hash_ops_detach. Otherwise, the Neighbor objects
+                 * will be detached. */
+                r = set_ensure_put(&neighbors, &neighbor_hash_ops, neighbor);
+                if (r < 0)
+                        return log_oom();
+                assert(r > 0);
+        }
+
+        return 0;
 }
 
 
@@ -606,7 +737,7 @@ int config_parse_neighbor_address(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(neighbor_free_or_set_invalidp) Neighbor *n = NULL;
+        _cleanup_(neighbor_unref_or_set_invalidp) Neighbor *n = NULL;
         Network *network = ASSERT_PTR(userdata);
         int r;
 
@@ -649,7 +780,7 @@ int config_parse_neighbor_lladdr(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(neighbor_free_or_set_invalidp) Neighbor *n = NULL;
+        _cleanup_(neighbor_unref_or_set_invalidp) Neighbor *n = NULL;
         Network *network = ASSERT_PTR(userdata);
         int r;
 

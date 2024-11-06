@@ -171,7 +171,7 @@ static int enumerate_print_list(struct udev_enumerate *enumerate) {
 }
 
 static void test_monitor(struct udev *udev) {
-        _cleanup_(udev_monitor_unrefp) struct udev_monitor *udev_monitor;
+        _cleanup_(udev_monitor_unrefp) struct udev_monitor *udev_monitor = NULL;
         _cleanup_close_ int fd_ep = -EBADF;
         int fd_udev;
         struct epoll_event ep_udev = {
@@ -338,6 +338,9 @@ static void test_hwdb(struct udev *udev, const char *modalias) {
         hwdb = udev_hwdb_new(udev);
         if (!hwdb)
                 log_warning_errno(errno, "Failed to open hwdb: %m");
+
+        SAVE_ASSERT_RETURN_IS_CRITICAL;
+        log_set_assert_return_is_critical(hwdb);
 
         udev_list_entry_foreach(entry, udev_hwdb_get_properties_list_entry(hwdb, modalias, 0))
                 log_info("'%s'='%s'", udev_list_entry_get_name(entry), udev_list_entry_get_value(entry));

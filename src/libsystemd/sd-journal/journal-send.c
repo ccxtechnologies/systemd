@@ -19,6 +19,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "io-util.h"
+#include "iovec-util.h"
 #include "journal-send.h"
 #include "memfd-util.h"
 #include "missing_syscall.h"
@@ -120,7 +121,7 @@ _public_ int sd_journal_printv(int priority, const char *format, va_list ap) {
         assert_return(priority <= 7, -EINVAL);
         assert_return(format, -EINVAL);
 
-        xsprintf(p, "PRIORITY=%i", priority & LOG_PRIMASK);
+        xsprintf(p, "PRIORITY=%i", LOG_PRI(priority));
 
         va_copy(aq, ap);
         len = vsnprintf(buffer + 8, LINE_MAX, format, aq);
@@ -397,20 +398,28 @@ _public_ int sd_journal_perror(const char *message) {
         return fill_iovec_perror_and_send(message, 0, iovec);
 }
 
-_public_ int sd_journal_stream_fd(const char *identifier, int priority, int level_prefix) {
+_public_ int sd_journal_stream_fd_with_namespace(
+                const char *name_space,
+                const char *identifier,
+                int priority,
+                int level_prefix) {
+
         _cleanup_close_ int fd = -EBADF;
-        char *header;
-        size_t l;
+        const char *path;
         int r;
 
         assert_return(priority >= 0, -EINVAL);
         assert_return(priority <= 7, -EINVAL);
 
+        path = journal_stream_path(name_space);
+        if (!path)
+                return -EINVAL;
+
         fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
         if (fd < 0)
                 return -errno;
 
-        r = connect_unix_path(fd, AT_FDCWD, "/run/systemd/journal/stdout");
+        r = connect_unix_path(fd, AT_FDCWD, path);
         if (r < 0)
                 return r;
 
@@ -420,6 +429,9 @@ _public_ int sd_journal_stream_fd(const char *identifier, int priority, int leve
         (void) fd_inc_sndbuf(fd, SNDBUF_SIZE);
 
         identifier = strempty(identifier);
+
+        char *header;
+        size_t l;
 
         l = strlen(identifier);
         header = newa(char, l + 1 + 1 + 2 + 2 + 2 + 2 + 2);
@@ -438,11 +450,15 @@ _public_ int sd_journal_stream_fd(const char *identifier, int priority, int leve
         header[l++] = '0';
         header[l++] = '\n';
 
-        r = loop_write(fd, header, l, false);
+        r = loop_write(fd, header, l);
         if (r < 0)
                 return r;
 
         return TAKE_FD(fd);
+}
+
+_public_ int sd_journal_stream_fd(const char *identifier, int priority, int level_prefix) {
+        return sd_journal_stream_fd_with_namespace(NULL, identifier, priority, level_prefix);
 }
 
 _public_ int sd_journal_print_with_location(int priority, const char *file, const char *line, const char *func, const char *format, ...) {
@@ -469,7 +485,7 @@ _public_ int sd_journal_printv_with_location(int priority, const char *file, con
         assert_return(priority <= 7, -EINVAL);
         assert_return(format, -EINVAL);
 
-        xsprintf(p, "PRIORITY=%i", priority & LOG_PRIMASK);
+        xsprintf(p, "PRIORITY=%i", LOG_PRI(priority));
 
         va_copy(aq, ap);
         len = vsnprintf(buffer + 8, LINE_MAX, format, aq);
@@ -529,7 +545,7 @@ _public_ int sd_journal_send_with_location(const char *file, const char *line, c
 
         r = sd_journal_sendv(iov, n_iov);
 
-        iov[0] = iov[1] = iov[2] = IOVEC_NULL;
+        iov[0] = iov[1] = iov[2] = (struct iovec) {};
 
         return r;
 }

@@ -7,6 +7,7 @@
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "login-util.h"
+#include "mountpoint-util.h"
 #include "process-util.h"
 #include "systemctl-logind.h"
 #include "systemctl-start-unit.h"
@@ -51,6 +52,7 @@ int logind_reboot(enum action a) {
                 [ACTION_HIBERNATE]              = "Hibernate",
                 [ACTION_HYBRID_SLEEP]           = "HybridSleep",
                 [ACTION_SUSPEND_THEN_HIBERNATE] = "SuspendThenHibernate",
+                [ACTION_SLEEP]                  = "Sleep",
         };
 
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -71,7 +73,7 @@ int logind_reboot(enum action a) {
         polkit_agent_open_maybe();
         (void) logind_set_wall_message(bus);
 
-        const char *method_with_flags = strjoina(actions[a], "WithFlags");
+        const char *method_with_flags = a == ACTION_SLEEP ? actions[a] : strjoina(actions[a], "WithFlags");
 
         log_debug("%s org.freedesktop.login1.Manager %s dbus call.",
                   arg_dry_run ? "Would execute" : "Executing", method_with_flags);
@@ -80,13 +82,33 @@ int logind_reboot(enum action a) {
                 return 0;
 
         SET_FLAG(flags, SD_LOGIND_ROOT_CHECK_INHIBITORS, arg_check_inhibitors > 0);
-        SET_FLAG(flags, SD_LOGIND_REBOOT_VIA_KEXEC, a == ACTION_KEXEC);
+        SET_FLAG(flags,
+                 SD_LOGIND_REBOOT_VIA_KEXEC,
+                 a == ACTION_KEXEC || (a == ACTION_REBOOT && getenv_bool("SYSTEMCTL_SKIP_AUTO_KEXEC") <= 0));
+        /* Try to soft-reboot if /run/nextroot/ is a valid OS tree, but only if it's also a mount point.
+         * Otherwise, if people store new rootfs directly on /run/ tmpfs, 'systemctl reboot' would always
+         * soft-reboot, as /run/nextroot/ can never go away. */
+        SET_FLAG(flags,
+                 SD_LOGIND_SOFT_REBOOT_IF_NEXTROOT_SET_UP,
+                 a == ACTION_REBOOT && getenv_bool("SYSTEMCTL_SKIP_AUTO_SOFT_REBOOT") <= 0 && path_is_mount_point("/run/nextroot") > 0);
         SET_FLAG(flags, SD_LOGIND_SOFT_REBOOT, a == ACTION_SOFT_REBOOT);
 
         r = bus_call_method(bus, bus_login_mgr, method_with_flags, &error, NULL, "t", flags);
+        if (r < 0 && FLAGS_SET(flags, SD_LOGIND_SOFT_REBOOT_IF_NEXTROOT_SET_UP) &&
+                        sd_bus_error_has_name(&error, SD_BUS_ERROR_INVALID_ARGS)) {
+                sd_bus_error_free(&error);
+                r = bus_call_method(
+                                bus,
+                                bus_login_mgr,
+                                method_with_flags,
+                                &error,
+                                NULL,
+                                "t",
+                                flags & ~SD_LOGIND_SOFT_REBOOT_IF_NEXTROOT_SET_UP);
+        }
         if (r >= 0)
                 return 0;
-        if (!sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_METHOD))
+        if (!sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_METHOD) || a == ACTION_SLEEP)
                 return log_error_errno(r, "Call to %s failed: %s", actions[a], bus_error_message(&error, r));
 
         /* Fall back to original methods in case there is an older version of systemd-logind */
@@ -168,7 +190,7 @@ int logind_check_inhibitors(enum action a) {
                                           ACTION_KEXEC) ? "shutdown" : "sleep"))
                         continue;
 
-                (void) get_process_comm(pid, &comm);
+                (void) pid_get_comm(pid, &comm);
                 user = uid_to_name(uid);
 
                 log_warning("Operation inhibited by \"%s\" (PID "PID_FMT" \"%s\", user %s), reason is \"%s\".",
@@ -375,7 +397,7 @@ int logind_show_shutdown(void) {
                 return r;
 
         if (isempty(action))
-                return log_error_errno(SYNTHETIC_ERRNO(ENODATA), "No scheduled shutdown.");
+                return log_full_errno(arg_quiet ? LOG_DEBUG : LOG_ERR, SYNTHETIC_ERRNO(ENODATA), "No scheduled shutdown.");
 
         if (STR_IN_SET(action, "halt", "poweroff", "exit"))
                 pretty_action = "Shutdown";
