@@ -3,12 +3,17 @@
   Copyright © 2014-2015 Intel Corporation. All rights reserved.
 ***/
 
-#include <errno.h>
+#include "sd-dhcp6-option.h"
 
 #include "alloc-util.h"
 #include "dhcp6-internal.h"
 #include "dhcp6-lease-internal.h"
+#include "dns-domain.h"
+#include "dns-resolver-internal.h"
 #include "network-common.h"
+#include "set.h"
+#include "sort-util.h"
+#include "string-util.h"
 #include "strv.h"
 #include "unaligned.h"
 
@@ -110,7 +115,7 @@ static void dhcp6_lease_set_lifetime(sd_dhcp6_lease *lease) {
         }
 
 DEFINE_GET_TIME_FUNCTIONS(t1, lifetime_t1);
-DEFINE_GET_TIME_FUNCTIONS(t2, lifetime_t1);
+DEFINE_GET_TIME_FUNCTIONS(t2, lifetime_t2);
 DEFINE_GET_TIME_FUNCTIONS(valid_lifetime, lifetime_valid);
 
 static void dhcp6_lease_set_server_address(sd_dhcp6_lease *lease, const struct in6_addr *server_address) {
@@ -424,7 +429,7 @@ int dhcp6_lease_add_domains(sd_dhcp6_lease *lease, const uint8_t *optval, size_t
         if (r < 0)
                 return r;
 
-        return strv_extend_strv(&lease->domains, domains, true);
+        return strv_extend_strv_consume(&lease->domains, TAKE_PTR(domains), /* filter_duplicates = */ true);
 }
 
 int sd_dhcp6_lease_get_domains(sd_dhcp6_lease *lease, char ***ret) {
@@ -436,6 +441,103 @@ int sd_dhcp6_lease_get_domains(sd_dhcp6_lease *lease, char ***ret) {
 
         *ret = lease->domains;
         return strv_length(lease->domains);
+}
+
+static int dhcp6_lease_add_dnr(sd_dhcp6_lease *lease, const uint8_t *optval, size_t optlen) {
+        int r;
+
+        assert(lease);
+
+        _cleanup_(sd_dns_resolver_done) sd_dns_resolver res = {};
+
+        size_t offset = 0;
+
+        /* priority */
+        if (optlen - offset < sizeof(uint16_t))
+                return -EBADMSG;
+        res.priority = unaligned_read_be16(optval + offset);
+        offset += sizeof(uint16_t);
+
+        /* adn */
+        if (optlen - offset < sizeof(uint16_t))
+                return -EBADMSG;
+        size_t ilen = unaligned_read_be16(optval + offset);
+        offset += sizeof(uint16_t);
+        if (offset + ilen > optlen)
+                return -EBADMSG;
+
+        r = dhcp6_option_parse_domainname(optval + offset, ilen, &res.auth_name);
+        if (r < 0)
+                return r;
+        r = dns_name_is_valid_ldh(res.auth_name);
+        if (r < 0)
+                return r;
+        if (!r)
+                return -EBADMSG;
+        offset += ilen;
+
+        /* RFC9463 § 3.1.6: adn only mode */
+        if (offset == optlen)
+                return 0;
+
+        /* addrs */
+        if (optlen - offset < sizeof(uint16_t))
+                return -EBADMSG;
+        ilen = unaligned_read_be16(optval + offset);
+        offset += sizeof(uint16_t);
+        if (offset + ilen > optlen)
+                return -EBADMSG;
+
+        _cleanup_free_ struct in6_addr *addrs = NULL;
+        size_t n_addrs = 0;
+
+        r = dhcp6_option_parse_addresses(optval + offset, ilen, &addrs, &n_addrs);
+        if (r < 0)
+                return r;
+        if (n_addrs == 0)
+                return -EBADMSG;
+        offset += ilen;
+
+        res.addrs = new(union in_addr_union, n_addrs);
+        if (!res.addrs)
+                return -ENOMEM;
+
+        for (size_t i = 0; i < n_addrs; i++) {
+                union in_addr_union addr = {.in6 = addrs[i]};
+                /* RFC9463 § 6.2 client MUST discard multicast and host loopback addresses */
+                if (in_addr_is_multicast(AF_INET6, &addr) ||
+                    in_addr_is_localhost(AF_INET6, &addr))
+                        return -EBADMSG;
+                res.addrs[i] = addr;
+        }
+        res.n_addrs = n_addrs;
+        res.family = AF_INET6;
+
+        /* svc params */
+        r = dnr_parse_svc_params(optval + offset, optlen-offset, &res);
+        if (r < 0)
+                return r;
+
+        /* Append this resolver */
+        if (!GREEDY_REALLOC(lease->dnr, lease->n_dnr+1))
+                return -ENOMEM;
+
+        lease->dnr[lease->n_dnr++] = TAKE_STRUCT(res);
+
+        typesafe_qsort(lease->dnr, lease->n_dnr, dns_resolver_prio_compare);
+
+        return 1;
+}
+
+int sd_dhcp6_lease_get_dnr(sd_dhcp6_lease *lease, sd_dns_resolver **ret) {
+        assert_return(lease, -EINVAL);
+        assert_return(ret, -EINVAL);
+
+        if (!lease->dnr)
+                return -ENODATA;
+
+        *ret = lease->dnr;
+        return lease->n_dnr;
 }
 
 int dhcp6_lease_add_ntp(sd_dhcp6_lease *lease, const uint8_t *optval, size_t optlen) {
@@ -525,6 +627,56 @@ int sd_dhcp6_lease_get_ntp_fqdn(sd_dhcp6_lease *lease, char ***ret) {
         if (ret)
                 *ret = lease->ntp_fqdn;
         return strv_length(lease->ntp_fqdn);
+}
+
+int dhcp6_lease_add_sip_addrs(sd_dhcp6_lease *lease, const uint8_t *optval, size_t optlen) {
+        assert(lease);
+        assert(optval || optlen == 0);
+
+        if (optlen == 0)
+                return 0;
+
+        return dhcp6_option_parse_addresses(optval, optlen, &lease->sip, &lease->sip_count);
+}
+
+int sd_dhcp6_lease_get_sip_addrs(sd_dhcp6_lease *lease, const struct in6_addr **ret) {
+        assert_return(lease, -EINVAL);
+
+        if (lease->sip) {
+                if (ret)
+                        *ret = lease->sip;
+                return lease->sip_count;
+        }
+
+        return -ENODATA;
+}
+
+int dhcp6_lease_add_sip_domains(sd_dhcp6_lease *lease, const uint8_t *optval, size_t optlen) {
+        _cleanup_strv_free_ char **domains = NULL;
+        int r;
+
+        assert(lease);
+        assert(optval || optlen == 0);
+
+        if (optlen == 0)
+                return 0;
+
+        r = dhcp6_option_parse_domainname_list(optval, optlen, &domains);
+        if (r < 0)
+                return r;
+
+        return strv_extend_strv_consume(&lease->sip_domains, TAKE_PTR(domains), /* filter_duplicates = */ true);
+}
+
+int sd_dhcp6_lease_get_sip_domains(sd_dhcp6_lease *lease, char ***ret) {
+        assert_return(lease, -EINVAL);
+        assert_return(ret, -EINVAL);
+
+        if (!lease->sip_domains)
+                return -ENODATA;
+
+        *ret = lease->sip_domains;
+        return strv_length(lease->sip_domains);
 }
 
 int dhcp6_lease_set_fqdn(sd_dhcp6_lease *lease, const uint8_t *optval, size_t optlen) {
@@ -763,8 +915,7 @@ static int dhcp6_lease_parse_message(
                                 continue;
                         }
 
-                        dhcp6_ia_free(lease->ia_na);
-                        lease->ia_na = TAKE_PTR(ia);
+                        free_and_replace_full(lease->ia_na, ia, dhcp6_ia_free);
                         break;
                 }
                 case SD_DHCP6_OPTION_IA_PD: {
@@ -788,8 +939,7 @@ static int dhcp6_lease_parse_message(
                                 continue;
                         }
 
-                        dhcp6_ia_free(lease->ia_pd);
-                        lease->ia_pd = TAKE_PTR(ia);
+                        free_and_replace_full(lease->ia_pd, ia, dhcp6_ia_free);
                         break;
                 }
                 case SD_DHCP6_OPTION_RAPID_COMMIT:
@@ -830,6 +980,19 @@ static int dhcp6_lease_parse_message(
 
                         break;
 
+                case SD_DHCP6_OPTION_SIP_SERVER_ADDRESS:
+                        r = dhcp6_lease_add_sip_addrs(lease, optval, optlen);
+                        if (r < 0)
+                                log_dhcp6_client_errno(client, r, "Failed to parse SIP server address option, ignoring: %m");
+
+                        break;
+
+                case SD_DHCP6_OPTION_SIP_SERVER_DOMAIN_NAME:
+                        r = dhcp6_lease_add_sip_domains(lease, optval, optlen);
+                        if (r < 0)
+                                log_dhcp6_client_errno(client, r, "Failed to parse SIP server domain name option, ignoring: %m");
+                        break;
+
                 case SD_DHCP6_OPTION_CAPTIVE_PORTAL:
                         r = dhcp6_lease_set_captive_portal(lease, optval, optlen);
                         if (r < 0)
@@ -849,6 +1012,15 @@ static int dhcp6_lease_parse_message(
                                                               "Received information refresh time option with an invalid length (%zu).", optlen);
 
                         irt = unaligned_be32_sec_to_usec(optval, /* max_as_infinity = */ false);
+                        break;
+
+                case SD_DHCP6_OPTION_V6_DNR:
+                        r = dhcp6_lease_add_dnr(lease, optval, optlen);
+                        if (r < 0)
+                                return log_dhcp6_client_errno(client, r, "Failed to parse DNR option, ignoring: %m");
+                        if (r == 0)
+                                log_dhcp6_client(client, "Received ADN-only DNRv6 option, ignoring.");
+
                         break;
 
                 case SD_DHCP6_OPTION_VENDOR_OPTS:
@@ -904,12 +1076,15 @@ static sd_dhcp6_lease *dhcp6_lease_free(sd_dhcp6_lease *lease) {
         dhcp6_ia_free(lease->ia_na);
         dhcp6_ia_free(lease->ia_pd);
         free(lease->dns);
+        dns_resolver_done_many(lease->dnr, lease->n_dnr);
         free(lease->fqdn);
         free(lease->captive_portal);
         strv_free(lease->domains);
         free(lease->ntp);
         strv_free(lease->ntp_fqdn);
         free(lease->sntp);
+        free(lease->sip);
+        strv_free(lease->sip_domains);
 
         return mfree(lease);
 }

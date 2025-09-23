@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
 #include "ask-password-api.h"
 #include "env-util.h"
 #include "hexdecoct.h"
-#include "json.h"
 #include "log.h"
 #include "luks2-tpm2.h"
 #include "parse-util.h"
@@ -23,15 +24,17 @@ int acquire_luks2_key(
                 const char *pin,
                 const char *pcrlock_path,
                 uint16_t primary_alg,
-                const struct iovec *blob,
-                const struct iovec *policy_hash,
+                const struct iovec blobs[],
+                size_t n_blobs,
+                const struct iovec policy_hash[],
+                size_t n_policy_hash,
                 const struct iovec *salt,
                 const struct iovec *srk,
                 const struct iovec *pcrlock_nv,
                 TPM2Flags flags,
                 struct iovec *ret_decrypted_key) {
 
-        _cleanup_(json_variant_unrefp) JsonVariant *signature_json = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *signature_json = NULL;
         _cleanup_free_ char *auto_device = NULL;
         _cleanup_(erase_and_freep) char *b64_salted_pin = NULL;
         int r;
@@ -100,10 +103,20 @@ int acquire_luks2_key(
                         pin,
                         FLAGS_SET(flags, TPM2_FLAGS_USE_PCRLOCK) ? &pcrlock_policy : NULL,
                         primary_alg,
-                        blob,
+                        blobs,
+                        n_blobs,
                         policy_hash,
+                        n_policy_hash,
                         srk,
                         ret_decrypted_key);
+        if (r == -EREMOTE)
+                return log_error_errno(r, "TPM key integrity check failed. Key enrolled in superblock most likely does not belong to this TPM.");
+        if (r == -EILSEQ)
+                return log_error_errno(SYNTHETIC_ERRNO(ENOANO), "Bad PIN."); /* cryptsetup docs say we should return ENOANO on bad PIN */
+        if (r == -ENOLCK)
+                return log_error_errno(r, "TPM is in dictionary attack lock-out mode.");
+        if (ERRNO_IS_NEG_TPM2_UNSEAL_BAD_PCR(r))
+                return log_error_errno(r, "TPM policy does not match current system state. Either system has been tempered with or policy out-of-date: %m");
         if (r < 0)
                 return log_error_errno(r, "Failed to unseal secret using TPM2: %m");
 

@@ -1,14 +1,17 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <net/ethernet.h>
 #include <linux/nl80211.h>
+#include <net/ethernet.h>
 
+#include "sd-netlink.h"
+
+#include "alloc-util.h"
 #include "ether-addr-util.h"
-#include "netlink-util.h"
 #include "networkd-link.h"
 #include "networkd-manager.h"
 #include "networkd-wifi.h"
 #include "networkd-wiphy.h"
+#include "set.h"
 #include "string-util.h"
 #include "wifi-util.h"
 
@@ -287,7 +290,7 @@ int manager_genl_process_nl80211_mlme(sd_netlink *genl, sd_netlink_message *mess
                  * To make SSID= or other WiFi related settings in [Match] section work, let's try to
                  * reconfigure the interface. */
                 if (link->ssid && link_has_carrier(link)) {
-                        r = link_reconfigure_impl(link, /* force = */ false);
+                        r = link_reconfigure_impl(link, /* flags = */ 0);
                         if (r < 0) {
                                 log_link_warning_errno(link, r, "Failed to reconfigure interface: %m");
                                 link_enter_failed(link);
@@ -326,7 +329,7 @@ int manager_genl_process_nl80211_mlme(sd_netlink *genl, sd_netlink_message *mess
                 }
 
                 /* If necessary, reconfigure based on those new properties */
-                r = link_reconfigure_impl(link, /* force = */ false);
+                r = link_reconfigure_impl(link, /* flags = */ 0);
                 if (r < 0) {
                         log_link_warning_errno(link, r, "Failed to reconfigure interface: %m");
                         link_enter_failed(link);

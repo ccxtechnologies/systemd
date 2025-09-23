@@ -1,33 +1,28 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #include "sd-bus.h"
+#include "sd-event.h"
 
 #include "alloc-util.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-log-control-api.h"
-#include "bus-message.h"
+#include "bus-object.h"
 #include "bus-polkit.h"
 #include "bus-unit-util.h"
+#include "bus-util.h"
 #include "constants.h"
 #include "daemon-util.h"
-#include "kbd-util.h"
+#include "hashmap.h"
+#include "label-util.h"
 #include "localed-util.h"
-#include "macro.h"
+#include "log.h"
 #include "main-func.h"
-#include "missing_capability.h"
-#include "path-util.h"
-#include "selinux-util.h"
 #include "service-util.h"
-#include "signal-util.h"
 #include "string-util.h"
 #include "strv.h"
-#include "user-util.h"
 
 static int vconsole_reload(sd_bus *bus) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -362,7 +357,7 @@ static int method_set_vc_keyboard(sd_bus_message *m, void *userdata, sd_bus_erro
         }
 
         if (convert) {
-                r = vconsole_convert_to_x11(&in, &converted);
+                r = vconsole_convert_to_x11(&in, x11_context_verify, &converted);
                 if (r < 0) {
                         log_error_errno(r, "Failed to convert keymap data: %m");
                         return sd_bus_error_set_errnof(error, r, "Failed to convert keymap data: %m");
@@ -622,6 +617,12 @@ static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
         return 0;
 }
 
+static bool context_check_idle(void *userdata) {
+        Context *c = ASSERT_PTR(userdata);
+
+        return hashmap_isempty(c->polkit_registry);
+}
+
 static int run(int argc, char *argv[]) {
         _cleanup_(context_clear) Context context = {};
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
@@ -658,11 +659,17 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return r;
 
-        r = sd_notify(false, NOTIFY_READY);
+        r = sd_notify(false, NOTIFY_READY_MESSAGE);
         if (r < 0)
                 log_warning_errno(r, "Failed to send readiness notification, ignoring: %m");
 
-        r = bus_event_loop_with_idle(event, bus, "org.freedesktop.locale1", DEFAULT_EXIT_USEC, NULL, NULL);
+        r = bus_event_loop_with_idle(
+                        event,
+                        bus,
+                        "org.freedesktop.locale1",
+                        DEFAULT_EXIT_USEC,
+                        context_check_idle,
+                        &context);
         if (r < 0)
                 return log_error_errno(r, "Failed to run event loop: %m");
 

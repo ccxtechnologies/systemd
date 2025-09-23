@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sys/utsname.h>
+#include <linux/capability.h>
 
-#include "af-list.h"
+#include "sd-bus.h"
+
+#include "alloc-util.h"
+#include "analyze-verify-util.h"
 #include "analyze.h"
 #include "analyze-security.h"
-#include "analyze-verify.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-map-properties.h"
@@ -17,22 +19,19 @@
 #include "fileio.h"
 #include "format-table.h"
 #include "in-addr-prefix-util.h"
-#include "locale-util.h"
-#include "macro.h"
 #include "manager.h"
-#include "missing_capability.h"
-#include "missing_sched.h"
 #include "mkdir.h"
 #include "nulstr-util.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "portable-util.h"
 #include "pretty-print.h"
 #include "seccomp-util.h"
 #include "service.h"
 #include "set.h"
 #include "stdio-util.h"
+#include "string-util.h"
 #include "strv.h"
-#include "terminal-util.h"
 #include "unit-def.h"
 #include "unit-name.h"
 #include "unit-serialize.h"
@@ -1244,8 +1243,8 @@ static const struct security_assessor security_assessor_table[] = {
         {
                 .id = "CapabilityBoundingSet=~CAP_BPF",
                 .json_field = "CapabilityBoundingSet_CAP_BPF",
-                .description_good = "Service may load BPF programs",
-                .description_bad = "Service may not load BPF programs",
+                .description_good = "Service may not load BPF programs",
+                .description_bad = "Service may load BPF programs",
                 .url = "https://www.freedesktop.org/software/systemd/man/systemd.exec.html#CapabilityBoundingSet=",
                 .weight = 25,
                 .range = 1,
@@ -1590,7 +1589,7 @@ static const struct security_assessor security_assessor_table[] = {
         {
                 .id = "IPAddressDeny=",
                 .json_field = "IPAddressDeny",
-                .url = "https://www.freedesktop.org/software/systemd/man/systemd.exec.html#IPAddressDeny=",
+                .url = "https://www.freedesktop.org/software/systemd/man/systemd.resource-control.html#IPAddressAllow=ADDRESS%5B/PREFIXLENGTH%5D…",
                 .weight = 1000,
                 .range = 10,
                 .assess = assess_ip_address_allow,
@@ -1598,7 +1597,7 @@ static const struct security_assessor security_assessor_table[] = {
         {
                 .id = "DeviceAllow=",
                 .json_field = "DeviceAllow",
-                .url = "https://www.freedesktop.org/software/systemd/man/systemd.exec.html#DeviceAllow=",
+                .url = "https://www.freedesktop.org/software/systemd/man/systemd.resource-control.html#DeviceAllow=",
                 .weight = 1000,
                 .range = 10,
                 .assess = assess_device_allow,
@@ -1615,97 +1614,97 @@ static const struct security_assessor security_assessor_table[] = {
         },
 };
 
-static JsonVariant* security_assessor_find_in_policy(const struct security_assessor *a, JsonVariant *policy, const char *name) {
-        JsonVariant *item;
+static sd_json_variant* security_assessor_find_in_policy(const struct security_assessor *a, sd_json_variant *policy, const char *name) {
+        sd_json_variant *item;
         assert(a);
 
         if (!policy)
                 return NULL;
-        if (!json_variant_is_object(policy)) {
+        if (!sd_json_variant_is_object(policy)) {
                 log_debug("Specified policy is not a JSON object, ignoring.");
                 return NULL;
         }
 
-        item = json_variant_by_key(policy, a->json_field);
+        item = sd_json_variant_by_key(policy, a->json_field);
         if (!item)
                 return NULL;
-        if (!json_variant_is_object(item)) {
+        if (!sd_json_variant_is_object(item)) {
                 log_debug("Item for '%s' in policy JSON object is not an object, ignoring.", a->id);
                 return NULL;
         }
 
-        return name ? json_variant_by_key(item, name) : item;
+        return name ? sd_json_variant_by_key(item, name) : item;
 }
 
-static uint64_t access_weight(const struct security_assessor *a, JsonVariant *policy) {
-        JsonVariant *val;
+static uint64_t access_weight(const struct security_assessor *a, sd_json_variant *policy) {
+        sd_json_variant *val;
 
         assert(a);
 
         val = security_assessor_find_in_policy(a, policy, "weight");
         if (val) {
-                if (json_variant_is_unsigned(val))
-                        return json_variant_unsigned(val);
+                if (sd_json_variant_is_unsigned(val))
+                        return sd_json_variant_unsigned(val);
                 log_debug("JSON field 'weight' of policy for %s is not an unsigned integer, ignoring.", a->id);
         }
 
         return a->weight;
 }
 
-static uint64_t access_range(const struct security_assessor *a, JsonVariant *policy) {
-        JsonVariant *val;
+static uint64_t access_range(const struct security_assessor *a, sd_json_variant *policy) {
+        sd_json_variant *val;
 
         assert(a);
 
         val = security_assessor_find_in_policy(a, policy, "range");
         if (val) {
-                if (json_variant_is_unsigned(val))
-                        return json_variant_unsigned(val);
+                if (sd_json_variant_is_unsigned(val))
+                        return sd_json_variant_unsigned(val);
                 log_debug("JSON field 'range' of policy for %s is not an unsigned integer, ignoring.", a->id);
         }
 
         return a->range;
 }
 
-static const char *access_description_na(const struct security_assessor *a, JsonVariant *policy) {
-        JsonVariant *val;
+static const char *access_description_na(const struct security_assessor *a, sd_json_variant *policy) {
+        sd_json_variant *val;
 
         assert(a);
 
         val = security_assessor_find_in_policy(a, policy, "description_na");
         if (val) {
-                if (json_variant_is_string(val))
-                        return json_variant_string(val);
+                if (sd_json_variant_is_string(val))
+                        return sd_json_variant_string(val);
                 log_debug("JSON field 'description_na' of policy for %s is not a string, ignoring.", a->id);
         }
 
         return a->description_na;
 }
 
-static const char *access_description_good(const struct security_assessor *a, JsonVariant *policy) {
-        JsonVariant *val;
+static const char *access_description_good(const struct security_assessor *a, sd_json_variant *policy) {
+        sd_json_variant *val;
 
         assert(a);
 
         val = security_assessor_find_in_policy(a, policy, "description_good");
         if (val) {
-                if (json_variant_is_string(val))
-                        return json_variant_string(val);
+                if (sd_json_variant_is_string(val))
+                        return sd_json_variant_string(val);
                 log_debug("JSON field 'description_good' of policy for %s is not a string, ignoring.", a->id);
         }
 
         return a->description_good;
 }
 
-static const char *access_description_bad(const struct security_assessor *a, JsonVariant *policy) {
-        JsonVariant *val;
+static const char *access_description_bad(const struct security_assessor *a, sd_json_variant *policy) {
+        sd_json_variant *val;
 
         assert(a);
 
         val = security_assessor_find_in_policy(a, policy, "description_bad");
         if (val) {
-                if (json_variant_is_string(val))
-                        return json_variant_string(val);
+                if (sd_json_variant_is_string(val))
+                        return sd_json_variant_string(val);
                 log_debug("JSON field 'description_bad' of policy for %s is not a string, ignoring.", a->id);
         }
 
@@ -1716,23 +1715,23 @@ static int assess(const SecurityInfo *info,
                   Table *overview_table,
                   AnalyzeSecurityFlags flags,
                   unsigned threshold,
-                  JsonVariant *policy,
+                  sd_json_variant *policy,
                   PagerFlags pager_flags,
-                  JsonFormatFlags json_format_flags) {
+                  sd_json_format_flags_t json_format_flags) {
 
         static const struct {
                 uint64_t exposure;
                 const char *name;
-                const char *color;
-                SpecialGlyph smiley;
+                const char* (*color)(void);
+                Glyph smiley;
         } badness_table[] = {
-                { 100, "DANGEROUS", ANSI_HIGHLIGHT_RED,    SPECIAL_GLYPH_DEPRESSED_SMILEY        },
-                { 90,  "UNSAFE",    ANSI_HIGHLIGHT_RED,    SPECIAL_GLYPH_UNHAPPY_SMILEY          },
-                { 75,  "EXPOSED",   ANSI_HIGHLIGHT_YELLOW, SPECIAL_GLYPH_SLIGHTLY_UNHAPPY_SMILEY },
-                { 50,  "MEDIUM",    NULL,                  SPECIAL_GLYPH_NEUTRAL_SMILEY          },
-                { 10,  "OK",        ANSI_HIGHLIGHT_GREEN,  SPECIAL_GLYPH_SLIGHTLY_HAPPY_SMILEY   },
-                { 1,   "SAFE",      ANSI_HIGHLIGHT_GREEN,  SPECIAL_GLYPH_HAPPY_SMILEY            },
-                { 0,   "PERFECT",   ANSI_HIGHLIGHT_GREEN,  SPECIAL_GLYPH_ECSTATIC_SMILEY         },
+                { 100, "DANGEROUS", ansi_highlight_red,    GLYPH_DEPRESSED_SMILEY        },
+                { 90,  "UNSAFE",    ansi_highlight_red,    GLYPH_UNHAPPY_SMILEY          },
+                { 75,  "EXPOSED",   ansi_highlight_yellow, GLYPH_SLIGHTLY_UNHAPPY_SMILEY },
+                { 50,  "MEDIUM",    NULL,                  GLYPH_NEUTRAL_SMILEY          },
+                { 10,  "OK",        ansi_highlight_green,  GLYPH_SLIGHTLY_HAPPY_SMILEY   },
+                { 1,   "SAFE",      ansi_highlight_green,  GLYPH_HAPPY_SMILEY            },
+                { 0,   "PERFECT",   ansi_highlight_green,  GLYPH_ECSTATIC_SMILEY         },
         };
 
         uint64_t badness_sum = 0, weight_sum = 0, exposure;
@@ -1871,7 +1870,7 @@ static int assess(const SecurityInfo *info,
                                 return log_error_errno(r, "Failed to update cell in table: %m");
                 }
 
-                if (json_format_flags & JSON_FORMAT_OFF) {
+                if (!sd_json_format_enabled(json_format_flags)) {
                         r = table_hide_column_from_display(details_table, (size_t) 2);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to set columns to display: %m");
@@ -1879,7 +1878,7 @@ static int assess(const SecurityInfo *info,
 
                 r = table_print_with_pager(details_table, json_format_flags, pager_flags, /* show_header= */true);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to output table: %m");
+                        return r;
         }
 
         exposure = DIV_ROUND_UP(badness_sum * 100U, weight_sum);
@@ -1890,7 +1889,7 @@ static int assess(const SecurityInfo *info,
 
         assert(i < ELEMENTSOF(badness_table));
 
-        if (details_table && (json_format_flags & JSON_FORMAT_OFF)) {
+        if (details_table && !sd_json_format_enabled(json_format_flags)) {
                 _cleanup_free_ char *clickable = NULL;
                 const char *name;
 
@@ -1906,15 +1905,15 @@ static int assess(const SecurityInfo *info,
                         name = info->id;
 
                 printf("\n%s %sOverall exposure level for %s%s: %s%" PRIu64 ".%" PRIu64 " %s%s %s\n",
-                       special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
+                       glyph(GLYPH_ARROW_RIGHT),
                        ansi_highlight(),
                        name,
                        ansi_normal(),
-                       colors_enabled() ? strempty(badness_table[i].color) : "",
+                       badness_table[i].color ? badness_table[i].color() : "",
                        exposure / 10, exposure % 10,
                        badness_table[i].name,
                        ansi_normal(),
-                       special_glyph(badness_table[i].smiley));
+                       glyph(badness_table[i].smiley));
         }
 
         fflush(stdout);
@@ -1937,8 +1936,8 @@ static int assess(const SecurityInfo *info,
                                    TABLE_STRING, buf,
                                    TABLE_SET_ALIGN_PERCENT, 100,
                                    TABLE_STRING, badness_table[i].name,
-                                   TABLE_SET_COLOR, strempty(badness_table[i].color),
-                                   TABLE_STRING, special_glyph(badness_table[i].smiley));
+                                   TABLE_SET_COLOR, badness_table[i].color ? badness_table[i].color() : "",
+                                   TABLE_STRING, glyph(badness_table[i].smiley));
                 if (r < 0)
                         return table_log_add_error(r);
         }
@@ -2412,9 +2411,9 @@ static int analyze_security_one(sd_bus *bus,
                                 Table *overview_table,
                                 AnalyzeSecurityFlags flags,
                                 unsigned threshold,
-                                JsonVariant *policy,
+                                sd_json_variant *policy,
                                 PagerFlags pager_flags,
-                                JsonFormatFlags json_format_flags) {
+                                sd_json_format_flags_t json_format_flags) {
 
         _cleanup_(security_info_freep) SecurityInfo *info = security_info_new();
         if (!info)
@@ -2644,9 +2643,9 @@ static int get_security_info(Unit *u, ExecContext *c, CGroupContext *g, Security
 
 static int offline_security_check(Unit *u,
                                   unsigned threshold,
-                                  JsonVariant *policy,
+                                  sd_json_variant *policy,
                                   PagerFlags pager_flags,
-                                  JsonFormatFlags json_format_flags) {
+                                  sd_json_format_flags_t json_format_flags) {
 
         _cleanup_(table_unrefp) Table *overview_table = NULL;
         AnalyzeSecurityFlags flags = 0;
@@ -2667,7 +2666,7 @@ static int offline_security_check(Unit *u,
 
 static int offline_security_checks(
                 char **filenames,
-                JsonVariant *policy,
+                sd_json_variant *policy,
                 RuntimeScope scope,
                 bool check_man,
                 bool run_generators,
@@ -2675,7 +2674,7 @@ static int offline_security_checks(
                 const char *root,
                 const char *profile,
                 PagerFlags pager_flags,
-                JsonFormatFlags json_format_flags) {
+                sd_json_format_flags_t json_format_flags) {
 
         const ManagerTestRunFlags flags =
                 MANAGER_TEST_RUN_MINIMAL |
@@ -2771,7 +2770,7 @@ static int offline_security_checks(
 
 static int analyze_security(sd_bus *bus,
                      char **units,
-                     JsonVariant *policy,
+                     sd_json_variant *policy,
                      RuntimeScope scope,
                      bool check_man,
                      bool run_generators,
@@ -2779,7 +2778,7 @@ static int analyze_security(sd_bus *bus,
                      unsigned threshold,
                      const char *root,
                      const char *profile,
-                     JsonFormatFlags json_format_flags,
+                     sd_json_format_flags_t json_format_flags,
                      PagerFlags pager_flags,
                      AnalyzeSecurityFlags flags) {
 
@@ -2869,7 +2868,7 @@ static int analyze_security(sd_bus *bus,
                                                        *i);
 
                         if (unit_name_is_valid(mangled, UNIT_NAME_TEMPLATE)) {
-                                r = unit_name_replace_instance(mangled, "test-instance", &instance);
+                                r = unit_name_replace_instance(mangled, arg_instance, &instance);
                                 if (r < 0)
                                         return log_oom();
 
@@ -2890,27 +2889,27 @@ static int analyze_security(sd_bus *bus,
 
                 r = table_print_with_pager(overview_table, json_format_flags, pager_flags, /* show_header= */true);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to output table: %m");
+                        return r;
         }
         return ret;
 }
 
 int verb_security(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *policy = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *policy = NULL;
         int r;
-        unsigned line, column;
 
         if (!arg_offline) {
                 r = acquire_bus(&bus, NULL);
                 if (r < 0)
-                        return bus_log_connect_error(r, arg_transport);
+                        return bus_log_connect_error(r, arg_transport, arg_runtime_scope);
         }
 
         pager_open(arg_pager_flags);
 
+        unsigned line = 0, column = 0;
         if (arg_security_policy) {
-                r = json_parse_file(/*f=*/ NULL, arg_security_policy, /*flags=*/ 0, &policy, &line, &column);
+                r = sd_json_parse_file(/*f=*/ NULL, arg_security_policy, /*flags=*/ 0, &policy, &line, &column);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse '%s' at %u:%u: %m", arg_security_policy, line, column);
         } else {
@@ -2922,7 +2921,7 @@ int verb_security(int argc, char *argv[], void *userdata) {
                         return r;
 
                 if (f) {
-                        r = json_parse_file(f, pp, /*flags=*/ 0, &policy, &line, &column);
+                        r = sd_json_parse_file(f, pp, /*flags=*/ 0, &policy, &line, &column);
                         if (r < 0)
                                 return log_error_errno(r, "[%s:%u:%u] Failed to parse JSON policy: %m", pp, line, column);
                 }

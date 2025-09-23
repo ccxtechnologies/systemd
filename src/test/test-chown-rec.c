@@ -1,11 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <sys/stat.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
-#include "alloc-util.h"
 #include "chown-recursive.h"
-#include "log.h"
 #include "rm-rf.h"
 #include "string-util.h"
 #include "tests.h"
@@ -153,8 +152,8 @@ TEST(chown_recursive) {
 }
 
 static int intro(void) {
-        if (geteuid() != 0)
-                return log_tests_skipped("not running as root");
+        if (geteuid() != 0 || userns_has_single_user())
+                return log_tests_skipped("not running as root or in userns with single user");
 
         return EXIT_SUCCESS;
 }

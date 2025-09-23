@@ -5,18 +5,8 @@
   Copyright © 2017 Intel Corporation. All rights reserved.
 ***/
 
-#include <inttypes.h>
-#include <stdbool.h>
-
-#include "sd-radv.h"
-
-#include "in-addr-util.h"
-#include "conf-parser.h"
 #include "ndisc-option.h"
-#include "networkd-util.h"
-
-typedef struct Link Link;
-typedef struct Network Network;
+#include "networkd-forward.h"
 
 typedef enum RADVPrefixDelegation {
         RADV_PREFIX_DELEGATION_NONE   = 0,
@@ -52,10 +42,6 @@ typedef struct Prefix64 {
         sd_ndisc_prefix64 prefix64;
 } Prefix64;
 
-Prefix* prefix_free(Prefix *prefix);
-RoutePrefix* route_prefix_free(RoutePrefix *prefix);
-Prefix64* prefix64_free(Prefix64 *prefix);
-
 void network_adjust_radv(Network *network);
 
 int link_request_radv_addresses(Link *link);
@@ -68,6 +54,7 @@ int radv_add_prefix(Link *link, const struct in6_addr *prefix, uint8_t prefix_le
                     usec_t lifetime_preferred_usec, usec_t lifetime_valid_usec);
 
 int link_request_radv(Link *link);
+int link_drop_radv_config(Link *link, Network *network);
 
 const char* radv_prefix_delegation_to_string(RADVPrefixDelegation i) _const_;
 RADVPrefixDelegation radv_prefix_delegation_from_string(const char *s) _pure_;
@@ -85,6 +72,7 @@ CONFIG_PARSER_PROTOTYPE(config_parse_radv_dns);
 CONFIG_PARSER_PROTOTYPE(config_parse_radv_search_domains);
 CONFIG_PARSER_PROTOTYPE(config_parse_route_prefix);
 CONFIG_PARSER_PROTOTYPE(config_parse_route_prefix_lifetime);
+CONFIG_PARSER_PROTOTYPE(config_parse_route_prefix_preference);
 CONFIG_PARSER_PROTOTYPE(config_parse_pref64_prefix);
 CONFIG_PARSER_PROTOTYPE(config_parse_pref64_prefix_lifetime);
 CONFIG_PARSER_PROTOTYPE(config_parse_router_home_agent_lifetime);

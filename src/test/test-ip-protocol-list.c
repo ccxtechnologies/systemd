@@ -2,10 +2,8 @@
 
 #include <netinet/in.h>
 
-#include "macro.h"
 #include "ip-protocol-list.h"
 #include "stdio-util.h"
-#include "string-util.h"
 #include "tests.h"
 
 static void test_int(int i) {
@@ -54,6 +52,8 @@ TEST(string) {
 TEST(parse_ip_protocol) {
         assert_se(parse_ip_protocol("sctp") == IPPROTO_SCTP);
         assert_se(parse_ip_protocol("ScTp") == IPPROTO_SCTP);
+        assert_se(parse_ip_protocol("mptcp") == IPPROTO_MPTCP);
+        assert_se(parse_ip_protocol("MPTCP") == IPPROTO_MPTCP);
         assert_se(parse_ip_protocol("ip") == IPPROTO_IP);
         assert_se(parse_ip_protocol("") == IPPROTO_IP);
         assert_se(parse_ip_protocol("1") == 1);

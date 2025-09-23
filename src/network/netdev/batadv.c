@@ -1,19 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <inttypes.h>
-#include <netinet/in.h>
-#include <linux/genetlink.h>
 #include <linux/if_arp.h>
 
+#include "sd-netlink.h"
+
 #include "batadv.h"
-#include "fileio.h"
+#include "conf-parser.h"
 #include "netlink-util.h"
-#include "network-internal.h"
 #include "networkd-manager.h"
 #include "parse-util.h"
-#include "stdio-util.h"
 #include "string-table.h"
-#include "string-util.h"
 
 static void batadv_init(NetDev *n) {
         BatmanAdvanced *b = BATADV(n);
@@ -47,12 +43,10 @@ static const char* const batadv_routing_algorithm_kernel_table[_BATADV_ROUTING_A
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(batadv_gateway_mode, BatadvGatewayModes);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_batadv_gateway_mode, batadv_gateway_mode, BatadvGatewayModes,
-                         "Failed to parse GatewayMode=");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_batadv_gateway_mode, batadv_gateway_mode, BatadvGatewayModes);
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(batadv_routing_algorithm, BatadvRoutingAlgorithm);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_batadv_routing_algorithm, batadv_routing_algorithm, BatadvRoutingAlgorithm,
-                         "Failed to parse RoutingAlgorithm=");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_batadv_routing_algorithm, batadv_routing_algorithm, BatadvRoutingAlgorithm);
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(batadv_routing_algorithm_kernel, BatadvRoutingAlgorithm);
 
@@ -164,6 +158,9 @@ static int netdev_batadv_post_create(NetDev *netdev, Link *link) {
         int r;
 
         assert(netdev);
+
+        if (!netdev_is_managed(netdev))
+                return 0; /* Already detached, due to e.g. reloading .netdev files. */
 
         r = sd_genl_message_new(netdev->manager->genl, BATADV_NL_NAME, BATADV_CMD_SET_MESH, &message);
         if (r < 0)

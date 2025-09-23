@@ -1,17 +1,23 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdlib.h>
+#include <unistd.h>
+
+#include "sd-bus.h"
 
 #include "all-units.h"
 #include "alloc-util.h"
+#include "analyze.h"
 #include "analyze-verify-util.h"
 #include "bus-error.h"
-#include "bus-util.h"
+#include "errno-util.h"
 #include "log.h"
 #include "manager.h"
 #include "pager.h"
 #include "path-util.h"
+#include "set.h"
 #include "string-table.h"
+#include "string-util.h"
 #include "strv.h"
 #include "unit-name.h"
 #include "unit-serialize.h"
@@ -30,7 +36,7 @@ static void log_syntax_callback(const char *unit, int level, void *userdata) {
 
         r = set_put_strdup(s, unit);
         if (r < 0) {
-                set_free_free(*s);
+                set_free(*s);
                 *s = POINTER_MAX;
         }
 }
@@ -55,7 +61,7 @@ int verify_prepare_filename(const char *filename, char **ret) {
                 return -EINVAL;
 
         if (unit_name_is_valid(name, UNIT_NAME_TEMPLATE)) {
-                r = unit_name_replace_instance(name, "i", &with_instance);
+                r = unit_name_replace_instance(name, arg_instance, &with_instance);
                 if (r < 0)
                         return r;
         }
@@ -155,7 +161,7 @@ int verify_set_unit_path(char **filenames) {
             !strextend_with_separator(&joined, ":", strempty(old)))
                 return -ENOMEM;
 
-        assert_se(set_unit_path(joined) >= 0);
+        assert_se(setenv_unit_path(joined) >= 0);
         return 0;
 }
 
@@ -250,7 +256,7 @@ static int verify_unit(Unit *u, bool check_man, const char *root) {
                 unit_dump(u, stdout, "\t");
 
         log_unit_debug(u, "Creating %s/start job", u->id);
-        r = manager_add_job(u->manager, JOB_START, u, JOB_REPLACE, NULL, &error, NULL);
+        r = manager_add_job(u->manager, JOB_START, u, JOB_REPLACE, &error, /* ret = */ NULL);
         if (r < 0)
                 log_unit_error_errno(u, r, "Failed to create %s/start: %s", u->id, bus_error_message(&error, r));
 
@@ -264,7 +270,7 @@ static int verify_unit(Unit *u, bool check_man, const char *root) {
 static void set_destroy_ignore_pointer_max(Set **s) {
         if (*s == POINTER_MAX)
                 return;
-        set_free_free(*s);
+        set_free(*s);
 }
 
 int verify_units(
@@ -356,9 +362,16 @@ int verify_units(
          * its direct dependencies. Hence, search for any of the filenames in the set and if found,
          * return a non-zero process exit status. */
         if (recursive_errors == RECURSIVE_ERRORS_ONE)
-                STRV_FOREACH(filename, filenames)
-                        if (set_contains(s, basename(*filename)))
+                STRV_FOREACH(filename, filenames) {
+                        _cleanup_free_ char *unit_file = NULL;
+
+                        r = path_extract_filename(*filename, &unit_file);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to extract file name from '%s': %m", *filename);
+
+                        if (set_contains(s, unit_file))
                                 return -ENOTRECOVERABLE;
+                }
 
         return 0;
 }

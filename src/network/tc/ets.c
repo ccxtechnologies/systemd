@@ -2,16 +2,15 @@
 
 #include <linux/pkt_sched.h>
 
+#include "sd-netlink.h"
+
 #include "alloc-util.h"
-#include "conf-parser.h"
 #include "ets.h"
 #include "extract-word.h"
-#include "memory-util.h"
-#include "netlink-util.h"
+#include "log.h"
 #include "parse-util.h"
 #include "qdisc.h"
 #include "string-util.h"
-#include "tc-util.h"
 
 static int enhanced_transmission_selection_fill_message(Link *link, QDisc *qdisc, sd_netlink_message *req) {
         EnhancedTransmissionSelection *ets;
@@ -88,7 +87,7 @@ int config_parse_ets_u8(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         EnhancedTransmissionSelection *ets;
         Network *network = ASSERT_PTR(data);
         uint8_t v, *p;
@@ -154,7 +153,7 @@ int config_parse_ets_quanta(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         EnhancedTransmissionSelection *ets;
         Network *network = ASSERT_PTR(data);
         int r;
@@ -237,7 +236,7 @@ int config_parse_ets_prio(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         EnhancedTransmissionSelection *ets;
         Network *network = ASSERT_PTR(data);
         int r;

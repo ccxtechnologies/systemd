@@ -1,13 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <errno.h>
-
-#include "macro.h"
+#include "forward.h"
 
 typedef enum KernelImageType {
         KERNEL_IMAGE_TYPE_UNKNOWN,
         KERNEL_IMAGE_TYPE_UKI,
+        KERNEL_IMAGE_TYPE_ADDON,
         KERNEL_IMAGE_TYPE_PE,
         _KERNEL_IMAGE_TYPE_MAX,
         _KERNEL_IMAGE_TYPE_INVALID = -EINVAL,

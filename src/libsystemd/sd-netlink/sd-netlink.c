@@ -1,21 +1,28 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <linux/filter.h>
 #include <poll.h>
+#include <stdlib.h>
 
+#include "sd-event.h"
 #include "sd-netlink.h"
 
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "hashmap.h"
 #include "io-util.h"
-#include "macro.h"
+#include "log.h"
 #include "netlink-genl.h"
 #include "netlink-internal.h"
 #include "netlink-slot.h"
 #include "netlink-util.h"
+#include "ordered-set.h"
+#include "prioq.h"
 #include "process-util.h"
 #include "socket-util.h"
 #include "string-util.h"
+#include "time-util.h"
 
 /* Some really high limit, to catch programming errors */
 #define REPLY_CALLBACKS_MAX UINT16_MAX
@@ -67,7 +74,7 @@ static int netlink_new(sd_netlink **ret) {
 
 int sd_netlink_open_fd(sd_netlink **ret, int fd) {
         _cleanup_(sd_netlink_unrefp) sd_netlink *nl = NULL;
-        int r, protocol;
+        int r, protocol = 0; /* Avoid maybe-uninitialized false positive */
 
         assert_return(ret, -EINVAL);
         assert_return(fd >= 0, -EBADF);
@@ -148,7 +155,7 @@ DEFINE_TRIVIAL_REF_UNREF_FUNC(sd_netlink, sd_netlink, netlink_free);
 int sd_netlink_send(
                 sd_netlink *nl,
                 sd_netlink_message *message,
-                uint32_t *serial) {
+                uint32_t *ret_serial) {
 
         int r;
 
@@ -163,8 +170,8 @@ int sd_netlink_send(
         if (r < 0)
                 return r;
 
-        if (serial)
-                *serial = message_get_serial(message);
+        if (ret_serial)
+                *ret_serial = message_get_serial(message);
 
         return 1;
 }
@@ -626,25 +633,25 @@ int sd_netlink_get_events(sd_netlink *nl) {
         return ordered_set_isempty(nl->rqueue) ? POLLIN : 0;
 }
 
-int sd_netlink_get_timeout(sd_netlink *nl, uint64_t *timeout_usec) {
+int sd_netlink_get_timeout(sd_netlink *nl, uint64_t *ret) {
         struct reply_callback *c;
 
         assert_return(nl, -EINVAL);
-        assert_return(timeout_usec, -EINVAL);
+        assert_return(ret, -EINVAL);
         assert_return(!netlink_pid_changed(nl), -ECHILD);
 
         if (!ordered_set_isempty(nl->rqueue)) {
-                *timeout_usec = 0;
+                *ret = 0;
                 return 1;
         }
 
         c = prioq_peek(nl->reply_callbacks_prioq);
         if (!c) {
-                *timeout_usec = UINT64_MAX;
+                *ret = UINT64_MAX;
                 return 0;
         }
 
-        *timeout_usec = c->timeout;
+        *ret = c->timeout;
         return 1;
 }
 

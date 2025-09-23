@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "conf-parser.h"
-#include "constants.h"
 #include "home-util.h"
 #include "homed-conf.h"
+#include "string-util.h"
+#include "user-record.h"
 
 int manager_parse_config_file(Manager *m) {
 
@@ -17,7 +18,7 @@ int manager_parse_config_file(Manager *m) {
                         m);
 }
 
-DEFINE_CONFIG_PARSE_ENUM(config_parse_default_storage, user_storage, UserStorage, "Failed to parse default storage setting");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_default_storage, user_storage, UserStorage);
 
 int config_parse_default_file_system_type(
                 const char *unit,
@@ -41,5 +42,4 @@ int config_parse_default_file_system_type(
         }
 
         return free_and_strdup_warn(s, empty_to_null(rvalue));
-
 }

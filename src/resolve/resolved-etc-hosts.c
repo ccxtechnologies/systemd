@@ -1,18 +1,24 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "sd-event.h"
 
+#include "alloc-util.h"
+#include "dns-domain.h"
+#include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "hostname-util.h"
-#include "resolved-dns-synthesize.h"
+#include "log.h"
+#include "resolved-dns-answer.h"
+#include "resolved-dns-question.h"
+#include "resolved-dns-rr.h"
 #include "resolved-etc-hosts.h"
+#include "resolved-manager.h"
+#include "set.h"
 #include "socket-netlink.h"
 #include "stat-util.h"
 #include "string-util.h"
-#include "strv.h"
 #include "time-util.h"
 
 /* Recheck /etc/hosts at most once every 2s */
@@ -235,12 +241,12 @@ static void strip_localhost(EtcHosts *hosts) {
          * This way our regular synthesizing can take over, but only if it would result in the exact same
          * mappings.  */
 
-        for (size_t j = 0; j < ELEMENTSOF(local_in_addrs); j++) {
+        FOREACH_ELEMENT(local_in_addr, local_in_addrs) {
                 bool all_localhost, all_local_address;
                 EtcHostsItemByAddress *item;
                 const char *name;
 
-                item = hashmap_get(hosts->by_address, local_in_addrs + j);
+                item = hashmap_get(hosts->by_address, local_in_addr);
                 if (!item)
                         continue;
 
@@ -284,7 +290,7 @@ static void strip_localhost(EtcHosts *hosts) {
                 SET_FOREACH(name, item->names)
                         etc_hosts_item_by_name_free(hashmap_remove(hosts->by_name, name));
 
-                assert_se(hashmap_remove(hosts->by_address, local_in_addrs + j) == item);
+                assert_se(hashmap_remove(hosts->by_address, local_in_addr) == item);
                 etc_hosts_item_by_address_free(item);
         }
 }
@@ -359,7 +365,7 @@ static int manager_etc_hosts_read(Manager *m) {
         f = fopen("/etc/hosts", "re");
         if (!f) {
                 if (errno != ENOENT)
-                        return log_error_errno(errno, "Failed to open /etc/hosts: %m");
+                        return log_error_errno(errno, "Failed to open %s: %m", "/etc/hosts");
 
                 manager_etc_hosts_flush(m);
                 return 0;

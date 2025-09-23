@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "tpm2-event-log.h"
-
 #include "sort-util.h"
+#include "tpm2-event-log.h"
 
 typedef struct tpm2_log_event_type_info {
         uint32_t event_type;
@@ -55,7 +54,7 @@ static int tpm2_log_event_type_info_cmp(const tpm2_log_event_type_info *a, const
         return CMP(ASSERT_PTR(a)->event_type, ASSERT_PTR(b)->event_type);
 }
 
-const char *tpm2_log_event_type_to_string(uint32_t type) {
+const char* tpm2_log_event_type_to_string(uint32_t type) {
 
         tpm2_log_event_type_info *found, key = {
                 .event_type = type,

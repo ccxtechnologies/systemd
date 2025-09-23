@@ -7,7 +7,6 @@
 #include "dbus-cgroup.h"
 #include "dbus-execute.h"
 #include "dbus-swap.h"
-#include "string-util.h"
 #include "swap.h"
 #include "unit.h"
 
@@ -49,7 +48,7 @@ int bus_swap_set_property(
 int bus_swap_commit_properties(Unit *u) {
         assert(u);
 
-        unit_realize_cgroup(u);
+        (void) unit_realize_cgroup(u);
 
         return 0;
 }

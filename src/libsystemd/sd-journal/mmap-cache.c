@@ -1,16 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "alloc-util.h"
+#include "bitfield.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "hashmap.h"
 #include "list.h"
 #include "log.h"
-#include "macro.h"
 #include "memory-util.h"
 #include "mmap-cache.h"
 #include "sigbus.h"
@@ -64,11 +64,13 @@ struct MMapCache {
 
         LIST_HEAD(Window, unused);
         Window *last_unused;
+        unsigned n_unused;
 
         Window *windows_by_category[_MMAP_CACHE_CATEGORY_MAX];
 };
 
 #define WINDOWS_MIN 64
+#define UNUSED_MIN 4
 
 #if ENABLE_DEBUG_MMAP_CACHE
 /* Tiny windows increase mmap activity and the chance of exposing unsafe use. */
@@ -103,10 +105,11 @@ static Window* window_unlink(Window *w) {
                 if (m->last_unused == w)
                         m->last_unused = w->unused_prev;
                 LIST_REMOVE(unused, m->unused, w);
+                m->n_unused--;
         }
 
         for (unsigned i = 0; i < _MMAP_CACHE_CATEGORY_MAX; i++)
-                if (FLAGS_SET(w->flags, 1u << i))
+                if (BIT_SET(w->flags, i))
                         assert_se(TAKE_PTR(m->windows_by_category[i]) == w);
 
         return LIST_REMOVE(windows, w->fd->windows, w);
@@ -160,7 +163,7 @@ static Window* window_add(MMapFileDescriptor *f, uint64_t offset, size_t size, v
         MMapCache *m = mmap_cache_fd_cache(f);
         Window *w;
 
-        if (!m->last_unused || m->n_windows <= WINDOWS_MIN) {
+        if (!m->last_unused || m->n_windows < WINDOWS_MIN || m->n_unused < UNUSED_MIN) {
                 /* Allocate a new window */
                 w = new(Window, 1);
                 if (!w)
@@ -190,7 +193,7 @@ static void category_detach_window(MMapCache *m, MMapCacheCategory c) {
         if (!w)
                 return; /* Nothing attached. */
 
-        assert(FLAGS_SET(w->flags, 1u << c));
+        assert(BIT_SET(w->flags, c));
         w->flags &= ~(1u << c);
 
         if (WINDOW_IS_UNUSED(w)) {
@@ -202,6 +205,7 @@ static void category_detach_window(MMapCache *m, MMapCacheCategory c) {
                 LIST_PREPEND(unused, m->unused, w);
                 if (!m->last_unused)
                         m->last_unused = w;
+                m->n_unused++;
                 w->flags |= WINDOW_IN_UNUSED;
 #endif
         }
@@ -222,6 +226,7 @@ static void category_attach_window(MMapCache *m, MMapCacheCategory c, Window *w)
                 if (m->last_unused == w)
                         m->last_unused = w->unused_prev;
                 LIST_REMOVE(unused, m->unused, w);
+                m->n_unused--;
                 w->flags &= ~WINDOW_IN_UNUSED;
         }
 
@@ -239,7 +244,7 @@ static MMapCache* mmap_cache_free(MMapCache *m) {
         assert(hashmap_isempty(m->fds));
         hashmap_free(m->fds);
 
-        assert(!m->unused);
+        assert(!m->unused && m->n_unused == 0);
         assert(m->n_windows == 0);
 
         return mfree(m);
@@ -430,8 +435,8 @@ found:
 void mmap_cache_stats_log_debug(MMapCache *m) {
         assert(m);
 
-        log_debug("mmap cache statistics: %u category cache hit, %u window list hit, %u miss",
-                  m->n_category_cache_hit, m->n_window_list_hit, m->n_missed);
+        log_debug("mmap cache statistics: %u category cache hit, %u window list hit, %u miss, %u files, %u windows, %u unused",
+                  m->n_category_cache_hit, m->n_window_list_hit, m->n_missed, hashmap_size(m->fds), m->n_windows, m->n_unused);
 }
 
 static void mmap_cache_process_sigbus(MMapCache *m) {

@@ -1,28 +1,29 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sys/xattr.h>
-#include <unistd.h>
-
+#include "alloc-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
+#include "log.h"
 #include "memstream-util.h"
 #include "oomd-util.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "pidref.h"
 #include "procfs-util.h"
+#include "set.h"
 #include "signal-util.h"
 #include "sort-util.h"
-#include "stat-util.h"
 #include "stdio-util.h"
-#include "user-util.h"
+#include "string-util.h"
+#include "time-util.h"
 
 DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
                 oomd_cgroup_ctx_hash_ops,
                 char,
-                string_hash_func,
-                string_compare_func,
+                path_hash_func,
+                path_compare,
                 OomdCGroupContext,
                 oomd_cgroup_context_free);
 
@@ -40,7 +41,7 @@ static int increment_oomd_xattr(const char *path, const char *xattr, uint64_t nu
         assert(path);
         assert(xattr);
 
-        r = cg_get_xattr_malloc(path, xattr, &value);
+        r = cg_get_xattr(path, xattr, &value, /* ret_size= */ NULL);
         if (r < 0 && !ERRNO_IS_XATTR_ABSENT(r))
                 return r;
 
@@ -69,7 +70,7 @@ OomdCGroupContext *oomd_cgroup_context_free(OomdCGroupContext *ctx) {
         return mfree(ctx);
 }
 
-int oomd_pressure_above(Hashmap *h, usec_t duration, Set **ret) {
+int oomd_pressure_above(Hashmap *h, Set **ret) {
         _cleanup_set_free_ Set *targets = NULL;
         OomdCGroupContext *ctx;
         char *key;
@@ -90,7 +91,7 @@ int oomd_pressure_above(Hashmap *h, usec_t duration, Set **ret) {
                                 ctx->mem_pressure_limit_hit_start = now(CLOCK_MONOTONIC);
 
                         diff = now(CLOCK_MONOTONIC) - ctx->mem_pressure_limit_hit_start;
-                        if (diff >= duration) {
+                        if (diff >= ctx->mem_pressure_duration_usec) {
                                 r = set_put(targets, ctx);
                                 if (r < 0)
                                         return -ENOMEM;
@@ -281,27 +282,45 @@ int oomd_cgroup_kill(const char *path, bool recurse, bool dry_run) {
 
 typedef void (*dump_candidate_func)(const OomdCGroupContext *ctx, FILE *f, const char *prefix);
 
-static int dump_kill_candidates(OomdCGroupContext **sorted, int n, int dump_until, dump_candidate_func dump_func) {
+static int dump_kill_candidates(
+                OomdCGroupContext *sorted[],
+                size_t n,
+                const OomdCGroupContext *killed,
+                dump_candidate_func dump_func) {
+
         _cleanup_(memstream_done) MemStream m = {};
         FILE *f;
 
         /* Try dumping top offendors, ignoring any errors that might happen. */
 
+        assert(sorted || n == 0);
+        assert(dump_func);
+
+        /* If nothing killed, then limit the number of contexts to be dumped, for safety. */
+        if (!killed)
+                n = MIN(n, DUMP_ON_KILL_COUNT);
+
         f = memstream_init(&m);
         if (!f)
                 return -ENOMEM;
 
-        fprintf(f, "Considered %d cgroups for killing, top candidates were:\n", n);
-        for (int i = 0; i < dump_until; i++)
-                dump_func(sorted[i], f, "\t");
+        fprintf(f, "Considered %zu cgroups for killing, top candidates were:\n", n);
+        FOREACH_ARRAY(i, sorted, n) {
+                const OomdCGroupContext *c = *i;
+
+                dump_func(c, f, "\t");
+
+                if (c == killed)
+                        break;
+        }
 
         return memstream_dump(LOG_INFO, &m);
 }
 
 int oomd_kill_by_pgscan_rate(Hashmap *h, const char *prefix, bool dry_run, char **ret_selected) {
         _cleanup_free_ OomdCGroupContext **sorted = NULL;
+        const OomdCGroupContext *killed = NULL;
         int n, r, ret = 0;
-        int dump_until;
 
         assert(h);
         assert(ret_selected);
@@ -310,14 +329,15 @@ int oomd_kill_by_pgscan_rate(Hashmap *h, const char *prefix, bool dry_run, char 
         if (n < 0)
                 return n;
 
-        dump_until = MIN(n, DUMP_ON_KILL_COUNT);
-        for (int i = 0; i < n; i++) {
+        FOREACH_ARRAY(i, sorted, n) {
+                const OomdCGroupContext *c = *i;
+
                 /* Skip cgroups with no reclaim and memory usage; it won't alleviate pressure.
                  * Continue since there might be "avoid" cgroups at the end. */
-                if (sorted[i]->pgscan == 0 && sorted[i]->current_memory_usage == 0)
+                if (c->pgscan == 0 && c->current_memory_usage == 0)
                         continue;
 
-                r = oomd_cgroup_kill(sorted[i]->path, /* recurse= */ true, /* dry_run= */ dry_run);
+                r = oomd_cgroup_kill(c->path, /* recurse= */ true, /* dry_run= */ dry_run);
                 if (r == -ENOMEM)
                         return r; /* Treat oom as a hard error */
                 if (r < 0) {
@@ -325,24 +345,23 @@ int oomd_kill_by_pgscan_rate(Hashmap *h, const char *prefix, bool dry_run, char 
                         continue; /* Try to find something else to kill */
                 }
 
-                dump_until = MAX(dump_until, i + 1);
-
                 ret = r;
-                r = strdup_to(ret_selected, sorted[i]->path);
+                r = strdup_to(ret_selected, c->path);
                 if (r < 0)
                         return r;
+
+                killed = c;
                 break;
         }
 
-        dump_kill_candidates(sorted, n, dump_until, oomd_dump_memory_pressure_cgroup_context);
-
+        (void) dump_kill_candidates(sorted, n, killed, oomd_dump_memory_pressure_cgroup_context);
         return ret;
 }
 
 int oomd_kill_by_swap_usage(Hashmap *h, uint64_t threshold_usage, bool dry_run, char **ret_selected) {
         _cleanup_free_ OomdCGroupContext **sorted = NULL;
+        const OomdCGroupContext *killed = NULL;
         int n, r, ret = 0;
-        int dump_until;
 
         assert(h);
         assert(ret_selected);
@@ -351,16 +370,18 @@ int oomd_kill_by_swap_usage(Hashmap *h, uint64_t threshold_usage, bool dry_run, 
         if (n < 0)
                 return n;
 
-        dump_until = MIN(n, DUMP_ON_KILL_COUNT);
         /* Try to kill cgroups with non-zero swap usage until we either succeed in killing or we get to a cgroup with
          * no swap usage. Threshold killing only cgroups with more than threshold swap usage. */
-        for (int i = 0; i < n; i++) {
+
+        FOREACH_ARRAY(i, sorted, n) {
+                const OomdCGroupContext *c = *i;
+
                 /* Skip over cgroups with not enough swap usage. Don't break since there might be "avoid"
                  * cgroups at the end. */
-                if (sorted[i]->swap_usage <= threshold_usage)
+                if (c->swap_usage <= threshold_usage)
                         continue;
 
-                r = oomd_cgroup_kill(sorted[i]->path, /* recurse= */ true, /* dry_run= */ dry_run);
+                r = oomd_cgroup_kill(c->path, /* recurse= */ true, /* dry_run= */ dry_run);
                 if (r == -ENOMEM)
                         return r; /* Treat oom as a hard error */
                 if (r < 0) {
@@ -368,17 +389,16 @@ int oomd_kill_by_swap_usage(Hashmap *h, uint64_t threshold_usage, bool dry_run, 
                         continue; /* Try to find something else to kill */
                 }
 
-                dump_until = MAX(dump_until, i + 1);
-
                 ret = r;
-                r = strdup_to(ret_selected, sorted[i]->path);
+                r = strdup_to(ret_selected, c->path);
                 if (r < 0)
                         return r;
+
+                killed = c;
                 break;
         }
 
-        dump_kill_candidates(sorted, n, dump_until, oomd_dump_swap_cgroup_context);
-
+        (void) dump_kill_candidates(sorted, n, killed, oomd_dump_swap_cgroup_context);
         return ret;
 }
 
@@ -507,13 +527,13 @@ int oomd_system_context_acquire(const char *proc_meminfo_path, OomdSystemContext
 
         if (mem_available > ctx.mem_total)
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "MemAvailable (%" PRIu64 ") cannot be greater than MemTotal (%" PRIu64 ") %m",
+                                       "MemAvailable (%" PRIu64 ") cannot be greater than MemTotal (%" PRIu64 ")",
                                        mem_available,
                                        ctx.mem_total);
 
         if (swap_free > ctx.swap_total)
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "SwapFree (%" PRIu64 ") cannot be greater than SwapTotal (%" PRIu64 ") %m",
+                                       "SwapFree (%" PRIu64 ") cannot be greater than SwapTotal (%" PRIu64 ")",
                                        swap_free,
                                        ctx.swap_total);
 
@@ -545,6 +565,7 @@ int oomd_insert_cgroup_context(Hashmap *old_h, Hashmap *new_h, const char *path)
                 curr_ctx->last_pgscan = old_ctx->pgscan;
                 curr_ctx->mem_pressure_limit = old_ctx->mem_pressure_limit;
                 curr_ctx->mem_pressure_limit_hit_start = old_ctx->mem_pressure_limit_hit_start;
+                curr_ctx->mem_pressure_duration_usec = old_ctx->mem_pressure_duration_usec;
                 curr_ctx->last_had_mem_reclaim = old_ctx->last_had_mem_reclaim;
         }
 
@@ -575,6 +596,7 @@ void oomd_update_cgroup_contexts_between_hashmaps(Hashmap *old_h, Hashmap *curr_
                 ctx->last_pgscan = old_ctx->pgscan;
                 ctx->mem_pressure_limit = old_ctx->mem_pressure_limit;
                 ctx->mem_pressure_limit_hit_start = old_ctx->mem_pressure_limit_hit_start;
+                ctx->mem_pressure_duration_usec = old_ctx->mem_pressure_duration_usec;
                 ctx->last_had_mem_reclaim = old_ctx->last_had_mem_reclaim;
 
                 if (oomd_pgscan_rate(ctx) > 0)
@@ -607,10 +629,12 @@ void oomd_dump_memory_pressure_cgroup_context(const OomdCGroupContext *ctx, FILE
         fprintf(f,
                 "%sPath: %s\n"
                 "%s\tMemory Pressure Limit: %lu.%02lu%%\n"
-                "%s\tPressure: Avg10: %lu.%02lu Avg60: %lu.%02lu Avg300: %lu.%02lu Total: %s\n"
+                "%s\tMemory Pressure Duration: %s\n"
+                "%s\tPressure: Avg10: %lu.%02lu, Avg60: %lu.%02lu, Avg300: %lu.%02lu, Total: %s\n"
                 "%s\tCurrent Memory Usage: %s\n",
                 strempty(prefix), ctx->path,
                 strempty(prefix), LOADAVG_INT_SIDE(ctx->mem_pressure_limit), LOADAVG_DECIMAL_SIDE(ctx->mem_pressure_limit),
+                strempty(prefix), FORMAT_TIMESPAN(ctx->mem_pressure_duration_usec, USEC_PER_SEC),
                 strempty(prefix),
                 LOADAVG_INT_SIDE(ctx->memory_pressure.avg10), LOADAVG_DECIMAL_SIDE(ctx->memory_pressure.avg10),
                 LOADAVG_INT_SIDE(ctx->memory_pressure.avg60), LOADAVG_DECIMAL_SIDE(ctx->memory_pressure.avg60),
@@ -635,8 +659,8 @@ void oomd_dump_system_context(const OomdSystemContext *ctx, FILE *f, const char 
         assert(f);
 
         fprintf(f,
-                "%sMemory: Used: %s Total: %s\n"
-                "%sSwap: Used: %s Total: %s\n",
+                "%sMemory: Used: %s, Total: %s\n"
+                "%sSwap: Used: %s, Total: %s\n",
                 strempty(prefix),
                 FORMAT_BYTES(ctx->mem_used),
                 FORMAT_BYTES(ctx->mem_total),

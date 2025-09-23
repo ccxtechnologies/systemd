@@ -1,21 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "format-util.h"
-#include "socket-util.h"
+#include "in-addr-util.h"
 #include "stdio-util.h"
-#include "string-util.h"
-#include "utmp-wtmp.h"
 #include "tests.h"
+#include "utmp-wtmp.h"
 
-#ifndef UT_LINESIZE
-#  define UT_LINESIZE      32
-#endif
-#ifndef UT_NAMESIZE
-#  define UT_NAMESIZE      32
-#endif
-#ifndef UT_HOSTSIZE
-#  define UT_HOSTSIZE     256
-#endif
+#define UTX_LINESIZE sizeof_field(struct utmpx, ut_line)
+#define UTX_NAMESIZE sizeof_field(struct utmpx, ut_user)
+#define UTX_HOSTSIZE sizeof_field(struct utmpx, ut_host)
 
 TEST(dump_run_utmp) {
         _unused_ _cleanup_(utxent_cleanup) bool utmpx = false;
@@ -46,11 +39,11 @@ TEST(dump_run_utmp) {
                 log_info("%14s %10"PID_PRI" line=%-7.*s id=%-4.4s name=%-8.*s session=%lu host=%.*s addr=%s",
                          type,
                          u->ut_pid,
-                         UT_LINESIZE, u->ut_line,
+                         (int) UTX_LINESIZE, u->ut_line,
                          u->ut_id,
-                         UT_NAMESIZE, u->ut_user,
+                         (int) UTX_NAMESIZE, u->ut_user,
                          (long unsigned) u->ut_session,
-                         UT_HOSTSIZE, u->ut_host,
+                         (int) UTX_HOSTSIZE, u->ut_host,
                          IN_ADDR_TO_STRING(is_ipv4 ? AF_INET : AF_INET6, &addr));
         }
 }

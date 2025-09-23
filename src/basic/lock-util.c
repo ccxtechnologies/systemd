@@ -1,22 +1,23 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
 #include "lock-util.h"
-#include "macro.h"
-#include "missing_fcntl.h"
+#include "log.h"
 #include "path-util.h"
 #include "process-util.h"
+#include "string-util.h"
+#include "time-util.h"
 
 int make_lock_file_at(int dir_fd, const char *p, int operation, LockFile *ret) {
         _cleanup_close_ int fd = -EBADF, dfd = -EBADF;
@@ -203,9 +204,9 @@ int lock_generic_with_timeout(int fd, LockType type, int operation, usec_t timeo
 
         assert(fd >= 0);
 
-        /* A version of lock_generic(), but with a time-out. We do this in a child process, since the kernel
+        /* A version of lock_generic(), but with a timeout. We do this in a child process, since the kernel
          * APIs natively don't support a timeout. We set a SIGALRM timer that will kill the child after the
-         * timeout is hit. Returns -ETIMEDOUT if the time-out is hit, and 0 on success.
+         * timeout is hit. Returns -ETIMEDOUT if the timeout is hit, and 0 on success.
          *
          * This only works for BSD and UNPOSIX locks, as only those are fd-bound, and hence can be acquired
          * from any process that has access to the fd. POSIX locks OTOH are process-bound, and hence if we'd
@@ -231,7 +232,7 @@ int lock_generic_with_timeout(int fd, LockType type, int operation, usec_t timeo
                         .sigev_notify = SIGEV_SIGNAL,
                         .sigev_signo = SIGALRM,
                 };
-                timer_t id = 0;
+                timer_t id;
 
                 if (timer_create(CLOCK_MONOTONIC, &sev, &id) < 0) {
                         log_error_errno(errno, "Failed to allocate CLOCK_MONOTONIC timer: %m");

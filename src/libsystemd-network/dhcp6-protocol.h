@@ -5,11 +5,7 @@
   Copyright © 2014 Intel Corporation. All rights reserved.
 ***/
 
-#include <errno.h>
-#include <netinet/ip6.h>
-#include <netinet/udp.h>
-
-#include "macro.h"
+#include "forward.h"
 #include "sparse-endian.h"
 
 struct DHCP6Message {
@@ -102,6 +98,8 @@ typedef enum DHCP6MessageType {
         DHCP6_MESSAGE_DISCONNECT                = 33, /* RFC 8156 */
         DHCP6_MESSAGE_STATE                     = 34, /* RFC 8156 */
         DHCP6_MESSAGE_CONTACT                   = 35, /* RFC 8156 */
+        DHCP6_MESSAGE_ADDR_REG_INFORM           = 36, /* RFC 9686 */
+        DHCP6_MESSAGE_ADDR_REG_REPLY            = 37, /* RFC 9686 */
         _DHCP6_MESSAGE_TYPE_MAX,
         _DHCP6_MESSAGE_TYPE_INVALID             = -EINVAL,
 } DHCP6MessageType;
@@ -152,9 +150,9 @@ typedef enum DHCP6FQDNFlag {
         DHCP6_FQDN_FLAG_N = 1 << 2,
 } DHCP6FQDNFlag;
 
-const char *dhcp6_state_to_string(DHCP6State s) _const_;
-const char *dhcp6_message_type_to_string(DHCP6MessageType s) _const_;
+const char* dhcp6_state_to_string(DHCP6State s) _const_;
+const char* dhcp6_message_type_to_string(DHCP6MessageType s) _const_;
 DHCP6MessageType dhcp6_message_type_from_string(const char *s) _pure_;
-const char *dhcp6_message_status_to_string(DHCP6Status s) _const_;
+const char* dhcp6_message_status_to_string(DHCP6Status s) _const_;
 DHCP6Status dhcp6_message_status_from_string(const char *s) _pure_;
 int dhcp6_message_status_to_errno(DHCP6Status s);

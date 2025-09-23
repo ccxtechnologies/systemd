@@ -3,7 +3,6 @@
 #include "dlfcn-util.h"
 #include "errno-util.h"
 #include "log.h"
-#include "macro.h"
 #include "memory-util.h"
 #include "password-quality-util.h"
 #include "strv.h"
@@ -12,12 +11,12 @@
 
 static void *passwdqc_dl = NULL;
 
-DLSYM_FUNCTION(passwdqc_params_reset);
-DLSYM_FUNCTION(passwdqc_params_load);
-DLSYM_FUNCTION(passwdqc_params_parse);
-DLSYM_FUNCTION(passwdqc_params_free);
-DLSYM_FUNCTION(passwdqc_check);
-DLSYM_FUNCTION(passwdqc_random);
+DLSYM_PROTOTYPE(passwdqc_params_reset) = NULL;
+DLSYM_PROTOTYPE(passwdqc_params_load) = NULL;
+DLSYM_PROTOTYPE(passwdqc_params_parse) = NULL;
+DLSYM_PROTOTYPE(passwdqc_params_free) = NULL;
+DLSYM_PROTOTYPE(passwdqc_check) = NULL;
+DLSYM_PROTOTYPE(passwdqc_random) = NULL;
 
 int dlopen_passwdqc(void) {
         ELF_NOTE_DLOPEN("passwdqc",
@@ -128,7 +127,7 @@ int check_password_quality(
 
                 check_reason = sym_passwdqc_check(&params->qc, password, old, &pw);
         } else
-                check_reason = sym_passwdqc_check(&params->qc, password, old, /* pw */ NULL);
+                check_reason = sym_passwdqc_check(&params->qc, password, old, /* pw = */ NULL);
 
         if (check_reason) {
                 if (ret_error) {

@@ -1,11 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "conf-parser.h"
-#include "macro.h"
+#include "networkd-forward.h"
 #include "networkd-util.h"
-
-typedef struct Link Link;
 
 typedef enum UseDomains {
         USE_DOMAINS_NO,
@@ -17,6 +14,7 @@ typedef enum UseDomains {
 
 UseDomains link_get_use_domains(Link *link, NetworkConfigSource proto);
 bool link_get_use_dns(Link *link, NetworkConfigSource proto);
+bool link_get_use_dnr(Link *link, NetworkConfigSource proto);
 
 const char* use_domains_to_string(UseDomains p) _const_;
 UseDomains use_domains_from_string(const char *s) _pure_;

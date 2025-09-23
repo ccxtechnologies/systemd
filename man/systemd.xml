@@ -30,7 +30,6 @@
     <cmdsynopsis>
       <command>init</command>
       <arg choice="opt" rep="repeat">OPTIONS</arg>
-      <arg choice="req">COMMAND</arg>
     </cmdsynopsis>
   </refsynopsisdiv>
 
@@ -47,13 +46,6 @@
     <citerefentry><refentrytitle>user@.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
     service.</para>
 
-    <para>For compatibility with SysV, if the binary is called as <command>init</command> and is not the
-    first process on the machine (PID is not 1), it will execute <command>telinit</command> and pass all
-    command line arguments unmodified. That means <command>init</command> and <command>telinit</command> are
-    mostly equivalent when invoked from normal login sessions. See
-    <citerefentry><refentrytitle>telinit</refentrytitle><manvolnum>8</manvolnum></citerefentry> for more
-    information.</para>
-
     <para>When run as a system instance, systemd interprets the
     configuration file <filename>system.conf</filename> and the files
     in <filename>system.conf.d</filename> directories; when run as a
@@ -62,33 +54,44 @@
     <filename>user.conf.d</filename> directories. See
     <citerefentry><refentrytitle>systemd-system.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
     for more information.</para>
+
+    <para><command>systemd</command> contains native implementations of various tasks that need to be
+    executed as part of the boot process. For example, it sets the hostname or configures the loopback
+    network device. It also sets up and mounts various API file systems, such as <filename>/sys/</filename>,
+    <filename>/proc/</filename>, and <filename>/dev/</filename>.</para>
+
+    <para><command>systemd</command> will also reset the system clock during early boot if it appears to be
+    set incorrectly. See "System clock epoch" section below.</para>
+
+    <para>Note that some but not all interfaces provided by systemd are covered by the
+    <ulink url="https://systemd.io/PORTABILITY_AND_STABILITY/">Interface Portability and Stability Promise</ulink>.</para>
+
+    <para>The D-Bus API of <command>systemd</command> is described in
+    <citerefentry><refentrytitle>org.freedesktop.systemd1</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+    and
+    <citerefentry><refentrytitle>org.freedesktop.LogControl1</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+    </para>
+
+    <para>Systems which invoke systemd in a container or initrd environment should implement the <ulink
+    url="https://systemd.io/CONTAINER_INTERFACE">Container Interface</ulink> or
+    <ulink url="https://systemd.io/INITRD_INTERFACE/">initrd Interface</ulink>
+    specifications, respectively.</para>
   </refsect1>
 
   <refsect1>
-    <title>Concepts</title>
+    <title>Units</title>
 
-    <para>systemd provides a dependency system between various
-    entities called "units" of 11 different types. Units encapsulate
-    various objects that are relevant for system boot-up and
-    maintenance. The majority of units are configured in unit
-    configuration files, whose syntax and basic set of options is
+    <para>systemd provides a dependency system between various entities called "units" of 11 different
+    types. Units encapsulate various objects that are relevant for system boot-up and maintenance. The
+    majority of units are configured in unit configuration files, whose syntax and basic set of options is
     described in
     <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-    however some are created automatically from other configuration
-    files, dynamically from system state or programmatically at runtime.
-    Units may be "active" (meaning started, bound, plugged in, …,
-    depending on the unit type, see below), or "inactive" (meaning
-    stopped, unbound, unplugged, …), as well as in the process of
-    being activated or deactivated, i.e. between the two states (these
-    states are called "activating", "deactivating"). A special
-    "failed" state is available as well, which is very similar to
-    "inactive" and is entered when the service failed in some way
-    (process returned error code on exit, or crashed, an operation
-    timed out, or after too many restarts). If this state is entered,
-    the cause will be logged, for later reference. Note that the
-    various unit types may have a number of additional substates,
-    which are mapped to the five generalized unit states described
-    here.</para>
+    however some are created automatically from other configuration files, dynamically from system state or
+    programmatically at runtime. Units may be in a number of states, described in the following table. Note
+    that the various unit types may have a number of additional substates, which are mapped to the
+    generalized unit states described here.</para>
+
+    <xi:include href="unit-states.xml" xpointer="table"/>
 
     <para>The following unit types are available:</para>
 
@@ -224,14 +227,8 @@
     xawf -eo pid,user,cgroup,args</command> is particularly useful to list all processes and the systemd
     units they belong to.).</para>
 
-    <para>systemd is compatible with the SysV init system to a large
-    degree: SysV init scripts are supported and simply read as an
-    alternative (though limited) configuration file format. The SysV
-    <filename>/dev/initctl</filename> interface is provided, and
-    compatibility implementations of the various SysV client tools are
-    available. In addition to that, various established Unix
-    functionality such as <filename>/etc/fstab</filename> or the
-    <filename>utmp</filename> database are supported.</para>
+    <para>systemd is compatible with various established Unix functionality such as
+    <filename>/etc/fstab</filename> or the <filename>utmp</filename> database.</para>
 
     <para>systemd has a minimal transaction system: if a unit is
     requested to start up or shut down it will add it and all its
@@ -261,34 +258,10 @@
     example, start jobs for any of those inactive units getting queued as
     well.</para>
 
-    <para>systemd contains native implementations of various tasks
-    that need to be executed as part of the boot process. For example,
-    it sets the hostname or configures the loopback network device. It
-    also sets up and mounts various API file systems, such as
-    <filename>/sys/</filename> or <filename>/proc/</filename>.</para>
-
-    <para>For more information about the concepts and
-    ideas behind systemd, please refer to the
-    <ulink url="https://0pointer.de/blog/projects/systemd.html">Original Design Document</ulink>.</para>
-
-    <para>Note that some but not all interfaces provided by systemd are covered by the
-    <ulink url="https://systemd.io/PORTABILITY_AND_STABILITY/">Interface Portability and Stability Promise</ulink>.</para>
-
     <para>Units may be generated dynamically at boot and system
     manager reload time, for example based on other configuration
     files or parameters passed on the kernel command line. For details, see
     <citerefentry><refentrytitle>systemd.generator</refentrytitle><manvolnum>7</manvolnum></citerefentry>.</para>
-
-    <para>The D-Bus API of <command>systemd</command> is described in
-    <citerefentry><refentrytitle>org.freedesktop.systemd1</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-    and
-    <citerefentry><refentrytitle>org.freedesktop.LogControl1</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
-    </para>
-
-    <para>Systems which invoke systemd in a container or initrd environment should implement the <ulink
-    url="https://systemd.io/CONTAINER_INTERFACE">Container Interface</ulink> or
-    <ulink url="https://systemd.io/INITRD_INTERFACE/">initrd Interface</ulink>
-    specifications, respectively.</para>
   </refsect1>
 
   <refsect1>
@@ -339,32 +312,6 @@
         directories is provided in
         <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
         </para></listitem>
-      </varlistentry>
-    </variablelist>
-
-    <variablelist>
-      <varlistentry>
-        <term>SysV init scripts directory</term>
-
-        <listitem><para>The location of the SysV init script directory
-        varies between distributions. If systemd cannot find a native
-        unit file for a requested service, it will look for a SysV
-        init script of the same name (with the
-        <filename>.service</filename> suffix
-        removed).</para></listitem>
-      </varlistentry>
-    </variablelist>
-
-    <variablelist>
-      <varlistentry>
-        <term>SysV runlevel link farm directory</term>
-
-        <listitem><para>The location of the SysV runlevel link farm
-        directory varies between distributions. systemd will take the
-        link farm into account when figuring out whether a service
-        shall be enabled. Note that a service unit with a native unit
-        configuration file cannot be started by activating it in the
-        SysV runlevel link farm.</para></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -576,7 +523,11 @@
         <listitem><para>Enables display of status messages on the
         console, as controlled via
         <varname>systemd.show_status=1</varname> on the kernel command
-        line.</para></listitem>
+        line.</para>
+        <para>You may want to use <function>SetShowStatus()</function> instead of
+        <constant>SIGRTMIN+20</constant> in order to prevent race conditions. See
+        <citerefentry project="man-pages"><refentrytitle>org.freedesktop.systemd1</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+        </para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -587,7 +538,11 @@
         controlled via
         <varname>systemd.show_status=0</varname>
         on the kernel command
-        line.</para></listitem>
+        line.</para>
+        <para>You may want to use <function>SetShowStatus()</function> instead of
+        <constant>SIGRTMIN+21</constant> in order to prevent race conditions. See
+        <citerefentry project="man-pages"><refentrytitle>org.freedesktop.systemd1</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+        </para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -797,10 +752,7 @@
     environment in which systemd is executed. If run inside a Linux container, these options are parsed from
     the command line arguments passed to systemd itself, next to any of the command line options listed in
     the Options section above. If run outside of Linux containers, these arguments are parsed from
-    <filename>/proc/cmdline</filename> and from the <literal>SystemdOptions</literal> EFI variable
-    (on EFI systems) instead. Options from <filename>/proc/cmdline</filename> have higher priority.</para>
-
-    <para>Note: use of <literal>SystemdOptions</literal> is deprecated.</para>
+    <filename>/proc/cmdline</filename> instead.</para>
 
     <para>The following variables are understood:</para>
 
@@ -845,9 +797,8 @@
 
         <listitem><para>Takes a boolean argument or enables the option if specified
         without an argument. If enabled, the system manager (PID 1) spawns a shell
-        when it crashes, after a 10s delay. Otherwise, no shell is spawned. Defaults
-        to disabled, for security reasons, as the shell is not protected by password
-        authentication.</para>
+        when it crashes. Otherwise, no shell is spawned. Defaults to disabled, for
+        security reasons, as the shell is not protected by password authentication.</para>
 
         <xi:include href="version-info.xml" xpointer="v233"/></listitem>
       </varlistentry>
@@ -1075,12 +1026,9 @@
         <term><varname>5</varname></term>
 
         <listitem><para>Boot into the specified legacy SysV runlevel.
-        These are equivalent to
-        <varname>systemd.unit=runlevel2.target</varname>,
-        <varname>systemd.unit=runlevel3.target</varname>,
-        <varname>systemd.unit=runlevel4.target</varname>, and
-        <varname>systemd.unit=runlevel5.target</varname>,
-        respectively, and provided for compatibility reasons and to be
+        <varname>2</varname>, <varname>3</varname>, and <varname>4</varname> are equivalent to
+        <varname>systemd.unit=multi-user.target</varname>; and <varname>5</varname> is equivalent to
+        <varname>systemd.unit=graphical.target</varname>, and provided for compatibility reasons and to be
         easier to type.</para>
 
         <xi:include href="version-info.xml" xpointer="v186"/></listitem>
@@ -1244,9 +1192,9 @@
       </itemizedlist>
 
       <para>Signals sent to PID 1 before this message is sent might not be handled correctly yet. A consumer
-      of these messages should parse the value as an unsigned integer indication the level of support. For
-      now only the mentioned level 2 is defined, but later on additional levels might be defined with higher
-      integers, that will implement a superset of the currently defined behaviour.</para>
+      of these messages should parse the value as an unsigned integer that indicates the level of support.
+      For now only the mentioned level 2 is defined, but later on additional levels might be defined with
+      higher integers, that will implement a superset of the currently defined behaviour.</para>
 
       <xi:include href="version-info.xml" xpointer="v256"/></listitem>
 
@@ -1395,8 +1343,8 @@
           <term><option>--crash-action=</option></term>
 
           <listitem><para>Specify what to do when the system manager (PID 1) crashes. This switch has no
-          effect when systemd is running as user instance. See <varname>systemd.crash_action=</varname>
-          above.</para>
+          effect when <command>systemd</command> is running as user instance. See
+          <varname>systemd.crash_action=</varname> above.</para>
 
           <xi:include href="version-info.xml" xpointer="v256"/></listitem>
         </varlistentry>
@@ -1487,7 +1435,26 @@
   </refsect1>
 
   <refsect1>
-    <title>Sockets and FIFOs</title>
+    <title>System clock epoch</title>
+
+    <para>When <command>systemd</command> is started or restarted, it may set the system clock to the
+    "epoch". This mechanism is used to ensure that the system clock remains somewhat reasonably initialized
+    and roughly monotonic across reboots, in case no battery-backed local RTC is available or it does not
+    work correctly.</para>
+
+    <para>The epoch is the lowest date above which the system clock time is assumed to be set correctly. When
+    initializing, the local clock is <emphasis>advanced</emphasis> to the epoch if it was set to a lower
+    value. As a special case, if the local clock is sufficiently far in the future (by default 15 years, but
+    this can be configured at build time), the hardware clock is assumed to be broken, and the system clock
+    is <emphasis>rewound</emphasis> to the epoch.</para>
+
+    <para>The epoch is set to the highest of: the build time of <filename>systemd</filename>, the
+    modification time ("mtime") of <filename>/usr/lib/clock-epoch</filename>, and the modification time of
+    <filename>/var/lib/systemd/timesync/clock</filename>.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>Files</title>
 
     <variablelist>
       <varlistentry>
@@ -1513,13 +1480,23 @@
       </varlistentry>
 
       <varlistentry>
-        <term><filename>/dev/initctl</filename></term>
+        <term><filename>/usr/lib/clock-epoch</filename></term>
 
-        <listitem><para>Limited compatibility support for the SysV
-        client interface, as implemented by the
-        <filename>systemd-initctl.service</filename> unit. This is a
-        named pipe in the file system. This interface is obsolete and
-        should not be used in new applications.</para></listitem>
+        <listitem><para>The modification time ("mtime") of this file is used for the time epoch, see previous
+        section.</para>
+
+        <xi:include href="version-info.xml" xpointer="v247"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><filename>/var/lib/systemd/timesync/clock</filename></term>
+
+        <listitem><para>The modification time ("mtime") of this file is updated by
+        <citerefentry><refentrytitle>systemd-timesyncd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
+        If present, the modification time of file is used for the epoch, see previous section.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -1530,11 +1507,10 @@
       <variablelist>
         <varlistentry>
           <term>systemd 252</term>
+
           <listitem><para>Kernel command-line arguments <varname>systemd.unified_cgroup_hierarchy</varname>
           and <varname>systemd.legacy_systemd_cgroup_controller</varname> were deprecated. Please switch to
-          the unified cgroup hierarchy.</para>
-
-          <xi:include href="version-info.xml" xpointer="v252"/></listitem>
+          the unified cgroup hierarchy.</para></listitem>
         </varlistentry>
       </variablelist>
   </refsect1>
@@ -1557,7 +1533,12 @@
       <member><citerefentry><refentrytitle>kernel-command-line</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
       <member><citerefentry project='man-pages'><refentrytitle>bootup</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
       <member><citerefentry><refentrytitle>systemd.directives</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>org.freedesktop.systemd1</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
     </simplelist></para>
+
+    <para>For more information about the concepts and
+    ideas behind systemd, please refer to the
+    <ulink url="https://0pointer.de/blog/projects/systemd.html">Original Design Document</ulink>.</para>
   </refsect1>
 
 </refentry>

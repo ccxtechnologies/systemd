@@ -3,6 +3,9 @@
 set -eux
 set -o pipefail
 
+# shellcheck source=test/units/util.sh
+. "$(dirname "$0")"/util.sh
+
 FAKE_ROOTS_DIR="$(mktemp -d --tmpdir="" fake-roots-XXX)"
 FSTYPE=$(stat --file-system --format "%T" /usr)
 
@@ -82,8 +85,14 @@ prepare_root() {
 
     {
         echo "ID=testtest"
+        echo "ID_LIKE=\"foobar test_alike something-else\""
         echo "VERSION=1.2.3"
     } >"$root/usr/lib/os-release"
+
+    if [[ -e $root/etc/os-release ]] && [[ ! -L $root/etc/os-release ]]; then
+        mv "$root/etc/os-release" "$root/etc/os-release.orig"
+        cp "$root/usr/lib/os-release" "$root/etc/os-release"
+    fi
 
     prepend_trap "cleanup_os_release ${root@Q}"
 }
@@ -99,6 +108,11 @@ cleanup_os_release() {
         # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
         mv "$root/usr/lib/os-release.orig" "$root/usr/lib/os-release"
     fi
+    # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
+    if [[ -e $root/etc/os-release.orig ]]; then
+        # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
+        mv "$root/etc/os-release.orig" "$root/etc/os-release"
+    fi
 }
 
 prepare_extension_image() {
@@ -111,6 +125,38 @@ prepare_extension_image() {
     ext_release="$ext_dir/usr/lib/extension-release.d/extension-release.$name"
     mkdir -p "${ext_release%/*}"
     echo "ID=_any" >"$ext_release"
+    mkdir -p "$ext_dir/$hierarchy"
+    touch "$ext_dir$hierarchy/preexisting-file-in-extension-image"
+
+    prepend_trap "rm -rf ${ext_dir@Q}"
+}
+
+prepare_extension_image_with_matching_id() {
+    local root=${1:-}
+    local hierarchy=${2:?}
+    local ext_dir ext_release name
+
+    name="test-extension-matching-id"
+    ext_dir="$root/var/lib/extensions/$name"
+    ext_release="$ext_dir/usr/lib/extension-release.d/extension-release.$name"
+    mkdir -p "${ext_release%/*}"
+    echo "ID=testtest" >"$ext_release"
+    mkdir -p "$ext_dir/$hierarchy"
+    touch "$ext_dir$hierarchy/preexisting-file-in-extension-image"
+
+    prepend_trap "rm -rf ${ext_dir@Q}"
+}
+
+prepare_extension_image_with_matching_id_like() {
+    local root=${1:-}
+    local hierarchy=${2:?}
+    local ext_dir ext_release name
+
+    name="test-extension-matching-id-like"
+    ext_dir="$root/var/lib/extensions/$name"
+    ext_release="$ext_dir/usr/lib/extension-release.d/extension-release.$name"
+    mkdir -p "${ext_release%/*}"
+    echo "ID=test_alike" >"$ext_release"
     mkdir -p "$ext_dir/$hierarchy"
     touch "$ext_dir$hierarchy/preexisting-file-in-extension-image"
 
@@ -979,6 +1025,40 @@ done
 
 
 ( init_trap
+: "Check if merging an extension with matching ID succeeds"
+fake_root=${roots_dir:+"$roots_dir/matching-id"}
+hierarchy=/opt
+
+prepare_root "$fake_root" "$hierarchy"
+prepare_extension_image_with_matching_id "$fake_root" "$hierarchy"
+prepare_read_only_hierarchy "$fake_root" "$hierarchy"
+
+run_systemd_sysext "$fake_root" merge
+extension_verify_after_merge "$fake_root" "$hierarchy" -e -h
+
+run_systemd_sysext "$fake_root" unmerge
+extension_verify_after_unmerge "$fake_root" "$hierarchy" -h
+)
+
+
+( init_trap
+: "Check if merging an extension that matches host ID_LIKE succeeds"
+fake_root=${roots_dir:+"$roots_dir/matching-id-like"}
+hierarchy=/opt
+
+prepare_root "$fake_root" "$hierarchy"
+prepare_extension_image_with_matching_id_like "$fake_root" "$hierarchy"
+prepare_read_only_hierarchy "$fake_root" "$hierarchy"
+
+run_systemd_sysext "$fake_root" merge
+extension_verify_after_merge "$fake_root" "$hierarchy" -e -h
+
+run_systemd_sysext "$fake_root" unmerge
+extension_verify_after_unmerge "$fake_root" "$hierarchy" -h
+)
+
+
+( init_trap
 : "Check if merging fails in case of invalid mutable directory permissions"
 
 fake_root=${roots_dir:+"$roots_dir/mutable-directory-with-invalid-permissions"}
@@ -1008,5 +1088,24 @@ if [[ -w /usr ]]; then
 fi
 run_sysext_tests "$FAKE_ROOTS_DIR"
 
+install_extension_images
+
+# Test that mountpoints are carried over into and back from the sysext overlayfs.
+ln -s /tmp/app0.raw /var/lib/extensions/app0.raw
+mkdir /tmp/foo
+mount --bind /tmp/foo /usr/share
+systemd-sysext merge
+test -f /usr/lib/systemd/system/some_file
+mountpoint /usr/share
+touch /tmp/foo/abc
+test -f /usr/share/abc
+umount /usr/share
+test ! -f /usr/share/abc
+mount --bind /tmp/foo /usr/share
+systemd-sysext unmerge
+test ! -f /usr/lib/systemd/system/some_file
+mountpoint /usr/share
+umount /usr/share
+rm -f /var/lib/extensions/app0.raw
 
 exit 0

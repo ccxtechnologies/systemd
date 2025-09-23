@@ -1,14 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <signal.h>
-#include <stddef.h>
 #include <sys/mman.h>
 
-#include "macro.h"
 #include "memory-util.h"
-#include "missing_syscall.h"
-#include "process-util.h"
 #include "sigbus.h"
 #include "signal-util.h"
 
@@ -29,10 +24,10 @@ static void sigbus_push(void *addr) {
         assert(addr);
 
         /* Find a free place, increase the number of entries and leave, if we can */
-        for (size_t u = 0; u < SIGBUS_QUEUE_MAX; u++) {
+        FOREACH_ELEMENT(u, sigbus_queue) {
                 /* OK to initialize this here since we haven't started the atomic ops yet */
                 void *tmp = NULL;
-                if (__atomic_compare_exchange_n(&sigbus_queue[u], &tmp, addr, false,
+                if (__atomic_compare_exchange_n(u, &tmp, addr, false,
                                                 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
                         __atomic_fetch_add(&n_sigbus_queue, 1, __ATOMIC_SEQ_CST);
                         return;
@@ -102,7 +97,7 @@ static void sigbus_handler(int sn, siginfo_t *si, void *data) {
         assert(si);
 
         if (si->si_code != BUS_ADRERR || !si->si_addr) {
-                assert_se(sigaction(SIGBUS, &old_sigaction, NULL) == 0);
+                assert_se(sigaction(SIGBUS, &old_sigaction, NULL) >= 0);
                 propagate_signal(sn, si);
                 return;
         }
@@ -121,7 +116,7 @@ static void sigbus_handler(int sn, siginfo_t *si, void *data) {
 }
 
 void sigbus_install(void) {
-        struct sigaction sa = {
+        static const struct sigaction sa = {
                 .sa_sigaction = sigbus_handler,
                 .sa_flags = SA_SIGINFO,
         };
@@ -133,7 +128,7 @@ void sigbus_install(void) {
         n_installed++;
 
         if (n_installed == 1)
-                assert_se(sigaction(SIGBUS, &sa, &old_sigaction) == 0);
+                assert_se(sigaction(SIGBUS, &sa, &old_sigaction) >= 0);
 
         return;
 }
@@ -146,7 +141,7 @@ void sigbus_reset(void) {
         n_installed--;
 
         if (n_installed == 0)
-                assert_se(sigaction(SIGBUS, &old_sigaction, NULL) == 0);
+                assert_se(sigaction(SIGBUS, &old_sigaction, NULL) >= 0);
 
         return;
 }

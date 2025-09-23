@@ -1,16 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <stdlib.h>
-
 #include "nulstr-util.h"
 #include "strbuf.h"
-#include "string-util.h"
 #include "strv.h"
 #include "tests.h"
-
-static ssize_t add_string(struct strbuf *sb, const char *s) {
-        return strbuf_add_string(sb, s, strlen(s));
-}
 
 TEST(strbuf) {
         _cleanup_(strbuf_freep) struct strbuf *sb = NULL;
@@ -19,14 +12,14 @@ TEST(strbuf) {
 
         sb = strbuf_new();
 
-        a = add_string(sb, "waldo");
-        b = add_string(sb, "foo");
-        c = add_string(sb, "bar");
-        d = add_string(sb, "waldo");   /* duplicate */
-        e = add_string(sb, "aldo");    /* duplicate */
-        f = add_string(sb, "do");      /* duplicate */
-        g = add_string(sb, "waldorf"); /* not a duplicate: matches from tail */
-        h = add_string(sb, "");
+        a = strbuf_add_string(sb, "waldo");
+        b = strbuf_add_string(sb, "foo");
+        c = strbuf_add_string(sb, "bar");
+        d = strbuf_add_string(sb, "waldo");   /* duplicate */
+        e = strbuf_add_string(sb, "aldo");    /* duplicate */
+        f = strbuf_add_string(sb, "do");      /* duplicate */
+        g = strbuf_add_string(sb, "waldorf"); /* not a duplicate: matches from tail */
+        h = strbuf_add_string(sb, "");
 
         /* check the content of the buffer directly */
         l = strv_parse_nulstr(sb->buf, sb->len);

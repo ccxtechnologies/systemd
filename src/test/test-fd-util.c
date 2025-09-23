@@ -6,13 +6,9 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "data-fd-util.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "fs-util.h"
-#include "macro.h"
-#include "memory-util.h"
-#include "missing_syscall.h"
+#include "memfd-util.h"
 #include "mkdir.h"
 #include "mount-util.h"
 #include "namespace-util.h"
@@ -24,7 +20,6 @@
 #include "seccomp-util.h"
 #include "serialize.h"
 #include "stat-util.h"
-#include "string-util.h"
 #include "tests.h"
 #include "tmpfile-util.h"
 
@@ -40,9 +35,9 @@ TEST(close_many) {
 
         close_many(fds, 2);
 
-        assert_se(fcntl(fds[0], F_GETFD) == -1);
-        assert_se(fcntl(fds[1], F_GETFD) == -1);
-        assert_se(fcntl(fds[2], F_GETFD) >= 0);
+        assert_se(fd_validate(fds[0]) == -EBADF);
+        assert_se(fd_validate(fds[1]) == -EBADF);
+        assert_se(fd_validate(fds[2]) >= 0);
 
         safe_close(fds[2]);
 }
@@ -57,14 +52,29 @@ TEST(close_nointr) {
         assert_se(close_nointr(fd) < 0);
 }
 
+TEST(fd_validate) {
+        assert_se(fd_validate(-EINVAL) == -EBADF);
+        assert_se(fd_validate(-EBADF) == -EBADF);
+
+        _cleanup_close_ int b = -EBADF;
+        assert_se((b = open("/dev/null", O_RDONLY|O_CLOEXEC)) >= 0);
+
+        assert_se(fd_validate(b) == 0);
+        safe_close(b);
+        assert_se(fd_validate(b) == -EBADF);
+        TAKE_FD(b);
+}
+
 TEST(same_fd) {
         _cleanup_close_pair_ int p[2];
-        _cleanup_close_ int a, b, c;
+        _cleanup_close_ int a, b, c, d, e;
 
         assert_se(pipe2(p, O_CLOEXEC) >= 0);
         assert_se((a = fcntl(p[0], F_DUPFD, 3)) >= 0);
-        assert_se((b = open("/dev/null", O_RDONLY|O_CLOEXEC)) >= 0);
+        assert_se((b = open("/bin/sh", O_RDONLY|O_CLOEXEC)) >= 0);
         assert_se((c = fcntl(a, F_DUPFD, 3)) >= 0);
+        assert_se((d = open("/bin/sh", O_RDONLY|O_CLOEXEC|O_PATH)) >= 0); /* O_PATH changes error returns in F_DUPFD_QUERY, let's test explicitly */
+        assert_se((e = fcntl(d, F_DUPFD, 3)) >= 0);
 
         assert_se(same_fd(p[0], p[0]) > 0);
         assert_se(same_fd(p[1], p[1]) > 0);
@@ -89,6 +99,20 @@ TEST(same_fd) {
 
         assert_se(same_fd(a, b) == 0);
         assert_se(same_fd(b, a) == 0);
+
+        assert_se(same_fd(a, d) == 0);
+        assert_se(same_fd(d, a) == 0);
+        assert_se(same_fd(d, d) > 0);
+        assert_se(same_fd(d, e) > 0);
+        assert_se(same_fd(e, d) > 0);
+
+        /* Let's now compare with a valid fd nr, that is definitely closed, and verify it returns the right error code */
+        safe_close(d);
+        assert_se(same_fd(d, d) == -EBADF);
+        assert_se(same_fd(e, d) == -EBADF);
+        assert_se(same_fd(d, e) == -EBADF);
+        assert_se(same_fd(e, e) > 0);
+        TAKE_FD(d);
 }
 
 TEST(open_serialization_fd) {
@@ -98,6 +122,8 @@ TEST(open_serialization_fd) {
         assert_se(fd >= 0);
 
         assert_se(write(fd, "test\n", 5) == 5);
+
+        assert_se(finish_serialization_fd(fd) >= 0);
 }
 
 TEST(open_serialization_file) {
@@ -109,6 +135,8 @@ TEST(open_serialization_file) {
         assert_se(f);
 
         assert_se(fwrite("test\n", 1, 5, f) == 5);
+
+        assert_se(finish_serialization_file(f) >= 0);
 }
 
 TEST(fd_move_above_stdio) {
@@ -174,7 +202,7 @@ TEST(rearrange_stdio) {
                 assert_se(pipe_read_fd >= 3);
 
                 assert_se(open("/dev/full", O_WRONLY|O_CLOEXEC) == 0);
-                assert_se(acquire_data_fd("foobar") == 2);
+                assert_se(memfd_new_and_seal_string("data", "foobar") == 2);
 
                 assert_se(rearrange_stdio(2, 0, 1) >= 0);
 
@@ -200,7 +228,7 @@ TEST(rearrange_stdio) {
 }
 
 TEST(read_nr_open) {
-        log_info("nr-open: %i", read_nr_open());
+        log_info("nr-open: %u", read_nr_open());
 }
 
 static size_t validate_fds(
@@ -222,9 +250,9 @@ static size_t validate_fds(
                         continue;
 
                 if (opened)
-                        assert_se(fcntl(fds[i], F_GETFD) >= 0);
+                        assert_se(fd_validate(fds[i]) >= 0);
                 else
-                        assert_se(fcntl(fds[i], F_GETFD) < 0 && errno == EBADF);
+                        assert_se(fd_validate(fds[i]) == -EBADF);
 
                 c++;
         }
@@ -360,6 +388,8 @@ TEST(close_all_fds) {
                         test_close_all_fds_inner();
                 _exit(EXIT_SUCCESS);
         }
+        if (ERRNO_IS_NEG_PRIVILEGE(r))
+                return (void) log_tests_skipped("Lacking privileges for test in namespace with /proc/ overmounted");
         assert_se(r >= 0);
 
         if (!is_seccomp_available())

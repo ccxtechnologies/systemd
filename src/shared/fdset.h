@@ -1,16 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-
-#include "hashmap.h"
-#include "macro.h"
-#include "set.h"
-
-typedef struct FDSet FDSet;
+#include "forward.h"
+#include "iterator.h"
 
 FDSet* fdset_new(void);
 FDSet* fdset_free(FDSet *s);
+FDSet* fdset_free_async(FDSet *s);
 
 int fdset_put(FDSet *s, int fd);
 int fdset_consume(FDSet *s, int fd);
@@ -36,7 +32,7 @@ int fdset_iterate(FDSet *s, Iterator *i);
 
 int fdset_steal_first(FDSet *fds);
 
-void fdset_close(FDSet *fds);
+void fdset_close(FDSet *fds, bool async);
 
 #define _FDSET_FOREACH(fd, fds, i) \
         for (Iterator i = ITERATOR_FIRST; ((fd) = fdset_iterate((fds), &i)) >= 0; )
@@ -45,3 +41,5 @@ void fdset_close(FDSet *fds);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(FDSet*, fdset_free);
 #define _cleanup_fdset_free_ _cleanup_(fdset_freep)
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(FDSet*, fdset_free_async);

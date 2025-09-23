@@ -1,18 +1,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
-#include <unistd.h>
+#include <sys/stat.h>
 
+#include "sd-messages.h"
+
+#include "alloc-util.h"
 #include "build.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
 #include "hexdecoct.h"
+#include "log.h"
 #include "main-func.h"
 #include "mkdir.h"
 #include "parse-util.h"
 #include "pretty-print.h"
-#include "terminal-util.h"
+#include "string-util.h"
 #include "tmpfile-util.h"
 #include "tpm2-util.h"
 
@@ -89,7 +93,7 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_TPM2_DEVICE:
                         if (streq(optarg, "list"))
-                                return tpm2_list_devices();
+                                return tpm2_list_devices(/* legend = */ true, /* quiet = */ false);
 
                         if (free_and_strdup(&arg_tpm2_device, streq(optarg, "auto") ? NULL : optarg) < 0)
                                 return log_oom();
@@ -184,7 +188,7 @@ static int load_public_key_disk(const char *path, struct public_key_data *ret) {
         } else {
                 log_debug("Loaded SRK public key from '%s'.", path);
 
-                r = openssl_pkey_from_pem(blob, blob_size, &data.pkey);
+                r = openssl_pubkey_from_pem(blob, blob_size, &data.pkey);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse SRK public key file '%s': %m", path);
 
@@ -223,6 +227,8 @@ static int load_public_key_tpm2(struct public_key_data *ret) {
                         /* ret_name= */ NULL,
                         /* ret_qname= */ NULL,
                         NULL);
+        if (r == -EDEADLK)
+                return r;
         if (r < 0)
                 return log_error_errno(r, "Failed to get or create SRK: %m");
         if (r > 0)
@@ -255,7 +261,7 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        if (arg_graceful && tpm2_support() != TPM2_SUPPORT_FULL) {
+        if (arg_graceful && !tpm2_is_fully_supported()) {
                 log_notice("No complete TPM2 support detected, exiting gracefully.");
                 return EXIT_SUCCESS;
         }
@@ -289,6 +295,13 @@ static int run(int argc, char *argv[]) {
         }
 
         r = load_public_key_tpm2(&tpm2_key);
+        if (r == -EDEADLK) {
+                log_struct_errno(LOG_INFO, r,
+                                 LOG_MESSAGE("Insufficient permissions to access TPM, not generating SRK."),
+                                 LOG_MESSAGE_ID(SD_MESSAGE_SRK_ENROLLMENT_NEEDS_AUTHORIZATION_STR));
+                return 76; /* Special return value which means "Insufficient permissions to access TPM,
+                            * cannot generate SRK". This isn't really an error when called at boot. */;
+        }
         if (r < 0)
                 return r;
 
@@ -296,7 +309,7 @@ static int run(int argc, char *argv[]) {
 
         if (runtime_key.pkey) {
                 if (memcmp_nn(tpm2_key.fingerprint, tpm2_key.fingerprint_size,
-                             runtime_key.fingerprint, runtime_key.fingerprint_size) != 0)
+                              runtime_key.fingerprint, runtime_key.fingerprint_size) != 0)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
                                                "Saved runtime SRK differs from TPM SRK, refusing.");
 
@@ -327,7 +340,7 @@ static int run(int argc, char *argv[]) {
         /* Write out public key (note that we only do that as a help to the user, we don't make use of this ever */
         _cleanup_(unlink_and_freep) char *t = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        r = fopen_tmpfile_linkable(pem_path, O_WRONLY, &t, &f);
+        r = fopen_tmpfile_linkable(pem_path, O_WRONLY|O_CLOEXEC, &t, &f);
         if (r < 0)
                 return log_error_errno(r, "Failed to open SRK public key file '%s' for writing: %m", pem_path);
 
@@ -336,10 +349,6 @@ static int run(int argc, char *argv[]) {
 
         if (fchmod(fileno(f), 0444) < 0)
                 return log_error_errno(errno, "Failed to adjust access mode of SRK public key file '%s' to 0444: %m", pem_path);
-
-        r = fflush_and_check(f);
-        if (r < 0)
-                return log_error_errno(r, "Failed to sync SRK key to disk: %m");
 
         r = flink_tmpfile(f, t, pem_path, LINK_TMPFILE_SYNC|LINK_TMPFILE_REPLACE);
         if (r < 0)
@@ -354,7 +363,7 @@ static int run(int argc, char *argv[]) {
         (void) mkdir_parents(tpm2b_public_path, 0755);
 
         /* Now also write this out in TPM2B_PUBLIC format */
-        r = fopen_tmpfile_linkable(tpm2b_public_path, O_WRONLY, &t, &f);
+        r = fopen_tmpfile_linkable(tpm2b_public_path, O_WRONLY|O_CLOEXEC, &t, &f);
         if (r < 0)
                 return log_error_errno(r, "Failed to open SRK public key file '%s' for writing: %m", tpm2b_public_path);
 
@@ -371,16 +380,14 @@ static int run(int argc, char *argv[]) {
         if (fchmod(fileno(f), 0444) < 0)
                 return log_error_errno(errno, "Failed to adjust access mode of SRK public key file '%s' to 0444: %m", tpm2b_public_path);
 
-        r = fflush_and_check(f);
-        if (r < 0)
-                return log_error_errno(r, "Failed to sync SRK key to disk: %m");
-
         r = flink_tmpfile(f, t, tpm2b_public_path, LINK_TMPFILE_SYNC|LINK_TMPFILE_REPLACE);
         if (r < 0)
                 return log_error_errno(r, "Failed to move SRK public key file to '%s': %m", tpm2b_public_path);
+
+        t = mfree(t);
 
         log_info("SRK public key saved to '%s' in TPM2B_PUBLIC format.", tpm2b_public_path);
         return 0;
 }
 
-DEFINE_MAIN_FUNCTION(run);
+DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);

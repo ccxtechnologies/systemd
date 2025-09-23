@@ -1,24 +1,53 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stdio.h>
-#include <unistd.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 
+#include "alloc-util.h"
 #include "dirent-util.h"
 #include "fd-util.h"
 #include "generator.h"
 #include "glyph-util.h"
 #include "hashmap.h"
 #include "log.h"
-#include "main-func.h"
-#include "nulstr-util.h"
 #include "path-lookup.h"
-#include "stat-util.h"
-#include "string-util.h"
 #include "strv.h"
 #include "xdg-autostart-service.h"
 
 DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(xdgautostartservice_hash_ops, char, string_hash_func, string_compare_func, XdgAutostartService, xdg_autostart_service_free);
+
+static int xdg_base_dirs(char ***ret_config_dirs, char ***ret_data_dirs) {
+        _cleanup_strv_free_ char **config_dirs = NULL, **data_dirs = NULL;
+        const char *e;
+
+        /* Implement the mechanisms defined in
+         * https://standards.freedesktop.org/basedir-spec/basedir-spec-0.6.html */
+
+        assert(ret_config_dirs);
+        assert(ret_data_dirs);
+
+        e = getenv("XDG_CONFIG_DIRS");
+        if (e)
+                config_dirs = strv_split(e, ":");
+        else
+                config_dirs = strv_new("/etc/xdg");
+        if (!config_dirs)
+                return -ENOMEM;
+
+        e = getenv("XDG_DATA_DIRS");
+        if (e)
+                data_dirs = strv_split(e, ":");
+        else
+                data_dirs = strv_new("/usr/local/share",
+                                     "/usr/share");
+        if (!data_dirs)
+                return -ENOMEM;
+
+        *ret_config_dirs = TAKE_PTR(config_dirs);
+        *ret_data_dirs = TAKE_PTR(data_dirs);
+
+        return 0;
+}
 
 static int enumerate_xdg_autostart(Hashmap *all_services) {
         _cleanup_strv_free_ char **autostart_dirs = NULL;
@@ -27,14 +56,14 @@ static int enumerate_xdg_autostart(Hashmap *all_services) {
         _cleanup_free_ char *user_config_autostart_dir = NULL;
         int r;
 
-        r = xdg_user_config_dir(&user_config_autostart_dir, "/autostart");
+        r = xdg_user_config_dir("/autostart", &user_config_autostart_dir);
         if (r < 0)
                 return r;
         r = strv_extend(&autostart_dirs, user_config_autostart_dir);
         if (r < 0)
                 return r;
 
-        r = xdg_user_dirs(&config_dirs, &data_dirs);
+        r = xdg_base_dirs(&config_dirs, &data_dirs);
         if (r < 0)
                 return r;
         r = strv_extend_strv_concat(&autostart_dirs, (const char* const*) config_dirs, "/autostart");
@@ -44,7 +73,7 @@ static int enumerate_xdg_autostart(Hashmap *all_services) {
         STRV_FOREACH(path, autostart_dirs) {
                 _cleanup_closedir_ DIR *d = NULL;
 
-                log_debug("Scanning autostart directory \"%s\"%s", *path, special_glyph(SPECIAL_GLYPH_ELLIPSIS));
+                log_debug("Scanning autostart directory \"%s\"%s", *path, glyph(GLYPH_ELLIPSIS));
                 d = opendir(*path);
                 if (!d) {
                         log_full_errno(errno == ENOENT ? LOG_DEBUG : LOG_WARNING, errno,

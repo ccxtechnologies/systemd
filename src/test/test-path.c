@@ -1,17 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <stdbool.h>
+#include <stdlib.h>
 #include <sys/stat.h>
-#include <sys/types.h>
+#include <unistd.h>
 
-#include "alloc-util.h"
 #include "all-units.h"
+#include "alloc-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
-#include "macro.h"
 #include "manager.h"
 #include "mkdir.h"
-#include "path-util.h"
 #include "rm-rf.h"
 #include "string-util.h"
 #include "strv.h"
@@ -397,8 +395,8 @@ int main(int argc, char *argv[]) {
 
         test_setup_logging(LOG_INFO);
 
-        assert_se(get_testdata_dir("test-path", &test_path) >= 0);
-        assert_se(set_unit_path(test_path) >= 0);
+        ASSERT_OK(get_testdata_dir("test-path", &test_path));
+        ASSERT_OK(setenv_unit_path(test_path));
         assert_se(runtime_dir = setup_fake_runtime_dir());
 
         for (const test_function_t *test = tests; *test; test++) {

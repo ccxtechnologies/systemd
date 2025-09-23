@@ -1,19 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <inttypes.h>
-#include <stdbool.h>
-
-#include "conf-parser.h"
-
-typedef struct Link Link;
-typedef struct Manager Manager;
-typedef struct Address Address;
-typedef struct Route Route;
+#include "networkd-forward.h"
 
 unsigned routes_max(void);
 
-bool route_type_is_reject(const Route *route);
+bool route_type_is_reject(uint8_t type);
+bool route_is_reject(const Route *route);
 
 bool link_find_default_gateway(Link *link, int family, Route **gw);
 static inline bool link_has_default_gateway(Link *link, int family) {
@@ -39,7 +32,7 @@ int manager_address_is_reachable(
                 Address **ret);
 
 int route_type_from_string(const char *s) _pure_;
-const char *route_type_to_string(int t) _const_;
+const char* route_type_to_string(int t) _const_;
 
 int route_scope_from_string(const char *s);
 int route_scope_to_string_alloc(int t, char **ret);

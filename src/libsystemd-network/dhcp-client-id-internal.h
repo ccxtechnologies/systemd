@@ -1,12 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include <linux/if_ether.h>
+
 #include "sd-dhcp-client-id.h"
 
 #include "dhcp-duid-internal.h"
-#include "json.h"
-#include "macro.h"
-#include "siphash24.h"
+#include "forward.h"
 #include "sparse-endian.h"
 
 /* RFC 2132 section 9.14: its minimum length is 2.
@@ -32,7 +32,7 @@ typedef struct sd_dhcp_client_id {
                                 } _packed_ eth;
                                 struct {
                                         /* 2 - 254: ARP/Link-Layer (RFC 2132) */
-                                        uint8_t haddr[0];
+                                        uint8_t haddr[HW_ADDR_MAX_SIZE];
                                 } _packed_ ll;
                                 struct {
                                         /* 255: Node-specific (RFC 4361) */
@@ -46,6 +46,8 @@ typedef struct sd_dhcp_client_id {
         };
 } sd_dhcp_client_id;
 
+assert_cc(sizeof_field(sd_dhcp_client_id, id) <= MAX_CLIENT_ID_LEN);
+
 static inline bool client_id_size_is_valid(size_t size) {
         return size >= MIN_CLIENT_ID_LEN && size <= MAX_CLIENT_ID_LEN;
 }
@@ -57,4 +59,4 @@ static inline bool client_id_data_size_is_valid(size_t size) {
 void client_id_hash_func(const sd_dhcp_client_id *client_id, struct siphash *state);
 int client_id_compare_func(const sd_dhcp_client_id *a, const sd_dhcp_client_id *b);
 
-int json_dispatch_client_id(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata);
+int json_dispatch_client_id(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);

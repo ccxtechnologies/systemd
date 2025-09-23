@@ -3,10 +3,10 @@
 
 #include <linux/pkt_sched.h>
 
-#include "alloc-util.h"
-#include "conf-parser.h"
+#include "sd-netlink.h"
+
 #include "drr.h"
-#include "netlink-util.h"
+#include "log.h"
 #include "parse-util.h"
 #include "string-util.h"
 
@@ -54,7 +54,7 @@ int config_parse_drr_size(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(tclass_free_or_set_invalidp) TClass *tclass = NULL;
+        _cleanup_(tclass_unref_or_set_invalidp) TClass *tclass = NULL;
         DeficitRoundRobinSchedulerClass *drr;
         Network *network = ASSERT_PTR(data);
         uint64_t u;

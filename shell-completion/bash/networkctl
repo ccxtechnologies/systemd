@@ -26,7 +26,7 @@ __contains_word () {
 }
 
 __get_links() {
-    networkctl list --no-legend --no-pager --all --full | { while read -r a b c; do echo " $b"; done; };
+    networkctl list --no-legend --no-pager --all --full 2>/dev/null | { while read -r a b c; do echo " $b"; done; }
 }
 
 __get_links_with_prefix() {
@@ -44,8 +44,8 @@ _networkctl() {
     local i verb comps
     local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]} words cword
     local -A OPTS=(
-        [STANDALONE]='-a --all -h --help --version --no-pager --no-legend -s --stats -l --full
-                      --no-reload --runtime'
+        [STANDALONE]='-a --all -h --help --version --no-pager --no-legend --no-ask-password
+                      -s --stats -l --full --no-reload --runtime'
         [ARG]='-n --lines --json --drop-in'
     )
 
@@ -70,7 +70,7 @@ _networkctl() {
     if __contains_word "$prev" ${OPTS[ARG]}; then
         case $prev in
             --json)
-                comps=$(networkctl --json=help)
+                comps=$(networkctl --json=help 2>/dev/null)
                 ;;
             *)
                 return 0

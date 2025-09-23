@@ -1,12 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "conf-parser.h"
+#include "in-addr-util.h"
 #include "resolve-util.h"
 #include "string-table.h"
 
-DEFINE_CONFIG_PARSE_ENUM(config_parse_resolve_support, resolve_support, ResolveSupport, "Failed to parse resolve support setting");
-DEFINE_CONFIG_PARSE_ENUM(config_parse_dnssec_mode, dnssec_mode, DnssecMode, "Failed to parse DNSSEC mode setting");
-DEFINE_CONFIG_PARSE_ENUM(config_parse_dns_over_tls_mode, dns_over_tls_mode, DnsOverTlsMode, "Failed to parse DNS-over-TLS mode setting");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_resolve_support, resolve_support, ResolveSupport);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_dnssec_mode, dnssec_mode, DnssecMode);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_dns_over_tls_mode, dns_over_tls_mode, DnsOverTlsMode);
 
 static const char* const resolve_support_table[_RESOLVE_SUPPORT_MAX] = {
         [RESOLVE_SUPPORT_NO] = "no",
@@ -42,7 +43,7 @@ bool dns_server_address_valid(int family, const union in_addr_union *sa) {
         return true;
 }
 
-DEFINE_CONFIG_PARSE_ENUM(config_parse_dns_cache_mode, dns_cache_mode, DnsCacheMode, "Failed to parse DNS cache mode setting")
+DEFINE_CONFIG_PARSE_ENUM(config_parse_dns_cache_mode, dns_cache_mode, DnsCacheMode);
 
 static const char* const dns_cache_mode_table[_DNS_CACHE_MODE_MAX] = {
         [DNS_CACHE_MODE_YES] = "yes",

@@ -1,32 +1,37 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+
+#include "sd-bus.h"
+#include "sd-event.h"
+#include "sd-varlink.h"
 
 #include "alloc-util.h"
-#include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-log-control-api.h"
-#include "bus-polkit.h"
-#include "cgroup-util.h"
+#include "bus-object.h"
+#include "bus-util.h"
 #include "common-signal.h"
+#include "constants.h"
 #include "daemon-util.h"
 #include "dirent-util.h"
-#include "discover-image.h"
+#include "errno-util.h"
 #include "fd-util.h"
-#include "format-util.h"
+#include "hash-funcs.h"
+#include "hashmap.h"
 #include "hostname-util.h"
-#include "machined-varlink.h"
+#include "machine.h"
 #include "machined.h"
+#include "machined-varlink.h"
 #include "main-func.h"
 #include "mkdir-label.h"
-#include "process-util.h"
+#include "operation.h"
 #include "service-util.h"
 #include "signal-util.h"
+#include "socket-util.h"
 #include "special.h"
+#include "string-util.h"
 
 static Manager* manager_unref(Manager *m);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_unref);
@@ -39,30 +44,27 @@ static int manager_new(Manager **ret) {
 
         assert(ret);
 
-        m = new0(Manager, 1);
+        m = new(Manager, 1);
         if (!m)
                 return -ENOMEM;
 
-        m->machines = hashmap_new(&machine_hash_ops);
-        m->machine_units = hashmap_new(&string_hash_ops);
-        m->machine_leaders = hashmap_new(NULL);
+        *m = (Manager) {
+                .runtime_scope = RUNTIME_SCOPE_SYSTEM,
+        };
 
-        if (!m->machines || !m->machine_units || !m->machine_leaders)
+        m->machines = hashmap_new(&machine_hash_ops);
+        if (!m->machines)
                 return -ENOMEM;
 
         r = sd_event_default(&m->event);
         if (r < 0)
                 return r;
 
-        r = sd_event_add_signal(m->event, NULL, SIGINT, NULL, NULL);
+        r = sd_event_set_signal_exit(m->event, true);
         if (r < 0)
                 return r;
 
-        r = sd_event_add_signal(m->event, NULL, SIGTERM, NULL, NULL);
-        if (r < 0)
-                return r;
-
-        r = sd_event_add_signal(m->event, NULL, SIGRTMIN+18, sigrtmin18_handler, NULL);
+        r = sd_event_add_signal(m->event, /* ret= */ NULL, (SIGRTMIN+18)|SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, /* userdata= */ NULL);
         if (r < 0)
                 return r;
 
@@ -86,15 +88,18 @@ static Manager* manager_unref(Manager *m) {
 
         assert(m->n_operations == 0);
 
-        hashmap_free(m->machines); /* This will free all machines, so that the machine_units/machine_leaders is empty */
-        hashmap_free(m->machine_units);
-        hashmap_free(m->machine_leaders);
+        hashmap_free(m->machines); /* This will free all machines, thus the by_unit/by_leader hashmaps shall be empty */
+
+        assert(hashmap_isempty(m->machines_by_unit));
+        hashmap_free(m->machines_by_unit);
+        assert(hashmap_isempty(m->machines_by_leader));
+        hashmap_free(m->machines_by_leader);
+
         hashmap_free(m->image_cache);
 
         sd_event_source_unref(m->image_cache_defer_event);
-#if ENABLE_NSCD
-        sd_event_source_unref(m->nscd_cache_flush_event);
-#endif
+
+        sd_event_source_disable_unref(m->deferred_gc_event_source);
 
         hashmap_free(m->polkit_registry);
 
@@ -143,6 +148,11 @@ static int manager_add_host_machine(Manager *m) {
         t->leader = TAKE_PIDREF(pidref);
         t->id = mid;
 
+        /* If vsock is available, let's expose the loopback CID for the local host (and not the actual local
+         * CID, in order to return a ideally constant record for the host) */
+        if (vsock_get_local_cid(/* ret= */ NULL) >= 0)
+                t->vsock_cid = VMADDR_CID_LOCAL;
+
         t->root_directory = TAKE_PTR(rd);
         t->unit = TAKE_PTR(unit);
 
@@ -169,7 +179,7 @@ static int manager_enumerate_machines(Manager *m) {
                 if (errno == ENOENT)
                         return 0;
 
-                return log_error_errno(errno, "Failed to open /run/systemd/machines: %m");
+                return log_error_errno(errno, "Failed to open %s: %m", "/run/systemd/machines");
         }
 
         FOREACH_DIRENT(de, d, return -errno) {
@@ -188,15 +198,13 @@ static int manager_enumerate_machines(Manager *m) {
 
                 k = manager_add_machine(m, de->d_name, &machine);
                 if (k < 0) {
-                        r = log_error_errno(k, "Failed to add machine by file name %s: %m", de->d_name);
+                        RET_GATHER(r, log_error_errno(k, "Failed to add machine by file name %s: %m", de->d_name));
                         continue;
                 }
 
                 machine_add_to_gc_queue(machine);
 
-                k = machine_load(machine);
-                if (k < 0)
-                        r = k;
+                RET_GATHER(r, machine_load(machine));
         }
 
         return r;
@@ -258,29 +266,6 @@ static int manager_connect_bus(Manager *m) {
         return 0;
 }
 
-static void manager_gc(Manager *m, bool drop_not_started) {
-        Machine *machine;
-
-        assert(m);
-
-        while ((machine = LIST_POP(gc_queue, m->machine_gc_queue))) {
-                machine->in_gc_queue = false;
-
-                /* First, if we are not closing yet, initiate stopping */
-                if (machine_may_gc(machine, drop_not_started) &&
-                    machine_get_state(machine) != MACHINE_CLOSING)
-                        machine_stop(machine);
-
-                /* Now, the stop probably made this referenced
-                 * again, but if it didn't, then it's time to let it
-                 * go entirely. */
-                if (machine_may_gc(machine, drop_not_started)) {
-                        machine_finalize(machine);
-                        machine_free(machine);
-                }
-        }
-}
-
 static int manager_startup(Manager *m) {
         Machine *machine;
         int r;
@@ -311,18 +296,19 @@ static int manager_startup(Manager *m) {
 }
 
 static bool check_idle(void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
 
         if (m->operations)
                 return false;
 
-        if (varlink_server_current_connections(m->varlink_userdb_server) > 0)
+        if (sd_varlink_server_current_connections(m->varlink_userdb_server) > 0)
                 return false;
 
-        if (varlink_server_current_connections(m->varlink_machine_server) > 0)
+        if (sd_varlink_server_current_connections(m->varlink_machine_server) > 0)
                 return false;
 
-        manager_gc(m, true);
+        if (!hashmap_isempty(m->polkit_registry))
+                return false;
 
         return hashmap_isempty(m->machines);
 }
@@ -349,7 +335,7 @@ static int run(int argc, char *argv[]) {
          * make sure this check stays in. */
         (void) mkdir_label("/run/systemd/machines", 0755);
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD, SIGTERM, SIGINT, SIGRTMIN+18) >= 0);
+        assert_se(sigprocmask_many(SIG_BLOCK, /* ret_old_mask= */ NULL, SIGCHLD) >= 0);
 
         r = manager_new(&m);
         if (r < 0)
@@ -359,7 +345,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to fully start up daemon: %m");
 
-        r = sd_notify(false, NOTIFY_READY);
+        r = sd_notify(false, NOTIFY_READY_MESSAGE);
         if (r < 0)
                 log_warning_errno(r, "Failed to send readiness notification, ignoring: %m");
 

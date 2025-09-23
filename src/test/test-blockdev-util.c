@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-daemon.h"
+
 #include "blockdev-util.h"
 #include "device-util.h"
 #include "errno-util.h"
@@ -65,7 +67,7 @@ TEST(partscan_enabled) {
                         continue;
                 }
 
-                r = blockdev_partscan_enabled(fd);
+                r = blockdev_partscan_enabled_fd(fd);
                 if (r < 0) {
                         log_warning_errno(r, "Failed to determine if block device '%s' has partition scanning enabled, skipping: %m", name);
                         continue;

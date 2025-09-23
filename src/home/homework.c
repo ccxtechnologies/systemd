@@ -1,41 +1,53 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <stddef.h>
+#include <linux/magic.h>
+#include <stdlib.h>
 #include <sys/mount.h>
+#include <unistd.h>
+
+#include "sd-daemon.h"
 
 #include "blockdev-util.h"
 #include "bus-unit-util.h"
+#include "chase.h"
 #include "chown-recursive.h"
 #include "copy.h"
+#include "cryptsetup-util.h"
 #include "env-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "filesystems.h"
 #include "format-util.h"
-#include "fs-util.h"
+#include "hashmap.h"
 #include "home-util.h"
+#include "homework-fido2.h"
+#include "homework-password-cache.h"
+#include "homework-pkcs11.h"
+#include "homework.h"
 #include "homework-blob.h"
 #include "homework-cifs.h"
 #include "homework-directory.h"
-#include "homework-fido2.h"
 #include "homework-fscrypt.h"
 #include "homework-luks.h"
 #include "homework-mount.h"
-#include "homework-pkcs11.h"
-#include "homework.h"
+#include "json-util.h"
 #include "libcrypt-util.h"
+#include "loop-util.h"
 #include "main-func.h"
 #include "memory-util.h"
-#include "missing_magic.h"
 #include "mount-util.h"
-#include "parse-util.h"
 #include "path-util.h"
 #include "recovery-key.h"
 #include "rm-rf.h"
 #include "stat-util.h"
+#include "string-util.h"
 #include "strv.h"
 #include "sync-util.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
+#include "user-record.h"
+#include "user-record-util.h"
 #include "user-util.h"
 #include "virt.h"
 
@@ -80,7 +92,7 @@ int user_record_authenticate(
 
         /* First, let's see if we already have a volume key from the keyring */
         if (cache->volume_key &&
-            json_variant_is_blank_object(json_variant_by_key(secret->json, "secret"))) {
+            sd_json_variant_is_blank_object(sd_json_variant_by_key(secret->json, "secret"))) {
                 log_info("LUKS volume key from keyring unlocks user record.");
                 return 1;
         }
@@ -538,10 +550,9 @@ int home_sync_and_statfs(int root_fd, struct statfs *ret) {
         return 0;
 }
 
-static int read_identity_file(int root_fd, JsonVariant **ret) {
+static int read_identity_file(int root_fd, sd_json_variant **ret) {
         _cleanup_fclose_ FILE *identity_file = NULL;
         _cleanup_close_ int identity_fd = -EBADF;
-        unsigned line, column;
         int r;
 
         assert(root_fd >= 0);
@@ -559,7 +570,8 @@ static int read_identity_file(int root_fd, JsonVariant **ret) {
         if (!identity_file)
                 return log_oom();
 
-        r = json_parse_file(identity_file, ".identity", JSON_PARSE_SENSITIVE, ret, &line, &column);
+        unsigned line = 0, column = 0;
+        r = sd_json_parse_file(identity_file, ".identity", SD_JSON_PARSE_SENSITIVE, ret, &line, &column);
         if (r < 0)
                 return log_error_errno(r, "[.identity:%u:%u] Failed to parse JSON data: %m", line, column);
 
@@ -568,8 +580,8 @@ static int read_identity_file(int root_fd, JsonVariant **ret) {
         return 0;
 }
 
-static int write_identity_file(int root_fd, JsonVariant *v, uid_t uid) {
-        _cleanup_(json_variant_unrefp) JsonVariant *normalized = NULL;
+static int write_identity_file(int root_fd, sd_json_variant *v, uid_t uid) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *normalized = NULL;
         _cleanup_fclose_ FILE *identity_file = NULL;
         _cleanup_close_ int identity_fd = -EBADF;
         _cleanup_free_ char *fn = NULL;
@@ -578,9 +590,9 @@ static int write_identity_file(int root_fd, JsonVariant *v, uid_t uid) {
         assert(root_fd >= 0);
         assert(v);
 
-        normalized = json_variant_ref(v);
+        normalized = sd_json_variant_ref(v);
 
-        r = json_variant_normalize(&normalized);
+        r = sd_json_variant_normalize(&normalized);
         if (r < 0)
                 log_warning_errno(r, "Failed to normalize user record, ignoring: %m");
 
@@ -598,7 +610,7 @@ static int write_identity_file(int root_fd, JsonVariant *v, uid_t uid) {
                 goto fail;
         }
 
-        json_variant_dump(normalized, JSON_FORMAT_PRETTY, identity_file, NULL);
+        sd_json_variant_dump(normalized, SD_JSON_FORMAT_PRETTY, identity_file, NULL);
 
         r = fflush_and_check(identity_file);
         if (r < 0) {
@@ -635,7 +647,7 @@ int home_load_embedded_identity(
                 UserRecord **ret_new_home) {
 
         _cleanup_(user_record_unrefp) UserRecord *embedded_home = NULL, *intermediate_home = NULL, *new_home = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         int r;
 
         assert(h);
@@ -925,36 +937,29 @@ static int home_activate(UserRecord *h, UserRecord **ret_home) {
         if (r < 0)
                 return r;
         if (r == USER_TEST_ABSENT)
-                return log_error_errno(SYNTHETIC_ERRNO(ENOENT), "Image path %s is missing, refusing.", user_record_image_path(h));
+                return log_error_errno(SYNTHETIC_ERRNO(ENETUNREACH), "Image path %s is missing, refusing.", user_record_image_path(h));
 
         switch (user_record_storage(h)) {
 
         case USER_LUKS:
                 r = home_activate_luks(h, flags, &setup, &cache, &new_home);
-                if (r < 0)
-                        return r;
-
                 break;
 
         case USER_SUBVOLUME:
         case USER_DIRECTORY:
         case USER_FSCRYPT:
                 r = home_activate_directory(h, flags, &setup, &cache, &new_home);
-                if (r < 0)
-                        return r;
-
                 break;
 
         case USER_CIFS:
                 r = home_activate_cifs(h, flags, &setup, &cache, &new_home);
-                if (r < 0)
-                        return r;
-
                 break;
 
         default:
                 assert_not_reached();
         }
+        if (r < 0)
+                return r;
 
         /* Note that the returned object might either be a reference to an updated version of the existing
          * home object, or a reference to a newly allocated home object. The caller has to be able to deal
@@ -1063,16 +1068,25 @@ static int home_deactivate(UserRecord *h, bool force) {
 }
 
 static int copy_skel(UserRecord *h, int root_fd, const char *skel) {
+        _cleanup_close_ int skel_fd = -EBADF;
         int r;
 
         assert(h);
         assert(root_fd >= 0);
 
-        r = copy_tree_at(AT_FDCWD, skel, root_fd, ".", h->uid, h->gid, COPY_MERGE|COPY_REPLACE, NULL, NULL);
+        r = chase(skel, /* root= */ NULL, CHASE_MUST_BE_DIRECTORY, /* ret_path= */ NULL, &skel_fd);
         if (r == -ENOENT) {
                 log_info("Skeleton directory %s missing, ignoring.", skel);
                 return 0;
         }
+
+        r = copy_tree_at(
+                        skel_fd, /* from= */ NULL,
+                        root_fd, ".",
+                        h->uid, user_record_gid(h),
+                        COPY_MERGE|COPY_REPLACE,
+                        /* denylist= */ NULL,
+                        /* subvolumes= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to copy in %s: %m", skel);
 
@@ -1595,7 +1609,7 @@ static int home_validate_update(UserRecord *h, HomeSetup *setup, HomeSetupFlags 
         if (r < 0)
                 return r;
         if (r == USER_TEST_ABSENT)
-                return log_error_errno(SYNTHETIC_ERRNO(ENOENT), "Image path %s does not exist", user_record_image_path(h));
+                return log_error_errno(SYNTHETIC_ERRNO(ENETUNREACH), "Image path %s does not exist", user_record_image_path(h));
 
         switch (user_record_storage(h)) {
 
@@ -1796,7 +1810,7 @@ static int home_passwd(UserRecord *h, UserRecord **ret_home) {
                 break;
 
         default:
-                break;
+                ;
         }
 
         r = home_store_header_identity_luks(new_home, &setup, header_home);
@@ -1869,7 +1883,7 @@ static int home_inspect(UserRecord *h, UserRecord **ret_home) {
         return 1;
 }
 
-static int user_session_freezer(uid_t uid, bool freeze_now, UnitFreezer **ret) {
+static int user_session_freezer_new(uid_t uid, UnitFreezer **ret) {
         _cleanup_free_ char *unit = NULL;
         int r;
 
@@ -1880,10 +1894,6 @@ static int user_session_freezer(uid_t uid, bool freeze_now, UnitFreezer **ret) {
         if (r < 0 && r != -ENXIO)
                 log_warning_errno(r, "Cannot parse value of $SYSTEMD_HOME_LOCK_FREEZE_SESSION, ignoring: %m");
         else if (r == 0) {
-                if (freeze_now)
-                        log_notice("Session remains unfrozen on explicit request ($SYSTEMD_HOME_LOCK_FREEZE_SESSION=0).\n"
-                                   "This is not recommended, and might result in unexpected behavior including data loss!");
-
                 *ret = NULL;
                 return 0;
         }
@@ -1891,10 +1901,7 @@ static int user_session_freezer(uid_t uid, bool freeze_now, UnitFreezer **ret) {
         if (asprintf(&unit, "user-" UID_FMT ".slice", uid) < 0)
                 return log_oom();
 
-        if (freeze_now)
-                r = unit_freezer_new_freeze(unit, ret);
-        else
-                r = unit_freezer_new(unit, ret);
+        r = unit_freezer_new(unit, ret);
         if (r < 0)
                 return r;
 
@@ -1920,9 +1927,16 @@ static int home_lock(UserRecord *h) {
 
         _cleanup_(unit_freezer_freep) UnitFreezer *f = NULL;
 
-        r = user_session_freezer(h->uid, /* freeze_now= */ true, &f);
+        r = user_session_freezer_new(h->uid, &f);
         if (r < 0)
                 return r;
+        if (r > 0) {
+                r = unit_freezer_freeze(f);
+                if (r < 0)
+                        return r;
+        } else
+                log_notice("Session remains unfrozen on explicit request ($SYSTEMD_HOME_LOCK_FREEZE_SESSION=0).\n"
+                           "This is not recommended, and might result in unexpected behavior including data loss!");
 
         r = home_lock_luks(h, &setup);
         if (r < 0) {
@@ -1965,7 +1979,7 @@ static int home_unlock(UserRecord *h) {
         _cleanup_(unit_freezer_freep) UnitFreezer *f = NULL;
 
         /* We want to thaw the session only after it's safe to access $HOME */
-        r = user_session_freezer(h->uid, /* freeze_now= */ false, &f);
+        r = user_session_freezer_new(h->uid, &f);
         if (r > 0)
                 r = unit_freezer_thaw(f);
         if (r < 0)
@@ -1977,14 +1991,13 @@ static int home_unlock(UserRecord *h) {
 
 static int run(int argc, char *argv[]) {
         _cleanup_(user_record_unrefp) UserRecord *home = NULL, *new_home = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         _cleanup_fclose_ FILE *opened_file = NULL;
         _cleanup_hashmap_free_ Hashmap *blobs = NULL;
-        unsigned line = 0, column = 0;
         const char *json_path = NULL, *blob_filename;
         FILE *json_file;
         usec_t start;
-        JsonVariant *fdmap, *blob_fd_variant;
+        sd_json_variant *fdmap, *blob_fd_variant;
         int r;
 
         start = now(CLOCK_MONOTONIC);
@@ -2011,11 +2024,12 @@ static int run(int argc, char *argv[]) {
                 json_file = stdin;
         }
 
-        r = json_parse_file(json_file, json_path, JSON_PARSE_SENSITIVE, &v, &line, &column);
+        unsigned line = 0, column = 0;
+        r = sd_json_parse_file(json_file, json_path, SD_JSON_PARSE_SENSITIVE, &v, &line, &column);
         if (r < 0)
                 return log_error_errno(r, "[%s:%u:%u] Failed to parse JSON data: %m", json_path, line, column);
 
-        fdmap = json_variant_by_key(v, HOMEWORK_BLOB_FDMAP_FIELD);
+        fdmap = sd_json_variant_by_key(v, HOMEWORK_BLOB_FDMAP_FIELD);
         if (fdmap) {
                 r = hashmap_ensure_allocated(&blobs, &blob_fd_hash_ops);
                 if (r < 0)
@@ -2025,10 +2039,10 @@ static int run(int argc, char *argv[]) {
                         _cleanup_free_ char *filename = NULL;
                         _cleanup_close_ int fd = -EBADF;
 
-                        assert(json_variant_is_integer(blob_fd_variant));
-                        assert(json_variant_integer(blob_fd_variant) >= 0);
-                        assert(json_variant_integer(blob_fd_variant) <= INT_MAX - SD_LISTEN_FDS_START);
-                        fd = SD_LISTEN_FDS_START + (int) json_variant_integer(blob_fd_variant);
+                        assert(sd_json_variant_is_integer(blob_fd_variant));
+                        assert(sd_json_variant_integer(blob_fd_variant) >= 0);
+                        assert(sd_json_variant_integer(blob_fd_variant) <= INT_MAX - SD_LISTEN_FDS_START);
+                        fd = SD_LISTEN_FDS_START + (int) sd_json_variant_integer(blob_fd_variant);
 
                         if (DEBUG_LOGGING) {
                                 _cleanup_free_ char *resolved = NULL;
@@ -2052,7 +2066,7 @@ static int run(int argc, char *argv[]) {
                         TAKE_FD(fd);
                 }
 
-                r = json_variant_filter(&v, STRV_MAKE(HOMEWORK_BLOB_FDMAP_FIELD));
+                r = sd_json_variant_filter(&v, STRV_MAKE(HOMEWORK_BLOB_FDMAP_FIELD));
                 if (r < 0)
                         return log_error_errno(r, "Failed to strip internal fdmap from JSON: %m");
         }
@@ -2091,6 +2105,7 @@ static int run(int argc, char *argv[]) {
          * ENOSPC          → not enough disk space for operation
          * EKEYREVOKED     → user record has not suitable hashed password or pkcs#11 entry, we cannot authenticate
          * EADDRINUSE      → home image is already used elsewhere (lock taken)
+         * ENETUNREACH     → backing storage is currently not (image is ENOENT, or AF_UNIX socket to connect to is ENOENT)
          */
 
         if (streq(argv[1], "activate"))
@@ -2141,7 +2156,7 @@ static int run(int argc, char *argv[]) {
          * prepare a fresh record, send to us, and only if it works use it without having to keep a local
          * copy. */
         if (new_home)
-                json_variant_dump(new_home->json, JSON_FORMAT_NEWLINE, stdout, NULL);
+                sd_json_variant_dump(new_home->json, SD_JSON_FORMAT_NEWLINE, stdout, NULL);
 
         return 0;
 }

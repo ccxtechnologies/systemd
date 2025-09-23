@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-#include <stdio.h>
-
-#include "sd-dhcp-lease.h"
+#include "forward.h"
 
 size_t serialize_in_addrs(FILE *f,
                           const struct in_addr *addresses,
@@ -16,6 +13,9 @@ void serialize_in6_addrs(FILE *f, const struct in6_addr *addresses,
                          size_t size,
                          bool *with_leading_space);
 int deserialize_in6_addrs(struct in6_addr **addresses, const char *string);
+
+int serialize_dnr(FILE *f, const sd_dns_resolver *dnr, size_t n_dnr, bool *with_leading_space);
+int deserialize_dnr(sd_dns_resolver **ret, const char *string);
 
 /* don't include "dhcp-lease-internal.h" as it causes conflicts between netinet/ip.h and linux/ip.h */
 struct sd_dhcp_route;

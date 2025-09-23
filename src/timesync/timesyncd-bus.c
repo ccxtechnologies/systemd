@@ -1,24 +1,20 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sys/capability.h>
-
 #include "sd-bus.h"
 
-#include "alloc-util.h"
 #include "bus-get-properties.h"
-#include "bus-internal.h"
 #include "bus-log-control-api.h"
+#include "bus-object.h"
 #include "bus-polkit.h"
-#include "bus-protocol.h"
 #include "bus-util.h"
 #include "dns-domain.h"
 #include "in-addr-util.h"
 #include "log.h"
-#include "macro.h"
 #include "strv.h"
 #include "time-util.h"
 #include "timesyncd-bus.h"
-#include "user-util.h"
+#include "timesyncd-manager.h"
+#include "timesyncd-server.h"
 
 static int property_get_servers(
                 sd_bus *bus,
@@ -246,9 +242,9 @@ int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to connect to bus: %m");
 
-        r = sd_bus_add_object_vtable(m->bus, NULL, "/org/freedesktop/timesync1", "org.freedesktop.timesync1.Manager", manager_vtable, m);
+        r = bus_add_implementation(m->bus, &manager_object, m);
         if (r < 0)
-                return log_error_errno(r, "Failed to add manager object vtable: %m");
+                return r;
 
         r = bus_log_control_api_register(m->bus);
         if (r < 0)
@@ -264,3 +260,9 @@ int manager_connect_bus(Manager *m) {
 
         return 0;
 }
+
+const BusObjectImplementation manager_object = {
+        "/org/freedesktop/timesync1",
+        "org.freedesktop.timesync1.Manager",
+        .vtables = BUS_VTABLES(manager_vtable),
+};

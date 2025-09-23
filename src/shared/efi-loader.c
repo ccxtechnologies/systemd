@@ -3,16 +3,19 @@
 #include "alloc-util.h"
 #include "efi-api.h"
 #include "efi-loader.h"
+#include "efivars.h"
 #include "env-util.h"
+#include "log.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "stat-util.h"
+#include "string-util.h"
 #include "strv.h"
+#include "time-util.h"
 #include "tpm2-pcr.h"
 #include "utf8.h"
 
 #if ENABLE_EFI
-
 static int read_usec(const char *variable, usec_t *ret) {
         _cleanup_free_ char *j = NULL;
         uint64_t x = 0;
@@ -33,7 +36,16 @@ static int read_usec(const char *variable, usec_t *ret) {
         return 0;
 }
 
+static int get_device_part_uuid(const char *variable, sd_id128_t *ret) {
+        if (!is_efi_boot())
+                return -EOPNOTSUPP;
+
+        return efi_get_variable_id128(variable, ret);
+}
+#endif
+
 int efi_loader_get_boot_usec(usec_t *ret_firmware, usec_t *ret_loader) {
+#if ENABLE_EFI
         uint64_t x, y;
         int r;
 
@@ -43,11 +55,11 @@ int efi_loader_get_boot_usec(usec_t *ret_firmware, usec_t *ret_loader) {
         if (!is_efi_boot())
                 return -EOPNOTSUPP;
 
-        r = read_usec(EFI_LOADER_VARIABLE(LoaderTimeInitUSec), &x);
+        r = read_usec(EFI_LOADER_VARIABLE_STR("LoaderTimeInitUSec"), &x);
         if (r < 0)
                 return log_debug_errno(r, "Failed to read LoaderTimeInitUSec: %m");
 
-        r = read_usec(EFI_LOADER_VARIABLE(LoaderTimeExecUSec), &y);
+        r = read_usec(EFI_LOADER_VARIABLE_STR("LoaderTimeExecUSec"), &y);
         if (r < 0)
                 return log_debug_errno(r, "Failed to read LoaderTimeExecUSec: %m");
 
@@ -59,35 +71,29 @@ int efi_loader_get_boot_usec(usec_t *ret_firmware, usec_t *ret_loader) {
         *ret_firmware = x;
         *ret_loader = y;
         return 0;
+#else
+        return -EOPNOTSUPP;
+#endif
 }
 
 int efi_loader_get_device_part_uuid(sd_id128_t *ret) {
-        _cleanup_free_ char *p = NULL;
-        int r;
-        unsigned parsed[16];
+#if ENABLE_EFI
+        return get_device_part_uuid(EFI_LOADER_VARIABLE_STR("LoaderDevicePartUUID"), ret);
+#else
+        return -EOPNOTSUPP;
+#endif
+}
 
-        if (!is_efi_boot())
-                return -EOPNOTSUPP;
-
-        r = efi_get_variable_string(EFI_LOADER_VARIABLE(LoaderDevicePartUUID), &p);
-        if (r < 0)
-                return r;
-
-        if (sscanf(p, SD_ID128_UUID_FORMAT_STR,
-                   &parsed[0], &parsed[1], &parsed[2], &parsed[3],
-                   &parsed[4], &parsed[5], &parsed[6], &parsed[7],
-                   &parsed[8], &parsed[9], &parsed[10], &parsed[11],
-                   &parsed[12], &parsed[13], &parsed[14], &parsed[15]) != 16)
-                return -EIO;
-
-        if (ret)
-                for (unsigned i = 0; i < ELEMENTSOF(parsed); i++)
-                        ret->bytes[i] = parsed[i];
-
-        return 0;
+int efi_stub_get_device_part_uuid(sd_id128_t *ret) {
+#if ENABLE_EFI
+        return get_device_part_uuid(EFI_LOADER_VARIABLE_STR("StubDevicePartUUID"), ret);
+#else
+        return -EOPNOTSUPP;
+#endif
 }
 
 int efi_loader_get_entries(char ***ret) {
+#if ENABLE_EFI
         _cleanup_free_ char16_t *entries = NULL;
         _cleanup_strv_free_ char **l = NULL;
         size_t size;
@@ -98,12 +104,12 @@ int efi_loader_get_entries(char ***ret) {
         if (!is_efi_boot())
                 return -EOPNOTSUPP;
 
-        r = efi_get_variable(EFI_LOADER_VARIABLE(LoaderEntries), NULL, (void**) &entries, &size);
+        r = efi_get_variable(EFI_LOADER_VARIABLE_STR("LoaderEntries"), NULL, (void**) &entries, &size);
         if (r < 0)
                 return r;
 
         /* The variable contains a series of individually NUL terminated UTF-16 strings. We gracefully
-         * consider the final NUL byte optional (i.e. the last string may or may not end in a NUL byte).*/
+         * consider the final NUL byte optional (i.e. the last string may or may not end in a NUL byte). */
 
         for (size_t i = 0, start = 0;; i++) {
                 _cleanup_free_ char *decoded = NULL;
@@ -145,9 +151,13 @@ int efi_loader_get_entries(char ***ret) {
 
         *ret = TAKE_PTR(l);
         return 0;
+#else
+        return -EOPNOTSUPP;
+#endif
 }
 
 int efi_loader_get_features(uint64_t *ret) {
+#if ENABLE_EFI
         _cleanup_free_ void *v = NULL;
         size_t s;
         int r;
@@ -159,12 +169,12 @@ int efi_loader_get_features(uint64_t *ret) {
                 return 0;
         }
 
-        r = efi_get_variable(EFI_LOADER_VARIABLE(LoaderFeatures), NULL, &v, &s);
+        r = efi_get_variable(EFI_LOADER_VARIABLE_STR("LoaderFeatures"), NULL, &v, &s);
         if (r == -ENOENT) {
                 _cleanup_free_ char *info = NULL;
 
                 /* The new (v240+) LoaderFeatures variable is not supported, let's see if it's systemd-boot at all */
-                r = efi_get_variable_string(EFI_LOADER_VARIABLE(LoaderInfo), &info);
+                r = efi_get_variable_string(EFI_LOADER_VARIABLE_STR("LoaderInfo"), &info);
                 if (r < 0) {
                         if (r != -ENOENT)
                                 return r;
@@ -196,9 +206,13 @@ int efi_loader_get_features(uint64_t *ret) {
 
         memcpy(ret, v, sizeof(uint64_t));
         return 0;
+#else
+        return -EOPNOTSUPP;
+#endif
 }
 
 int efi_stub_get_features(uint64_t *ret) {
+#if ENABLE_EFI
         _cleanup_free_ void *v = NULL;
         size_t s;
         int r;
@@ -210,12 +224,12 @@ int efi_stub_get_features(uint64_t *ret) {
                 return 0;
         }
 
-        r = efi_get_variable(EFI_LOADER_VARIABLE(StubFeatures), NULL, &v, &s);
+        r = efi_get_variable(EFI_LOADER_VARIABLE_STR("StubFeatures"), NULL, &v, &s);
         if (r == -ENOENT) {
                 _cleanup_free_ char *info = NULL;
 
                 /* The new (v252+) StubFeatures variable is not supported, let's see if it's systemd-stub at all */
-                r = efi_get_variable_string(EFI_LOADER_VARIABLE(StubInfo), &info);
+                r = efi_get_variable_string(EFI_LOADER_VARIABLE_STR("StubInfo"), &info);
                 if (r < 0) {
                         if (r != -ENOENT)
                                 return r;
@@ -244,9 +258,13 @@ int efi_stub_get_features(uint64_t *ret) {
 
         memcpy(ret, v, sizeof(uint64_t));
         return 0;
+#else
+        return -EOPNOTSUPP;
+#endif
 }
 
 int efi_measured_uki(int log_level) {
+#if ENABLE_EFI
         _cleanup_free_ char *pcr_string = NULL;
         static int cached = -1;
         unsigned pcr_nr;
@@ -272,7 +290,7 @@ int efi_measured_uki(int log_level) {
         if (!efi_has_tpm2())
                 return (cached = 0);
 
-        r = efi_get_variable_string(EFI_LOADER_VARIABLE(StubPcrKernelImage), &pcr_string);
+        r = efi_get_variable_string(EFI_LOADER_VARIABLE_STR("StubPcrKernelImage"), &pcr_string);
         if (r == -ENOENT)
                 return (cached = 0);
         if (r < 0)
@@ -289,9 +307,13 @@ int efi_measured_uki(int log_level) {
                                       pcr_nr, TPM2_PCR_KERNEL_BOOT);
 
         return (cached = 1);
+#else
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP), "Compiled without support for EFI");
+#endif
 }
 
 int efi_loader_get_config_timeout_one_shot(usec_t *ret) {
+#if ENABLE_EFI
         _cleanup_free_ char *v = NULL;
         static struct stat cache_stat = {};
         struct stat new_stat;
@@ -302,7 +324,7 @@ int efi_loader_get_config_timeout_one_shot(usec_t *ret) {
         assert(ret);
 
         /* stat() the EFI variable, to see if the mtime changed. If it did, we need to cache again. */
-        if (stat(EFIVAR_PATH(EFI_LOADER_VARIABLE(LoaderConfigTimeoutOneShot)), &new_stat) < 0)
+        if (stat(EFIVAR_PATH(EFI_LOADER_VARIABLE_STR("LoaderConfigTimeoutOneShot")), &new_stat) < 0)
                 return -errno;
 
         if (stat_inode_unmodified(&new_stat, &cache_stat)) {
@@ -310,7 +332,7 @@ int efi_loader_get_config_timeout_one_shot(usec_t *ret) {
                 return 0;
         }
 
-        r = efi_get_variable_string(EFI_LOADER_VARIABLE(LoaderConfigTimeoutOneShot), &v);
+        r = efi_get_variable_string(EFI_LOADER_VARIABLE_STR("LoaderConfigTimeoutOneShot"), &v);
         if (r < 0)
                 return r;
 
@@ -323,9 +345,13 @@ int efi_loader_get_config_timeout_one_shot(usec_t *ret) {
         cache_stat = new_stat;
         *ret = cache = sec * USEC_PER_SEC; /* return in μs */
         return 0;
+#else
+        return -EOPNOTSUPP;
+#endif
 }
 
 int efi_loader_update_entry_one_shot_cache(char **cache, struct stat *cache_stat) {
+#if ENABLE_EFI
         _cleanup_free_ char *v = NULL;
         struct stat new_stat;
         int r;
@@ -334,13 +360,13 @@ int efi_loader_update_entry_one_shot_cache(char **cache, struct stat *cache_stat
         assert(cache_stat);
 
         /* stat() the EFI variable, to see if the mtime changed. If it did we need to cache again. */
-        if (stat(EFIVAR_PATH(EFI_LOADER_VARIABLE(LoaderEntryOneShot)), &new_stat) < 0)
+        if (stat(EFIVAR_PATH(EFI_LOADER_VARIABLE_STR("LoaderEntryOneShot")), &new_stat) < 0)
                 return -errno;
 
         if (stat_inode_unmodified(&new_stat, cache_stat))
                 return 0;
 
-        r = efi_get_variable_string(EFI_LOADER_VARIABLE(LoaderEntryOneShot), &v);
+        r = efi_get_variable_string(EFI_LOADER_VARIABLE_STR("LoaderEntryOneShot"), &v);
         if (r < 0)
                 return r;
 
@@ -351,13 +377,34 @@ int efi_loader_update_entry_one_shot_cache(char **cache, struct stat *cache_stat
         free_and_replace(*cache, v);
 
         return 0;
+#else
+        return -EOPNOTSUPP;
+#endif
 }
 
+int efi_get_variable_id128(const char *variable, sd_id128_t *ret) {
+#if ENABLE_EFI
+        int r;
+
+        assert(variable);
+
+        /* This is placed here (rather than in basic/efivars.c) because code in basic/ is not allowed to link
+         * against libsystemd.so */
+
+        _cleanup_free_ char *p = NULL;
+        r = efi_get_variable_string(variable, &p);
+        if (r < 0)
+                return r;
+
+        return sd_id128_from_string(p, ret);
+#else
+        return -EOPNOTSUPP;
 #endif
+}
 
 bool efi_loader_entry_name_valid(const char *s) {
         if (!filename_is_valid(s)) /* Make sure entry names fit in filenames */
                 return false;
 
-        return in_charset(s, ALPHANUMERICAL "+-_.");
+        return in_charset(s, ALPHANUMERICAL "+-_.@");
 }

@@ -40,16 +40,31 @@ See [reporting of security vulnerabilities](https://systemd.io/SECURITY).
 * Make sure to post PRs only relative to a recent tip of the `main` branch.
 * Follow our [Coding Style](https://systemd.io/CODING_STYLE) when contributing code. This is a requirement for all code we merge.
 * Please make sure to test your change before submitting the PR. See the [Hacking guide](https://systemd.io/HACKING) for details on how to do this.
-* Make sure to run the test suite locally, before posting your PR. We use a CI system, meaning we don't even look at your PR if the build and tests don't pass.
+* Make sure to run the test suite locally, before posting your PR. We use a CI system, meaning we don't even look at a PR if the build fails or the unit tests don't pass.
 * If you need to update the code in an existing PR, force-push into the same branch, overriding old commits with new versions.
 * After you have pushed a new version, add a comment explaining the latest changes.
-  If you are a member of the systemd project on GitHub, remove the `reviewed/needs-rework`/`ci-fails/needs-rework`/`needs-rebase` labels.
 * If you are copying existing code from another source (eg: a compat header), please make sure the license is compatible with `LGPL-2.1-or-later`.
   If the license is not `LGPL-2.1-or-later`, please add a note to [`LICENSES/README.md`](https://github.com/systemd/systemd/blob/main/LICENSES/README.md).
 * If the pull request stalls without review, post a ping in a comment after some time has passed.
   We are always short on reviewer time, and pull requests which haven't seen any recent activity can be easily forgotten.
 * Github will automatically add the `please-review` label when a pull request is opened or updated.
   If you need more information after a review, you can comment `/please-review` on the pull request to have Github add the `please-review` label to the pull request.
+
+## Using AI Code Generators
+
+If you use an AI code generator such as ChatGPT, Claude, Copilot, Llama or a similar tool, this must be
+disclosed in the commit messages and pull request description.
+
+The quality bar for contributions to this project is high, and unlikely to be met by an unattended AI tool,
+without significant manual corrections. Always thoroughly review and correct any such outputs, for example
+ensuring it accurately follows [Coding Style](https://systemd.io/CODING_STYLE) at the very minimum. Please do
+not fire-and-forget pull requests without any human intervention and review, as that will likely result in
+low-quality results that will not be accepted, and if done repeatedly, may result in the account being
+blocked. As with any other submissions, authors are responsible for doing due diligence and ensuring their
+submissions are compatible with the project's license as documented in LICENSES/README.md.
+
+As a guideline, if someone notices that a contribution (code, issues, comments) was made with the help of AI,
+there was likely a lack of human review of the AI generated output.
 
 ## Reviewing Pull Requests
 

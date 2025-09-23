@@ -14,7 +14,12 @@ fi
 at_exit() {
     if [[ -n "${ROOT:-}" ]]; then
         ls -lR "$ROOT"
+        grep -r . "$ROOT/etc" || :
         rm -fr "$ROOT"
+    fi
+
+    if [[ -d /etc/otherpath ]]; then
+        rm -rf /etc/otherpath
     fi
 
     restore_locale
@@ -83,15 +88,42 @@ grep -q "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$ROOT/etc/machine-id"
 rm -fv "$ROOT/etc/passwd" "$ROOT/etc/shadow"
 systemd-firstboot --root="$ROOT" --root-password=foo
 grep -q "^root:x:0:0:" "$ROOT/etc/passwd"
-grep -q "^root:" "$ROOT/etc/shadow"
+grep -q "^root:[^!*]" "$ROOT/etc/shadow"
 rm -fv "$ROOT/etc/passwd" "$ROOT/etc/shadow"
 echo "foo" >root.passwd
 systemd-firstboot --root="$ROOT" --root-password-file=root.passwd
 grep -q "^root:x:0:0:" "$ROOT/etc/passwd"
-grep -q "^root:" "$ROOT/etc/shadow"
+grep -q "^root:[^!*]" "$ROOT/etc/shadow"
 rm -fv "$ROOT/etc/passwd" "$ROOT/etc/shadow" root.passwd
-# Set the shell together with the password, as firstboot won't touch
-# /etc/passwd if it already exists
+# Make sure the root password is set if /etc/passwd and /etc/shadow exist but
+# don't have a root entry.
+touch "$ROOT/etc/passwd" "$ROOT/etc/shadow"
+systemd-firstboot --root="$ROOT" --root-password=foo
+grep -q "^root:x:0:0:" "$ROOT/etc/passwd"
+grep -q "^root:[^!*]" "$ROOT/etc/shadow"
+rm -fv "$ROOT/etc/passwd" "$ROOT/etc/shadow"
+# If /etc/passwd and /etc/shadow exist, they will only be updated if the shadow
+# password is !unprovisioned.
+echo "root:x:0:0:root:/root:/bin/sh" >"$ROOT/etc/passwd"
+echo "root:!test:::::::" >"$ROOT/etc/shadow"
+systemd-firstboot --root="$ROOT" --root-password=foo
+grep -q "^root:x:0:0:" "$ROOT/etc/passwd"
+grep -q "^root:!test:" "$ROOT/etc/shadow"
+rm -fv "$ROOT/etc/passwd" "$ROOT/etc/shadow"
+echo "root:x:0:0:root:/root:/bin/sh" >"$ROOT/etc/passwd"
+echo "root:!unprovisioned:::::::" >"$ROOT/etc/shadow"
+systemd-firstboot --root="$ROOT" --root-password=foo
+grep -q "^root:x:0:0:" "$ROOT/etc/passwd"
+grep -q "^root:[^!*]" "$ROOT/etc/shadow"
+rm -fv "$ROOT/etc/passwd" "$ROOT/etc/shadow"
+systemd-firstboot --root="$ROOT" --root-password-hashed="$ROOT_HASHED_PASSWORD1"
+grep -q "^root:x:0:0:" "$ROOT/etc/passwd"
+grep -q "^root:$ROOT_HASHED_PASSWORD1:" "$ROOT/etc/shadow"
+rm -fv "$ROOT/etc/passwd" "$ROOT/etc/shadow"
+systemd-firstboot --root="$ROOT" --root-shell=/bin/fooshell
+grep -q "^root:x:0:0:.*:/bin/fooshell$" "$ROOT/etc/passwd"
+grep -q "^root:!\*:" "$ROOT/etc/shadow"
+rm -fv "$ROOT/etc/passwd" "$ROOT/etc/shadow"
 systemd-firstboot --root="$ROOT" --root-password-hashed="$ROOT_HASHED_PASSWORD1" --root-shell=/bin/fooshell
 grep -q "^root:x:0:0:.*:/bin/fooshell$" "$ROOT/etc/passwd"
 grep -q "^root:$ROOT_HASHED_PASSWORD1:" "$ROOT/etc/shadow"
@@ -104,7 +136,7 @@ systemd-firstboot --root="$ROOT" \
                   --locale=locale-overwrite \
                   --locale-messages=messages-overwrite \
                   --keymap=keymap-overwrite \
-                  --timezone=CET \
+                  --timezone=Europe/Berlin \
                   --hostname=hostname-overwrite \
                   --machine-id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
                   --root-password-hashed="$ROOT_HASHED_PASSWORD2" \
@@ -125,7 +157,7 @@ systemd-firstboot --root="$ROOT" --force \
                   --locale=locale-overwrite \
                   --locale-messages=messages-overwrite \
                   --keymap=keymap-overwrite \
-                  --timezone=CET \
+                  --timezone=Europe/Berlin \
                   --hostname=hostname-overwrite \
                   --machine-id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
                   --root-password-hashed="$ROOT_HASHED_PASSWORD2" \
@@ -134,7 +166,7 @@ systemd-firstboot --root="$ROOT" --force \
 grep -q "LANG=locale-overwrite" "$ROOT$LOCALE_PATH"
 grep -q "LC_MESSAGES=messages-overwrite" "$ROOT$LOCALE_PATH"
 grep -q "KEYMAP=keymap-overwrite" "$ROOT/etc/vconsole.conf"
-readlink "$ROOT/etc/localtime" | grep -q "/CET$"
+readlink "$ROOT/etc/localtime" | grep -q "/Europe/Berlin$"
 grep -q "hostname-overwrite" "$ROOT/etc/hostname"
 grep -q "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$ROOT/etc/machine-id"
 grep -q "^root:x:0:0:.*:/bin/barshell$" "$ROOT/etc/passwd"
@@ -176,8 +208,9 @@ mkdir -p "$ROOT/bin"
 touch "$ROOT/bin/fooshell" "$ROOT/bin/barshell"
 # Temporarily disable pipefail to avoid `echo: write error: Broken pipe
 set +o pipefail
-# We can do only limited testing here, since it's all an interactive stuff,
-# so --prompt and --prompt-root-password are skipped on purpose
+# We can do only limited testing here, since it's all an interactive stuff, so
+# --prompt is skipped on purpose and only limited --prompt-root-password
+# testing can be done.
 echo -ne "\nfoo\nbar\n" | systemd-firstboot --root="$ROOT" --prompt-locale
 grep -q "LANG=foo" "$ROOT$LOCALE_PATH"
 grep -q "LC_MESSAGES=bar" "$ROOT$LOCALE_PATH"
@@ -193,6 +226,11 @@ echo -ne "\nEurope/Berlin\n" | systemd-firstboot --root="$ROOT" --prompt-timezon
 readlink "$ROOT/etc/localtime" | grep -q "Europe/Berlin$"
 echo -ne "\nfoobar\n" | systemd-firstboot --root="$ROOT" --prompt-hostname
 grep -q "foobar" "$ROOT/etc/hostname"
+# With no root password provided, a locked account should be created.
+systemd-firstboot --root="$ROOT" --prompt-root-password </dev/null
+grep -q "^root:x:0:0:" "$ROOT/etc/passwd"
+grep -q "^root:!\*:" "$ROOT/etc/shadow"
+rm -fv "$ROOT/etc/passwd" "$ROOT/etc/shadow"
 echo -ne "\n/bin/fooshell\n" | systemd-firstboot --root="$ROOT" --prompt-root-shell
 grep -q "^root:.*:0:0:.*:/bin/fooshell$" "$ROOT/etc/passwd"
 # Existing files should not get overwritten
@@ -204,16 +242,80 @@ grep -q "^root:.*:0:0:.*:/bin/barshell$" "$ROOT/etc/passwd"
 # Re-enable pipefail
 set -o pipefail
 
+# --prompt-* options with credentials. Unfortunately, with --root the
+# --systemd.firstboot kernel command line option is ignored, so that can't be
+# --tested.
+rm -fr "$ROOT"
+mkdir -p "$ROOT/bin"
+touch "$ROOT/bin/fooshell" "$ROOT/bin/barshell"
+systemd-run --wait --pipe --service-type=exec \
+    -p SetCredential=firstboot.locale:foo \
+    -p SetCredential=firstboot.locale-messages:bar \
+    -p SetCredential=firstboot.keymap:foo \
+    -p SetCredential=firstboot.timezone:Europe/Berlin \
+    -p SetCredential=passwd.hashed-password.root:"$ROOT_HASHED_PASSWORD1" \
+    -p SetCredential=passwd.shell.root:/bin/fooshell \
+    systemd-firstboot \
+    --root="$ROOT" \
+    --prompt-locale \
+    --prompt-keymap \
+    --prompt-timezone \
+    --prompt-root-password \
+    --prompt-root-shell \
+    </dev/null
+grep -q "LANG=foo" "$ROOT$LOCALE_PATH"
+grep -q "LC_MESSAGES=bar" "$ROOT$LOCALE_PATH"
+grep -q "KEYMAP=foo" "$ROOT/etc/vconsole.conf"
+readlink "$ROOT/etc/localtime" | grep -q "Europe/Berlin$"
+grep -q "^root:x:0:0:.*:/bin/fooshell$" "$ROOT/etc/passwd"
+grep -q "^root:$ROOT_HASHED_PASSWORD1:" "$ROOT/etc/shadow"
+
 # Assorted tests
 rm -fr "$ROOT"
 mkdir "$ROOT"
 
 systemd-firstboot --root="$ROOT" --setup-machine-id
 grep -E "[a-z0-9]{32}" "$ROOT/etc/machine-id"
+rm -fv "$ROOT/etc/machine-id"
 
 systemd-firstboot --root="$ROOT" --delete-root-password
-diff <(echo) <(awk -F: '/^root/ { print $2; }' "$ROOT/etc/shadow")
+grep -q "^root:x:0:0:" "$ROOT/etc/passwd"
+grep -q "^root::" "$ROOT/etc/shadow"
+rm -fv "$ROOT/etc/passwd" "$ROOT/etc/shadow"
 
 (! systemd-firstboot --root="$ROOT" --root-shell=/bin/nonexistentshell)
 (! systemd-firstboot --root="$ROOT" --machine-id=invalidmachineid)
 (! systemd-firstboot --root="$ROOT" --timezone=Foo/Bar)
+
+mkdir -p "${ROOT}/etc/otherpath"
+mkdir -p /etc/otherpath
+echo "KEYMAP=us" >/etc/otherpath/vconsole.conf
+echo "LANG=en_US.UTF-8" >/etc/otherpath/locale.conf
+ln -s "../$(readlink /etc/localtime)" /etc/otherpath/localtime
+
+SYSTEMD_ETC_LOCALE_CONF=/etc/otherpath/locale.conf \
+SYSTEMD_ETC_VCONSOLE_CONF=/etc/otherpath/vconsole.conf \
+SYSTEMD_ETC_LOCALTIME=/etc/otherpath/localtime \
+SYSTEMD_ETC_HOSTNAME=/etc/otherpath/hostname \
+systemd-firstboot --root="$ROOT" --copy-locale --copy-keymap --copy-timezone --hostname="weirdpaths"
+
+diff "${ROOT}/etc/otherpath/locale.conf" "/etc/otherpath/locale.conf"
+diff "${ROOT}/etc/otherpath/vconsole.conf" "/etc/otherpath/vconsole.conf"
+grep -q "weirdpaths" "${ROOT}/etc/otherpath/hostname"
+
+[[ "$(readlink /etc/otherpath/localtime)" = "$(readlink "${ROOT}/etc/otherpath/localtime")" ]]
+
+SYSTEMD_ETC_LOCALE_CONF=/etc/otherpath/locale.conf \
+SYSTEMD_ETC_VCONSOLE_CONF=/etc/otherpath/vconsole.conf \
+SYSTEMD_ETC_LOCALTIME=/etc/otherpath/localtime \
+SYSTEMD_ETC_HOSTNAME=/etc/otherpath/hostname \
+systemd-firstboot --root="$ROOT" --force \
+                  --hostname="weirdpaths2" \
+                  --locale=no_NO.UTF-8 \
+                  --keymap=no \
+                  --timezone=Europe/Oslo
+
+grep -q "LANG=no_NO.UTF-8" "${ROOT}/etc/otherpath/locale.conf"
+grep -q "KEYMAP=no" "${ROOT}/etc/otherpath/vconsole.conf"
+grep -q "weirdpaths2" "${ROOT}/etc/otherpath/hostname"
+[[ "$(readlink "${ROOT}/etc/otherpath/localtime")" = "../../usr/share/zoneinfo/Europe/Oslo" ]]

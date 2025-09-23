@@ -203,6 +203,7 @@ _busctl_set-property()
         "tree:Show object tree of service"
         "introspect:Introspect object"
         "call:Call a method"
+        "wait:Wait for a signal"
         "get-property:Get property value"
         "set-property:Set property value"
     )
@@ -260,7 +261,7 @@ __dbus_matchspec() {
     local -a bus_names
     local NAME OTHER
     __busctl --unique list |
-    while read NAME OTHER; do
+    while read -r NAME OTHER; do
         echo $NAME
     done
 }
@@ -277,7 +278,7 @@ __dbus_matchspec() {
 {
     local NAME TYPE OTHER
     __busctl introspect "$1" "$2" |
-    while read NAME TYPE OTHER; do
+    while read -r NAME TYPE OTHER; do
         if [[ ${TYPE} == "interface" ]]; then
             echo ${NAME}
         fi
@@ -290,7 +291,7 @@ __dbus_matchspec() {
     local required="$5"
     local NAME TYPE SIGNATURE VALUE FLAGS
     __busctl introspect "$1" "$2" "$3" |
-    while read NAME TYPE SIGNATURE VALUE FLAGS; do
+    while read -r NAME TYPE SIGNATURE VALUE FLAGS; do
         [[ -z "$member" || ${TYPE} == "$member" ]] &&
         [[ -z "$required" || "${${(os: :)FLAGS}}" == $~required ]] &&
         echo ${NAME#.}
@@ -301,7 +302,7 @@ __dbus_matchspec() {
 {
     local NAME TYPE SIGNATURE VALUE FLAGS
     __busctl introspect "$1" "$2" "$3" |
-    while read NAME TYPE SIGNATURE VALUE FLAGS; do
+    while read -r NAME TYPE SIGNATURE VALUE FLAGS; do
         if [[ ${NAME#.} == "$4" ]]; then
             [[ ${SIGNATURE} != "-" ]] && echo ${SIGNATURE}
         fi
@@ -369,6 +370,31 @@ __dbus_matchspec() {
             ;;
         6)
             compadd "$@" - $(_busctl_get_signature $words[2,5])
+            ;;
+        *)
+            _message "no more options"
+    esac
+}
+
+(( $+functions[_busctl_wait] )) || _busctl_wait()
+{
+    local expl
+    case $CURRENT in
+        2)
+            _wanted busname expl 'busname' \
+            compadd "$@" - $(_busctl_get_service_names)
+            ;;
+        3)
+            _wanted path expl 'path' \
+            compadd "$@" - $(_busctl_get_objects $words[2])
+            ;;
+        4)
+            _wanted interface expl 'interface' \
+            compadd "$@" - $(_busctl_get_interfaces $words[2,3])
+            ;;
+        5)
+            _wanted method expl 'method' \
+            compadd "$@" - $(_busctl_get_members $words[2,4] "signal")
             ;;
         *)
             _message "no more options"
@@ -456,6 +482,7 @@ _arguments \
     '--expect-reply=[Expect a method call reply]:boolean:(1 0)' \
     '--auto-start=[Auto-start destination service]:boolean:(1 0)' \
     '--allow-interactive-authorization=[Allow interactive authorization for operation]:boolean:(1 0)' \
-    '--timeout=[Maximum time to wait for method call completion]:timeout (seconds)' \
+    '--timeout=[Maximum time to wait for method call completion and monitoring]:timeout (seconds)' \
     '--augment-creds=[Extend credential data with data read from /proc/$PID]:boolean:(1 0)' \
+    '(-M --limit-messages)'{-M,--limit-messages}'[Exit after receiving a number of messages while monitoring]:integer' \
     '*::busctl command:_busctl_commands'

@@ -1,12 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 
 #include "alloc-util.h"
 #include "fd-util.h"
 #include "iovec-util.h"
+#include "log.h"
 #include "parse-util.h"
 #include "show-status.h"
 #include "string-table.h"
@@ -72,8 +71,14 @@ int status_vprintf(const char *status, ShowStatusFlags flags, const char *format
                 int c;
 
                 c = fd_columns(fd);
-                if (c <= 0)
-                        c = 80;
+                if (c <= 0) {
+                        const char *env = getenv("COLUMNS");
+                        if (env)
+                                (void) safe_atoi(env, &c);
+
+                        if (c <= 0)
+                                c = 80;
+                }
 
                 sl = status ? strlen(status_indent) : 0;
 

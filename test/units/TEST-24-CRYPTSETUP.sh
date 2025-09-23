@@ -143,18 +143,18 @@ cryptsetup luksAddKey --batch-mode \
 STORE_IMAGE="$WORKDIR/store.img"
 truncate -s 64M "$STORE_IMAGE"
 STORE_LOOP="$(losetup --show --find --partscan "$STORE_IMAGE")"
-udevadm lock --device "$STORE_LOOP" sfdisk "$STORE_LOOP" <<EOF
+udevadm lock --timeout=30 --device "$STORE_LOOP" sfdisk "$STORE_LOOP" <<EOF
 label: gpt
 type=0FC63DAF-8483-4772-8E79-3D69D8477DE4 name=header_store size=32M
 type=0FC63DAF-8483-4772-8E79-3D69D8477DE4 name=keyfile_store
 EOF
 udevadm settle --timeout=60
 mkdir -p /mnt
-udevadm lock --device "/dev/disk/by-partlabel/header_store" mkfs.ext4 -L header_store "/dev/disk/by-partlabel/header_store"
+udevadm lock --timeout=30 --device "/dev/disk/by-partlabel/header_store" mkfs.ext4 -L header_store "/dev/disk/by-partlabel/header_store"
 mount "/dev/disk/by-partlabel/header_store" /mnt
 cp "$IMAGE_DETACHED_HEADER" /mnt/header
 umount /mnt
-udevadm lock --device "/dev/disk/by-partlabel/keyfile_store" mkfs.ext4 -L keyfile_store "/dev/disk/by-partlabel/keyfile_store"
+udevadm lock --timeout=30 --device "/dev/disk/by-partlabel/keyfile_store" mkfs.ext4 -L keyfile_store "/dev/disk/by-partlabel/keyfile_store"
 mount "/dev/disk/by-partlabel/keyfile_store" /mnt
 cp "$IMAGE_DETACHED_KEYFILE2" /mnt/keyfile
 umount /mnt
@@ -269,5 +269,7 @@ cryptsetup_start_and_check -f detached_fail{0..4}
 cryptsetup_start_and_check detached_slot{0..1}
 cryptsetup_start_and_check -f detached_slot_fail
 cryptsetup_start_and_check -u detached_nofail
+
+systemd-cryptenroll --list-devices
 
 touch /testok

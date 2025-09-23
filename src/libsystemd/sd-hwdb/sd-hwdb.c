@@ -3,9 +3,7 @@
   Copyright © 2008 Alan Jenkins <alan.christopher.jenkins@googlemail.com>
 ***/
 
-#include <errno.h>
 #include <fnmatch.h>
-#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -18,9 +16,9 @@
 #include "fileio.h"
 #include "hashmap.h"
 #include "hwdb-internal.h"
+#include "log.h"
 #include "nulstr-util.h"
 #include "string-util.h"
-#include "time-util.h"
 
 struct linebuf {
         char bytes[LINE_MAX];
@@ -166,11 +164,7 @@ static int hwdb_add_property(sd_hwdb *hwdb, const struct trie_value_entry_f *ent
                 }
         }
 
-        r = ordered_hashmap_ensure_allocated(&hwdb->properties, &string_hash_ops);
-        if (r < 0)
-                return r;
-
-        r = ordered_hashmap_replace(hwdb->properties, key, (void *)entry);
+        r = ordered_hashmap_ensure_replace(&hwdb->properties, &string_hash_ops, key, (void *) entry);
         if (r < 0)
                 return r;
 
@@ -293,14 +287,14 @@ static int hwdb_new(const char *path, sd_hwdb **ret) {
 
         hwdb->n_ref = 1;
 
-        /* Find hwdb.bin in the explicit path if provided, or iterate over hwdb_bin_paths otherwise  */
+        /* Find hwdb.bin in the explicit path if provided, or iterate over HWDB_BIN_PATHS otherwise  */
         if (!isempty(path)) {
                 log_debug("Trying to open \"%s\"...", path);
                 hwdb->f = fopen(path, "re");
                 if (!hwdb->f)
                         return log_debug_errno(errno, "Failed to open %s: %m", path);
         } else {
-                NULSTR_FOREACH(p, hwdb_bin_paths) {
+                NULSTR_FOREACH(p, HWDB_BIN_PATHS) {
                         log_debug("Trying to open \"%s\"...", p);
                         hwdb->f = fopen(p, "re");
                         if (hwdb->f) {
@@ -323,7 +317,7 @@ static int hwdb_new(const char *path, sd_hwdb **ret) {
         if (file_offset_beyond_memory_size(hwdb->st.st_size))
                 return log_debug_errno(SYNTHETIC_ERRNO(EFBIG), "File %s is too long.", path);
 
-        hwdb->map = mmap(0, hwdb->st.st_size, PROT_READ, MAP_SHARED, fileno(hwdb->f), 0);
+        hwdb->map = mmap(NULL, hwdb->st.st_size, PROT_READ, MAP_SHARED, fileno(hwdb->f), 0);
         if (hwdb->map == MAP_FAILED)
                 return log_debug_errno(errno, "Failed to map %s: %m", path);
 

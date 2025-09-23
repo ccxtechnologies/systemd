@@ -1,15 +1,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <netinet/tcp.h>
 #include <unistd.h>
 
+#include "sd-event.h"
+
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "iovec-util.h"
-#include "macro.h"
-#include "missing_network.h"
+#include "log.h"
+#include "missing-network.h"
+#include "ordered-set.h"
+#include "resolved-dns-packet.h"
+#include "resolved-dns-server.h"
 #include "resolved-dns-stream.h"
 #include "resolved-manager.h"
+#include "set.h"
+#include "time-util.h"
 
 #define DNS_STREAMS_MAX 128
 
@@ -205,6 +212,7 @@ static int dns_stream_identify(DnsStream *s) {
 
 ssize_t dns_stream_writev(DnsStream *s, const struct iovec *iov, size_t iovcnt, int flags) {
         ssize_t m;
+        int r;
 
         assert(s);
         assert(iov);
@@ -224,12 +232,14 @@ ssize_t dns_stream_writev(DnsStream *s, const struct iovec *iov, size_t iovcnt, 
 
                 m = sendmsg(s->fd, &hdr, MSG_FASTOPEN);
                 if (m < 0) {
-                        if (errno == EOPNOTSUPP) {
-                                s->tfo_salen = 0;
-                                if (connect(s->fd, &s->tfo_address.sa, s->tfo_salen) < 0)
-                                        return -errno;
+                        if (ERRNO_IS_NOT_SUPPORTED(errno)) {
+                                /* MSG_FASTOPEN not supported? Then try to connect() traditionally */
+                                r = RET_NERRNO(connect(s->fd, &s->tfo_address.sa, s->tfo_salen));
+                                s->tfo_salen = 0; /* connection is made */
+                                if (r < 0 && r != -EINPROGRESS)
+                                        return r;
 
-                                return -EAGAIN;
+                                return -EAGAIN; /* In case of EINPROGRESS, EAGAIN or success: return EAGAIN, so that caller calls us again */
                         }
                         if (errno == EINPROGRESS)
                                 return -EAGAIN;
@@ -322,6 +332,12 @@ static int on_stream_io(sd_event_source *es, int fd, uint32_t revents, void *use
                         return dns_stream_complete(s, -r);
         }
 
+        if (revents & EPOLLERR) {
+                socklen_t errlen = sizeof(r);
+                if (getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &r, &errlen) == 0)
+                        return dns_stream_complete(s, r);
+        }
+
         if ((revents & EPOLLOUT) &&
             s->write_packet &&
             s->n_written < sizeof(s->write_size) + s->write_packet->size) {
@@ -350,7 +366,8 @@ static int on_stream_io(sd_event_source *es, int fd, uint32_t revents, void *use
                 }
         }
 
-        while ((revents & (EPOLLIN|EPOLLHUP|EPOLLRDHUP)) &&
+        while (s->identified && /* Only read data once we identified the peer, because we cannot fill in the DNS packet meta info otherwise */
+               (revents & (EPOLLIN|EPOLLHUP|EPOLLRDHUP)) &&
                (!s->read_packet ||
                 s->n_read < sizeof(s->read_size) + s->read_packet->size)) {
 
@@ -559,7 +576,7 @@ int dns_stream_new(
 
         if (tfo_address) {
                 s->tfo_address = *tfo_address;
-                s->tfo_salen = tfo_address->sa.sa_family == AF_INET6 ? sizeof(tfo_address->in6) : sizeof(tfo_address->in);
+                s->tfo_salen = sockaddr_len(tfo_address);
         }
 
         *ret = TAKE_PTR(s);
@@ -602,7 +619,7 @@ DEFINE_PRIVATE_HASH_OPS_WITH_KEY_DESTRUCTOR(
                 dns_stream_unref);
 
 int dns_stream_disconnect_all(Manager *m) {
-        _cleanup_(set_freep) Set *closed = NULL;
+        _cleanup_set_free_ Set *closed = NULL;
         int r;
 
         assert(m);

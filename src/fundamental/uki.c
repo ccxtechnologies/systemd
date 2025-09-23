@@ -20,5 +20,9 @@ const char* const unified_sections[_UNIFIED_SECTION_MAX + 1] = {
         [UNIFIED_SECTION_SBAT]    = ".sbat",
         [UNIFIED_SECTION_PCRSIG]  = ".pcrsig",
         [UNIFIED_SECTION_PCRPKEY] = ".pcrpkey",
+        [UNIFIED_SECTION_PROFILE] = ".profile",
+        [UNIFIED_SECTION_DTBAUTO] = ".dtbauto",
+        [UNIFIED_SECTION_HWIDS]   = ".hwids",
+        [UNIFIED_SECTION_EFIFW]   = ".efifw",
         NULL,
 };

@@ -3,6 +3,7 @@
 #include "alloc-util.h"
 #include "extract-word.h"
 #include "image-policy.h"
+#include "log.h"
 #include "logarithm.h"
 #include "sort-util.h"
 #include "string-util.h"
@@ -376,7 +377,7 @@ int image_policy_from_string(const char *s, ImagePolicy **ret) {
 
 int partition_policy_flags_to_string(PartitionPolicyFlags flags, bool simplify, char **ret) {
         _cleanup_free_ char *buf = NULL;
-        const char *l[CONST_LOG2U(_PARTITION_POLICY_MASK) + 1]; /* one string per known flag at most */
+        const char *l[CONST_LOG2U(_PARTITION_POLICY_MASK + 1) + 1]; /* one string per known flag at most */
         size_t m = 0;
 
         assert(ret);
@@ -437,7 +438,7 @@ int partition_policy_flags_to_string(PartitionPolicyFlags flags, bool simplify, 
         if (m == 0)
                 buf = strdup("-");
         else {
-                assert(m+1 < ELEMENTSOF(l));
+                assert(m < ELEMENTSOF(l));
                 l[m] = NULL;
 
                 buf = strv_join((char**) l, "+");
@@ -771,6 +772,60 @@ int image_policy_intersect(const ImagePolicy *a, const ImagePolicy *b, ImagePoli
         if (ret)
                 *ret = TAKE_PTR(p);
 
+        return 0;
+}
+
+ImagePolicy* image_policy_free(ImagePolicy *p) {
+        return mfree(p);
+}
+
+int image_policy_ignore_designators(const ImagePolicy *p, const PartitionDesignator table[], size_t n_table, ImagePolicy **ret) {
+        assert(p);
+        assert(table || n_table == 0);
+        assert(ret);
+
+        /* Patches the specified image policy, replacing the policy for the specified designators by an
+         * "ignore" policy. Returns a patched copy. This is useful in context where only some of the
+         * available partitions shall be mounted, and hence the policy for the others really doesn't
+         * matter. */
+
+        _cleanup_(image_policy_freep) ImagePolicy *np = image_policy_new(_PARTITION_DESIGNATOR_MAX);
+        if (!np)
+                return -ENOMEM;
+
+        FOREACH_ARRAY(t, table, n_table) {
+                assert(*t >= 0);
+                assert(*t < _PARTITION_DESIGNATOR_MAX);
+
+                if (image_policy_bsearch(np, *t))
+                        continue;
+
+                /* Insert an ignore policy for this entry, and sort it to the right place, so that image_policy_bsearch() can work */
+                np->policies[np->n_policies++] = (PartitionPolicy) {
+                        .designator = *t,
+                        .flags = PARTITION_POLICY_IGNORE,
+                };
+                typesafe_qsort(np->policies, np->n_policies, partition_policy_compare);
+        }
+
+        FOREACH_ARRAY(i, p->policies, p->n_policies) {
+
+                if (image_policy_bsearch(np, i->designator))
+                        continue;
+
+                /* Copy the policy entry from the old image policy, and sort it to the right place, so that image_policy_bsearch() can work */
+                np->policies[np->n_policies++] = *i;
+                typesafe_qsort(np->policies, np->n_policies, partition_policy_compare);
+        }
+
+        np->default_flags = p->default_flags;
+
+        /* Return unused space to libc */
+        ImagePolicy *t = realloc(np, offsetof(ImagePolicy, policies) + sizeof(PartitionPolicy) * np->n_policies);
+        if (t)
+                np = t;
+
+        *ret = TAKE_PTR(np);
         return 0;
 }
 

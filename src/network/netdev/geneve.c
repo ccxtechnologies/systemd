@@ -1,20 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-/* Make sure the net/if.h header is included before any linux/ one */
-#include <net/if.h>
 #include <linux/if_arp.h>
-#include <netinet/in.h>
 
-#include "alloc-util.h"
+#include "sd-netlink.h"
+
 #include "conf-parser.h"
-#include "extract-word.h"
 #include "geneve.h"
-#include "netlink-util.h"
-#include "networkd-manager.h"
 #include "parse-util.h"
 #include "string-table.h"
 #include "string-util.h"
-#include "strv.h"
 
 #define GENEVE_FLOW_LABEL_MAX_MASK 0xFFFFFU
 #define DEFAULT_GENEVE_DESTINATION_PORT 6081
@@ -26,7 +20,7 @@ static const char* const geneve_df_table[_NETDEV_GENEVE_DF_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(geneve_df, GeneveDF, NETDEV_GENEVE_DF_YES);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_geneve_df, geneve_df, GeneveDF, "Failed to parse Geneve IPDoNotFragment= setting");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_geneve_df, geneve_df, GeneveDF);
 
 static int netdev_geneve_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *m) {
         assert(m);
@@ -254,6 +248,10 @@ static int netdev_geneve_verify(NetDev *netdev, const char *filename) {
         return 0;
 }
 
+static bool geneve_can_set_mac(NetDev *netdev, const struct hw_addr_data *hw_addr) {
+        return true;
+}
+
 static void geneve_init(NetDev *netdev) {
         Geneve *v = GENEVE(netdev);
 
@@ -272,6 +270,7 @@ const NetDevVTable geneve_vtable = {
         .fill_message_create = netdev_geneve_fill_message_create,
         .create_type = NETDEV_CREATE_INDEPENDENT,
         .config_verify = netdev_geneve_verify,
+        .can_set_mac = geneve_can_set_mac,
         .iftype = ARPHRD_ETHER,
         .generate_mac = true,
 };

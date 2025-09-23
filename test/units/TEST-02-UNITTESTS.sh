@@ -9,13 +9,15 @@ if ! systemd-detect-virt -qc && [[ "${TEST_CMDLINE_NEWLINE:-}" != bar ]]; then
     exit 1
 fi
 
-# If we're running with TEST_PREFER_NSPAWN=1 limit the set of tests we run
-# in QEMU to only those that can't run in a container to avoid running
-# the same tests again in a, most likely, very slow environment
-if ! systemd-detect-virt -qc && [[ "${TEST_PREFER_NSPAWN:-0}" -ne 0 ]]; then
-    TESTS_GLOB="test-loop-block"
-else
-    TESTS_GLOB=${TESTS_GLOB:-test-*}
+if [[ -z "${TEST_MATCH_SUBTEST:-}" ]]; then
+    # If we're running with TEST_PREFER_NSPAWN=1 limit the set of tests we run
+    # in QEMU to only those that can't run in a container to avoid running
+    # the same tests again in a, most likely, very slow environment
+    if ! systemd-detect-virt -qc && [[ "${TEST_PREFER_NSPAWN:-0}" -ne 0 ]]; then
+        TEST_MATCH_SUBTEST="test-loop-block"
+    else
+        TEST_MATCH_SUBTEST="test-*"
+    fi
 fi
 
 NPROC=$(nproc)
@@ -29,6 +31,11 @@ if ! systemd-detect-virt -qc; then
     # Make sure ping works for unprivileged users (for test-bpf-firewall)
     sysctl net.ipv4.ping_group_range="0 2147483647"
 fi
+
+# Disable firewalld and friends to make them not disturb test-firewall-util
+systemctl disable --now firewalld.service || :
+systemctl disable --now iptables.service || :
+systemctl disable --now ip6tables.service || :
 
 # Check & report test results
 # Arguments:
@@ -92,8 +99,22 @@ run_test() {
 
 export -f run_test
 
-find /usr/lib/systemd/tests/unit-tests/ -maxdepth 1 -type f -name "${TESTS_GLOB}" -print0 |
+find /usr/lib/systemd/tests/unit-tests/ -maxdepth 1 -type f -name "${TEST_MATCH_SUBTEST}" -print0 |
     xargs -0 -I {} --max-procs="$MAX_QUEUE_SIZE" bash -ec "run_test {}"
+
+# Write all pending messages, so they don't get mixed with the summaries below
+journalctl --sync
+
+# No need for full test logs in this case
+if [[ -s /skipped-tests ]]; then
+    : "=== SKIPPED TESTS ==="
+    cat /skipped-tests
+fi
+
+if [[ -s /failed ]]; then
+    : "=== FAILED TESTS ==="
+    cat /failed
+fi
 
 # Test logs are sometimes lost, as the system shuts down immediately after
 journalctl --sync

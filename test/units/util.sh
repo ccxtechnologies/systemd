@@ -6,15 +6,26 @@
 # shellcheck disable=SC2034
 [[ -e /var/tmp/.systemd_reboot_count ]] && REBOOT_COUNT="$(</var/tmp/.systemd_reboot_count)" || REBOOT_COUNT=0
 
-assert_true() {(
+assert_ok() {(
     set +ex
 
     local rc
 
     "$@"
     rc=$?
-    if [[ $rc -ne 0 ]]; then
+    if [[ "$rc" -ne 0 ]]; then
         echo "FAIL: command '$*' failed with exit code $rc" >&2
+        exit 1
+    fi
+)}
+
+assert_fail() {(
+    set +ex
+
+    local rc
+
+    if "$@"; then
+        echo "FAIL: command '$*' unexpectedly succeeded" >&2
         exit 1
     fi
 )}
@@ -24,6 +35,15 @@ assert_eq() {(
 
     if [[ "${1?}" != "${2?}" ]]; then
         echo "FAIL: expected: '$2' actual: '$1'" >&2
+        exit 1
+    fi
+)}
+
+assert_neq() {(
+    set +ex
+
+    if [[ "${1?}" = "${2?}" ]]; then
+        echo "FAIL: not expected: '$2' actual: '$1'" >&2
         exit 1
     fi
 )}
@@ -140,7 +160,6 @@ coverage_create_nspawn_dropin() {
     # If we're collecting coverage, bind mount the $BUILD_DIR into the nspawn
     # container so gcov can update the counters. This is mostly for standalone
     # containers, as machinectl stuff is handled by overriding the systemd-nspawn@.service
-    # (see test/test-functions:install_systemd())
     local root="${1:?}"
     local container
 
@@ -162,8 +181,39 @@ create_dummy_container() {
     fi
 
     mkdir -p "$root"
+    chmod 555 "$root"
     cp -a /usr/share/TEST-13-NSPAWN-container-template/* "$root"
     coverage_create_nspawn_dropin "$root"
+}
+
+can_do_rootless_nspawn() {
+    # Our create_dummy_ddi() uses squashfs and openssl.
+    command -v mksquashfs &&
+    command -v openssl &&
+
+    # Need to have bpf-lsm
+    grep -q bpf /sys/kernel/security/lsm &&
+    # ...and libbpf installed
+    find /usr/lib* -name "libbpf.so.*" 2>/dev/null | grep -q . &&
+
+    # Ensure mountfsd/nsresourced are listening
+    systemctl start systemd-mountfsd.socket systemd-nsresourced.socket &&
+
+    # mountfsd must be enabled...
+    [[ -S /run/systemd/io.systemd.MountFileSystem ]] &&
+    # ...and have pidfd support for unprivileged operation.
+    systemd-analyze compare-versions "$(uname -r)" ge 6.5 &&
+    systemd-analyze compare-versions "$(pkcheck --version | awk '{print $3}')" ge 124 &&
+
+    # nsresourced must be enabled...
+    [[ -S /run/systemd/userdb/io.systemd.NamespaceResource ]] &&
+    # ...and must support the UserNamespaceInterface.
+    ! (SYSTEMD_LOG_TARGET=console varlinkctl call \
+           /run/systemd/userdb/io.systemd.NamespaceResource \
+           io.systemd.NamespaceResource.AllocateUserRange \
+           '{"name":"test-supported","size":65536,"userNamespaceFileDescriptor":0}' \
+           2>&1 || true) |
+        grep -q "io.systemd.NamespaceResource.UserNamespaceInterfaceNotSupported"
 }
 
 # Bump the reboot counter and call systemctl with the given arguments
@@ -263,6 +313,7 @@ EOF
         chmod +x "$initdir/opt/script0.sh"
         echo MARKER=1 >"$initdir/usr/lib/systemd/system/some_file"
         mksquashfs "$initdir" /tmp/app0.raw -noappend
+        veritysetup format /tmp/app0.raw /tmp/app0.verity --root-hash-file /tmp/app0.roothash
 
         initdir="/var/tmp/conf0"
         mkdir -p "$initdir/etc/extension-release.d" "$initdir/etc/systemd/system" "$initdir/opt"
@@ -274,6 +325,7 @@ EOF
         ) >>"$initdir/etc/extension-release.d/extension-release.conf0"
         echo MARKER_1 >"$initdir/etc/systemd/system/some_file"
         mksquashfs "$initdir" /tmp/conf0.raw -noappend
+        veritysetup format /tmp/conf0.raw /tmp/conf0.verity --root-hash-file /tmp/conf0.roothash
 
         initdir="/var/tmp/app1"
         mkdir -p "$initdir/usr/lib/extension-release.d" "$initdir/usr/lib/systemd/system" "$initdir/opt"

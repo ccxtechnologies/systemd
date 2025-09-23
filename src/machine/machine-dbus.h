@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "sd-bus.h"
-
-#include "bus-util.h"
-#include "machine.h"
+#include "machine-forward.h"
 
 typedef enum {
         MACHINE_COPY_REPLACE = 1 << 0, /* Public API via DBUS, do not change */
@@ -13,7 +10,7 @@ typedef enum {
 
 extern const BusObjectImplementation machine_object;
 
-char *machine_bus_path(Machine *s);
+char* machine_bus_path(Machine *s);
 
 int bus_machine_method_unregister(sd_bus_message *message, void *userdata, sd_bus_error *error);
 int bus_machine_method_terminate(sd_bus_message *message, void *userdata, sd_bus_error *error);

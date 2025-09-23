@@ -3,21 +3,22 @@
   Copyright © 2010 ProFUSION embedded systems
 ***/
 
-#include <errno.h>
 #include <fcntl.h>
 #include <sys/mount.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
 #include "chase.h"
+#include "constants.h"
 #include "dirent-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "format-util.h"
 #include "fs-util.h"
 #include "fstab-util.h"
 #include "libmount-util.h"
+#include "log.h"
 #include "mkdir.h"
 #include "mount-setup.h"
 #include "mount-util.h"
@@ -26,6 +27,8 @@
 #include "process-util.h"
 #include "random-util.h"
 #include "signal-util.h"
+#include "stat-util.h"
+#include "string-util.h"
 #include "umount.h"
 #include "virt.h"
 
@@ -47,30 +50,30 @@ void mount_points_list_free(MountPoint **head) {
                 mount_point_free(head, *head);
 }
 
-int mount_points_list_get(const char *mountinfo, MountPoint **head) {
+int mount_points_list_get(FILE *f, MountPoint **head) {
         _cleanup_(mnt_free_tablep) struct libmnt_table *table = NULL;
         _cleanup_(mnt_free_iterp) struct libmnt_iter *iter = NULL;
         int r;
 
         assert(head);
 
-        r = libmount_parse(mountinfo, NULL, &table, &iter);
+        r = libmount_parse_mountinfo(f, &table, &iter);
         if (r < 0)
-                return log_error_errno(r, "Failed to parse %s: %m", mountinfo ?: "/proc/self/mountinfo");
+                return log_error_errno(r, "Failed to parse /proc/self/mountinfo: %m");
 
         for (;;) {
                 _cleanup_free_ char *options = NULL, *remount_options = NULL;
                 struct libmnt_fs *fs;
                 const char *path, *fstype;
                 unsigned long remount_flags = 0u;
-                bool try_remount_ro, is_api_vfs;
+                bool try_remount_ro, is_api_vfs, is_network;
                 _cleanup_free_ MountPoint *m = NULL;
 
                 r = mnt_table_next_fs(table, iter, &fs);
                 if (r == 1) /* EOF */
                         break;
                 if (r < 0)
-                        return log_error_errno(r, "Failed to get next entry from %s: %m", mountinfo ?: "/proc/self/mountinfo");
+                        return log_error_errno(r, "Failed to get next entry from /proc/self/mountinfo: %m");
 
                 path = mnt_fs_get_target(fs);
                 if (!path)
@@ -98,6 +101,7 @@ int mount_points_list_get(const char *mountinfo, MountPoint **head) {
                     path_below_api_vfs(path))
                         continue;
 
+                is_network = fstype_is_network(fstype);
                 is_api_vfs = fstype_is_api_vfs(fstype);
 
                 /* If we are in a container, don't attempt to read-only mount anything as that brings no real
@@ -108,7 +112,7 @@ int mount_points_list_get(const char *mountinfo, MountPoint **head) {
                  * leave a "dirty fs") and could hang if the network is down.  Note that umount2() is more
                  * careful and will not hang because of the network being down. */
                 try_remount_ro = detect_container() <= 0 &&
-                                 !fstype_is_network(fstype) &&
+                                 !is_network &&
                                  !is_api_vfs &&
                                  !fstype_is_ro(fstype) &&
                                  !fstab_test_yes_no_option(options, "ro\0rw\0");
@@ -141,7 +145,7 @@ int mount_points_list_get(const char *mountinfo, MountPoint **head) {
 
                 r = libmount_is_leaf(table, fs);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to get children mounts for %s from %s: %m", path, mountinfo ?: "/proc/self/mountinfo");
+                        return log_error_errno(r, "Failed to get children mounts for %s from /proc/self/mountinfo: %m", path);
                 bool leaf = r;
 
                 *m = (MountPoint) {
@@ -152,7 +156,11 @@ int mount_points_list_get(const char *mountinfo, MountPoint **head) {
                         /* Unmount sysfs/procfs/… lazily, since syncing doesn't matter there, and it's OK if
                          * something keeps an fd open to it. */
                         .umount_lazily = is_api_vfs,
-                        .leaf = leaf,
+
+                        /* If a mount point is not a leaf, moving it would invalidate our mount table.
+                         * If a mount point is on the network and the network is down, it can hang and block
+                         * the shutdown. */
+                        .umount_move_if_busy = leaf && !is_network,
                 };
 
                 m->path = strdup(path);
@@ -180,7 +188,7 @@ static void log_umount_blockers(const char *mnt) {
 
         _cleanup_closedir_ DIR *dir = opendir("/proc");
         if (!dir)
-                return (void) log_warning_errno(errno, "Failed to open /proc/: %m");
+                return (void) log_warning_errno(errno, "Failed to open %s: %m", "/proc/");
 
         FOREACH_DIRENT_ALL(de, dir, break) {
                 if (!IN_SET(de->d_type, DT_DIR, DT_UNKNOWN))
@@ -274,8 +282,7 @@ static int remount_with_timeout(MountPoint *m, bool last_try) {
                                        "Failed to remount '%s' read-only: %m",
                                        m->path);
 
-                (void) write(pfd[1], &r, sizeof(r)); /* try to send errno up */
-                _exit(r < 0 ? EXIT_FAILURE : EXIT_SUCCESS);
+                report_errno_and_exit(pfd[1], r);
         }
 
         pfd[1] = safe_close(pfd[1]);
@@ -337,8 +344,7 @@ static int umount_with_timeout(MountPoint *m, bool last_try) {
                                 log_umount_blockers(m->path);
                 }
 
-                (void) write(pfd[1], &r, sizeof(r)); /* try to send errno up */
-                _exit(r < 0 ? EXIT_FAILURE : EXIT_SUCCESS);
+                report_errno_and_exit(pfd[1], r);
         }
 
         pfd[1] = safe_close(pfd[1]);
@@ -405,10 +411,9 @@ static int mount_points_list_umount(MountPoint **head, bool *changed, bool last_
                         *changed = true;
 
                 /* If a mount is busy, we move it to not keep parent mount points busy.
-                 * If a mount point is not a leaf, moving it would invalidate our mount table.
                  * More moving will occur in next iteration with a fresh mount table.
                  */
-                if (r != -EBUSY || !m->leaf)
+                if (r != -EBUSY || !m->umount_move_if_busy)
                         continue;
 
                 _cleanup_free_ char *dirname = NULL;

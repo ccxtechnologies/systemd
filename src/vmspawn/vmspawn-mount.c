@@ -2,9 +2,8 @@
 
 #include "alloc-util.h"
 #include "extract-word.h"
-#include "macro.h"
-#include "parse-argument.h"
 #include "path-util.h"
+#include "stat-util.h"
 #include "string-util.h"
 #include "vmspawn-mount.h"
 
@@ -59,7 +58,7 @@ int runtime_mount_parse(RuntimeMountContext *ctx, const char *s, bool read_only)
                 return -EINVAL;
 
         if (!GREEDY_REALLOC(ctx->mounts, ctx->n_mounts + 1))
-                return log_oom();
+                return -ENOMEM;
 
         ctx->mounts[ctx->n_mounts++] = TAKE_STRUCT(mount);
 

@@ -1,18 +1,19 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <string.h>
 #include <unistd.h>
 
 #include "sd-login.h"
 
+#include "alloc-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
-#include "hostname-util.h"
+#include "hostname-setup.h"
 #include "io-util.h"
 #include "path-util.h"
 #include "string-util.h"
+#include "strv.h"
 #include "terminal-util.h"
+#include "time-util.h"
 #include "user-util.h"
 #include "utmp-wtmp.h"
 #include "wall.h"
@@ -32,7 +33,7 @@ static int write_to_terminal(const char *tty, const char *message) {
                 return -errno;
 
         if (!isatty_safe(fd))
-                return -errno;
+                return -ENOTTY;
 
         return loop_write_full(fd, message, SIZE_MAX, TIMEOUT_USEC);
 }
@@ -51,7 +52,7 @@ static int wall_utmp(
 
         /* libc's setutxent() unfortunately doesn't inform us about success, i.e. whether /var/run/utmp
          * exists. Hence we have to check manually first. */
-        if (access(_PATH_UTMPX, F_OK) < 0) {
+        if (access(UTMPX_FILE, F_OK) < 0) {
                 if (errno == ENOENT)
                         return -ENOPROTOOPT;
 

@@ -2,6 +2,8 @@
 
 #include <openssl/evp.h>
 
+#include "log.h"
+#include "memory-util.h"
 #include "pcrlock-firmware.h"
 #include "unaligned.h"
 
@@ -128,7 +130,7 @@ int validate_firmware_header(
 
         log_debug("TPM PC Client Platform Firmware Profile: family %u.%u, revision %u.%u",
                   id->specVersionMajor, id->specVersionMinor,
-                  id->specErrata / 100, id->specErrata % 100);
+                  id->specErrata / 100U, id->specErrata % 100U);
 
         if (h->eventDataSize < (uint64_t) offsetof(TCG_EfiSpecIDEvent, digestSizes) + (uint64_t) (id->numberOfAlgorithms * sizeof(TCG_EfiSpecIdEventAlgorithmSize)) + 1U)
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Event log header doesn't fit all algorithms.");

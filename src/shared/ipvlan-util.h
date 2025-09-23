@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <netinet/in.h>
 #include <linux/if_link.h>
 
-#include "macro.h"
+#include "forward.h"
 
 typedef enum IPVlanMode {
         NETDEV_IPVLAN_MODE_L2 = IPVLAN_MODE_L2,
@@ -22,8 +21,8 @@ typedef enum IPVlanFlags {
         _NETDEV_IPVLAN_FLAGS_INVALID = -EINVAL,
 } IPVlanFlags;
 
-const char *ipvlan_mode_to_string(IPVlanMode d) _const_;
+const char* ipvlan_mode_to_string(IPVlanMode d) _const_;
 IPVlanMode ipvlan_mode_from_string(const char *d) _pure_;
 
-const char *ipvlan_flags_to_string(IPVlanFlags d) _const_;
+const char* ipvlan_flags_to_string(IPVlanFlags d) _const_;
 IPVlanFlags ipvlan_flags_from_string(const char *d) _pure_;

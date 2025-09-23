@@ -19,25 +19,21 @@
   along with systemd; If not, see <https://www.gnu.org/licenses/>.
 ***/
 
-#include <errno.h>
-#include <inttypes.h>
-#include <net/ethernet.h>
-#include <netinet/in.h>
-#include <sys/types.h>
-
-#include "sd-event.h"
-#include "sd-ndisc-neighbor.h"
-#include "sd-ndisc-protocol.h"
-#include "sd-ndisc-redirect.h"
-#include "sd-ndisc-router.h"
-
 #include "_sd-common.h"
+#include "sd-ndisc-neighbor.h"  /* IWYU pragma: export */
+#include "sd-ndisc-protocol.h"  /* IWYU pragma: export */
+#include "sd-ndisc-redirect.h"  /* IWYU pragma: export */
+#include "sd-ndisc-router.h"    /* IWYU pragma: export */
 
 _SD_BEGIN_DECLARATIONS;
 
+struct ether_addr;
+struct in6_addr;
+
+typedef struct sd_event sd_event;
 typedef struct sd_ndisc sd_ndisc;
 
-__extension__ typedef enum sd_ndisc_event_t {
+__extension__ typedef enum _SD_ENUM_TYPE_S64(sd_ndisc_event_t) {
         SD_NDISC_EVENT_TIMEOUT,
         SD_NDISC_EVENT_ROUTER,
         SD_NDISC_EVENT_NEIGHBOR,

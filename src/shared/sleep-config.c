@@ -4,19 +4,11 @@
 
 #include "alloc-util.h"
 #include "conf-parser.h"
-#include "constants.h"
-#include "device-util.h"
-#include "devnum-util.h"
-#include "errno-util.h"
-#include "fd-util.h"
+#include "extract-word.h"
 #include "fileio.h"
 #include "hibernate-util.h"
 #include "log.h"
-#include "macro.h"
-#include "path-util.h"
 #include "sleep-config.h"
-#include "stat-util.h"
-#include "stdio-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
@@ -124,7 +116,8 @@ int parse_sleep_config(SleepConfig **ret) {
                 return log_oom();
 
         *sc = (SleepConfig) {
-                .hibernate_delay_usec = USEC_INFINITY,
+                .hibernate_delay_usec  = USEC_INFINITY,
+                .hibernate_on_ac_power = true,
         };
 
         const ConfigTableItem items[] = {
@@ -145,6 +138,7 @@ int parse_sleep_config(SleepConfig **ret) {
                 { "Sleep", "MemorySleepMode",           config_parse_sleep_mode,  0,               &sc->mem_modes               },
 
                 { "Sleep", "HibernateDelaySec",         config_parse_sec,         0,               &sc->hibernate_delay_usec    },
+                { "Sleep", "HibernateOnACPower",        config_parse_bool,        0,               &sc->hibernate_on_ac_power   },
                 { "Sleep", "SuspendEstimationSec",      config_parse_sec,         0,               &sc->suspend_estimation_usec },
                 {}
         };
@@ -185,6 +179,18 @@ int parse_sleep_config(SleepConfig **ret) {
 
         *ret = TAKE_PTR(sc);
         return 0;
+}
+
+bool sleep_needs_mem_sleep(const SleepConfig *sc, SleepOperation operation) {
+        assert(sc);
+        assert(operation >= 0 && operation < _SLEEP_OPERATION_CONFIG_MAX);
+
+        /* As per https://docs.kernel.org/admin-guide/pm/sleep-states.html#basic-sysfs-interfaces-for-system-suspend-and-hibernation,
+        * /sys/power/mem_sleep is honored if /sys/power/state is set to "mem" (common for suspend)
+        * or /sys/power/disk is set to "suspend" (hybrid-sleep). */
+
+        return strv_contains(sc->states[operation], "mem") ||
+               strv_contains(sc->modes[operation], "suspend");
 }
 
 int sleep_state_supported(char * const *states) {
@@ -348,7 +354,7 @@ static int sleep_supported_internal(
                 return false;
         }
 
-        if (SLEEP_NEEDS_MEM_SLEEP(sleep_config, operation)) {
+        if (sleep_needs_mem_sleep(sleep_config, operation)) {
                 r = sleep_mode_supported("/sys/power/mem_sleep", sleep_config->mem_modes);
                 if (r < 0)
                         return r;

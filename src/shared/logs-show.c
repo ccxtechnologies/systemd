@@ -1,34 +1,30 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <fcntl.h>
 #include <signal.h>
-#include <stdint.h>
-#include <stdlib.h>
 #include <syslog.h>
 #include <unistd.h>
 
 #include "sd-id128.h"
 #include "sd-journal.h"
+#include "sd-json.h"
+#include "sd-messages.h"
 
 #include "alloc-util.h"
-#include "fd-util.h"
 #include "format-util.h"
 #include "glyph-util.h"
 #include "hashmap.h"
-#include "hostname-util.h"
 #include "id128-util.h"
-#include "io-util.h"
 #include "journal-internal.h"
 #include "journal-util.h"
-#include "json.h"
 #include "locale-util.h"
 #include "log.h"
 #include "logs-show.h"
-#include "macro.h"
 #include "output-mode.h"
 #include "parse-util.h"
 #include "pretty-print.h"
+#include "rlimit-util.h"
+#include "set.h"
+#include "sigbus.h"
 #include "sparse-endian.h"
 #include "stdio-util.h"
 #include "string-table.h"
@@ -36,6 +32,7 @@
 #include "strv.h"
 #include "terminal-util.h"
 #include "time-util.h"
+#include "user-util.h"
 #include "utf8.h"
 #include "web-util.h"
 
@@ -59,7 +56,7 @@ static int print_catalog(FILE *f, sd_journal *j) {
                 return log_error_errno(r, "Failed to find catalog entry: %m");
 
         if (is_locale_utf8())
-                prefix = strjoina(special_glyph(SPECIAL_GLYPH_LIGHT_SHADE), special_glyph(SPECIAL_GLYPH_LIGHT_SHADE));
+                prefix = strjoina(glyph(GLYPH_LIGHT_SHADE), glyph(GLYPH_LIGHT_SHADE));
         else
                 prefix = "--";
 
@@ -228,8 +225,8 @@ static bool print_multiline(
                 get_log_colors(priority, &color_on, &color_off, &highlight_on);
 
                 if (audit && strempty(color_on)) {
-                        color_on = ANSI_BLUE;
-                        color_off = ANSI_NORMAL;
+                        color_on = ansi_blue();
+                        color_off = ansi_normal();
                 }
         }
 
@@ -333,7 +330,7 @@ static int output_timestamp_monotonic(
         assert(previous_boot_id);
 
         if (!VALID_MONOTONIC(display_ts->monotonic))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No valid monotonic timestamp available");
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "No valid monotonic timestamp available, skipping showing journal entry.");
 
         written_chars += fprintf(f, "[%5"PRI_USEC".%06"PRI_USEC, display_ts->monotonic / USEC_PER_SEC, display_ts->monotonic % USEC_PER_SEC);
 
@@ -361,78 +358,87 @@ finish:
 
 static int output_timestamp_realtime(
                 FILE *f,
-                sd_journal *j,
                 OutputMode mode,
                 OutputFlags flags,
                 usec_t usec) {
 
         char buf[CONST_MAX(FORMAT_TIMESTAMP_MAX, 64U)];
+        int r;
 
         assert(f);
-        assert(j);
 
         if (!VALID_REALTIME(usec))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No valid realtime timestamp available.");
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "No valid realtime timestamp available, skipping showing journal entry.");
 
-        if (IN_SET(mode, OUTPUT_SHORT_FULL, OUTPUT_WITH_UNIT)) {
-                const char *k;
+        switch (mode) {
 
-                if (flags & OUTPUT_UTC)
-                        k = format_timestamp_style(buf, sizeof(buf), usec, TIMESTAMP_UTC);
-                else
-                        k = format_timestamp(buf, sizeof(buf), usec);
-                if (!k)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "Failed to format timestamp: %" PRIu64, usec);
+        case OUTPUT_SHORT_FULL:
+        case OUTPUT_WITH_UNIT: {
+                if (!format_timestamp_style(buf, sizeof(buf), usec, flags & OUTPUT_UTC ? TIMESTAMP_UTC : TIMESTAMP_PRETTY))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to format timestamp (%"PRIu64"), skipping showing journal entry.", usec);
+                break;
+        }
 
-        } else {
+        case OUTPUT_SHORT_UNIX:
+                xsprintf(buf, "%10" PRI_USEC ".%06" PRI_USEC, usec / USEC_PER_SEC, usec % USEC_PER_SEC);
+                break;
+
+        case OUTPUT_SHORT:
+        case OUTPUT_SHORT_PRECISE:
+        case OUTPUT_SHORT_ISO:
+        case OUTPUT_SHORT_ISO_PRECISE: {
                 struct tm tm;
-                time_t t;
+                size_t tail = 0;
 
-                t = (time_t) (usec / USEC_PER_SEC);
-
-                switch (mode) {
-
-                case OUTPUT_SHORT_UNIX:
-                        xsprintf(buf, "%10"PRI_TIME".%06"PRIu64, t, usec % USEC_PER_SEC);
-                        break;
-
-                case OUTPUT_SHORT_ISO:
-                case OUTPUT_SHORT_ISO_PRECISE: {
-                        size_t tail = strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S",
-                                               localtime_or_gmtime_r(&t, &tm, flags & OUTPUT_UTC));
-                        if (tail == 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to format ISO time.");
-
-                        /* No usec in strftime, need to append */
-                        if (mode == OUTPUT_SHORT_ISO_PRECISE) {
-                                assert_se(snprintf_ok(buf + tail, ELEMENTSOF(buf) - tail, ".%06"PRI_USEC, usec % USEC_PER_SEC));
-                                tail += 7;
-                        }
-
-                        int h = tm.tm_gmtoff / 60 / 60;
-                        int m = labs((tm.tm_gmtoff / 60) % 60);
-                        snprintf(buf + tail, ELEMENTSOF(buf) - tail, "%+03d:%02d", h, m);
-                        break;
+                r = localtime_or_gmtime_usec(usec, flags & OUTPUT_UTC, &tm);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to convert timestamp to calendar time, generating fallback timestamp: %m");
+                else {
+                        tail = strftime(
+                                        buf, sizeof(buf),
+                                        IN_SET(mode, OUTPUT_SHORT_ISO, OUTPUT_SHORT_ISO_PRECISE) ? "%Y-%m-%dT%H:%M:%S" : "%b %d %H:%M:%S",
+                                        &tm);
+                        if (tail <= 0)
+                                log_debug("Failed to format calendar time, generating fallback timestamp.");
                 }
 
-                case OUTPUT_SHORT:
-                case OUTPUT_SHORT_PRECISE:
+                if (tail <= 0) {
+                        /* Generate fallback timestamp if regular formatting didn't work. (This might happen on systems where time_t is 32bit) */
 
-                        if (strftime(buf, sizeof(buf), "%b %d %H:%M:%S",
-                                     localtime_or_gmtime_r(&t, &tm, flags & OUTPUT_UTC)) <= 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to format syslog time.");
+                        static const char *const xxx[_OUTPUT_MODE_MAX] = {
+                                [OUTPUT_SHORT]             = "XXX XX XX:XX:XX",
+                                [OUTPUT_SHORT_PRECISE]     = "XXX XX XX:XX:XX.XXXXXX",
+                                [OUTPUT_SHORT_ISO]         = "XXXX-XX-XXTXX:XX:XX+XX:XX",
+                                [OUTPUT_SHORT_ISO_PRECISE] = "XXXX-XX-XXTXX:XX:XX.XXXXXX+XX:XX",
+                        };
 
-                        if (mode == OUTPUT_SHORT_PRECISE) {
-                                assert(sizeof(buf) > strlen(buf));
-                                if (!snprintf_ok(buf + strlen(buf), sizeof(buf) - strlen(buf), ".%06"PRIu64, usec % USEC_PER_SEC))
-                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to format precise time.");
-                        }
-                        break;
-
-                default:
-                        assert_not_reached();
+                        fputs(xxx[mode], f);
+                        return strlen(xxx[mode]);
                 }
+
+                assert(tail <= sizeof(buf));
+
+                /* No usec in strftime, need to append */
+                if (IN_SET(mode, OUTPUT_SHORT_ISO_PRECISE, OUTPUT_SHORT_PRECISE)) {
+                        assert_se(snprintf_ok(buf + tail, sizeof(buf) - tail, ".%06" PRI_USEC, usec % USEC_PER_SEC));
+
+                        tail += 7;
+
+                        assert(tail <= sizeof(buf));
+                }
+
+                if (IN_SET(mode, OUTPUT_SHORT_ISO, OUTPUT_SHORT_ISO_PRECISE)) {
+                        int h = tm.tm_gmtoff / 60 / 60,
+                                m = ABS((int) ((tm.tm_gmtoff / 60) % 60));
+
+                        assert_se(snprintf_ok(buf + tail, sizeof(buf) - tail, "%+03d:%02d", h, m));
+                }
+
+                break;
+        }
+
+        default:
+                assert_not_reached();
         }
 
         fputs(buf, f);
@@ -445,7 +451,7 @@ static void parse_display_realtime(
                 const char *source_monotonic,
                 usec_t *ret) {
 
-        usec_t t, s, u;
+        usec_t t;
 
         assert(j);
         assert(ret);
@@ -463,11 +469,15 @@ static void parse_display_realtime(
         }
 
         /* If _SOURCE_MONOTONIC_TIMESTAMP is provided, adjust the header timestamp. */
+        // FIXME: _SOURCE_MONOTONIC_TIMESTAMP is in CLOCK_BOOTTIME, hence we cannot use it for adjusting realtime.
+        /*
+        usec_t s, u;
         if (source_monotonic && safe_atou64(source_monotonic, &s) >= 0 && VALID_MONOTONIC(s) &&
             sd_journal_get_monotonic_usec(j, &u, &(sd_id128_t) {}) >= 0) {
                 *ret = map_clock_usec_raw(t, u, s);
                 return;
         }
+        */
 
         /* Otherwise, use the header timestamp as is. */
         *ret = t;
@@ -491,8 +501,11 @@ static void parse_display_timestamp(
         if (source_realtime && safe_atou64(source_realtime, &t) >= 0 && VALID_REALTIME(t))
                 source_ts.realtime = t;
 
+        // FIXME: _SOURCE_MONOTONIC_TIMESTAMP is in CLOCK_BOOTTIME, hence we cannot use it for adjusting realtime.
+        /*
         if (source_monotonic && safe_atou64(source_monotonic, &t) >= 0 && VALID_MONOTONIC(t))
                 source_ts.monotonic = t;
+        */
 
         (void) sd_journal_get_realtime_usec(j, &header_ts.realtime);
         (void) sd_journal_get_monotonic_usec(j, &header_ts.monotonic, &boot_id);
@@ -601,8 +614,10 @@ static int output_short(
         } else {
                 usec_t usec;
                 parse_display_realtime(j, realtime, monotonic, &usec);
-                r = output_timestamp_realtime(f, j, mode, flags, usec);
+                r = output_timestamp_realtime(f, mode, flags, usec);
         }
+        if (r == -EINVAL)
+                return 0;
         if (r < 0)
                 return r;
         n += r;
@@ -673,7 +688,7 @@ static int output_short(
                 if (c) {
                         _cleanup_free_ char *urlified = NULL;
 
-                        if (terminal_urlify(c, special_glyph(SPECIAL_GLYPH_EXTERNAL_LINK), &urlified) >= 0) {
+                        if (terminal_urlify(c, glyph(GLYPH_EXTERNAL_LINK), &urlified) >= 0) {
                                 fputs(urlified, f);
                                 fputc(' ', f);
                         }
@@ -791,7 +806,7 @@ static int output_verbose(
 
         r = get_display_realtime(j, &usec);
         if (IN_SET(r, -EBADMSG, -EADDRNOTAVAIL)) {
-                log_debug_errno(r, "Skipping message we can't read: %m");
+                log_debug_errno(r, "Unable to read realtime timestamp from entry, assuming bad or partially written entry: %m");
                 return 0;
         }
         if (r < 0)
@@ -801,18 +816,22 @@ static int output_verbose(
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No valid realtime timestamp available");
 
         r = sd_journal_get_cursor(j, &cursor);
+        if (r == -EBADMSG) {
+                log_debug_errno(r, "Unable to determine cursor for entry, assuming bad or partially written entry: %m");
+                return 0;
+        }
         if (r < 0)
                 return log_error_errno(r, "Failed to get cursor: %m");
 
         timestamp = format_timestamp_style(buf, sizeof buf, usec,
                                            flags & OUTPUT_UTC ? TIMESTAMP_US_UTC : TIMESTAMP_US);
         fprintf(f, "%s%s%s %s[%s]%s\n",
-                timestamp && (flags & OUTPUT_COLOR) ? ANSI_UNDERLINE : "",
+                timestamp && (flags & OUTPUT_COLOR) ? ansi_underline() : "",
                 timestamp ?: "(no timestamp)",
-                timestamp && (flags & OUTPUT_COLOR) ? ANSI_NORMAL : "",
-                (flags & OUTPUT_COLOR) ? ANSI_GREY : "",
+                timestamp && (flags & OUTPUT_COLOR) ? ansi_normal() : "",
+                (flags & OUTPUT_COLOR) ? ansi_grey() : "",
                 cursor,
-                (flags & OUTPUT_COLOR) ? ANSI_NORMAL : "");
+                (flags & OUTPUT_COLOR) ? ansi_grey() : "");
 
         JOURNAL_FOREACH_DATA_RETVAL(j, data, length, r) {
                 _cleanup_free_ char *urlified = NULL;
@@ -821,12 +840,16 @@ static int output_verbose(
                 size_t fieldlen, valuelen;
 
                 c = memchr(data, '=', length);
-                if (!c)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid field.");
+                if (!c) {
+                        log_debug("Encountered field without '=', assuming bad or partially written entry, leaving.");
+                        break;
+                }
 
                 fieldlen = c - (const char*) data;
-                if (!journal_field_valid(data, fieldlen, true))
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid field.");
+                if (!journal_field_valid(data, fieldlen, /* allow_protected= */ true)) {
+                        log_debug("Encountered invalid field, assuming bad or partially written entry, leaving.");
+                        break;
+                }
 
                 r = field_set_test(output_fields, data, fieldlen);
                 if (r < 0)
@@ -838,10 +861,10 @@ static int output_verbose(
                 p = c + 1;
 
                 if (flags & OUTPUT_COLOR) {
-                        if (startswith(data, "MESSAGE=")) {
-                                on = ANSI_HIGHLIGHT;
-                                off = ANSI_NORMAL;
-                        } else if (startswith(data, "CONFIG_FILE=")) {
+                        if (memory_startswith(data, length, "MESSAGE=")) {
+                                on = ansi_highlight();
+                                off = ansi_normal();
+                        } else if (memory_startswith(data, length, "CONFIG_FILE=")) {
                                 _cleanup_free_ char *u = NULL;
 
                                 u = memdup_suffix0(p, valuelen);
@@ -853,10 +876,10 @@ static int output_verbose(
                                         valuelen = strlen(urlified);
                                 }
 
-                        } else if (startswith(data, "_")) {
+                        } else if (memory_startswith(data, length, "_")) {
                                 /* Highlight trusted data as such */
-                                on = ANSI_GREEN;
-                                off = ANSI_NORMAL;
+                                on = ansi_green();
+                                off = ansi_normal();
                         }
                 }
 
@@ -909,18 +932,34 @@ static int output_export(
         (void) sd_journal_set_data_threshold(j, 0);
 
         r = sd_journal_get_cursor(j, &cursor);
+        if (IN_SET(r, -EBADMSG, -EADDRNOTAVAIL)) {
+                log_debug_errno(r, "Unable to determine cursor of entry, assuming bad or partially written entry: %m");
+                return 0;
+        }
         if (r < 0)
                 return log_error_errno(r, "Failed to get cursor: %m");
 
         r = sd_journal_get_realtime_usec(j, &realtime);
+        if (r == -EBADMSG) {
+                log_debug_errno(r, "Unable to read realtime timestamp of entry, assuming bad or partially written entry: %m");
+                return 0;
+        }
         if (r < 0)
                 return log_error_errno(r, "Failed to get realtime timestamp: %m");
 
         r = sd_journal_get_monotonic_usec(j, &monotonic, &journal_boot_id);
+        if (r == -EBADMSG) {
+                log_debug_errno(r, "Unable to read monotonic timestamp of entry, assuming bad or partially written entry: %m");
+                return 0;
+        }
         if (r < 0)
                 return log_error_errno(r, "Failed to get monotonic timestamp: %m");
 
         r = sd_journal_get_seqnum(j, &seqnum, &seqnum_id);
+        if (r == -EBADMSG) {
+                log_debug_errno(r, "Unable to read sequence number of entry, assuming bad or partially written entry: %m");
+                return 0;
+        }
         if (r < 0)
                 return log_error_errno(r, "Failed to get seqnum: %m");
 
@@ -947,12 +986,16 @@ static int output_export(
                         continue;
 
                 c = memchr(data, '=', length);
-                if (!c)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid field.");
+                if (!c) {
+                        log_debug("Encountered data field without '=', assuming bad or partially written entry, leaving.");
+                        break;
+                }
 
                 fieldlen = c - (const char*) data;
-                if (!journal_field_valid(data, fieldlen, true))
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid field.");
+                if (!journal_field_valid(data, fieldlen, /* allow_protected= */ true)) {
+                        log_debug("Encountered invalid field, assuming bad or partially written entry, leaving.");
+                        break;
+                }
 
                 r = field_set_test(output_fields, data, fieldlen);
                 if (r < 0)
@@ -1040,16 +1083,16 @@ void json_escape(
 }
 
 typedef struct JsonData {
-        JsonVariant* name;
-        JsonVariant* values;
+        sd_json_variant* name;
+        sd_json_variant* values;
 } JsonData;
 
 static JsonData* json_data_free(JsonData *d) {
         if (!d)
                 return NULL;
 
-        json_variant_unref(d->name);
-        json_variant_unref(d->values);
+        sd_json_variant_unref(d->name);
+        sd_json_variant_unref(d->values);
 
         return mfree(d);
 }
@@ -1067,7 +1110,7 @@ static int update_json_data(
                 const void *value,
                 size_t size) {
 
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         JsonData *d;
         int r;
 
@@ -1078,17 +1121,17 @@ static int update_json_data(
                 size = strlen(value);
 
         if (!(flags & OUTPUT_SHOW_ALL) && strlen(name) + 1 + size >= JSON_THRESHOLD)
-                r = json_variant_new_null(&v);
+                r = sd_json_variant_new_null(&v);
         else if (utf8_is_printable(value, size))
-                r = json_variant_new_stringn(&v, value, size);
+                r = sd_json_variant_new_stringn(&v, value, size);
         else
-                r = json_variant_new_array_bytes(&v, value, size);
+                r = sd_json_variant_new_array_bytes(&v, value, size);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate JSON data: %m");
 
         d = hashmap_get(h, name);
         if (d) {
-                r = json_variant_append_array(&d->values, v);
+                r = sd_json_variant_append_array(&d->values, v);
                 if (r < 0)
                         return log_error_errno(r, "Failed to append JSON value into array: %m");
         } else {
@@ -1098,15 +1141,15 @@ static int update_json_data(
                 if (!e)
                         return log_oom();
 
-                r = json_variant_new_string(&e->name, name);
+                r = sd_json_variant_new_string(&e->name, name);
                 if (r < 0)
                         return log_error_errno(r, "Failed to allocate JSON name variant: %m");
 
-                r = json_variant_append_array(&e->values, v);
+                r = sd_json_variant_append_array(&e->values, v);
                 if (r < 0)
                         return log_error_errno(r, "Failed to create JSON value array: %m");
 
-                r = hashmap_put(h, json_variant_string(e->name), e);
+                r = hashmap_put(h, sd_json_variant_string(e->name), e);
                 if (r < 0)
                         return log_error_errno(r, "Failed to insert JSON data into hashmap: %m");
 
@@ -1138,8 +1181,10 @@ static int update_json_data_split(
                 return 0;
 
         fieldlen = eq - (const char*) data;
-        if (!journal_field_valid(data, fieldlen, true))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid field.");
+        if (!journal_field_valid(data, fieldlen, /* allow_protected= */ true)) {
+                log_debug("Encountered invalid field, assuming bad or incompletely written field, leaving.");
+                return 0;
+        }
 
         name = strndupa_safe(data, fieldlen);
         if (output_fields && !set_contains(output_fields, name))
@@ -1160,12 +1205,12 @@ static int output_json(
                 sd_id128_t *previous_boot_id) {      /* unused */
 
         char usecbuf[CONST_MAX(DECIMAL_STR_MAX(usec_t), DECIMAL_STR_MAX(uint64_t))];
-        _cleanup_(json_variant_unrefp) JsonVariant *object = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *object = NULL;
         _cleanup_hashmap_free_ Hashmap *h = NULL;
         sd_id128_t journal_boot_id, seqnum_id;
         _cleanup_free_ char *cursor = NULL;
         usec_t realtime, monotonic;
-        JsonVariant **array = NULL;
+        sd_json_variant **array = NULL;
         JsonData *d;
         uint64_t seqnum;
         size_t n = 0;
@@ -1176,18 +1221,34 @@ static int output_json(
         (void) sd_journal_set_data_threshold(j, flags & OUTPUT_SHOW_ALL ? 0 : JSON_THRESHOLD);
 
         r = sd_journal_get_cursor(j, &cursor);
+        if (IN_SET(r, -EBADMSG, -EADDRNOTAVAIL)) {
+                log_debug_errno(r, "Unable to determine cursor of entry, assuming bad or partially written entry: %m");
+                return 0;
+        }
         if (r < 0)
                 return log_error_errno(r, "Failed to get cursor: %m");
 
         r = sd_journal_get_realtime_usec(j, &realtime);
+        if (r == -EBADMSG) {
+                log_debug_errno(r, "Unable to read realtime timestamp of entry, assuming bad or partially written entry: %m");
+                return 0;
+        }
         if (r < 0)
                 return log_error_errno(r, "Failed to get realtime timestamp: %m");
 
         r = sd_journal_get_monotonic_usec(j, &monotonic, &journal_boot_id);
+        if (r == -EBADMSG) {
+                log_debug_errno(r, "Unable to read monotonic timestamp of entry, assuming bad or partially written entry: %m");
+                return 0;
+        }
         if (r < 0)
                 return log_error_errno(r, "Failed to get monotonic timestamp: %m");
 
         r = sd_journal_get_seqnum(j, &seqnum, &seqnum_id);
+        if (r == -EBADMSG) {
+                log_debug_errno(r, "Unable to read sequence number of entry, assuming bad or partially written entry: %m");
+                return 0;
+        }
         if (r < 0)
                 return log_error_errno(r, "Failed to get seqnum: %m");
 
@@ -1241,30 +1302,30 @@ static int output_json(
                         return r;
         }
 
-        array = new(JsonVariant*, hashmap_size(h)*2);
+        array = new(sd_json_variant*, hashmap_size(h)*2);
         if (!array)
                 return log_oom();
 
-        CLEANUP_ARRAY(array, n, json_variant_unref_many);
+        CLEANUP_ARRAY(array, n, sd_json_variant_unref_many);
 
         HASHMAP_FOREACH(d, h) {
-                assert(json_variant_elements(d->values) > 0);
+                assert(sd_json_variant_elements(d->values) > 0);
 
-                array[n++] = json_variant_ref(d->name);
+                array[n++] = sd_json_variant_ref(d->name);
 
-                if (json_variant_elements(d->values) == 1)
-                        array[n++] = json_variant_ref(json_variant_by_index(d->values, 0));
+                if (sd_json_variant_elements(d->values) == 1)
+                        array[n++] = sd_json_variant_ref(sd_json_variant_by_index(d->values, 0));
                 else
-                        array[n++] = json_variant_ref(d->values);
+                        array[n++] = sd_json_variant_ref(d->values);
         }
 
-        r = json_variant_new_object(&object, array, n);
+        r = sd_json_variant_new_object(&object, array, n);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate JSON object: %m");
 
-        return json_variant_dump(object,
+        return sd_json_variant_dump(object,
                                  output_mode_to_json_format_flags(mode) |
-                                 (FLAGS_SET(flags, OUTPUT_COLOR) ? JSON_FORMAT_COLOR : 0),
+                                 (FLAGS_SET(flags, OUTPUT_COLOR) ? SD_JSON_FORMAT_COLOR : 0),
                                  f, NULL);
 }
 
@@ -1391,7 +1452,6 @@ typedef int (*output_func_t)(
                 dual_timestamp *previous_display_ts,
                 sd_id128_t *previous_boot_id);
 
-
 static output_func_t output_funcs[_OUTPUT_MODE_MAX] = {
         [OUTPUT_SHORT]             = output_short,
         [OUTPUT_SHORT_ISO]         = output_short,
@@ -1504,6 +1564,10 @@ int show_journal(
 
                 if (need_seek) {
                         r = sd_journal_next(j);
+                        if (r == -EBADMSG) {
+                                log_debug_errno(r, "Bad or partially written entry, leaving.");
+                                break;
+                        }
                         if (r < 0)
                                 return log_error_errno(r, "Failed to iterate through journal: %m");
                 }
@@ -1583,34 +1647,95 @@ int show_journal(
         return 0;
 }
 
-int add_matches_for_unit(sd_journal *j, const char *unit) {
+int add_matches_for_invocation_id(sd_journal *j, sd_id128_t id) {
+        int r;
+
+        assert(j);
+        assert(!sd_id128_is_null(id));
+
+        (void) (
+                /* Look for messages from the service itself. */
+                (r = journal_add_match_pair(j, "_SYSTEMD_INVOCATION_ID", SD_ID128_TO_STRING(id))) ||
+
+                /* Look for messages from authorized daemons about this service. */
+                (r = sd_journal_add_disjunction(j)) ||
+                (r = journal_add_match_pair(j, "OBJECT_SYSTEMD_INVOCATION_ID", SD_ID128_TO_STRING(id))) ||
+
+                /* Look for messages from system service manager (PID 1) about this service. */
+                (r = sd_journal_add_disjunction(j)) ||
+                (r = journal_add_match_pair(j, "INVOCATION_ID", SD_ID128_TO_STRING(id))) ||
+
+                /* Look for messages from user-session service manager about this service. */
+                (r = sd_journal_add_disjunction(j)) ||
+                (r = journal_add_match_pair(j, "USER_INVOCATION_ID", SD_ID128_TO_STRING(id)))
+        );
+
+        return r;
+}
+
+static int add_matches_for_coredump_uid(sd_journal *j, MatchUnitFlag flags, const char *unit) {
+        static uid_t cached_uid = 0;
+        int r;
+
+        assert(j);
+        assert(unit);
+
+        if (!FLAGS_SET(flags, MATCH_UNIT_COREDUMP_UID))
+                return 0;
+
+        if (cached_uid == 0) {
+                const char *user = "systemd-coredump";
+
+                r = get_user_creds(&user, &cached_uid, NULL, NULL, NULL, 0);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to resolve systemd-coredump user, ignoring: %m");
+                        cached_uid = UID_INVALID;
+                } else if (cached_uid == 0) /* Huh? Let's handle that gracefully. */
+                        cached_uid = UID_INVALID;
+        }
+
+        if (!uid_is_valid(cached_uid))
+                return 0;
+
+        r = journal_add_matchf(j, "_UID="UID_FMT, cached_uid);
+        if (r < 0)
+                return r;
+
+        /* for systemd-coredump older than 888e378da2dbf4520e68a9d7e59712a3cd5a830f */
+        return sd_journal_add_match(j, "_UID=0", SIZE_MAX);
+}
+
+int add_matches_for_unit_full(sd_journal *j, MatchUnitFlag flags, const char *unit) {
         int r;
 
         assert(j);
         assert(unit);
 
         (void) (
-            /* Look for messages from the service itself */
-            (r = journal_add_match_pair(j, "_SYSTEMD_UNIT", unit)) ||
+                /* Look for messages from the service itself */
+                (r = journal_add_match_pair(j, "_SYSTEMD_UNIT", unit)) ||
 
-            /* Look for coredumps of the service */
-            (r = sd_journal_add_disjunction(j)) ||
-            (r = sd_journal_add_match(j, "MESSAGE_ID=fc2e22bc6ee647b6b90729ab34a250b1", SIZE_MAX)) ||
-            (r = sd_journal_add_match(j, "_UID=0", SIZE_MAX)) ||
-            (r = journal_add_match_pair(j, "COREDUMP_UNIT", unit)) ||
+                /* Look for messages from PID 1 about this service */
+                (r = sd_journal_add_disjunction(j)) ||
+                (r = sd_journal_add_match(j, "_PID=1", SIZE_MAX)) ||
+                (r = journal_add_match_pair(j, "UNIT", unit)) ||
 
-             /* Look for messages from PID 1 about this service */
-            (r = sd_journal_add_disjunction(j)) ||
-            (r = sd_journal_add_match(j, "_PID=1", SIZE_MAX)) ||
-            (r = journal_add_match_pair(j, "UNIT", unit)) ||
-
-            /* Look for messages from authorized daemons about this service */
-            (r = sd_journal_add_disjunction(j)) ||
-            (r = sd_journal_add_match(j, "_UID=0", SIZE_MAX)) ||
-            (r = journal_add_match_pair(j, "OBJECT_SYSTEMD_UNIT", unit))
+                /* Look for messages from authorized daemons about this service */
+                (r = sd_journal_add_disjunction(j)) ||
+                (r = sd_journal_add_match(j, "_UID=0", SIZE_MAX)) ||
+                (r = journal_add_match_pair(j, "OBJECT_SYSTEMD_UNIT", unit))
         );
 
-        if (r == 0 && endswith(unit, ".slice"))
+        if (r == 0 && FLAGS_SET(flags, MATCH_UNIT_COREDUMP))
+                (void) (
+                        /* Look for coredumps of the service */
+                        (r = sd_journal_add_disjunction(j)) ||
+                        (r = sd_journal_add_match(j, "MESSAGE_ID=" SD_MESSAGE_COREDUMP_STR, SIZE_MAX)) ||
+                        (r = add_matches_for_coredump_uid(j, flags, unit)) ||
+                        (r = journal_add_match_pair(j, "COREDUMP_UNIT", unit))
+                );
+
+        if (r == 0 && FLAGS_SET(flags, MATCH_UNIT_SLICE) && endswith(unit, ".slice"))
                 /* Show all messages belonging to a slice */
                 (void) (
                         (r = sd_journal_add_disjunction(j)) ||
@@ -1620,7 +1745,7 @@ int add_matches_for_unit(sd_journal *j, const char *unit) {
         return r;
 }
 
-int add_matches_for_user_unit(sd_journal *j, const char *unit) {
+int add_matches_for_user_unit_full(sd_journal *j, MatchUnitFlag flags, const char *unit) {
         uid_t uid = getuid();
         int r;
 
@@ -1637,12 +1762,6 @@ int add_matches_for_user_unit(sd_journal *j, const char *unit) {
                 (r = journal_add_match_pair(j, "USER_UNIT", unit)) ||
                 (r = journal_add_matchf(j, "_UID="UID_FMT, uid)) ||
 
-                /* Look for coredumps of the service */
-                (r = sd_journal_add_disjunction(j)) ||
-                (r = journal_add_match_pair(j, "COREDUMP_USER_UNIT", unit)) ||
-                (r = journal_add_matchf(j, "_UID="UID_FMT, uid)) ||
-                (r = sd_journal_add_match(j, "_UID=0", SIZE_MAX)) ||
-
                 /* Look for messages from authorized daemons about this service */
                 (r = sd_journal_add_disjunction(j)) ||
                 (r = journal_add_match_pair(j, "OBJECT_SYSTEMD_USER_UNIT", unit)) ||
@@ -1650,7 +1769,16 @@ int add_matches_for_user_unit(sd_journal *j, const char *unit) {
                 (r = sd_journal_add_match(j, "_UID=0", SIZE_MAX))
         );
 
-        if (r == 0 && endswith(unit, ".slice"))
+        if (r == 0 && FLAGS_SET(flags, MATCH_UNIT_COREDUMP))
+                (void) (
+                        /* Look for coredumps of the service */
+                        (r = sd_journal_add_disjunction(j)) ||
+                        (r = journal_add_match_pair(j, "COREDUMP_USER_UNIT", unit)) ||
+                        (r = journal_add_matchf(j, "_UID="UID_FMT, uid)) ||
+                        (r = sd_journal_add_match(j, "_UID=0", SIZE_MAX))
+                );
+
+        if (r == 0 && FLAGS_SET(flags, MATCH_UNIT_SLICE) && endswith(unit, ".slice"))
                 /* Show all messages belonging to a slice */
                 (void) (
                         (r = sd_journal_add_disjunction(j)) ||
@@ -1759,16 +1887,127 @@ int show_journal_by_unit(
         return show_journal(f, j, mode, n_columns, not_before, how_many, flags, ellipsized);
 }
 
-static int discover_next_boot(
+static int journal_get_id128(sd_journal *j, const char *field, sd_id128_t *ret) {
+        const char *data, *str;
+        size_t len, fl;
+        sd_id128_t v;
+        int r;
+
+        assert(j);
+        assert(field);
+
+        /* This returns 1 when non-null ID is found, 0 when null ID is found, -ENOENT when the field not
+         * found, -EINVAL when the field found but not a valid ID, -EBADMSG or -EADDRNOTAVAIL when journal
+         * corruption detected. On a critical issue, other negative errno may be returned. */
+
+        r = sd_journal_get_data(j, field, (const void**) &data, &len);
+        if (r < 0)
+                return r;
+
+        fl = strlen(field);
+        assert(len > fl);
+        assert(data[fl] == '=');
+
+        if (len > fl + 1 + SD_ID128_UUID_STRING_MAX)
+                return -EINVAL;
+
+        str = memdupa_suffix0(data + fl + 1, len - fl - 1);
+
+        r = sd_id128_from_string(str, ret ?: &v);
+        if (r < 0)
+                return r;
+
+        return !sd_id128_is_null(ret ? *ret : v);
+}
+
+static int journal_get_invocation_id(sd_journal *j, sd_id128_t *ret) {
+        int r;
+
+        assert(j);
+
+        FOREACH_STRING(s,
+                       "_SYSTEMD_INVOCATION_ID",       /* By the systemd unit. */
+                       "OBJECT_SYSTEMD_INVOCATION_ID", /* Added by journald. */
+                       "INVOCATION_ID",                /* By the system service manager (PID 1). */
+                       "USER_INVOCATION_ID") {         /* By the user session service manager. */
+
+                r = journal_get_id128(j, s, ret);
+                if (!IN_SET(r, 0, -ENOENT, -EINVAL, -EBADMSG, -EADDRNOTAVAIL))
+                        return r;
+        }
+
+        /* No invocation ID found in the entry. */
+        if (ret)
+                *ret = SD_ID128_NULL;
+        return 0;
+}
+
+static const char* const log_id_type_table[_LOG_ID_TYPE_MAX] = {
+        [LOG_BOOT_ID]                   = "boot ID",
+        [LOG_SYSTEM_UNIT_INVOCATION_ID] = "system unit invocation ID",
+        [LOG_USER_UNIT_INVOCATION_ID]   = "user unit invocation ID",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(log_id_type, LogIdType);
+
+static int set_matches_for_discover_id(
                 sd_journal *j,
-                sd_id128_t previous_boot_id,
+                LogIdType type,
+                sd_id128_t boot_id,
+                const char *unit,
+                sd_id128_t id) {
+
+        int r;
+
+        assert(j);
+        assert(type >= 0 && type < _LOG_ID_TYPE_MAX);
+
+        sd_journal_flush_matches(j);
+
+        if (type == LOG_BOOT_ID) {
+                if (sd_id128_is_null(id))
+                        return 0;
+
+                return add_match_boot_id(j, id);
+        }
+
+        if (!sd_id128_is_null(boot_id)) {
+                r = add_match_boot_id(j, boot_id);
+                if (r < 0)
+                        return r;
+
+                r = sd_journal_add_conjunction(j);
+                if (r < 0)
+                        return r;
+        }
+
+        if (!sd_id128_is_null(id))
+                return add_matches_for_invocation_id(j, id);
+
+        if (type == LOG_SYSTEM_UNIT_INVOCATION_ID)
+                return add_matches_for_unit_full(j, /* flags = */ 0, unit);
+
+        if (type == LOG_USER_UNIT_INVOCATION_ID)
+                return add_matches_for_user_unit_full(j, /* flags = */ 0, unit);
+
+        return -EINVAL;
+}
+
+int discover_next_id(
+                sd_journal *j,
+                LogIdType type,
+                sd_id128_t boot_id,  /* optional, used when type == JOURNAL_{SYSTEM,USER}_UNIT_INVOCATION_ID */
+                const char *unit,    /* mandatory when type == JOURNAL_{SYSTEM,USER}_UNIT_INVOCATION_ID */
+                sd_id128_t previous_id,
                 bool advance_older,
-                BootId *ret) {
+                LogId *ret) {
 
         _cleanup_set_free_ Set *broken_ids = NULL;
         int r;
 
         assert(j);
+        assert(type >= 0 && type < _LOG_ID_TYPE_MAX);
+        assert(type == LOG_BOOT_ID || unit);
         assert(ret);
 
         /* We expect the journal to be on the last position of a boot
@@ -1780,49 +2019,59 @@ static int discover_next_boot(
 
         /* Make sure we aren't restricted by any _BOOT_ID matches, so that
          * we can actually advance to a *different* boot. */
-        sd_journal_flush_matches(j);
+        r = set_matches_for_discover_id(j, type, boot_id, unit, SD_ID128_NULL);
+        if (r < 0)
+                return r;
 
         for (;;) {
                 sd_id128_t *id_dup;
-                BootId boot;
+                LogId id;
 
                 r = sd_journal_step_one(j, !advance_older);
                 if (r < 0)
                         return r;
                 if (r == 0) {
                         sd_journal_flush_matches(j);
-                        *ret = (BootId) {};
+                        *ret = (LogId) {};
                         return 0; /* End of journal, yay. */
                 }
 
-                r = sd_journal_get_monotonic_usec(j, NULL, &boot.id);
+                if (type == LOG_BOOT_ID)
+                        r = sd_journal_get_monotonic_usec(j, NULL, &id.id);
+                else
+                        r = journal_get_invocation_id(j, &id.id);
                 if (r < 0)
                         return r;
 
-                /* We iterate through this in a loop, until the boot ID differs from the previous one. Note that
-                 * normally, this will only require a single iteration, as we moved to the last entry of the previous
-                 * boot entry already. However, it might happen that the per-journal-field entry arrays are less
-                 * complete than the main entry array, and hence might reference an entry that's not actually the last
-                 * one of the boot ID as last one. Let's hence use the per-field array is initial seek position to
+                if (sd_id128_is_null(id.id))
+                        continue;
+
+                /* We iterate through this in a loop, until the boot or invocation ID differs from the
+                 * previous one. Note that normally, this will only require a single iteration, as we moved
+                 * to the last entry of the previous boot or invocation entry already. However, it might
+                 * happen that the per-journal-field entry arrays are less complete than the main entry
+                 * array, and hence might reference an entry that's not actually the last one of the boot or
+                 * invocation ID as last one. Let's hence use the per-field array is initial seek position to
                  * speed things up, but let's not trust that it is complete, and hence, manually advance as
                  * necessary. */
 
-                if (!sd_id128_is_null(previous_boot_id) && sd_id128_equal(boot.id, previous_boot_id))
+                if (!sd_id128_is_null(previous_id) && sd_id128_equal(id.id, previous_id))
                         continue;
 
-                if (set_contains(broken_ids, &boot.id))
+                if (set_contains(broken_ids, &id.id))
                         continue;
 
-                /* Yay, we found a new boot ID from the entry object. Let's check there exist corresponding
-                 * entries matching with the _BOOT_ID= data. */
+                /* Yay, we found a new boot or invocation ID from the entry object. Let's check there exist
+                 * corresponding entries matching with the _BOOT_ID=, INVOCATION_ID= or friends data. */
 
-                r = add_match_boot_id(j, boot.id);
+                r = set_matches_for_discover_id(j, type, boot_id, unit, id.id);
                 if (r < 0)
                         return r;
 
-                /* First, seek to the first (or the last when we are going upwards) occurrence of this boot ID.
-                 * You may think this is redundant. Yes, that's redundant unless the journal is corrupted.
-                 * But when the journal is corrupted, especially, badly 'truncated', then the below may fail.
+                /* First, seek to the first (or the last when we are going upwards) occurrence of this boot
+                 * or invocation ID. You may think this is redundant. Yes, that's redundant unless the
+                 * journal is corrupted. But when the journal is corrupted, especially, badly 'truncated',
+                 * then the below may fail.
                  * See https://github.com/systemd/systemd/pull/29334#issuecomment-1736567951. */
                 if (advance_older)
                         r = sd_journal_seek_tail(j);
@@ -1835,17 +2084,19 @@ static int discover_next_boot(
                 if (r < 0)
                         return r;
                 if (r == 0) {
-                        log_debug("Whoopsie! We found a boot ID %s but can't read its first entry. "
-                                  "The journal seems to be corrupted. Ignoring the boot ID.",
-                                  SD_ID128_TO_STRING(boot.id));
+                        log_debug("Whoopsie! We found a %s %s but can't read its first entry. "
+                                  "The journal seems to be corrupted. Ignoring the %s.",
+                                  log_id_type_to_string(type),
+                                  SD_ID128_TO_STRING(id.id),
+                                  log_id_type_to_string(type));
                         goto try_again;
                 }
 
-                r = sd_journal_get_realtime_usec(j, advance_older ? &boot.last_usec : &boot.first_usec);
+                r = sd_journal_get_realtime_usec(j, advance_older ? &id.last_usec : &id.first_usec);
                 if (r < 0)
                         return r;
 
-                /* Next, seek to the last occurrence of this boot ID. */
+                /* Next, seek to the last occurrence of this boot or invocation ID. */
                 if (advance_older)
                         r = sd_journal_seek_head(j);
                 else
@@ -1857,23 +2108,25 @@ static int discover_next_boot(
                 if (r < 0)
                         return r;
                 if (r == 0) {
-                        log_debug("Whoopsie! We found a boot ID %s but can't read its last entry. "
-                                  "The journal seems to be corrupted. Ignoring the boot ID.",
-                                  SD_ID128_TO_STRING(boot.id));
+                        log_debug("Whoopsie! We found a %s %s but can't read its last entry. "
+                                  "The journal seems to be corrupted. Ignoring the %s.",
+                                  log_id_type_to_string(type),
+                                  SD_ID128_TO_STRING(id.id),
+                                  log_id_type_to_string(type));
                         goto try_again;
                 }
 
-                r = sd_journal_get_realtime_usec(j, advance_older ? &boot.first_usec : &boot.last_usec);
+                r = sd_journal_get_realtime_usec(j, advance_older ? &id.first_usec : &id.last_usec);
                 if (r < 0)
                         return r;
 
                 sd_journal_flush_matches(j);
-                *ret = boot;
+                *ret = id;
                 return 1;
 
         try_again:
-                /* Save the bad boot ID. */
-                id_dup = newdup(sd_id128_t, &boot.id, 1);
+                /* Save the bad boot or invocation ID. */
+                id_dup = newdup(sd_id128_t, &id.id, 1);
                 if (!id_dup)
                         return -ENOMEM;
 
@@ -1882,13 +2135,9 @@ static int discover_next_boot(
                         return r;
 
                 /* Move to the previous position again. */
-                sd_journal_flush_matches(j);
-
-                if (!sd_id128_is_null(previous_boot_id)) {
-                        r = add_match_boot_id(j, previous_boot_id);
-                        if (r < 0)
-                                return r;
-                }
+                r = set_matches_for_discover_id(j, type, boot_id, unit, previous_id);
+                if (r < 0)
+                        return r;
 
                 if (advance_older)
                         r = sd_journal_seek_head(j);
@@ -1902,31 +2151,41 @@ static int discover_next_boot(
                         return r;
                 if (r == 0)
                         return log_debug_errno(SYNTHETIC_ERRNO(ENODATA),
-                                               "Whoopsie! Cannot seek to the last entry of boot %s.",
-                                               SD_ID128_TO_STRING(previous_boot_id));
+                                               "Whoopsie! Cannot seek to the last entry of %s %s.",
+                                               log_id_type_to_string(type),
+                                               SD_ID128_TO_STRING(previous_id));
 
                 sd_journal_flush_matches(j);
         }
 }
 
-int journal_find_boot(sd_journal *j, sd_id128_t boot_id, int offset, sd_id128_t *ret) {
+int journal_find_log_id(
+                sd_journal *j,
+                LogIdType type,
+                sd_id128_t boot_id,  /* optional, used when type == JOURNAL_{SYSTEM,USER}_UNIT_INVOCATION_ID */
+                const char *unit,    /* mandatory when type == JOURNAL_{SYSTEM,USER}_UNIT_INVOCATION_ID
+                                      * unless an invocation ID is explicitly specified without an offset. */
+                sd_id128_t previous_id,
+                int offset,
+                sd_id128_t *ret) {
+
         bool advance_older;
         int r, offset_start;
 
         assert(j);
+        assert(type >= 0 && type < _LOG_ID_TYPE_MAX);
+        assert(type == LOG_BOOT_ID || (!sd_id128_is_null(previous_id) && offset == 0) || unit);
         assert(ret);
 
-        /* Adjust for the asymmetry that offset 0 is the last (and current) boot, while 1 is considered the
-         * (chronological) first boot in the journal. */
+        /* Adjust for the asymmetry that offset 0 is the last (and current) boot or invocation, while 1 is
+         * considered the (chronological) first boot or invocation in the journal. */
         advance_older = offset <= 0;
 
-        sd_journal_flush_matches(j);
+        r = set_matches_for_discover_id(j, type, boot_id, unit, previous_id);
+        if (r < 0)
+                return r;
 
-        if (!sd_id128_is_null(boot_id)) {
-                r = add_match_boot_id(j, boot_id);
-                if (r < 0)
-                        return r;
-
+        if (!sd_id128_is_null(previous_id)) {
                 if (advance_older)
                         r = sd_journal_seek_head(j); /* seek to oldest */
                 else
@@ -1943,9 +2202,9 @@ int journal_find_boot(sd_journal *j, sd_id128_t boot_id, int offset, sd_id128_t 
                         return false;
                 }
                 if (offset == 0) {
-                        /* If boot ID is specified without an offset, then let's short cut the loop below. */
+                        /* If a non-null ID is specified without an offset, then let's short cut the loop below. */
                         sd_journal_flush_matches(j);
-                        *ret = boot_id;
+                        *ret = previous_id;
                         return true;
                 }
 
@@ -1961,14 +2220,14 @@ int journal_find_boot(sd_journal *j, sd_id128_t boot_id, int offset, sd_id128_t 
                 offset_start = advance_older ? 0 : 1;
         }
 
-        /* At this point the cursor is positioned at the newest/oldest entry of the reference boot ID if
-         * specified, or whole journal otherwise. The next invocation of _previous()/_next() will hence
-         * position us at the newest/oldest entry we have. */
+        /* At this point the cursor is positioned at the newest/oldest entry of the reference boot or
+         * invocation ID if specified, or whole journal otherwise. The next invocation of _previous()/_next()
+         * will hence position us at the newest/oldest entry we have. */
 
         for (int off = offset_start; ; off += advance_older ? -1 : 1) {
-                BootId boot;
+                LogId id;
 
-                r = discover_next_boot(j, boot_id, advance_older, &boot);
+                r = discover_next_id(j, type, boot_id, unit, previous_id, advance_older, &id);
                 if (r < 0)
                         return r;
                 if (r == 0) {
@@ -1976,30 +2235,36 @@ int journal_find_boot(sd_journal *j, sd_id128_t boot_id, int offset, sd_id128_t 
                         return false;
                 }
 
-                boot_id = boot.id;
-                log_debug("Found boot ID %s by offset %i", SD_ID128_TO_STRING(boot_id), off);
+                previous_id = id.id;
+                log_debug("Found %s %s by offset %i.",
+                          log_id_type_to_string(type), SD_ID128_TO_STRING(previous_id), off);
 
                 if (off == offset) {
-                        *ret = boot_id;
+                        *ret = previous_id;
                         return true;
                 }
         }
 }
 
-int journal_get_boots(
+int journal_get_log_ids(
                 sd_journal *j,
+                LogIdType type,
+                sd_id128_t boot_id,  /* optional, used when type == JOURNAL_{SYSTEM,USER}_UNIT_INVOCATION_ID */
+                const char *unit,    /* mandatory when type == JOURNAL_{SYSTEM,USER}_UNIT_INVOCATION_ID */
                 bool advance_older,
                 size_t max_ids,
-                BootId **ret_boots,
-                size_t *ret_n_boots) {
+                LogId **ret_ids,
+                size_t *ret_n_ids) {
 
-        _cleanup_free_ BootId *boots = NULL;
-        size_t n_boots = 0;
+        _cleanup_free_ LogId *ids = NULL;
+        size_t n_ids = 0;
         int r;
 
         assert(j);
-        assert(ret_boots);
-        assert(ret_n_boots);
+        assert(type >= 0 && type < _LOG_ID_TYPE_MAX);
+        assert(type == LOG_BOOT_ID || unit);
+        assert(ret_ids);
+        assert(ret_n_ids);
 
         sd_journal_flush_matches(j);
 
@@ -2015,33 +2280,42 @@ int journal_get_boots(
          * At this point the read pointer is positioned before the oldest entry in the whole journal. The
          * next invocation of _next() will hence position us at the oldest entry we have. */
 
-        sd_id128_t previous_boot_id = SD_ID128_NULL;
+        sd_id128_t previous_id = SD_ID128_NULL;
         for (;;) {
-                BootId boot;
+                LogId id;
 
-                if (n_boots >= max_ids)
+                if (n_ids >= max_ids)
                         break;
 
-                r = discover_next_boot(j, previous_boot_id, advance_older, &boot);
+                r = discover_next_id(j, type, boot_id, unit, previous_id, advance_older, &id);
                 if (r < 0)
                         return r;
                 if (r == 0)
                         break;
 
-                previous_boot_id = boot.id;
+                previous_id = id.id;
 
-                FOREACH_ARRAY(i, boots, n_boots)
-                        if (sd_id128_equal(i->id, boot.id))
-                                /* The boot id is already stored, something wrong with the journal files.
-                                 * Exiting as otherwise this problem would cause an infinite loop. */
+                FOREACH_ARRAY(i, ids, n_ids)
+                        if (sd_id128_equal(i->id, id.id))
+                                /* The boot or invocation ID is already stored, something wrong with the
+                                 * journal files. Exiting as otherwise this problem would cause an infinite
+                                 * loop. */
                                 goto finish;
 
-                if (!GREEDY_REALLOC_APPEND(boots, n_boots, &boot, 1))
+                if (!GREEDY_REALLOC_APPEND(ids, n_ids, &id, 1))
                         return -ENOMEM;
         }
 
  finish:
-        *ret_boots = TAKE_PTR(boots);
-        *ret_n_boots = n_boots;
-        return n_boots > 0;
+        *ret_ids = TAKE_PTR(ids);
+        *ret_n_ids = n_ids;
+        return n_ids > 0;
+}
+
+void journal_browse_prepare(void) {
+        /* Increase max number of open files if we can, we might needs this when browsing journal files,
+         * which might be split up into many files. */
+        (void) rlimit_nofile_bump(HIGH_RLIMIT_NOFILE);
+
+        sigbus_install();
 }

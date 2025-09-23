@@ -1,29 +1,28 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdlib.h>
 #include <sys/file.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "argv-util.h"
 #include "copy.h"
-#include "dirent-util.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "fs-util.h"
-#include "macro.h"
 #include "mkdir.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "random-util.h"
 #include "rm-rf.h"
 #include "stat-util.h"
-#include "stdio-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "sync-util.h"
 #include "tests.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
 #include "umask-util.h"
-#include "user-util.h"
 #include "virt.h"
 
 static const char *arg_test_dir = NULL;
@@ -185,8 +184,7 @@ TEST(touch_file) {
         r = touch_file(a, false, test_mtime, test_uid, test_gid, 0640);
         if (r < 0) {
                 assert_se(IN_SET(r, -EINVAL, -ENOSYS, -ENOTTY, -EPERM));
-                log_tests_skipped_errno(errno, "touch_file() not possible");
-                return;
+                return (void) log_tests_skipped_errno(errno, "touch_file() not possible");
         }
 
         assert_se(lstat(a, &st) >= 0);
@@ -368,8 +366,8 @@ TEST(chmod_and_chown) {
         struct stat st;
         const char *p;
 
-        if (geteuid() != 0)
-                return;
+        if (geteuid() != 0 || userns_has_single_user())
+                return (void) log_tests_skipped("not running as root or in userns with single user");
 
         BLOCK_WITH_UMASK(0000);
 
@@ -606,71 +604,81 @@ TEST(open_mkdir_at) {
 }
 
 TEST(openat_report_new) {
-        _cleanup_free_ char *j = NULL;
-        _cleanup_(rm_rf_physical_and_freep) char *d = NULL;
-        _cleanup_close_ int fd = -EBADF;
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF, fd = -EBADF;
         bool b;
 
-        assert_se(mkdtemp_malloc(NULL, &d) >= 0);
+        ASSERT_OK(tfd = mkdtemp_open(NULL, 0, &t));
 
-        j = path_join(d, "test");
-        assert_se(j);
-
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(b);
+        ASSERT_TRUE(b);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(!b);
+        ASSERT_FALSE(b);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(!b);
+        ASSERT_FALSE(b);
 
-        assert_se(unlink(j) >= 0);
+        ASSERT_OK_ERRNO(unlinkat(tfd, "test", 0));
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(b);
+        ASSERT_TRUE(b);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(!b);
+        ASSERT_FALSE(b);
 
-        assert_se(unlink(j) >= 0);
+        ASSERT_OK_ERRNO(unlinkat(tfd, "test", 0));
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, NULL);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, NULL);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(!b);
+        ASSERT_FALSE(b);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(!b);
+        ASSERT_FALSE(b);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT|O_EXCL, 0666, &b);
-        assert_se(fd == -EEXIST);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT|O_EXCL, 0666, &b);
+        ASSERT_ERROR(fd, EEXIST);
 
-        assert_se(unlink(j) >= 0);
+        ASSERT_OK_ERRNO(unlinkat(tfd, "test", 0));
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR, 0666, &b);
-        assert_se(fd == -ENOENT);
+        fd = openat_report_new(tfd, "test", O_RDWR, 0666, &b);
+        ASSERT_ERROR(fd, ENOENT);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT|O_EXCL, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT|O_EXCL, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(b);
+        ASSERT_TRUE(b);
+
+        ASSERT_OK_ERRNO(symlinkat("target", tfd, "link"));
+        fd = openat_report_new(tfd, "link", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_ERROR(fd, EEXIST);
+
+        fd = openat_report_new(tfd, "target", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
+        fd = safe_close(fd);
+        ASSERT_TRUE(b);
+
+        fd = openat_report_new(tfd, "link", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
+        fd = safe_close(fd);
+        ASSERT_FALSE(b);
 }
 
 TEST(xopenat_full) {
@@ -701,6 +709,34 @@ TEST(xopenat_full) {
 
         assert_se((fd = xopenat_full(tfd, "def", O_PATH|O_CLOEXEC, 0, 0)) >= 0);
         assert_se((fd2 = xopenat_full(fd, "", O_RDWR|O_CLOEXEC, 0, 0644)) >= 0);
+}
+
+TEST(xopenat_regular) {
+
+        _cleanup_close_ int fd = -EBADF;
+
+        assert_se(xopenat_full(AT_FDCWD, "/dev/null", O_RDWR|O_CLOEXEC, XO_REGULAR, 0) == -EBADFD);
+        assert_se(xopenat_full(AT_FDCWD, "/proc", O_RDONLY|O_CLOEXEC, XO_REGULAR, 0) == -EISDIR);
+        assert_se(xopenat_full(AT_FDCWD, "/proc/self", O_RDONLY|O_CLOEXEC, XO_REGULAR, 0) == -EISDIR);
+        assert_se(xopenat_full(AT_FDCWD, "/proc/self", O_RDONLY|O_CLOEXEC|O_NOFOLLOW, XO_REGULAR, 0) == -ELOOP);
+
+        fd = xopenat_full(AT_FDCWD, "/proc/mounts", O_RDONLY|O_CLOEXEC, XO_REGULAR, 0);
+        assert_se(fd >= 0);
+        fd = safe_close(fd);
+
+        assert_se(xopenat_full(AT_FDCWD, "/proc/mounts", O_RDONLY|O_CLOEXEC|O_NOFOLLOW, XO_REGULAR, 0) == -ELOOP);
+
+        fd = xopenat_full(AT_FDCWD, "/proc/mounts", O_RDONLY|O_CLOEXEC|O_PATH, XO_REGULAR, 0);
+        assert_se(fd >= 0);
+        fd = safe_close(fd);
+
+        fd = xopenat_full(AT_FDCWD, "/tmp/xopenat-regular-test", O_RDWR|O_CLOEXEC|O_CREAT, XO_REGULAR, 0600);
+        assert_se(fd >= 0);
+        fd = safe_close(fd);
+
+        assert_se(xopenat_full(AT_FDCWD, "/tmp/xopenat-regular-test", O_RDWR|O_CLOEXEC|O_CREAT|O_EXCL, XO_REGULAR, 0600) == -EEXIST);
+
+        assert_se(unlink("/tmp/xopenat-regular-test") >= 0);
 }
 
 TEST(xopenat_lock_full) {

@@ -1,18 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <inttypes.h>
 #include <net/ethernet.h>
-#include <netinet/icmp6.h>
-#include <netinet/in.h>
 #include <netinet/ip6.h>
-#include <sys/uio.h>
 
-#include "sd-ndisc-protocol.h"
+#include "sd-dns-resolver.h"
 
-#include "icmp6-packet.h"
-#include "macro.h"
-#include "set.h"
 #include "time-util.h"
 
 typedef struct sd_ndisc_raw {
@@ -66,6 +59,12 @@ typedef struct sd_ndisc_prefix64 {
         usec_t valid_until;
 } sd_ndisc_prefix64;
 
+typedef struct sd_ndisc_dnr {
+        sd_dns_resolver *resolver;
+        usec_t lifetime;
+        usec_t valid_until;
+} sd_ndisc_dnr;
+
 typedef struct sd_ndisc_option {
         uint8_t type;
         size_t offset;
@@ -83,6 +82,7 @@ typedef struct sd_ndisc_option {
                 sd_ndisc_dnssl dnssl;           /* SD_NDISC_OPTION_DNSSL */
                 char *captive_portal;           /* SD_NDISC_OPTION_CAPTIVE_PORTAL */
                 sd_ndisc_prefix64 prefix64;     /* SD_NDISC_OPTION_PREF64 */
+                sd_ndisc_dnr encrypted_dns;     /* SD_NDISC_OPTION_ENCRYPTED_DNS */
         };
 } sd_ndisc_option;
 
@@ -123,25 +123,15 @@ int ndisc_option_parse(
 
 int ndisc_parse_options(ICMP6Packet *p, Set **ret_options);
 
-static inline sd_ndisc_option* ndisc_option_get(Set *options, const sd_ndisc_option *p) {
-        return set_get(options, ASSERT_PTR(p));
-}
-static inline sd_ndisc_option* ndisc_option_get_by_type(Set *options, uint8_t type) {
-        return ndisc_option_get(options, &(const sd_ndisc_option) { .type = type });
-}
+sd_ndisc_option* ndisc_option_get(Set *options, const sd_ndisc_option *p);
+sd_ndisc_option* ndisc_option_get_by_type(Set *options, uint8_t type);
 int ndisc_option_get_mac(Set *options, uint8_t type, struct ether_addr *ret);
 
-static inline void ndisc_option_remove(Set *options, const sd_ndisc_option *p) {
-        ndisc_option_free(set_remove(options, ASSERT_PTR(p)));
-}
+void ndisc_option_remove(Set *options, const sd_ndisc_option *p);
 static inline void ndisc_option_remove_by_type(Set *options, uint8_t type) {
         ndisc_option_remove(options, &(const sd_ndisc_option) { .type = type });
 }
 
-int ndisc_option_set_raw(
-                Set **options,
-                size_t length,
-                const uint8_t *bytes);
 int ndisc_option_add_link_layer_address(
                 Set **options,
                 uint8_t type,
@@ -325,6 +315,28 @@ static inline int ndisc_option_set_prefix64(
                 usec_t lifetime,
                 usec_t valid_until) {
         return ndisc_option_add_prefix64_internal(options, 0, prefixlen, prefix, lifetime, valid_until);
+}
+
+int ndisc_option_add_encrypted_dns_internal(
+                Set **options,
+                size_t offset,
+                sd_dns_resolver *res,
+                usec_t lifetime,
+                usec_t valid_until);
+static inline int ndisc_option_add_encrypted_dns(
+                Set **options,
+                size_t offset,
+                sd_dns_resolver *res,
+                usec_t lifetime) {
+        return ndisc_option_add_encrypted_dns_internal(options, offset, res, lifetime, USEC_INFINITY);
+}
+static inline int ndisc_option_set_encrypted_dns(
+                Set **options,
+                size_t offset,
+                sd_dns_resolver *res,
+                usec_t lifetime,
+                usec_t valid_until) {
+        return ndisc_option_add_encrypted_dns_internal(options, 0, res, lifetime, valid_until);
 }
 
 int ndisc_send(int fd, const struct in6_addr *dst, const struct icmp6_hdr *hdr, Set *options, usec_t timestamp);

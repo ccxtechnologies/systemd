@@ -1,39 +1,50 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
+#include <linux/if_tun.h>
+#include <linux/magic.h>
 #include <linux/nsfs.h>
 #include <linux/veth.h>
+#include <net/if.h>
+#include <poll.h>
+#include <sched.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
+#include <unistd.h>
+#include <utmpx.h>
 
 #include "sd-daemon.h"
+#include "sd-event.h"
 #include "sd-netlink.h"
+#include "sd-varlink.h"
 
+#include "argv-util.h"
+#include "bus-polkit.h"
 #include "env-util.h"
+#include "errno-util.h"
+#include "ether-addr-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "fs-util.h"
-#include "group-record.h"
+#include "format-util.h"
+#include "hashmap.h"
 #include "io-util.h"
-#include "lock-util.h"
+#include "json-util.h"
 #include "main-func.h"
-#include "missing_magic.h"
-#include "missing_mount.h"
-#include "missing_syscall.h"
-#include "mount-util.h"
 #include "mountpoint-util.h"
 #include "namespace-util.h"
 #include "netlink-util.h"
+#include "pidref.h"
 #include "process-util.h"
 #include "random-util.h"
+#include "siphash24.h"
 #include "socket-util.h"
 #include "stat-util.h"
+#include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
 #include "uid-classification.h"
 #include "uid-range.h"
-#include "user-record-nss.h"
 #include "user-record.h"
 #include "user-util.h"
 #include "userdb.h"
@@ -41,14 +52,18 @@
 #include "userns-restrict.h"
 #include "varlink-io.systemd.NamespaceResource.h"
 #include "varlink-io.systemd.UserDatabase.h"
-#include "varlink.h"
+#include "varlink-util.h"
 
 #define ITERATIONS_MAX 64U
 #define RUNTIME_MAX_USEC (5 * USEC_PER_MINUTE)
 #define PRESSURE_SLEEP_TIME_USEC (50 * USEC_PER_MSEC)
-#define CONNECTION_IDLE_USEC (15 * USEC_PER_SEC)
 #define LISTEN_IDLE_USEC (90 * USEC_PER_SEC)
 #define USERNS_PER_UID 256
+
+typedef struct Context {
+        Hashmap *polkit_registry;
+        struct userns_restrict_bpf *bpf;
+} Context;
 
 typedef struct LookupParameters {
         const char *user_name;
@@ -60,7 +75,7 @@ typedef struct LookupParameters {
         const char *service;
 } LookupParameters;
 
-static int build_user_json(UserNamespaceInfo *userns_info, uid_t offset, JsonVariant **ret) {
+static int build_user_json(UserNamespaceInfo *userns_info, uid_t offset, sd_json_variant **ret) {
         _cleanup_free_ char *name = NULL, *realname = NULL;
         UserDisposition disposition;
         int r;
@@ -81,29 +96,30 @@ static int build_user_json(UserNamespaceInfo *userns_info, uid_t offset, JsonVar
         if (r < 0)
                 return -ENOMEM;
 
-        return json_build(ret, JSON_BUILD_OBJECT(
-                                          JSON_BUILD_PAIR("userName", JSON_BUILD_STRING(name)),
-                                          JSON_BUILD_PAIR("uid", JSON_BUILD_UNSIGNED(userns_info->start + offset)),
-                                          JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(GID_NOBODY)),
-                                          JSON_BUILD_PAIR("realName", JSON_BUILD_STRING(realname)),
-                                          JSON_BUILD_PAIR("homeDirectory", JSON_BUILD_CONST_STRING("/")),
-                                          JSON_BUILD_PAIR("shell", JSON_BUILD_STRING(NOLOGIN)),
-                                          JSON_BUILD_PAIR("locked", JSON_BUILD_BOOLEAN(true)),
-                                          JSON_BUILD_PAIR("service", JSON_BUILD_CONST_STRING("io.systemd.NamespaceResource")),
-                                          JSON_BUILD_PAIR("disposition", JSON_BUILD_STRING(user_disposition_to_string(disposition)))));
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR("userName", SD_JSON_BUILD_STRING(name)),
+                        SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(userns_info->start_uid + offset)),
+                        SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(GID_NOBODY)),
+                        SD_JSON_BUILD_PAIR("realName", SD_JSON_BUILD_STRING(realname)),
+                        SD_JSON_BUILD_PAIR("homeDirectory", JSON_BUILD_CONST_STRING("/")),
+                        SD_JSON_BUILD_PAIR("shell", SD_JSON_BUILD_STRING(NOLOGIN)),
+                        SD_JSON_BUILD_PAIR("locked", SD_JSON_BUILD_BOOLEAN(true)),
+                        SD_JSON_BUILD_PAIR("service", JSON_BUILD_CONST_STRING("io.systemd.NamespaceResource")),
+                        SD_JSON_BUILD_PAIR("disposition", SD_JSON_BUILD_STRING(user_disposition_to_string(disposition))));
 }
 
-static int vl_method_get_user_record(Varlink *link, JsonVariant *parameters, VarlinkMethodFlags flags, void *userdata) {
+static int vl_method_get_user_record(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
 
-        static const JsonDispatch dispatch_table[] = {
-                { "uid",      JSON_VARIANT_UNSIGNED, json_dispatch_uid_gid,      offsetof(LookupParameters, uid),       0 },
-                { "userName", JSON_VARIANT_STRING,   json_dispatch_const_string, offsetof(LookupParameters, user_name), 0 },
-                { "service",  JSON_VARIANT_STRING,   json_dispatch_const_string, offsetof(LookupParameters, service),   0 },
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "uid",      _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uid_gid,            offsetof(LookupParameters, uid),       0             },
+                { "userName", SD_JSON_VARIANT_STRING,        json_dispatch_const_user_group_name, offsetof(LookupParameters, user_name), SD_JSON_RELAX },
+                { "service",  SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string,       offsetof(LookupParameters, service),   0             },
                 {}
         };
 
         _cleanup_(userns_info_freep) UserNamespaceInfo *userns_info = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         LookupParameters p = {
                 .uid = UID_INVALID,
         };
@@ -112,12 +128,12 @@ static int vl_method_get_user_record(Varlink *link, JsonVariant *parameters, Var
 
         assert(parameters);
 
-        r = varlink_dispatch(link, parameters, dispatch_table, &p);
+        r = sd_varlink_dispatch(link, parameters, dispatch_table, &p);
         if (r != 0)
                 return r;
 
         if (!streq_ptr(p.service, "io.systemd.NamespaceResource"))
-                return varlink_error(link, "io.systemd.UserDatabase.BadService", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.BadService", NULL);
 
         if (p.user_name) {
                 _cleanup_free_ char *n = NULL;
@@ -139,7 +155,7 @@ static int vl_method_get_user_record(Varlink *link, JsonVariant *parameters, Var
                         return log_oom();
 
                 r = userns_registry_load_by_name(
-                                /* registry_fd= */ -EBADF,
+                                /* dir_fd= */ -EBADF,
                                 n,
                                 &userns_info);
                 if (r == -ENOENT)
@@ -150,8 +166,8 @@ static int vl_method_get_user_record(Varlink *link, JsonVariant *parameters, Var
                 if (offset >= userns_info->size) /* Outside of range? */
                         goto not_found;
 
-                if (uid_is_valid(p.uid) && p.uid != userns_info->start + offset)
-                        return varlink_error(link, "io.systemd.UserDatabase.ConflictingRecordFound", NULL);
+                if (uid_is_valid(p.uid) && p.uid != userns_info->start_uid + offset)
+                        return sd_varlink_error(link, "io.systemd.UserDatabase.ConflictingRecordFound", NULL);
 
         } else if (uid_is_valid(p.uid)) {
                 uid_t start, uidmask;
@@ -167,7 +183,7 @@ static int vl_method_get_user_record(Varlink *link, JsonVariant *parameters, Var
                 offset = p.uid - start;
 
                 r = userns_registry_load_by_start_uid(
-                                /* registry_fd= */ -EBADF,
+                                /* dir_fd= */ -EBADF,
                                 start,
                                 &userns_info);
                 if (r == -ENOENT)
@@ -178,19 +194,19 @@ static int vl_method_get_user_record(Varlink *link, JsonVariant *parameters, Var
                 if (offset >= userns_info->size) /* Outside of range? */
                         goto not_found;
         } else
-                return varlink_error(link, "io.systemd.UserDatabase.EnumerationNotSupported", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.EnumerationNotSupported", NULL);
 
         r = build_user_json(userns_info, offset, &v);
         if (r < 0)
                 return r;
 
-        return varlink_replyb(link, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("record", JSON_BUILD_VARIANT(v))));
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR("record", SD_JSON_BUILD_VARIANT(v)));
 
 not_found:
-        return varlink_error(link, "io.systemd.UserDatabase.NoRecordFound", NULL);
+        return sd_varlink_error(link, "io.systemd.UserDatabase.NoRecordFound", NULL);
 }
 
-static int build_group_json(UserNamespaceInfo *userns_info, gid_t offset, JsonVariant **ret) {
+static int build_group_json(UserNamespaceInfo *userns_info, gid_t offset, sd_json_variant **ret) {
         _cleanup_free_ char *name = NULL, *description = NULL;
         UserDisposition disposition;
         int r;
@@ -211,25 +227,26 @@ static int build_group_json(UserNamespaceInfo *userns_info, gid_t offset, JsonVa
         if (r < 0)
                 return -ENOMEM;
 
-        return json_build(ret, JSON_BUILD_OBJECT(
-                                          JSON_BUILD_PAIR("groupName", JSON_BUILD_STRING(name)),
-                                          JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(userns_info->start + offset)),
-                                          JSON_BUILD_PAIR("description", JSON_BUILD_STRING(description)),
-                                          JSON_BUILD_PAIR("service", JSON_BUILD_CONST_STRING("io.systemd.NamespaceResource")),
-                                          JSON_BUILD_PAIR("disposition", JSON_BUILD_STRING(user_disposition_to_string(disposition)))));
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR("groupName", SD_JSON_BUILD_STRING(name)),
+                        SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(userns_info->start_gid + offset)),
+                        SD_JSON_BUILD_PAIR("description", SD_JSON_BUILD_STRING(description)),
+                        SD_JSON_BUILD_PAIR("service", JSON_BUILD_CONST_STRING("io.systemd.NamespaceResource")),
+                        SD_JSON_BUILD_PAIR("disposition", SD_JSON_BUILD_STRING(user_disposition_to_string(disposition))));
 }
 
-static int vl_method_get_group_record(Varlink *link, JsonVariant *parameters, VarlinkMethodFlags flags, void *userdata) {
+static int vl_method_get_group_record(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
 
-        static const JsonDispatch dispatch_table[] = {
-                { "gid",       JSON_VARIANT_UNSIGNED, json_dispatch_uid_gid,      offsetof(LookupParameters, gid),        0 },
-                { "groupName", JSON_VARIANT_STRING,   json_dispatch_const_string, offsetof(LookupParameters, group_name), 0 },
-                { "service",   JSON_VARIANT_STRING,   json_dispatch_const_string, offsetof(LookupParameters, service),    0 },
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "gid",       _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uid_gid,            offsetof(LookupParameters, gid),        0             },
+                { "groupName", SD_JSON_VARIANT_STRING,        json_dispatch_const_user_group_name, offsetof(LookupParameters, group_name), SD_JSON_RELAX },
+                { "service",   SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string,       offsetof(LookupParameters, service),    0             },
                 {}
         };
 
         _cleanup_(userns_info_freep) UserNamespaceInfo *userns_info = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         LookupParameters p = {
                 .gid = GID_INVALID,
         };
@@ -238,12 +255,12 @@ static int vl_method_get_group_record(Varlink *link, JsonVariant *parameters, Va
 
         assert(parameters);
 
-        r = varlink_dispatch(link, parameters, dispatch_table, &p);
+        r = sd_varlink_dispatch(link, parameters, dispatch_table, &p);
         if (r != 0)
                 return r;
 
         if (!streq_ptr(p.service, "io.systemd.NamespaceResource"))
-                return varlink_error(link, "io.systemd.UserDatabase.BadService", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.BadService", NULL);
 
         if (p.group_name) {
                 _cleanup_free_ char *n = NULL;
@@ -265,7 +282,7 @@ static int vl_method_get_group_record(Varlink *link, JsonVariant *parameters, Va
                         return log_oom();
 
                 r = userns_registry_load_by_name(
-                                /* registry_fd= */ -EBADF,
+                                /* dir_fd= */ -EBADF,
                                 n,
                                 &userns_info);
                 if (r == -ENOENT)
@@ -276,8 +293,8 @@ static int vl_method_get_group_record(Varlink *link, JsonVariant *parameters, Va
                 if (offset >= userns_info->size) /* Outside of range? */
                         goto not_found;
 
-                if (gid_is_valid(p.gid) && p.uid != userns_info->start + offset)
-                        return varlink_error(link, "io.systemd.UserDatabase.ConflictingRecordFound", NULL);
+                if (gid_is_valid(p.gid) && p.gid != userns_info->start_gid + offset)
+                        return sd_varlink_error(link, "io.systemd.UserDatabase.ConflictingRecordFound", NULL);
 
         } else if (gid_is_valid(p.gid)) {
                 gid_t start, gidmask;
@@ -292,9 +309,9 @@ static int vl_method_get_group_record(Varlink *link, JsonVariant *parameters, Va
                 start = p.gid & gidmask;
                 offset = p.gid - start;
 
-                r = userns_registry_load_by_start_uid(
-                                /* registry_fd= */ -EBADF,
-                                (uid_t) start,
+                r = userns_registry_load_by_start_gid(
+                                /* dir_fd= */ -EBADF,
+                                start,
                                 &userns_info);
                 if (r == -ENOENT)
                         goto not_found;
@@ -304,23 +321,23 @@ static int vl_method_get_group_record(Varlink *link, JsonVariant *parameters, Va
                 if (offset >= userns_info->size) /* Outside of range? */
                         goto not_found;
         } else
-                return varlink_error(link, "io.systemd.UserDatabase.EnumerationNotSupported", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.EnumerationNotSupported", NULL);
 
         r = build_group_json(userns_info, offset, &v);
         if (r < 0)
                 return r;
 
-        return varlink_replyb(link, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("record", JSON_BUILD_VARIANT(v))));
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR("record", SD_JSON_BUILD_VARIANT(v)));
 
 not_found:
-        return varlink_error(link, "io.systemd.UserDatabase.NoRecordFound", NULL);
+        return sd_varlink_error(link, "io.systemd.UserDatabase.NoRecordFound", NULL);
 }
 
-static int vl_method_get_memberships(Varlink *link, JsonVariant *parameters, VarlinkMethodFlags flags, void *userdata) {
-        static const JsonDispatch dispatch_table[] = {
-                { "userName",  JSON_VARIANT_STRING, json_dispatch_const_string, offsetof(LookupParameters, user_name),  0 },
-                { "groupName", JSON_VARIANT_STRING, json_dispatch_const_string, offsetof(LookupParameters, group_name), 0 },
-                { "service",   JSON_VARIANT_STRING, json_dispatch_const_string, offsetof(LookupParameters, service),    0 },
+static int vl_method_get_memberships(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "userName",  SD_JSON_VARIANT_STRING, json_dispatch_const_user_group_name, offsetof(LookupParameters, user_name),  SD_JSON_RELAX },
+                { "groupName", SD_JSON_VARIANT_STRING, json_dispatch_const_user_group_name, offsetof(LookupParameters, group_name), SD_JSON_RELAX },
+                { "service",   SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string,       offsetof(LookupParameters, service),    0             },
                 {}
         };
 
@@ -329,15 +346,15 @@ static int vl_method_get_memberships(Varlink *link, JsonVariant *parameters, Var
 
         assert(parameters);
 
-        r = varlink_dispatch(link, parameters, dispatch_table, &p);
+        r = sd_varlink_dispatch(link, parameters, dispatch_table, &p);
         if (r != 0)
                 return r;
 
         if (!streq_ptr(p.service, "io.systemd.NamespaceResource"))
-                return varlink_error(link, "io.systemd.UserDatabase.BadService", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.BadService", NULL);
 
         /* We don't support auxiliary groups for namespace allocations */
-        return varlink_error(link, "io.systemd.UserDatabase.NoRecordFound", NULL);
+        return sd_varlink_error(link, "io.systemd.UserDatabase.NoRecordFound", NULL);
 }
 
 static int uid_is_available(
@@ -356,13 +373,19 @@ static int uid_is_available(
         if (r > 0)
                 return false;
 
-        r = userdb_by_uid(candidate, USERDB_AVOID_MULTIPLEXER, NULL);
+        r = userns_registry_gid_exists(registry_dir_fd, (gid_t) candidate);
+        if (r < 0)
+                return r;
+        if (r > 0)
+                return false;
+
+        r = userdb_by_uid(candidate, /* match= */ NULL, USERDB_AVOID_MULTIPLEXER, /* ret= */ NULL);
         if (r >= 0)
                 return false;
         if (r != -ESRCH)
                 return r;
 
-        r = groupdb_by_gid(candidate, USERDB_AVOID_MULTIPLEXER, NULL);
+        r = groupdb_by_gid(candidate, /* match= */ NULL, USERDB_AVOID_MULTIPLEXER, /* ret= */ NULL);
         if (r >= 0)
                 return false;
         if (r != -ESRCH)
@@ -393,13 +416,13 @@ static int name_is_available(
         if (!user_name)
                 return -ENOMEM;
 
-        r = userdb_by_name(user_name, USERDB_AVOID_MULTIPLEXER, NULL);
+        r = userdb_by_name(user_name, /* match= */ NULL, USERDB_AVOID_MULTIPLEXER, /* ret= */ NULL);
         if (r >= 0)
                 return false;
         if (r != -ESRCH)
                 return r;
 
-        r = groupdb_by_name(user_name, USERDB_AVOID_MULTIPLEXER, NULL);
+        r = groupdb_by_name(user_name, /* match= */ NULL, USERDB_AVOID_MULTIPLEXER, /* ret= */ NULL);
         if (r >= 0)
                 return false;
         if (r != -ESRCH)
@@ -502,7 +525,8 @@ static int allocate_now(
                 if (r < 0)
                         return log_debug_errno(r, "Can't determine if UID range " UID_FMT " is available: %m", candidate);
                 if (r > 0) {
-                        info->start = candidate;
+                        info->start_uid = candidate;
+                        info->start_gid = (gid_t) candidate;
 
                         log_debug("Allocating UID range " UID_FMT "…" UID_FMT, candidate, candidate + info->size - 1);
 
@@ -524,10 +548,13 @@ static int write_userns(int usernsfd, const UserNamespaceInfo *userns_info) {
 
         assert(usernsfd >= 0);
         assert(userns_info);
-        assert(uid_is_valid(userns_info->target));
-        assert(uid_is_valid(userns_info->start));
+        assert(uid_is_valid(userns_info->target_uid));
+        assert(uid_is_valid(userns_info->start_uid));
+        assert(gid_is_valid(userns_info->target_gid));
+        assert(gid_is_valid(userns_info->start_gid));
         assert(userns_info->size > 0);
-        assert(userns_info->size <= UINT32_MAX - userns_info->start);
+        assert(userns_info->size <= UINT32_MAX - userns_info->start_uid);
+        assert(userns_info->size <= UINT32_MAX - userns_info->start_gid);
 
         efd = eventfd(0, EFD_CLOEXEC);
         if (efd < 0)
@@ -566,7 +593,7 @@ static int write_userns(int usernsfd, const UserNamespaceInfo *userns_info) {
         if (asprintf(&pmap, "/proc/" PID_FMT "/uid_map", pid) < 0)
                 return log_oom();
 
-        r = write_string_filef(pmap, 0, UID_FMT " " UID_FMT " " UID_FMT "\n", userns_info->target, userns_info->start, userns_info->size);
+        r = write_string_filef(pmap, 0, UID_FMT " " UID_FMT " %" PRIu32 "\n", userns_info->target_uid, userns_info->start_uid, userns_info->size);
         if (r < 0)
                 return log_error_errno(r, "Failed to write 'uid_map' file of user namespace: %m");
 
@@ -574,7 +601,7 @@ static int write_userns(int usernsfd, const UserNamespaceInfo *userns_info) {
         if (asprintf(&pmap, "/proc/" PID_FMT "/gid_map", pid) < 0)
                 return log_oom();
 
-        r = write_string_filef(pmap, 0, GID_FMT " " GID_FMT " " GID_FMT "\n", (gid_t) userns_info->target, (gid_t) userns_info->start, (gid_t) userns_info->size);
+        r = write_string_filef(pmap, 0, GID_FMT " " GID_FMT " %" PRIu32 "\n", userns_info->target_gid, userns_info->start_gid, userns_info->size);
         if (r < 0)
                 return log_error_errno(r, "Failed to write 'gid_map' file of user namespace: %m");
 
@@ -584,7 +611,7 @@ static int write_userns(int usernsfd, const UserNamespaceInfo *userns_info) {
         return 0;
 }
 
-static int test_userns_api_support(Varlink *link) {
+static int test_userns_api_support(sd_varlink *link) {
         int r;
 
         assert(link);
@@ -598,13 +625,60 @@ static int test_userns_api_support(Varlink *link) {
         if (r < 0)
                 return log_error_errno(r, "Failed to parse $NSRESOURCE_API: %m");
         if (r == 0)
-                return varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceInterfaceNotSupported", NULL);
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceInterfaceNotSupported", NULL);
 
         return 0;
 }
 
-static int validate_name(Varlink *link, const char *name, char **ret) {
-        _cleanup_free_ char *un = NULL;
+static char* hash_name(sd_varlink *link, const char *name) {
+        int r;
+
+        assert(link);
+        assert(name);
+
+        /* Make up a hashed name for this userns. We take the passed name, and hash it together with the
+         * connection cookie. This should make collisions unlikely but generation still deterministic (this
+         * matters because on polkit requests we might be called twice, and should generate the same string
+         * each time, to ensure the Polkit query looks the same) */
+
+        uint64_t cookie = 0;
+        r = socket_get_cookie(sd_varlink_get_fd(link), &cookie);
+        if (r < 0)
+                log_debug_errno(r, "Failed to determine connection cookie, ignoring: %m");
+
+        struct siphash h;
+        static sd_id128_t key = SD_ID128_MAKE(ed,3a,bb,01,3a,14,4b,b3,8a,63,a4,ad,ba,2d,c9,0a);
+        siphash24_init(&h, key.bytes);
+        siphash24_compress_typesafe(cookie, &h);
+        siphash24_compress_string(name, &h);
+
+        /* Make sure the hashed name fits into utmpx even if prefixed with "ns-", the peer's UID, "-", and
+         * suffixed by "-65535". */
+
+        assert_cc(STRLEN("ns-65535-") + 16 + STRLEN("-65535") < sizeof_field(struct utmpx, ut_user));
+
+        char *s = NULL;
+        if (asprintf(&s, "%016" PRIx64, siphash24_finalize(&h)) < 0)
+                return NULL;
+
+        return s;
+}
+
+static char *shorten_name(const char *name) {
+
+        /* Shorten the specified name, so that it works as a userns name */
+
+        char *n = strdup(name);
+        if (!n)
+                return NULL;
+
+        /* make sure the truncated name fits into utmpx even if prefixed with "ns-" and suffixed by "-65535" */
+        strshorten(n, sizeof_field(struct utmpx, ut_user) - STRLEN("ns-") - STRLEN("-65536") - 1);
+
+        return n;
+}
+
+static int validate_name(sd_varlink *link, const char *name, bool mangle, char **ret) {
         int r;
 
         assert(link);
@@ -612,45 +686,88 @@ static int validate_name(Varlink *link, const char *name, char **ret) {
         assert(ret);
 
         uid_t peer_uid;
-        r = varlink_get_peer_uid(link, &peer_uid);
+        r = sd_varlink_get_peer_uid(link, &peer_uid);
         if (r < 0)
                 return r;
 
+        _cleanup_free_ char *un = NULL;
         if (peer_uid == 0) {
-                if (!userns_name_is_valid(name))
-                        return varlink_error_invalid_parameter_name(link, "name");
+                /* If the client is root, we'll not prefix it, but we will make sure it's suitable for
+                 * inclusion in a user name */
+                if (userns_name_is_valid(name)) {
+                        un = strdup(name);
+                        if (!un)
+                                return -ENOMEM;
+                } else {
+                        if (!mangle)
+                                return sd_varlink_error_invalid_parameter_name(link, "name");
 
-                un = strdup(name);
-                if (!un)
-                        return -ENOMEM;
+                        un = shorten_name(name);
+                        if (!un)
+                                return -ENOMEM;
+
+                        /* Let's see if shortening was enough? (It might not be, for example because an empty
+                         * string was provided – which no truncation would make valid.) */
+                        if (!userns_name_is_valid(un)) {
+                                free(un);
+
+                                /* if not, make up a hashed name */
+                                un = hash_name(link, name);
+                                if (!un)
+                                        return -ENOMEM;
+                        }
+                }
         } else {
-                /* The the client is not root then prefix the name with the UID of the peer, so that they
-                 * live in separate namespaces and cannot steal each other's names. */
+                /* If the client is not root then prefix the name with the UID of the peer, so that they live
+                 * in separate namespaces and cannot interfere with each other's names. */
 
                 if (asprintf(&un, UID_FMT "-%s", peer_uid, name) < 0)
                         return -ENOMEM;
 
-                if (!userns_name_is_valid(un))
-                        return varlink_error_invalid_parameter_name(link, "name");
+                if (!userns_name_is_valid(un)) {
+                        if (!mangle)
+                                return sd_varlink_error_invalid_parameter_name(link, "name");
+
+                        _cleanup_free_ char *c = shorten_name(un);
+                        if (!c)
+                                return -ENOMEM;
+
+                        /* Let's see if shortening was enough? */
+                        if (userns_name_is_valid(c))
+                                free_and_replace(un, c);
+                        else  {
+                                free(c);
+                                c = hash_name(link, name);
+                                if (!c)
+                                        return -ENOMEM;
+
+                                un = mfree(un);
+                                if (asprintf(&un, UID_FMT "-%s", peer_uid, c) < 0)
+                                        return -ENOMEM;
+
+                                if (!userns_name_is_valid(un))
+                                        return sd_varlink_error_invalid_parameter_name(link, "name");
+                        }
+                }
         }
 
         *ret = TAKE_PTR(un);
         return 0;
 }
 
-static int validate_target_and_size(Varlink *link, unsigned target, unsigned size) {
+static int validate_target_and_size(sd_varlink *link, uid_t target, uint32_t size) {
         assert(link);
 
         if (!IN_SET(size, 1U, 0x10000))
-                return varlink_error_invalid_parameter_name(link, "size");
+                return sd_varlink_error_invalid_parameter_name(link, "size");
 
         if (!uid_is_valid(target) || target > UINT32_MAX - size)
-                return varlink_error_invalid_parameter_name(link, "target");
+                return sd_varlink_error_invalid_parameter_name(link, "target");
 
         return 0;
 }
 
-static int validate_userns(Varlink *link, int userns_fd) {
+static int validate_userns(sd_varlink *link, int userns_fd) {
         int r;
 
         assert(link);
@@ -661,21 +778,21 @@ static int validate_userns(Varlink *link, int userns_fd) {
                 return log_debug_errno(r, "User namespace file descriptor has unsafe flags set: %m");
 
         /* Validate this is actually a valid user namespace fd */
-        r = fd_is_ns(userns_fd, CLONE_NEWUSER);
+        r = fd_is_namespace(userns_fd, NAMESPACE_USER);
         if (r < 0)
                 return log_debug_errno(r, "Failed to check if user namespace fd is actually a user namespace: %m");
         if (r == 0)
-                return varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+                return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
 
         /* And refuse the thing if it is our own */
         r = is_our_namespace(userns_fd, NAMESPACE_USER);
         if (r < 0)
                 return log_debug_errno(r, "Failed to check if user namespace fd refers to our own user namespace: %m");
         if (r > 0)
-                return varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+                return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
 
         uid_t peer_uid;
-        r = varlink_get_peer_uid(link, &peer_uid);
+        r = sd_varlink_get_peer_uid(link, &peer_uid);
         if (r < 0)
                 return log_debug_errno(r, "Failed to acquire peer UID: %m");
 
@@ -686,13 +803,13 @@ static int validate_userns(Varlink *link, int userns_fd) {
                         return log_debug_errno(errno, "Failed to get owner UID of user namespace: %m");
 
                 if (owner_uid != peer_uid)
-                        return varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+                        return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
         }
 
         return 0;
 }
 
-static int validate_userns_is_empty(Varlink *link, int userns_fd) {
+static int validate_userns_is_empty(sd_varlink *link, int userns_fd) {
         int r;
 
         assert(link);
@@ -704,7 +821,7 @@ static int validate_userns_is_empty(Varlink *link, int userns_fd) {
                 return log_debug_errno(r, "Failed to read userns UID range: %m");
 
         if (!uid_range_is_empty(range))
-                return varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+                return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
 
         range = uid_range_free(range);
         r = uid_range_load_userns_by_fd(userns_fd, GID_RANGE_USERNS_OUTSIDE, &range);
@@ -712,35 +829,37 @@ static int validate_userns_is_empty(Varlink *link, int userns_fd) {
                 return log_debug_errno(r, "Failed to read userns GID range: %m");
 
         if (!uid_range_is_empty(range))
-                return varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+                return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
 
         return 0;
 }
 
 typedef struct AllocateParameters {
         const char *name;
-        unsigned size;
-        unsigned target;
+        uint32_t size;
+        uid_t target;
         unsigned userns_fd_idx;
+        bool mangle_name;
 } AllocateParameters;
 
-static int vl_method_allocate_user_range(Varlink *link, JsonVariant *parameters, VarlinkMethodFlags flags, void *userdata) {
+static int vl_method_allocate_user_range(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
 
-        static const JsonDispatch dispatch_table[] = {
-                { "name",                        JSON_VARIANT_STRING,        json_dispatch_const_string, offsetof(AllocateParameters, name),          JSON_MANDATORY },
-                { "size",                        _JSON_VARIANT_TYPE_INVALID, json_dispatch_uint,         offsetof(AllocateParameters, size),          JSON_MANDATORY },
-                { "target",                      _JSON_VARIANT_TYPE_INVALID, json_dispatch_uint,         offsetof(AllocateParameters, target),        0              },
-                { "userNamespaceFileDescriptor", _JSON_VARIANT_TYPE_INVALID, json_dispatch_uint,         offsetof(AllocateParameters, userns_fd_idx), JSON_MANDATORY },
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "name",                        SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string, offsetof(AllocateParameters, name),          SD_JSON_MANDATORY },
+                { "size",                        _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint32,       offsetof(AllocateParameters, size),          SD_JSON_MANDATORY },
+                { "target",                      _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uid_gid,      offsetof(AllocateParameters, target),        0                 },
+                { "userNamespaceFileDescriptor", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint,         offsetof(AllocateParameters, userns_fd_idx), SD_JSON_MANDATORY },
+                { "mangleName",                  SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool,      offsetof(AllocateParameters, mangle_name),   0                 },
                 {}
         };
 
-        struct userns_restrict_bpf **bpf = ASSERT_PTR(userdata);
         _cleanup_close_ int userns_fd = -EBADF, registry_dir_fd = -EBADF, lock_fd = -EBADF;
         _cleanup_free_ char *userns_name = NULL;
+        Context *c = ASSERT_PTR(userdata);
         uid_t peer_uid;
         struct stat userns_st;
         AllocateParameters p = {
-                .size = UINT_MAX,
+                .size = UINT32_MAX,
                 .userns_fd_idx = UINT_MAX,
         };
         int r;
@@ -752,11 +871,11 @@ static int vl_method_allocate_user_range(Varlink *link, JsonVariant *parameters,
         if (r != 0)
                 return r;
 
-        r = varlink_dispatch(link, parameters, dispatch_table, &p);
+        r = sd_varlink_dispatch(link, parameters, dispatch_table, &p);
         if (r != 0)
                 return r;
 
-        r = validate_name(link, p.name, &userns_name);
+        r = validate_name(link, p.name, p.mangle_name, &userns_name);
         if (r != 0)
                 return r;
 
@@ -764,7 +883,7 @@ static int vl_method_allocate_user_range(Varlink *link, JsonVariant *parameters,
         if (r != 0)
                 return r;
 
-        userns_fd = varlink_take_fd(link, p.userns_fd_idx);
+        userns_fd = sd_varlink_peek_dup_fd(link, p.userns_fd_idx);
         if (userns_fd < 0)
                 return log_debug_errno(userns_fd, "Failed to take user namespace fd from Varlink connection: %m");
 
@@ -779,12 +898,28 @@ static int vl_method_allocate_user_range(Varlink *link, JsonVariant *parameters,
         if (fstat(userns_fd, &userns_st) < 0)
                 return log_debug_errno(errno, "Failed to fstat() user namespace fd: %m");
 
-        r = varlink_get_peer_uid(link, &peer_uid);
+        r = sd_varlink_get_peer_uid(link, &peer_uid);
         if (r < 0)
                 return r;
 
-        if (!*bpf) {
-                r = userns_restrict_install(/* pin= */ true, bpf);
+        const char *polkit_details[] = {
+                "name", userns_name,
+                NULL,
+        };
+
+        r = varlink_verify_polkit_async_full(
+                        link,
+                        /* bus= */ NULL,
+                        "io.systemd.namespace-resource.allocate-user-namespace",
+                        polkit_details,
+                        /* good_user= */ UID_INVALID,
+                        POLKIT_DEFAULT_ALLOW, /* If no polkit is installed, allow unpriv userns namespace allocation */
+                        &c->polkit_registry);
+        if (r <= 0)
+                return r;
+
+        if (!c->bpf) {
+                r = userns_restrict_install(/* pin= */ true, &c->bpf);
                 if (r < 0)
                         return r;
         }
@@ -804,17 +939,18 @@ static int vl_method_allocate_user_range(Varlink *link, JsonVariant *parameters,
         userns_info->owner = peer_uid;
         userns_info->userns_inode = userns_st.st_ino;
         userns_info->size = p.size;
-        userns_info->target = p.target;
+        userns_info->target_uid = p.target;
+        userns_info->target_gid = (gid_t) p.target;
 
         r = allocate_now(registry_dir_fd, userns_info, &lock_fd);
         if (r == -EHOSTDOWN) /* The needed UID range is not delegated to us */
-                return varlink_error(link, "io.systemd.NamespaceResource.DynamicRangeUnavailable", NULL);
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.DynamicRangeUnavailable", NULL);
         if (r == -EBUSY)     /* All used up */
-                return varlink_error(link, "io.systemd.NamespaceResource.NoDynamicRange", NULL);
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.NoDynamicRange", NULL);
         if (r == -EDEADLK)
-                return varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceExists", NULL);
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceExists", NULL);
         if (r == -EEXIST)
-                return varlink_error(link, "io.systemd.NamespaceResource.NameExists", NULL);
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.NameExists", NULL);
         if (r < 0)
                 return r;
 
@@ -824,7 +960,7 @@ static int vl_method_allocate_user_range(Varlink *link, JsonVariant *parameters,
 
         /* Register the userns in the BPF map with an empty allowlist */
         r = userns_restrict_put_by_fd(
-                        *bpf,
+                        c->bpf,
                         userns_fd,
                         /* replace= */ true,
                         /* mount_fds= */ NULL,
@@ -851,7 +987,7 @@ static int vl_method_allocate_user_range(Varlink *link, JsonVariant *parameters,
         /* Note, we'll not return UID values from the host, since the child might not run in the same
          * user namespace as us. If they want to know the ranges they should read them off the userns fd, so
          * that they are translated into their PoV */
-        return varlink_replyb(link, JSON_BUILD_EMPTY_OBJECT);
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("name", userns_name));
 
 fail:
         /* Note: we don't have to clean-up the BPF maps in the error path: the bpf map type used will
@@ -860,7 +996,7 @@ fail:
         return r;
 }
 
-static int validate_userns_is_safe(Varlink *link, int userns_fd) {
+static int validate_userns_is_safe(sd_varlink *link, int userns_fd) {
         int r;
 
         assert(link);
@@ -872,7 +1008,7 @@ static int validate_userns_is_safe(Varlink *link, int userns_fd) {
         if (r < 0)
                 return log_debug_errno(r, "Failed to read userns UID range: %m");
         if (uid_range_is_empty(outside_range))
-                return varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+                return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
 
         /* Read the outside GID range and check it is the same as the UID range */
         _cleanup_(uid_range_freep) UIDRange *outside_range_gid = NULL;
@@ -880,7 +1016,7 @@ static int validate_userns_is_safe(Varlink *link, int userns_fd) {
         if (r < 0)
                 return log_debug_errno(r, "Failed to read userns GID range: %m");
         if (!uid_range_equal(outside_range, outside_range_gid))
-                return varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+                return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
 
         /* Read the inside UID range, and verify it matches the size of the outside UID range */
         _cleanup_(uid_range_freep) UIDRange *inside_range = NULL;
@@ -896,26 +1032,26 @@ static int validate_userns_is_safe(Varlink *link, int userns_fd) {
         if (r < 0)
                 return log_debug_errno(r, "Failed to read userns contents: %m");
         if (!uid_range_equal(inside_range, inside_range_gid))
-                return varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+                return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
 
         uid_t peer_uid;
-        r = varlink_get_peer_uid(link, &peer_uid);
+        r = sd_varlink_get_peer_uid(link, &peer_uid);
         if (r < 0)
                 return r;
 
         uid_t peer_gid;
-        r = varlink_get_peer_gid(link, &peer_gid);
+        r = sd_varlink_get_peer_gid(link, &peer_gid);
         if (r < 0)
                 return r;
 
         /* Insist that the first UID/GID in the range matches the client's UID/GID */
         if (outside_range->entries[0].start != peer_uid ||
             outside_range_gid->entries[0].start != peer_gid)
-                return varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+                return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
 
         /* If there are more than one UID in the range, then also insist that the first UID maps to root inside the userns */
         if (uid_range_size(outside_range) > 1 && inside_range->entries[0].start != 0)
-                return varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
+                return sd_varlink_error_invalid_parameter_name(link, "userNamespaceFileDescriptor");
 
         return 0;
 }
@@ -923,19 +1059,21 @@ static int validate_userns_is_safe(Varlink *link, int userns_fd) {
 typedef struct RegisterParameters {
         const char *name;
         unsigned userns_fd_idx;
+        bool mangle_name;
 } RegisterParameters;
 
-static int vl_method_register_user_namespace(Varlink *link, JsonVariant *parameters, VarlinkMethodFlags flags, void *userdata) {
+static int vl_method_register_user_namespace(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
 
-        static const JsonDispatch dispatch_table[] = {
-                { "name",                        JSON_VARIANT_STRING,        json_dispatch_const_string, offsetof(RegisterParameters, name),          JSON_MANDATORY },
-                { "userNamespaceFileDescriptor", _JSON_VARIANT_TYPE_INVALID, json_dispatch_uint,         offsetof(RegisterParameters, userns_fd_idx), JSON_MANDATORY },
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "name",                        SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string, offsetof(RegisterParameters, name),          SD_JSON_MANDATORY },
+                { "userNamespaceFileDescriptor", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint,         offsetof(RegisterParameters, userns_fd_idx), SD_JSON_MANDATORY },
+                { "mangleName",                  SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool,      offsetof(RegisterParameters, mangle_name),   0                 },
                 {}
         };
 
-        struct userns_restrict_bpf **bpf = ASSERT_PTR(userdata);
         _cleanup_close_ int userns_fd = -EBADF, registry_dir_fd = -EBADF;
         _cleanup_free_ char *userns_name = NULL;
+        Context *c = ASSERT_PTR(userdata);
         uid_t peer_uid;
         struct stat userns_st;
         RegisterParameters p = {
@@ -950,15 +1088,15 @@ static int vl_method_register_user_namespace(Varlink *link, JsonVariant *paramet
         if (r != 0)
                 return r;
 
-        r = varlink_dispatch(link, parameters, dispatch_table, &p);
+        r = sd_varlink_dispatch(link, parameters, dispatch_table, &p);
         if (r != 0)
                 return r;
 
-        r = validate_name(link, p.name, &userns_name);
+        r = validate_name(link, p.name, p.mangle_name, &userns_name);
         if (r != 0)
                 return r;
 
-        userns_fd = varlink_take_fd(link, p.userns_fd_idx);
+        userns_fd = sd_varlink_peek_dup_fd(link, p.userns_fd_idx);
         if (userns_fd < 0)
                 return userns_fd;
 
@@ -973,12 +1111,28 @@ static int vl_method_register_user_namespace(Varlink *link, JsonVariant *paramet
         if (fstat(userns_fd, &userns_st) < 0)
                 return log_debug_errno(errno, "Failed to fstat() user namespace fd: %m");
 
-        r = varlink_get_peer_uid(link, &peer_uid);
+        r = sd_varlink_get_peer_uid(link, &peer_uid);
         if (r < 0)
                 return r;
 
-        if (!*bpf) {
-                r = userns_restrict_install(/* pin= */ true, bpf);
+        const char *polkit_details[] = {
+                "name", userns_name,
+                NULL,
+        };
+
+        r = varlink_verify_polkit_async_full(
+                        link,
+                        /* bus= */ NULL,
+                        "io.systemd.namespace-resource.register-user-namespace",
+                        polkit_details,
+                        /* good_user= */ UID_INVALID,
+                        POLKIT_DEFAULT_ALLOW, /* If no polkit is installed, allow unpriv userns namespace registration */
+                        &c->polkit_registry);
+        if (r <= 0)
+                return r;
+
+        if (!c->bpf) {
+                r = userns_restrict_install(/* pin= */ true, &c->bpf);
                 if (r < 0)
                         return r;
         }
@@ -996,13 +1150,13 @@ static int vl_method_register_user_namespace(Varlink *link, JsonVariant *paramet
         if (r < 0)
                 return r;
         if (r > 0)
-                return varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceExists", NULL);
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceExists", NULL);
 
         r = name_is_available(registry_dir_fd, userns_name);
         if (r < 0)
                 return r;
         if (r == 0)
-                return varlink_error(link, "io.systemd.NamespaceResource.NameExists", NULL);
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.NameExists", NULL);
 
         _cleanup_(userns_info_freep) UserNamespaceInfo *userns_info = userns_info_new();
         if (!userns_info)
@@ -1021,7 +1175,7 @@ static int vl_method_register_user_namespace(Varlink *link, JsonVariant *paramet
 
         /* Register the userns in the BPF map with an empty allowlist */
         r = userns_restrict_put_by_fd(
-                        *bpf,
+                        c->bpf,
                         userns_fd,
                         /* replace= */ true,
                         /* mount_fds= */ NULL,
@@ -1039,7 +1193,7 @@ static int vl_method_register_user_namespace(Varlink *link, JsonVariant *paramet
         if (r < 0)
                 goto fail;
 
-        return varlink_replyb(link, JSON_BUILD_EMPTY_OBJECT);
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("name", userns_name));
 
 fail:
         userns_registry_remove(registry_dir_fd, userns_info);
@@ -1051,23 +1205,22 @@ typedef struct AddMountParameters {
         unsigned mount_fd_idx;
 } AddMountParameters;
 
-static int vl_method_add_mount_to_user_namespace(Varlink *link, JsonVariant *parameters, VarlinkMethodFlags flags, void *userdata) {
+static int vl_method_add_mount_to_user_namespace(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
 
-        static const JsonDispatch parameter_dispatch_table[] = {
-                { "userNamespaceFileDescriptor", _JSON_VARIANT_TYPE_INVALID, json_dispatch_uint, offsetof(AddMountParameters, userns_fd_idx), JSON_MANDATORY },
-                { "mountFileDescriptor",         _JSON_VARIANT_TYPE_INVALID, json_dispatch_uint, offsetof(AddMountParameters, mount_fd_idx),  JSON_MANDATORY },
+        static const sd_json_dispatch_field parameter_dispatch_table[] = {
+                { "userNamespaceFileDescriptor", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint, offsetof(AddMountParameters, userns_fd_idx), SD_JSON_MANDATORY },
+                { "mountFileDescriptor",         _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint, offsetof(AddMountParameters, mount_fd_idx),  SD_JSON_MANDATORY },
                 {}
         };
 
         _cleanup_close_ int userns_fd = -EBADF, mount_fd = -EBADF, registry_dir_fd = -EBADF;
-        struct userns_restrict_bpf **bpf = ASSERT_PTR(userdata);
+        Context *c = ASSERT_PTR(userdata);
         AddMountParameters p = {
                 .userns_fd_idx = UINT_MAX,
                 .mount_fd_idx = UINT_MAX,
         };
         int r, mnt_id = 0;
         struct stat userns_st;
-        uid_t peer_uid;
 
         assert(link);
         assert(parameters);
@@ -1077,17 +1230,15 @@ static int vl_method_add_mount_to_user_namespace(Varlink *link, JsonVariant *par
                 return r;
 
         /* Allowlisting arbitrary mounts is a privileged operation */
-        r = varlink_get_peer_uid(link, &peer_uid);
+        r = varlink_check_privileged_peer(link);
         if (r < 0)
                 return r;
-        if (peer_uid != 0)
-                return varlink_error(link, VARLINK_ERROR_PERMISSION_DENIED, NULL);
 
-        r = varlink_dispatch(link, parameters, parameter_dispatch_table, &p);
+        r = sd_varlink_dispatch(link, parameters, parameter_dispatch_table, &p);
         if (r != 0)
                 return r;
 
-        userns_fd = varlink_take_fd(link, p.userns_fd_idx);
+        userns_fd = sd_varlink_peek_dup_fd(link, p.userns_fd_idx);
         if (userns_fd < 0)
                 return userns_fd;
 
@@ -1098,7 +1249,7 @@ static int vl_method_add_mount_to_user_namespace(Varlink *link, JsonVariant *par
         if (fstat(userns_fd, &userns_st) < 0)
                 return -errno;
 
-        mount_fd = varlink_take_fd(link, p.mount_fd_idx);
+        mount_fd = sd_varlink_peek_dup_fd(link, p.mount_fd_idx);
         if (mount_fd < 0)
                 return mount_fd;
 
@@ -1112,6 +1263,17 @@ static int vl_method_add_mount_to_user_namespace(Varlink *link, JsonVariant *par
 
         r = path_get_mnt_id_at(mount_fd, NULL, &mnt_id);
         if (r < 0)
+                return r;
+
+        r = varlink_verify_polkit_async_full(
+                        link,
+                        /* bus= */ NULL,
+                        "io.systemd.namespace-resource.delegate-mount",
+                        /* details= */ NULL,
+                        /* good_user= */ UID_INVALID,
+                        POLKIT_DEFAULT_ALLOW, /* If no polkit is installed, allow delegation of mounts to registered userns */
+                        &c->polkit_registry);
+        if (r <= 0)
                 return r;
 
         registry_dir_fd = userns_registry_open_fd();
@@ -1129,12 +1291,12 @@ static int vl_method_add_mount_to_user_namespace(Varlink *link, JsonVariant *par
                         userns_st.st_ino,
                         &userns_info);
         if (r == -ENOENT)
-                return varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceNotRegistered", NULL);
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceNotRegistered", NULL);
         if (r < 0)
                 return r;
 
-        if (!*bpf) {
-                r = userns_restrict_install(/* pin= */ true, bpf);
+        if (!c->bpf) {
+                r = userns_restrict_install(/* pin= */ true, &c->bpf);
                 if (r < 0)
                         return r;
         }
@@ -1151,7 +1313,7 @@ static int vl_method_add_mount_to_user_namespace(Varlink *link, JsonVariant *par
 
         /* Add this mount to the user namespace's BPF map allowlist entry. */
         r = userns_restrict_put_by_fd(
-                        *bpf,
+                        c->bpf,
                         userns_fd,
                         /* replace= */ false,
                         &mount_fd,
@@ -1159,17 +1321,19 @@ static int vl_method_add_mount_to_user_namespace(Varlink *link, JsonVariant *par
         if (r < 0)
                 return r;
 
-        if (userns_info->size > 0)
-                log_debug("Granting access to mount %i to user namespace " INO_FMT " ('%s' @ UID " UID_FMT ")",
-                          mnt_id, userns_st.st_ino, userns_info->name, userns_info->start);
-        else
-                log_debug("Granting access to mount %i to user namespace " INO_FMT " ('%s')",
-                          mnt_id, userns_st.st_ino, userns_info->name);
+        if (DEBUG_LOGGING) {
+                if (userns_info->size > 0)
+                        log_debug("Granting access to mount %i to user namespace " INO_FMT " ('%s' @ UID " UID_FMT ")",
+                                  mnt_id, userns_st.st_ino, userns_info->name, userns_info->start_uid);
+                else
+                        log_debug("Granting access to mount %i to user namespace " INO_FMT " ('%s')",
+                                  mnt_id, userns_st.st_ino, userns_info->name);
+        }
 
-        return varlink_replyb(link, JSON_BUILD_EMPTY_OBJECT);
+        return sd_varlink_replyb(link, SD_JSON_BUILD_EMPTY_OBJECT);
 }
 
-static int validate_cgroup(Varlink *link, int fd, uint64_t *ret_cgroup_id) {
+static int validate_cgroup(sd_varlink *link, int fd, uint64_t *ret_cgroup_id) {
         int r;
 
         assert(link);
@@ -1188,7 +1352,7 @@ static int validate_cgroup(Varlink *link, int fd, uint64_t *ret_cgroup_id) {
         if (r < 0)
                 return log_debug_errno(r, "Failed to check if cgroup fd actually refers to cgroupfs: %m");
         if (r == 0)
-                return varlink_error_invalid_parameter_name(link, "controlGroupFileDescriptor");
+                return sd_varlink_error_invalid_parameter_name(link, "controlGroupFileDescriptor");
 
         r = cg_fd_get_cgroupid(fd, ret_cgroup_id);
         if (r < 0)
@@ -1202,10 +1366,10 @@ typedef struct AddCGroupParameters {
         unsigned cgroup_fd_idx;
 } AddCGroupParameters;
 
-static int vl_method_add_cgroup_to_user_namespace(Varlink *link, JsonVariant *parameters, VarlinkMethodFlags flags, void *userdata) {
-        static const JsonDispatch parameter_dispatch_table[] = {
-                { "userNamespaceFileDescriptor", _JSON_VARIANT_TYPE_INVALID, json_dispatch_uint, offsetof(AddCGroupParameters, userns_fd_idx), JSON_MANDATORY },
-                { "controlGroupFileDescriptor",  _JSON_VARIANT_TYPE_INVALID, json_dispatch_uint, offsetof(AddCGroupParameters, cgroup_fd_idx), JSON_MANDATORY },
+static int vl_method_add_cgroup_to_user_namespace(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field parameter_dispatch_table[] = {
+                { "userNamespaceFileDescriptor", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint, offsetof(AddCGroupParameters, userns_fd_idx), SD_JSON_MANDATORY },
+                { "controlGroupFileDescriptor",  _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint, offsetof(AddCGroupParameters, cgroup_fd_idx), SD_JSON_MANDATORY },
                 {}
         };
 
@@ -1215,6 +1379,7 @@ static int vl_method_add_cgroup_to_user_namespace(Varlink *link, JsonVariant *pa
                 .cgroup_fd_idx = UINT_MAX,
         };
         _cleanup_(userns_info_freep) UserNamespaceInfo *userns_info = NULL;
+        Context *c = ASSERT_PTR(userdata);
         struct stat userns_st, cgroup_st;
         uid_t peer_uid;
         int r;
@@ -1226,11 +1391,11 @@ static int vl_method_add_cgroup_to_user_namespace(Varlink *link, JsonVariant *pa
         if (r != 0)
                 return r;
 
-        r = varlink_dispatch(link, parameters, parameter_dispatch_table, &p);
+        r = sd_varlink_dispatch(link, parameters, parameter_dispatch_table, &p);
         if (r != 0)
                 return r;
 
-        userns_fd = varlink_take_fd(link, p.userns_fd_idx);
+        userns_fd = sd_varlink_peek_dup_fd(link, p.userns_fd_idx);
         if (userns_fd < 0)
                 return log_debug_errno(userns_fd, "Failed to take user namespace fd from Varlink connection: %m");
 
@@ -1241,7 +1406,7 @@ static int vl_method_add_cgroup_to_user_namespace(Varlink *link, JsonVariant *pa
         if (fstat(userns_fd, &userns_st) < 0)
                 return log_debug_errno(errno, "Failed to fstat() user namespace fd: %m");
 
-        cgroup_fd = varlink_take_fd(link, p.cgroup_fd_idx);
+        cgroup_fd = sd_varlink_peek_dup_fd(link, p.cgroup_fd_idx);
         if (cgroup_fd < 0)
                 return log_debug_errno(cgroup_fd, "Failed to take cgroup fd from Varlink connection: %m");
 
@@ -1252,6 +1417,17 @@ static int vl_method_add_cgroup_to_user_namespace(Varlink *link, JsonVariant *pa
 
         if (fstat(cgroup_fd, &cgroup_st) < 0)
                 return log_debug_errno(errno, "Failed to fstat() cgroup fd: %m");
+
+        r = varlink_verify_polkit_async_full(
+                        link,
+                        /* bus= */ NULL,
+                        "io.systemd.namespace-resource.delegate-cgroup",
+                        /* details= */ NULL,
+                        /* good_user= */ UID_INVALID,
+                        POLKIT_DEFAULT_ALLOW, /* If no polkit is installed, allow delegation of cgroups to registered userns */
+                        &c->polkit_registry);
+        if (r <= 0)
+                return r;
 
         registry_dir_fd = userns_registry_open_fd();
         if (registry_dir_fd < 0)
@@ -1267,29 +1443,29 @@ static int vl_method_add_cgroup_to_user_namespace(Varlink *link, JsonVariant *pa
                         userns_st.st_ino,
                         &userns_info);
         if (r == -ENOENT)
-                return varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceNotRegistered", NULL);
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceNotRegistered", NULL);
         if (r < 0)
                 return r;
 
         /* The user namespace must have a user assigned */
         if (userns_info->size == 0)
-                return varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceWithoutUserRange", NULL);
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceWithoutUserRange", NULL);
         if (userns_info_has_cgroup(userns_info, cgroup_id))
-                return varlink_error(link, "io.systemd.NamespaceResource.ControlGroupAlreadyAdded", NULL);
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.ControlGroupAlreadyAdded", NULL);
         if (userns_info->n_cgroups > USER_NAMESPACE_CGROUPS_DELEGATE_MAX)
-                return varlink_error(link, "io.systemd.NamespaceResource.TooManyControlGroups", NULL);
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.TooManyControlGroups", NULL);
 
         /* Registering a cgroup for this client is only allowed for the root or the owner of a userns */
-        r = varlink_get_peer_uid(link, &peer_uid);
+        r = sd_varlink_get_peer_uid(link, &peer_uid);
         if (r < 0)
                 return log_debug_errno(r, "Failed to get connection peer: %m");
         if (peer_uid != 0) {
                 if (peer_uid != userns_info->owner)
-                        return varlink_error(link, VARLINK_ERROR_PERMISSION_DENIED, NULL);
+                        return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, NULL);
 
                 /* The cgroup must be owned by the owner of the userns */
                 if (cgroup_st.st_uid != userns_info->owner)
-                        return varlink_error(link, VARLINK_ERROR_PERMISSION_DENIED, NULL);
+                        return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, NULL);
         }
 
         r = userns_info_add_cgroup(userns_info, cgroup_id);
@@ -1300,7 +1476,7 @@ static int vl_method_add_cgroup_to_user_namespace(Varlink *link, JsonVariant *pa
         if (r < 0)
                 return r;
 
-        if (fchown(cgroup_fd, userns_info->start, userns_info->start) < 0)
+        if (fchown(cgroup_fd, userns_info->start_uid, userns_info->start_gid) < 0)
                 return log_debug_errno(errno, "Failed to change ownership of cgroup: %m");
 
         if (fchmod(cgroup_fd, 0755) < 0)
@@ -1308,13 +1484,13 @@ static int vl_method_add_cgroup_to_user_namespace(Varlink *link, JsonVariant *pa
 
         FOREACH_STRING(attr, "cgroup.procs", "cgroup.subtree_control", "cgroup.threads") {
                 (void) fchmodat(cgroup_fd, attr, 0644, AT_SYMLINK_NOFOLLOW);
-                (void) fchownat(cgroup_fd, attr, userns_info->start, userns_info->start, AT_SYMLINK_NOFOLLOW);
+                (void) fchownat(cgroup_fd, attr, userns_info->start_uid, userns_info->start_gid, AT_SYMLINK_NOFOLLOW);
         }
 
         log_debug("Granting ownership to cgroup %" PRIu64 " to userns " INO_FMT " ('%s' @ UID " UID_FMT ")",
-                  cgroup_id, userns_st.st_ino, userns_info->name, userns_info->start);
+                  cgroup_id, userns_st.st_ino, userns_info->name, userns_info->start_uid);
 
-        return varlink_replyb(link, JSON_BUILD_EMPTY_OBJECT);
+        return sd_varlink_replyb(link, SD_JSON_BUILD_EMPTY_OBJECT);
 }
 
 static uint64_t hash_ifname_id(UserNamespaceInfo *userns_info, const char *ifname) {
@@ -1343,7 +1519,7 @@ static void hash_ether_addr(UserNamespaceInfo *userns_info, const char *ifname, 
         siphash24_compress_string(strempty(ifname), &state);
         siphash24_compress_byte(0, &state); /* separator */
         n = htole64(n); /* add the 'index' to the mix in an endianess-independent fashion */
-        siphash24_compress(&n, sizeof(n), &state);
+        siphash24_compress_typesafe(n, &state);
 
         h = htole64(siphash24_finalize(&state));
 
@@ -1376,7 +1552,7 @@ static int create_veth(
         _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
         r = sd_netlink_open(&rtnl);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to allocation netlink connection: %m");
 
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
         r = sd_rtnl_message_new_link(rtnl, &m, RTM_NEWLINK, 0);
@@ -1438,7 +1614,66 @@ static int create_veth(
         return 0;
 }
 
-static int validate_netns(Varlink *link, int userns_fd, int netns_fd) {
+static int create_tap(
+                int userns_fd,
+                const char *ifname_host,
+                char *const *altifname_host,
+                struct ether_addr *mac_host) {
+
+        int r;
+
+        assert(ifname_host);
+        assert(mac_host);
+
+        if (!ifname_valid(ifname_host))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid interface name: %s", ifname_host);
+
+        log_debug("Creating tap link on host %s (%s) with address %s",
+                  ifname_host, strna(altifname_host ? altifname_host[0] : NULL), ETHER_ADDR_TO_STR(mac_host));
+
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
+        if (altifname_host) {
+                r = sd_netlink_open(&rtnl);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to allocate netlink connection: %m");
+        }
+
+        uid_t uid;
+        r = userns_get_base_uid(userns_fd, &uid, /* ret_gid= */ NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get namespace base UID/GID: %m");
+
+        struct ifreq ifr = {
+                .ifr_flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR,
+        };
+
+        assert(strlen(ifname_host) < sizeof(ifr.ifr_name));
+        strcpy(ifr.ifr_name, ifname_host);
+
+        _cleanup_close_ int fd = open("/dev/net/tun", O_RDWR|O_CLOEXEC);
+        if (fd < 0) {
+                if (errno == ENOENT) /* Turn ENOENT → EOPNOTSUPP */
+                        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Network tap device node /dev/net/tun not found, cannot create network interface.");
+
+                return log_error_errno(errno, "Failed to open %s: %m", "/dev/net/tun");
+        }
+
+        if (ioctl(fd, TUNSETIFF, &ifr) < 0)
+                return log_error_errno(errno, "TUNSETIFF failed: %m");
+
+        if (ioctl(fd, TUNSETOWNER, uid) < 0)
+                return log_error_errno(errno, "TUNSETOWNER failed: %m");
+
+        if (!strv_isempty(altifname_host)) {
+                r = rtnl_set_link_alternative_names_by_ifname(&rtnl, ifname_host, altifname_host);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to set alternative interface names, ignoring: %m");
+        }
+
+        return TAKE_FD(fd);
+}
+
+static int validate_netns(sd_varlink *link, int userns_fd, int netns_fd) {
         int r;
 
         assert(link);
@@ -1450,18 +1685,18 @@ static int validate_netns(Varlink *link, int userns_fd, int netns_fd) {
                 return log_debug_errno(r, "Network namespace file descriptor has unsafe flags set: %m");
 
         /* Validate this is actually a valid network namespace fd */
-        r = fd_is_ns(netns_fd, CLONE_NEWNET);
+        r = fd_is_namespace(netns_fd, NAMESPACE_NET);
         if (r < 0)
                 return r;
         if (r == 0)
-                return varlink_error_invalid_parameter_name(link, "networkNamespaceFileDescriptor");
+                return sd_varlink_error_invalid_parameter_name(link, "networkNamespaceFileDescriptor");
 
         /* And refuse the thing if it is our own */
         r = is_our_namespace(netns_fd, NAMESPACE_NET);
         if (r < 0)
                 return r;
         if (r > 0)
-                return varlink_error_invalid_parameter_name(link, "networkNamespaceFileDescriptor");
+                return sd_varlink_error_invalid_parameter_name(link, "networkNamespaceFileDescriptor");
 
         /* Check if the netns actually belongs to the userns */
         _cleanup_close_ int owner_userns_fd = -EBADF;
@@ -1469,14 +1704,14 @@ static int validate_netns(Varlink *link, int userns_fd, int netns_fd) {
         if (owner_userns_fd < 0)
                 return -errno;
 
-        r = inode_same_at(owner_userns_fd, /* path_a= */ NULL, userns_fd, /* path_b= */ NULL, AT_EMPTY_PATH);
+        r = inode_same_at(owner_userns_fd, /* filea= */ NULL, userns_fd, /* fileb= */ NULL, AT_EMPTY_PATH);
         if (r < 0)
                 return r;
         if (r == 0)
-                return varlink_error_invalid_parameter_name(link, "networkNamespaceFileDescriptor");
+                return sd_varlink_error_invalid_parameter_name(link, "networkNamespaceFileDescriptor");
 
         uid_t peer_uid;
-        r = varlink_get_peer_uid(link, &peer_uid);
+        r = sd_varlink_get_peer_uid(link, &peer_uid);
         if (r < 0)
                 return r;
 
@@ -1488,7 +1723,7 @@ static int validate_netns(Varlink *link, int userns_fd, int netns_fd) {
                         return -errno;
 
                 if (owner_uid != peer_uid)
-                        return varlink_error_invalid_parameter_name(link, "networkNamespaceFileDescriptor");
+                        return sd_varlink_error_invalid_parameter_name(link, "networkNamespaceFileDescriptor");
         }
 
         return 0;
@@ -1501,22 +1736,21 @@ typedef struct AddNetworkParameters {
         const char *mode;
 } AddNetworkParameters;
 
-static int vl_method_add_netif_to_user_namespace(Varlink *link, JsonVariant *parameters, VarlinkMethodFlags flags, void *userdata) {
-        static const JsonDispatch parameter_dispatch_table[] = {
-                { "userNamespaceFileDescriptor",    _JSON_VARIANT_TYPE_INVALID, json_dispatch_uint,         offsetof(AddNetworkParameters, userns_fd_idx), JSON_MANDATORY },
-                { "networkNamespaceFileDescriptor", _JSON_VARIANT_TYPE_INVALID, json_dispatch_uint,         offsetof(AddNetworkParameters, netns_fd_idx),  JSON_MANDATORY },
-                { "namespaceInterfaceName",         JSON_VARIANT_STRING,        json_dispatch_const_string, offsetof(AddNetworkParameters, ifname),        0              },
-                { "mode",                           JSON_VARIANT_STRING,        json_dispatch_const_string, offsetof(AddNetworkParameters, mode),          JSON_MANDATORY },
+static int vl_method_add_netif_to_user_namespace(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field parameter_dispatch_table[] = {
+                { "userNamespaceFileDescriptor",    _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint,         offsetof(AddNetworkParameters, userns_fd_idx), SD_JSON_MANDATORY },
+                { "networkNamespaceFileDescriptor", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint,         offsetof(AddNetworkParameters, netns_fd_idx),  0                 },
+                { "namespaceInterfaceName",         SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string, offsetof(AddNetworkParameters, ifname),        0                 },
+                { "mode",                           SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string, offsetof(AddNetworkParameters, mode),          SD_JSON_MANDATORY },
                 {}
         };
 
         _cleanup_close_ int userns_fd = -EBADF, netns_fd = -EBADF, registry_dir_fd = -EBADF;
+        Context *c = ASSERT_PTR(userdata);
         AddNetworkParameters p = {
                 .userns_fd_idx = UINT_MAX,
+                .netns_fd_idx = UINT_MAX,
         };
-        _cleanup_(userns_info_freep) UserNamespaceInfo *userns_info = NULL;
-        struct stat userns_st;
-        uid_t peer_uid;
         int r;
 
         assert(link);
@@ -1526,11 +1760,11 @@ static int vl_method_add_netif_to_user_namespace(Varlink *link, JsonVariant *par
         if (r != 0)
                 return r;
 
-        r = varlink_dispatch(link, parameters, parameter_dispatch_table, &p);
+        r = sd_varlink_dispatch(link, parameters, parameter_dispatch_table, &p);
         if (r != 0)
                 return r;
 
-        userns_fd = varlink_take_fd(link, p.userns_fd_idx);
+        userns_fd = sd_varlink_peek_dup_fd(link, p.userns_fd_idx);
         if (userns_fd < 0)
                 return userns_fd;
 
@@ -1538,47 +1772,84 @@ static int vl_method_add_netif_to_user_namespace(Varlink *link, JsonVariant *par
         if (r != 0)
                 return r;
 
+        struct stat userns_st;
         if (fstat(userns_fd, &userns_st) < 0)
                 return -errno;
 
-        netns_fd = varlink_take_fd(link, p.netns_fd_idx);
-        if (netns_fd < 0)
-                return netns_fd;
+        if (p.netns_fd_idx != UINT_MAX) {
+                netns_fd = sd_varlink_peek_dup_fd(link, p.netns_fd_idx);
+                if (netns_fd < 0)
+                        return netns_fd;
 
-        r = validate_netns(link, userns_fd, netns_fd);
-        if (r != 0)
-                return r;
-
-        if (!streq_ptr(p.mode, "veth"))
-                return varlink_error_invalid_parameter_name(link, "mode");
+                r = validate_netns(link, userns_fd, netns_fd);
+                if (r != 0)
+                        return r;
+        }
 
         if (p.ifname && !ifname_valid(p.ifname))
-                return varlink_error_invalid_parameter_name(link, "interfaceName");
+                return sd_varlink_error_invalid_parameter_name(link, "interfaceName");
+
+        if (streq(p.mode, "veth")) {
+                /* In veth mode we need a netns */
+
+                if (netns_fd < 0)
+                        return sd_varlink_error_invalid_parameter_name(link, "networkNamespaceFileDescriptor");
+
+        } else if (streq(p.mode, "tap")) {
+                /* In tap mode we do want a netns, nor an interface name for it */
+
+                if (p.ifname)
+                        return sd_varlink_error_invalid_parameter_name(link, "namespaceInterfaceName");
+
+                if (netns_fd >= 0)
+                        return sd_varlink_error_invalid_parameter_name(link, "networkNamespaceFileDescriptor");
+        } else
+                return sd_varlink_error_invalid_parameter_name(link, "mode");
+
+        const char *polkit_details[] = {
+                "type", p.mode,
+                NULL,
+        };
+
+        r = varlink_verify_polkit_async_full(
+                        link,
+                        /* bus= */ NULL,
+                        "io.systemd.namespace-resource.delegate-network-interface",
+                        polkit_details,
+                        /* good_user= */ UID_INVALID,
+                        POLKIT_DEFAULT_ALLOW, /* If no polkit is installed, allow delegation of network interfaces to registered userns */
+                        &c->polkit_registry);
+        if (r <= 0)
+                return r;
 
         registry_dir_fd = userns_registry_open_fd();
         if (registry_dir_fd < 0)
                 return registry_dir_fd;
 
-        _cleanup_close_ int lock_fd = -EBADF;
-        lock_fd = userns_registry_lock(registry_dir_fd);
+        _cleanup_close_ int lock_fd = userns_registry_lock(registry_dir_fd);
         if (lock_fd < 0)
                 return log_debug_errno(lock_fd, "Failed to open nsresource registry lock file: %m");
 
+        _cleanup_(userns_info_freep) UserNamespaceInfo *userns_info = NULL;
         r = userns_registry_load_by_userns_inode(
                         registry_dir_fd,
                         userns_st.st_ino,
                         &userns_info);
         if (r == -ENOENT)
-                return varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceNotRegistered", NULL);
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.UserNamespaceNotRegistered", NULL);
         if (r < 0)
                 return r;
 
+        if (strv_length(userns_info->netifs) > USER_NAMESPACE_NETIFS_DELEGATE_MAX)
+                return sd_varlink_error(link, "io.systemd.NamespaceResource.TooManyNetworkInterfaces", NULL);
+
         /* Registering a network interface for this client is only allowed for the root or the owner of a userns */
-        r = varlink_get_peer_uid(link, &peer_uid);
+        uid_t peer_uid;
+        r = sd_varlink_get_peer_uid(link, &peer_uid);
         if (r < 0)
                 return r;
         if (peer_uid != 0 && peer_uid != userns_info->owner)
-                return varlink_error(link, VARLINK_ERROR_PERMISSION_DENIED, NULL);
+                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, NULL);
 
         _cleanup_free_ char *ifname_host = NULL, *altifname_host = NULL;
         const char *ifname_namespace = p.ifname ?: "host0";
@@ -1590,6 +1861,17 @@ static int vl_method_add_netif_to_user_namespace(Varlink *link, JsonVariant *par
                 return -ENOMEM;
         strshorten(ifname_host, IFNAMSIZ-1);
 
+        /* Register the interface in the userns store first, so that we can be sure it's properly 'owned' at
+         * any time, in case setup fails for some reason. Given we the interface name is hashed accidental
+         * collisions should be unlikely. */
+        r = userns_info_add_netif(userns_info, ifname_host);
+        if (r < 0)
+                return r;
+
+        r = userns_registry_store(registry_dir_fd, userns_info);
+        if (r < 0)
+                return r;
+
         if (p.ifname)
                 r = asprintf(&altifname_host, "ns-" UID_FMT "-%s-%s", userns_info->owner, userns_info->name, p.ifname);
         else
@@ -1597,69 +1879,103 @@ static int vl_method_add_netif_to_user_namespace(Varlink *link, JsonVariant *par
         if (r < 0)
                 return -ENOMEM;
 
-        struct ether_addr ether_addr_host, ether_addr_namespace;
+        if (!ifname_valid_full(altifname_host, IFNAME_VALID_ALTERNATIVE))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Generated alternative interface name not valid: %s", altifname_host);
 
+        struct ether_addr ether_addr_host;
         hash_ether_addr(userns_info, p.ifname, 0, &ether_addr_host);
-        hash_ether_addr(userns_info, p.ifname, 1, &ether_addr_namespace);
 
-        r = create_veth(netns_fd,
-                        ifname_host, altifname_host, &ether_addr_host,
-                        ifname_namespace, &ether_addr_namespace);
+        if (streq(p.mode, "veth")) {
+                struct ether_addr ether_addr_namespace;
+                hash_ether_addr(userns_info, p.ifname, 1, &ether_addr_namespace);
+
+                r = create_veth(netns_fd,
+                                ifname_host, altifname_host, &ether_addr_host,
+                                ifname_namespace, &ether_addr_namespace);
+                if (r < 0)
+                        return r;
+
+                log_debug("Added veth tunnel %s from host to userns " INO_FMT " ('%s' @ UID " UID_FMT ", interface %s).",
+                          ifname_host, userns_st.st_ino, userns_info->name, userns_info->start_uid, ifname_namespace);
+
+                return sd_varlink_replybo(
+                                link,
+                                SD_JSON_BUILD_PAIR("hostInterfaceName", SD_JSON_BUILD_STRING(ifname_host)),
+                                SD_JSON_BUILD_PAIR("namespaceInterfaceName", SD_JSON_BUILD_STRING(ifname_namespace)));
+
+        } else if (streq(p.mode, "tap")) {
+                /* NB: when we do the "tap" stuff we do not actually do any namespace operation here, neither
+                 * netns nor userns. We use the userns only as conduit for user identity information and
+                 * indication that the calling user has some control over the UID they want to assign the tap
+                 * device to. */
+
+                _cleanup_close_ int tap_fd = create_tap(userns_fd, ifname_host, STRV_MAKE(altifname_host), &ether_addr_host);
+                if (tap_fd < 0)
+                        return tap_fd;
+
+                log_debug("Added tap device %s from host to userns " INO_FMT " ('%s' @ UID " UID_FMT ").",
+                          ifname_host, userns_st.st_ino, userns_info->name, userns_info->start_uid);
+
+                int fd_index = sd_varlink_push_fd(link, tap_fd);
+                if (fd_index < 0)
+                        return log_error_errno(fd_index, "Failed to push tap fd into varlink socket: %m");
+
+                TAKE_FD(tap_fd);
+
+                return sd_varlink_replybo(
+                                link,
+                                SD_JSON_BUILD_PAIR_STRING("hostInterfaceName", ifname_host),
+                                SD_JSON_BUILD_PAIR_INTEGER("interfaceFileDescriptor", fd_index));
+        } else
+                assert_not_reached();
+}
+
+static int process_connection(sd_varlink_server *server, int _fd) {
+        _cleanup_close_ int fd = TAKE_FD(_fd); /* always take possession */
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *vl = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        int r;
+
+        assert(server);
+        assert(fd >= 0);
+
+        r = sd_event_new(&event);
         if (r < 0)
                 return r;
 
-        log_debug("Adding veth tunnel %s from host to userns " INO_FMT " ('%s' @ UID " UID_FMT ", interface %s).",
-                  ifname_host, userns_st.st_ino, userns_info->name, userns_info->start, ifname_namespace);
+        r = sd_varlink_server_attach_event(server, event, /* priority= */ 0);
+        if (r < 0)
+                return log_error_errno(r, "Failed to attach Varlink server to event loop: %m");
 
-        return varlink_replyb(link, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("hostInterfaceName", JSON_BUILD_STRING(ifname_host)),
-                                                      JSON_BUILD_PAIR("namespaceInterfaceName", JSON_BUILD_STRING(ifname_namespace))));
-}
-
-static int process_connection(VarlinkServer *server, int _fd) {
-        _cleanup_close_ int fd = TAKE_FD(_fd); /* always take possession */
-        _cleanup_(varlink_close_unrefp) Varlink *vl = NULL;
-        int r;
-
-        r = varlink_server_add_connection(server, fd, &vl);
+        r = sd_varlink_server_add_connection(server, fd, &vl);
         if (r < 0)
                 return log_error_errno(r, "Failed to add connection: %m");
 
         TAKE_FD(fd);
-        vl = varlink_ref(vl);
+        vl = sd_varlink_ref(vl);
 
-        r = varlink_set_allow_fd_passing_input(vl, true);
+        r = sd_event_loop(event);
         if (r < 0)
-                return log_error_errno(r, "Failed to enable fd passing for read: %m");
+                return log_error_errno(r, "Failed to run event loop: %m");
 
-        r = varlink_set_allow_fd_passing_output(vl, true);
+        r = sd_varlink_server_detach_event(server);
         if (r < 0)
-                return log_error_errno(r, "Failed to enable fd passing for write: %m");
-
-        for (;;) {
-                r = varlink_process(vl);
-                if (r == -ENOTCONN) {
-                        log_debug("Connection terminated.");
-                        break;
-                }
-                if (r < 0)
-                        return log_error_errno(r, "Failed to process connection: %m");
-                if (r > 0)
-                        continue;
-
-                r = varlink_wait(vl, CONNECTION_IDLE_USEC);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to wait for connection events: %m");
-                if (r == 0)
-                        break;
-        }
+                return log_error_errno(r, "Failed to detach Varlink server from event loop: %m");
 
         return 0;
 }
 
+static void context_free(Context *c) {
+        assert(c);
+
+        c->polkit_registry = hashmap_free(c->polkit_registry);
+        c->bpf = userns_restrict_bpf_free(c->bpf);
+}
+
 static int run(int argc, char *argv[]) {
-        _cleanup_(userns_restrict_bpf_freep) struct userns_restrict_bpf *bpf = NULL;
         usec_t start_time, listen_idle_usec, last_busy_usec = USEC_INFINITY;
-        _cleanup_(varlink_server_unrefp) VarlinkServer *server = NULL;
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *server = NULL;
+        _cleanup_(context_free) Context c = {};
         _cleanup_(pidref_done) PidRef parent = PIDREF_NULL;
         unsigned n_iterations = 0;
         int m, listen_fd, r;
@@ -1680,18 +1996,22 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to turn off non-blocking mode for listening socket: %m");
 
-        r = varlink_server_new(&server, VARLINK_SERVER_INHERIT_USERDATA);
+        r = varlink_server_new(
+                        &server,
+                        SD_VARLINK_SERVER_INHERIT_USERDATA|
+                        SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT|SD_VARLINK_SERVER_ALLOW_FD_PASSING_OUTPUT,
+                        &c);
         if (r < 0)
-                return log_error_errno(r, "Failed to allocate server: %m");
+                return log_error_errno(r, "Failed to allocate varlink server: %m");
 
-        r = varlink_server_add_interface_many(
+        r = sd_varlink_server_add_interface_many(
                         server,
                         &vl_interface_io_systemd_NamespaceResource,
                         &vl_interface_io_systemd_UserDatabase);
         if (r < 0)
                 return log_error_errno(r, "Failed to add UserDatabase and NamespaceResource interface to varlink server: %m");
 
-        r = varlink_server_bind_method_many(
+        r = sd_varlink_server_bind_method_many(
                         server,
                         "io.systemd.NamespaceResource.AllocateUserRange",              vl_method_allocate_user_range,
                         "io.systemd.NamespaceResource.RegisterUserNamespace",          vl_method_register_user_namespace,
@@ -1704,7 +2024,9 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to bind methods: %m");
 
-        varlink_server_set_userdata(server, &bpf);
+        r = sd_varlink_server_set_exit_on_idle(server, true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to enable exit-on-idle mode: %m");
 
         r = getenv_bool("NSRESOURCE_FIXED_WORKER");
         if (r < 0)
@@ -1768,7 +2090,7 @@ static int run(int argc, char *argv[]) {
                                 if (r == -ESRCH)
                                         return log_error_errno(r, "Parent already died?");
                                 if (r < 0)
-                                        return log_error_errno(r, "Failed to send SIGUSR2 signal to parent. %m");
+                                        return log_error_errno(r, "Failed to send SIGUSR2 signal to parent: %m");
                         }
                 }
 

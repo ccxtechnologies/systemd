@@ -1,25 +1,25 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <net/if.h>
-#include <netinet/in.h>
-#include <sys/capability.h>
+#include <sys/stat.h>
+
+#include "sd-bus.h"
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-message-util.h"
+#include "bus-object.h"
 #include "bus-polkit.h"
+#include "hashmap.h"
 #include "networkd-dhcp-server-bus.h"
 #include "networkd-dhcp4-bus.h"
 #include "networkd-dhcp6-bus.h"
 #include "networkd-json.h"
-#include "networkd-link-bus.h"
 #include "networkd-link.h"
-#include "networkd-manager-bus.h"
+#include "networkd-link-bus.h"
 #include "networkd-manager.h"
+#include "networkd-manager-bus.h"
 #include "networkd-network-bus.h"
 #include "path-util.h"
-#include "strv.h"
-#include "user-util.h"
 
 static int method_list_links(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
@@ -55,7 +55,7 @@ static int method_list_links(sd_bus_message *message, void *userdata, sd_bus_err
         if (r < 0)
                 return r;
 
-        return sd_bus_send(NULL, reply, NULL);
+        return sd_bus_message_send(reply);
 }
 
 static int method_get_link_by_name(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -85,7 +85,7 @@ static int method_get_link_by_name(sd_bus_message *message, void *userdata, sd_b
         if (r < 0)
                 return r;
 
-        return sd_bus_send(NULL, reply, NULL);
+        return sd_bus_message_send(reply);
 }
 
 static int method_get_link_by_index(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -115,7 +115,7 @@ static int method_get_link_by_index(sd_bus_message *message, void *userdata, sd_
         if (r < 0)
                 return r;
 
-        return sd_bus_send(NULL, reply, NULL);
+        return sd_bus_message_send(reply);
 }
 
 static int call_link_method(Manager *m, sd_bus_message *message, sd_bus_message_handler_t handler, sd_bus_error *error) {
@@ -231,7 +231,7 @@ static int bus_method_describe_link(sd_bus_message *message, void *userdata, sd_
 
 static int bus_method_describe(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         _cleanup_free_ char *text = NULL;
         Manager *manager = ASSERT_PTR(userdata);
         int r;
@@ -242,7 +242,7 @@ static int bus_method_describe(sd_bus_message *message, void *userdata, sd_bus_e
         if (r < 0)
                 return log_error_errno(r, "Failed to build JSON data: %m");
 
-        r = json_variant_format(v, 0, &text);
+        r = sd_json_variant_format(v, 0, &text);
         if (r < 0)
                 return log_error_errno(r, "Failed to format JSON data: %m");
 
@@ -254,7 +254,7 @@ static int bus_method_describe(sd_bus_message *message, void *userdata, sd_bus_e
         if (r < 0)
                 return r;
 
-        return sd_bus_send(NULL, reply, NULL);
+        return sd_bus_message_send(reply);
 }
 
 static int property_get_namespace_id(
@@ -304,7 +304,7 @@ static int property_get_namespace_nsid(
          * number. */
 
         r = netns_get_nsid(/* netnsfd= */ -EBADF, &nsid);
-        if (r < 0)
+        if (r < 0 && r != -ENODATA)
                 log_warning_errno(r, "Failed to query network nsid, ignoring: %m");
 
         return sd_bus_message_append(reply, "u", nsid);

@@ -1,16 +1,21 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <linux/rtnetlink.h>
 #include <netinet/in.h>
-#include <linux/if.h>
 
+#include "sd-event.h"
+#include "sd-ipv4ll.h"
+
+#include "errno-util.h"
 #include "netif-util.h"
 #include "networkd-address.h"
 #include "networkd-ipv4acd.h"
 #include "networkd-ipv4ll.h"
 #include "networkd-link.h"
 #include "networkd-manager.h"
-#include "networkd-queue.h"
 #include "parse-util.h"
+#include "set.h"
+#include "string-util.h"
 
 bool link_ipv4ll_enabled(Link *link) {
         assert(link);
@@ -80,8 +85,9 @@ static int ipv4ll_address_handler(sd_netlink *rtnl, sd_netlink_message *m, Reque
 
         assert(link);
         assert(!link->ipv4ll_address_configured);
+        assert(address);
 
-        r = address_configure_handler_internal(rtnl, m, link, "Could not set ipv4ll address");
+        r = address_configure_handler_internal(m, link, address);
         if (r <= 0)
                 return r;
 
@@ -108,6 +114,10 @@ static int ipv4ll_address_claimed(sd_ipv4ll *ll, Link *link) {
 
         log_link_debug(link, "IPv4 link-local claim "IPV4_ADDRESS_FMT_STR,
                        IPV4_ADDRESS_FMT_VAL(address->in_addr.in));
+
+        r = link_request_stacked_netdevs(link, NETDEV_LOCAL_ADDRESS_IPV4LL);
+        if (r < 0)
+                return r;
 
         return link_request_address(link, address, NULL, ipv4ll_address_handler, NULL);
 }
@@ -152,7 +162,6 @@ static void ipv4ll_handler(sd_ipv4ll *ll, int event, void *userdata) {
                         break;
                 default:
                         log_link_warning(link, "IPv4 link-local unknown event: %d", event);
-                        break;
         }
 }
 
@@ -170,17 +179,63 @@ static int ipv4ll_check_mac(sd_ipv4ll *ll, const struct ether_addr *mac, void *u
         return link_get_by_hw_addr(m, &hw_addr, NULL) >= 0;
 }
 
+static int ipv4ll_set_address(Link *link) {
+        int r;
+
+        assert(link);
+        assert(link->network);
+        assert(link->ipv4ll);
+
+        /* 1. Use already assigned address. */
+        Address *a;
+        SET_FOREACH(a, link->addresses) {
+                if (a->source != NETWORK_CONFIG_SOURCE_IPV4LL)
+                        continue;
+
+                assert(a->family == AF_INET);
+                return sd_ipv4ll_set_address(link->ipv4ll, &a->in_addr.in);
+        }
+
+        /* 2. If no address is assigned yet, use explicitly configured address. */
+        if (in4_addr_is_set(&link->network->ipv4ll_start_address))
+                return sd_ipv4ll_set_address(link->ipv4ll, &link->network->ipv4ll_start_address);
+
+        /* 3. If KeepConfiguration=dynamic, use a foreign IPv4LL address. */
+        if (!FLAGS_SET(link->network->keep_configuration, KEEP_CONFIGURATION_DYNAMIC))
+                return 0;
+
+        SET_FOREACH(a, link->addresses) {
+                if (a->source != NETWORK_CONFIG_SOURCE_FOREIGN)
+                        continue;
+                if (a->family != AF_INET)
+                        continue;
+                if (!in4_addr_is_link_local_dynamic(&a->in_addr.in))
+                        continue;
+
+                r = sd_ipv4ll_set_address(link->ipv4ll, &a->in_addr.in);
+                if (r < 0)
+                        return r;
+
+                /* Make sure the address is not removed by link_drop_unmanaged_addresses(). */
+                a->source = NETWORK_CONFIG_SOURCE_IPV4LL;
+                return 0;
+        }
+
+        return 0;
+}
+
 int ipv4ll_configure(Link *link) {
         uint64_t seed;
         int r;
 
         assert(link);
+        assert(link->network);
 
         if (!link_ipv4ll_enabled(link))
                 return 0;
 
         if (link->ipv4ll)
-                return -EBUSY;
+                return 0;
 
         r = sd_ipv4ll_new(&link->ipv4ll);
         if (r < 0)
@@ -197,7 +252,15 @@ int ipv4ll_configure(Link *link) {
                         return r;
         }
 
+        r = ipv4ll_set_address(link);
+        if (r < 0)
+                return r;
+
         r = sd_ipv4ll_set_mac(link->ipv4ll, &link->hw_addr.ether);
+        if (r < 0)
+                return r;
+
+        r = sd_ipv4ll_set_timeout(link->ipv4ll, link->network->ipv4_dad_timeout_usec);
         if (r < 0)
                 return r;
 
@@ -210,6 +273,63 @@ int ipv4ll_configure(Link *link) {
                 return r;
 
         return sd_ipv4ll_set_check_mac_callback(link->ipv4ll, ipv4ll_check_mac, link->manager);
+}
+
+int ipv4ll_start(Link *link) {
+        int r;
+
+        assert(link);
+
+        if (!link->ipv4ll)
+                return 0;
+
+        if (sd_ipv4ll_is_running(link->ipv4ll))
+                return 0;
+
+        if (!link_has_carrier(link))
+                return 0;
+
+        /* On exit, we cannot and should not start sd-ipv4ll. */
+        r = sd_event_get_state(link->manager->event);
+        if (r < 0)
+                return r;
+        if (r == SD_EVENT_FINISHED)
+                return 0;
+
+        r = sd_ipv4ll_start(link->ipv4ll);
+        if (r < 0)
+                return r;
+
+        return 1; /* started */
+}
+
+int link_drop_ipv4ll_config(Link *link, Network *network) {
+        int ret = 0;
+
+        assert(link);
+        assert(link->network);
+
+        if (link->network == network)
+                return 0; /* .network file is unchanged. It is not necessary to reconfigure the client. */
+
+        if (!link_ipv4ll_enabled(link)) {
+                /* The client is disabled. Stop if it is running, and drop the address. */
+                ret = sd_ipv4ll_stop(link->ipv4ll);
+
+                /* Also, explicitly drop the address for the case that this is called on start up.
+                 * See also comments in link_drop_dhcp4_config(). */
+                Address *a;
+                SET_FOREACH(a, link->addresses) {
+                        if (a->source != NETWORK_CONFIG_SOURCE_IPV4LL)
+                                continue;
+
+                        assert(a->family == AF_INET);
+                        RET_GATHER(ret, address_remove_and_cancel(a, link));
+                }
+        }
+
+        link->ipv4ll = sd_ipv4ll_unref(link->ipv4ll);
+        return ret;
 }
 
 int ipv4ll_update_mac(Link *link) {
@@ -226,7 +346,7 @@ int ipv4ll_update_mac(Link *link) {
 }
 
 int config_parse_ipv4ll(
-                const char* unit,
+                const char *unit,
                 const char *filename,
                 unsigned line,
                 const char *section,
@@ -267,7 +387,7 @@ int config_parse_ipv4ll(
 }
 
 int config_parse_ipv4ll_address(
-                const char* unit,
+                const char *unit,
                 const char *filename,
                 unsigned line,
                 const char *section,

@@ -1,11 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <fcntl.h>
+#include <stdlib.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 
 #include "alloc-util.h"
+#include "cryptsetup-util.h"
 #include "dropin.h"
 #include "escape.h"
 #include "fd-util.h"
@@ -22,6 +21,7 @@
 #include "specifier.h"
 #include "string-util.h"
 #include "strv.h"
+#include "time-util.h"
 #include "unit-name.h"
 
 typedef struct crypto_device {
@@ -232,7 +232,7 @@ static int print_dependencies(FILE *f, const char* device_path, const char* time
         assert(f);
         assert(device_path);
 
-        if (STR_IN_SET(device_path, "-", "none"))
+        if (!mangle_none(device_path))
                 /* None, nothing to do */
                 return 0;
 
@@ -518,7 +518,7 @@ static int create_disk(
                         "After=modprobe@loop.service\n",
                         u_escaped);
 
-        r = generator_write_timeouts(arg_dest, device, name, options, &filtered);
+        r = generator_write_device_timeout(arg_dest, device, options, &filtered);
         if (r < 0)
                 log_warning_errno(r, "Failed to write device timeout drop-in: %m");
 
@@ -795,10 +795,56 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
         return 0;
 }
 
+static int add_crypttab_device(const char *name, const char *device, const char *keyspec, const char *options) {
+        _cleanup_free_ char *keyfile = NULL, *keydev = NULL, *headerdev = NULL, *filtered_header = NULL;
+        crypto_device *d = NULL;
+        char *uuid;
+        int r;
+
+        uuid = startswith(device, "UUID=");
+        if (!uuid)
+                uuid = path_startswith(device, "/dev/disk/by-uuid/");
+        if (!uuid)
+                uuid = startswith(name, "luks-");
+        if (uuid)
+                d = hashmap_get(arg_disks, uuid);
+
+        if (arg_allow_list && !d) {
+                log_info("Not creating device '%s' because it was not specified on the kernel command line.", name);
+                return 0;
+        }
+
+        r = split_locationspec(keyspec, &keyfile, &keydev);
+        if (r < 0)
+                return r;
+
+        if (options && (!d || !d->options)) {
+                r = filter_header_device(options, &headerdev, &filtered_header);
+                if (r < 0)
+                        return r;
+                options = filtered_header;
+        }
+
+        r = create_disk(name,
+                        device,
+                        keyfile,
+                        keydev,
+                        (d && d->options) ? d->headerdev : headerdev,
+                        (d && d->options) ? d->options : options,
+                        arg_crypttab);
+        if (r < 0)
+                return r;
+
+        if (d)
+                d->create = false;
+
+        return 0;
+}
+
 static int add_crypttab_devices(void) {
         _cleanup_fclose_ FILE *f = NULL;
         unsigned crypttab_line = 0;
-        int r;
+        int r, ret = 0;
 
         if (!arg_read_crypttab)
                 return 0;
@@ -811,10 +857,7 @@ static int add_crypttab_devices(void) {
         }
 
         for (;;) {
-                _cleanup_free_ char *line = NULL, *name = NULL, *device = NULL, *keyspec = NULL, *options = NULL,
-                                    *keyfile = NULL, *keydev = NULL, *headerdev = NULL, *filtered_header = NULL;
-                crypto_device *d = NULL;
-                char *uuid;
+                _cleanup_free_ char *line = NULL, *name = NULL, *device = NULL, *keyspec = NULL, *options = NULL;
                 int k;
 
                 r = read_stripped_line(f, LONG_LINE_MAX, &line);
@@ -834,49 +877,14 @@ static int add_crypttab_devices(void) {
                         continue;
                 }
 
-                uuid = startswith(device, "UUID=");
-                if (!uuid)
-                        uuid = path_startswith(device, "/dev/disk/by-uuid/");
-                if (!uuid)
-                        uuid = startswith(name, "luks-");
-                if (uuid)
-                        d = hashmap_get(arg_disks, uuid);
-
-                if (arg_allow_list && !d) {
-                        log_info("Not creating device '%s' because it was not specified on the kernel command line.", name);
-                        continue;
-                }
-
-                r = split_locationspec(keyspec, &keyfile, &keydev);
-                if (r < 0)
-                        return r;
-
-                if (options && (!d || !d->options)) {
-                        r = filter_header_device(options, &headerdev, &filtered_header);
-                        if (r < 0)
-                                return r;
-                        free_and_replace(options, filtered_header);
-                }
-
-                r = create_disk(name,
-                                device,
-                                keyfile,
-                                keydev,
-                                (d && d->options) ? d->headerdev : headerdev,
-                                (d && d->options) ? d->options : options,
-                                arg_crypttab);
-                if (r < 0)
-                        return r;
-
-                if (d)
-                        d->create = false;
+                RET_GATHER(ret, add_crypttab_device(name, device, keyspec, options));
         }
 
-        return 0;
+        return ret;
 }
 
 static int add_proc_cmdline_devices(void) {
-        int r;
+        int r, ret = 0;
         crypto_device *d;
 
         HASHMAP_FOREACH(d, arg_disks) {
@@ -902,11 +910,10 @@ static int add_proc_cmdline_devices(void) {
                                 d->headerdev,
                                 d->options ?: arg_default_options,
                                 "/proc/cmdline");
-                if (r < 0)
-                        return r;
+                RET_GATHER(ret, r);
         }
 
-        return 0;
+        return ret;
 }
 
 DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(crypt_device_hash_ops, char, string_hash_func, string_compare_func,
@@ -932,14 +939,9 @@ static int run(const char *dest, const char *dest_early, const char *dest_late) 
                 return 0;
 
         r = add_crypttab_devices();
-        if (r < 0)
-                return r;
+        RET_GATHER(r, add_proc_cmdline_devices());
 
-        r = add_proc_cmdline_devices();
-        if (r < 0)
-                return r;
-
-        return 0;
+        return r;
 }
 
 DEFINE_MAIN_GENERATOR_FUNCTION(run);

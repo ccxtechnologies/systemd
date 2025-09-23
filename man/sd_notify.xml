@@ -140,9 +140,12 @@
     <para><function>sd_pid_notify()</function> and <function>sd_pid_notifyf()</function> are similar to
     <function>sd_notify()</function> and <function>sd_notifyf()</function> but take a process ID (PID) to use
     as originating PID for the message as first argument. This is useful to send notification messages on
-    behalf of other processes, provided the appropriate privileges are available. If the PID argument is
-    specified as 0, the process ID of the calling process is used, in which case the calls are fully
-    equivalent to <function>sd_notify()</function> and <function>sd_notifyf()</function>.</para>
+    behalf of other processes, provided the appropriate privileges are available. Effectively, this means
+    that a privileged invocation of <command>sd_pid_notify()</command> may circumvent
+    <varname>NotifyAccess=main</varname> or <varname>NotifyAccess=exec</varname> restrictions enforced for a
+    service. If the PID argument is specified as 0, the process ID of the calling process is used, in which
+    case the calls are fully equivalent to <function>sd_notify()</function> and
+    <function>sd_notifyf()</function>.</para>
 
     <para><function>sd_pid_notify_with_fds()</function> is similar to <function>sd_pid_notify()</function>
     but takes an additional array of file descriptors. These file descriptors are sent along the notification
@@ -258,10 +261,18 @@
         <term>BUSERROR=…</term>
 
         <listitem><para>If a service fails, the D-Bus error-style error code. Example:
-        <literal>BUSERROR=org.freedesktop.DBus.Error.TimedOut</literal>. Note that this assignment is
-        currently not used by <command>systemd</command>.</para>
+        <literal>BUSERROR=org.freedesktop.DBus.Error.TimedOut</literal>.</para>
 
         <xi:include href="version-info.xml" xpointer="v233"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>VARLINKERROR=…</term>
+
+        <listitem><para>If a service fails, the Varlink error-style error code. Example:
+        <literal>VARLINKERROR=org.varlink.service.InvalidParameter</literal>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -283,10 +294,33 @@
       <varlistentry>
         <term>MAINPID=…</term>
 
-        <listitem><para>The main process ID (PID) of the service, in case the service manager did not fork
-        off the process itself. Example: <literal>MAINPID=4711</literal>.</para>
+        <listitem><para>Change the main process ID (PID) of the service. This is especially useful in the case
+        where the real main process is not directly forked off by the service manager.
+        Example: <literal>MAINPID=4711</literal>.</para>
 
         <xi:include href="version-info.xml" xpointer="v233"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>MAINPIDFDID=…</term>
+
+        <listitem><para>The pidfd inode number of the new main process (specified through <varname>MAINPID=</varname>).
+        This information can be acquired through
+        <citerefentry><refentrytitle>sd_pidfd_get_inode_id</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+        on the pidfd and is used to identify the process in a race-free fashion. Alternatively,
+        a pidfd can be sent directly to the service manager (see <varname>MAINPIDFD=1</varname> below).</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>MAINPIDFD=1</term>
+
+        <listitem><para>Similar to <varname>MAINPID=</varname> with <varname>MAINPIDFDID=</varname>, but
+        the process is referenced directly by the pidfd passed to the service manager. This is useful
+        if pidfd id is not supported on the system. Exactly one fd is expected for this notification.</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -298,7 +332,7 @@
         <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
         for information how to enable this functionality and
         <citerefentry><refentrytitle>sd_watchdog_enabled</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-        for the details of how the service can check whether the watchdog is enabled. </para></listitem>
+        for the details of how the service can check whether the watchdog is enabled.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -310,7 +344,7 @@
         in time. Note that <varname>WatchdogSec=</varname> does not need to be enabled for
         <literal>WATCHDOG=trigger</literal> to trigger the watchdog action. See
         <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-        for information about the watchdog behavior. </para>
+        for information about the watchdog behavior.</para>
 
         <xi:include href="version-info.xml" xpointer="v243"/></listitem>
       </varlistentry>
@@ -331,7 +365,7 @@
 
         <listitem><para>Tells the service manager to extend the startup, runtime or shutdown service timeout
         corresponding the current state. The value specified is a time in microseconds during which the
-        service must send a new message. A service timeout will occur if the message isn't received, but only
+        service must send a new message. A service timeout will occur if the message is not received, but only
         if the runtime of the current state is beyond the original maximum times of
         <varname>TimeoutStartSec=</varname>, <varname>RuntimeMaxSec=</varname>, and
         <varname>TimeoutStopSec=</varname>.  See
@@ -339,6 +373,18 @@
         for effects on the service timeouts.</para>
 
         <xi:include href="version-info.xml" xpointer="v236"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>RESTART_RESET=1</term>
+
+        <listitem><para>Reset the restart counter of the service, which has the effect of restoring
+        the restart duration to <varname>RestartSec=</varname> if <varname>RestartSteps=</varname> and
+        <varname>RestartMaxDelaySec=</varname> are in use. For more information, refer to
+        <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v258"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -468,6 +514,26 @@
     successfully. Specifically, no error is returned when a file descriptor is attempted to be stored using
     <varname>FDSTORE=1</varname> but the service is not actually configured to permit storing of file
     descriptors (see above).</para>
+
+    <refsect2 id='errors'>
+      <title>Errors</title>
+
+      <para>Returned errors may indicate the following problems:</para>
+
+      <variablelist>
+        <varlistentry>
+          <term><constant>-E2BIG</constant></term>
+
+          <listitem><para>More file descriptors passed at once than the system allows. On Linux the number of
+          file descriptors that may be passed across <constant>AF_UNIX</constant> sockets at once is 253, see
+          <citerefentry
+          project='man-pages'><refentrytitle>unix</refentrytitle><manvolnum>7</manvolnum></citerefentry> for
+          details.</para>
+
+          <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+        </varlistentry>
+      </variablelist>
+    </refsect2>
   </refsect1>
 
   <refsect1>
@@ -581,7 +647,7 @@ sd_notifyf(0, "STATUS=Failed to start up: %s\n"
 sd_notify(0, "READY=1");
 /* set timeout to 5 seconds */
 sd_notify_barrier(0, 5 * 1000000);
-      </programlisting>
+</programlisting>
     </example>
   </refsect1>
 

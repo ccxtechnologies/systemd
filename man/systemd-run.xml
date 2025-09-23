@@ -33,22 +33,25 @@
       <command>systemd-run</command>
       <arg choice="opt" rep="repeat">OPTIONS</arg>
       <arg choice="opt" rep="repeat">PATH OPTIONS</arg>
-      <arg choice="req"><replaceable>COMMAND</replaceable></arg>
+      <arg choice="req"><replaceable>COMMAND</replaceable>
       <arg choice="opt" rep="repeat">ARGS</arg>
+      </arg>
     </cmdsynopsis>
     <cmdsynopsis>
       <command>systemd-run</command>
       <arg choice="opt" rep="repeat">OPTIONS</arg>
       <arg choice="opt" rep="repeat">SOCKET OPTIONS</arg>
-      <arg choice="req"><replaceable>COMMAND</replaceable></arg>
+      <arg choice="req"><replaceable>COMMAND</replaceable>
       <arg choice="opt" rep="repeat">ARGS</arg>
+      </arg>
     </cmdsynopsis>
     <cmdsynopsis>
       <command>systemd-run</command>
       <arg choice="opt" rep="repeat">OPTIONS</arg>
       <arg choice="opt" rep="repeat">TIMER OPTIONS</arg>
-      <arg choice="req"><replaceable>COMMAND</replaceable></arg>
+      <arg choice="req"><replaceable>COMMAND</replaceable>
       <arg choice="opt" rep="repeat">ARGS</arg>
+      </arg>
     </cmdsynopsis>
   </refsynopsisdiv>
 
@@ -105,15 +108,6 @@
     <para>The following options are understood:</para>
 
     <variablelist>
-      <varlistentry>
-        <term><option>--no-ask-password</option></term>
-
-        <listitem><para>Do not query the user for authentication for
-        privileged operations.</para>
-
-        <xi:include href="version-info.xml" xpointer="v226"/></listitem>
-      </varlistentry>
-
       <varlistentry>
         <term><option>--scope</option></term>
 
@@ -194,18 +188,14 @@
       <varlistentry>
         <term><option>--expand-environment=<replaceable>BOOL</replaceable></option></term>
 
-        <listitem><para>Expand environment variables in command arguments. If enabled, environment variables
-        specified as <literal>${<replaceable>VARIABLE</replaceable>}</literal> will be expanded in the same
-        way as in commands specified via <varname>ExecStart=</varname> in units. With
+        <listitem><para>Expand environment variables in command arguments. If enabled (the default),
+        environment variables specified as <literal>${<replaceable>VARIABLE</replaceable>}</literal> will be
+        expanded in the same way as in commands specified via <varname>ExecStart=</varname> in units. With
         <varname>--scope</varname>, this expansion is performed by <command>systemd-run</command> itself, and
         in other cases by the service manager that spawns the command. Note that this is similar to, but not
         the same as variable expansion in
         <citerefentry project='man-pages'><refentrytitle>bash</refentrytitle><manvolnum>1</manvolnum></citerefentry>
         and other shells.</para>
-
-        <para>The default is to enable this option in all cases, except for <varname>--scope</varname> where
-        it is disabled by default, for backward compatibility reasons. Note that this will be changed in a
-        future release, where it will be switched to enabled by default as well.</para>
 
         <para>See
         <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
@@ -327,7 +317,7 @@
 
         <para>This option will result in <command>systemd-run</command> synchronously waiting for
         the transient service to terminate, similar to specifying <option>--wait</option>. If specified
-        along with <option>--wait</option>, <command>systemd-run</command> won't exit when manually disconnecting
+        along with <option>--wait</option>, <command>systemd-run</command> will not exit when manually disconnecting
         from the pseudo TTY device.</para>
 
         <para>Note that
@@ -338,6 +328,20 @@
         <para>See below for details on how this switch combines with <option>--pipe</option>.</para>
 
         <xi:include href="version-info.xml" xpointer="v219"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--pty-late</option></term>
+        <term><option>-T</option></term>
+
+        <listitem><para>Much like <option>--pty</option>, but the PTY communication only begins once the unit
+        start is complete. This effectively means PTY input during <varname>ExecStartPre=</varname> of a
+        service is not available while using <option>--pty-late</option>, while it is available using
+        <option>--pty</option>, for most service types. However, if this option is used, access to the
+        invoking TTY is available for password queries (see <option>--no-ask-password</option> below) during
+        unit start-up.</para>
+
+        <xi:include href="version-info.xml" xpointer="v258"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -391,6 +395,17 @@
         message explaining how to terminate the TTY connection.</para>
 
         <xi:include href="version-info.xml" xpointer="v219"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>-v</option></term>
+        <term><option>--verbose</option></term>
+
+        <listitem>
+          <para>Display unit log output while running.</para>
+
+          <xi:include href="version-info.xml" xpointer="v258"/>
+        </listitem>
       </varlistentry>
 
       <varlistentry>
@@ -473,9 +488,10 @@
         start request for the transient unit is verified, enqueued, and waited for. Subsequently the invoked unit is
         monitored, and it is waited until it is deactivated again (most likely because the specified command
         completed). On exit, terse information about the unit's runtime is shown, including total runtime (as well as
-        CPU usage, if <option>--property=CPUAccounting=1</option> was set) and the exit code and status of the main
-        process. This output may be suppressed with <option>--quiet</option>. This option may not be combined with
-        <option>--no-block</option>, <option>--scope</option> or the various path, socket, or timer options.</para>
+        CPU, memory, IO, and IP accounting data, if the corresponding cgroup accounting settings are enabled)
+        and the exit code and status of the main process. This output may be suppressed with <option>--quiet</option>.
+        This option may not be combined with <option>--no-block</option>, <option>--scope</option> or the various
+        path, socket, or timer options.</para>
 
         <xi:include href="version-info.xml" xpointer="v232"/></listitem>
       </varlistentry>
@@ -488,13 +504,30 @@
         all units that ran and failed are kept in memory until the user explicitly resets their failure state with
         <command>systemctl reset-failed</command> or an equivalent command. On the other hand, units that ran
         successfully are unloaded immediately. If this option is turned on the "garbage collection" of units is more
-        aggressive, and unloads units regardless if they exited successfully or failed. This option is a shortcut for
+        aggressive, and unloads units regardless of whether they exited successfully or failed. This option is a shortcut for
         <command>--property=CollectMode=inactive-or-failed</command>, see the explanation for
         <varname>CollectMode=</varname> in
         <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry> for further
         information.</para>
 
         <xi:include href="version-info.xml" xpointer="v236"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--job-mode=<replaceable>MODE</replaceable></option></term>
+
+        <listitem>
+          <para>When queuing a new job, this option controls how to deal with
+          already queued jobs.</para>
+
+          <para>The option takes the same mode values as
+          <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>'s
+          <option>--job-mode=</option> option. The default job mode is <literal>fail</literal>.</para>
+
+          <para>Running <option>--job-mode=help</option> shows a list of available job modes.</para>
+
+          <xi:include href="version-info.xml" xpointer="v258"/>
+        </listitem>
       </varlistentry>
 
       <varlistentry>
@@ -528,8 +561,20 @@
       <xi:include href="user-system-options.xml" xpointer="machine" />
       <xi:include href="user-system-options.xml" xpointer="capsule" />
 
+      <xi:include href="standard-options.xml" xpointer="no-ask-password" />
       <xi:include href="standard-options.xml" xpointer="help" />
       <xi:include href="standard-options.xml" xpointer="version" />
+      <xi:include href="standard-options.xml" xpointer="json" />
+
+      <varlistentry id='no-pager'>
+        <term><option>--no-pager</option></term>
+
+        <listitem><para>Do not pipe output into a pager. This currently only applies to
+        <option>--help</option>. (The pager is not started during normal operation.)</para>
+
+        <xi:include href="version-info.xml" xpointer="v258"/>
+        </listitem>
+      </varlistentry>
     </variablelist>
 
     <para>All command line arguments after the first non-option argument become part of the command line of
@@ -654,7 +699,7 @@ There is a screen on:
 
       <programlisting>$ systemd-run -t echo "&lt;${INVOCATION_ID}>" '&lt;${INVOCATION_ID}>'
       &lt;> &lt;5d0149bfa2c34b79bccb13074001eb20>
-      </programlisting>
+</programlisting>
 
       <para>The first argument is expanded by the shell (double quotes), but the second one is not expanded
       by the shell (single quotes).
@@ -663,7 +708,7 @@ There is a screen on:
       <literal>&lt;></literal>, <literal>&lt;${INVOCATION_ID}></literal>] as the argument array, and then
       <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>
       generates <varname>${INVOCATION_ID}</varname> and substitutes it in the command-line. This substitution
-      could not be done on the client side, because the target ID that will be set for the service isn't
+      could not be done on the client side, because the target ID that will be set for the service is not
       known before the call is made.</para>
     </example>
 
@@ -680,13 +725,13 @@ There is a screen on:
       <programlisting>$ systemd-run --expand-environment=no -t bash \
       -c 'echo $SHELL $$ >/dev/stdout'
 /bin/bash 12345
-      </programlisting>
+</programlisting>
 
       <para>The last argument is passed verbatim to the
       <citerefentry project='man-pages'><refentrytitle>bash</refentrytitle><manvolnum>1</manvolnum></citerefentry>
       shell which is started by the service unit. The shell expands <literal>$SHELL</literal> to the path of
       the shell, and <literal>$$</literal> to its process number, and then those strings are passed to the
-      <command>echo</command> built-in and printed to standard output (which in this case is connected to the
+      <command>echo</command> built-in and printed to standard output (which, in this case, is connected to the
       calling terminal).</para>
     </example>
 

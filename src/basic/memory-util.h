@@ -1,15 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <inttypes.h>
-#include <malloc.h>
-#include <stdbool.h>
 #include <string.h>
-#include <sys/types.h>
 
-#include "alloc-util.h"
-#include "macro.h"
-#include "memory-util-fundamental.h"
+#include "forward.h"
+#include "memory-util-fundamental.h" /* IWYU pragma: export */
 
 size_t page_size(void) _pure_;
 #define PAGE_ALIGN(l)          ALIGN_TO(l, page_size())
@@ -20,7 +15,7 @@ size_t page_size(void) _pure_;
 #define PAGE_OFFSET_U64(l)     ALIGN_OFFSET_U64(l, page_size())
 
 /* Normal memcpy() requires src to be nonnull. We do nothing if n is 0. */
-static inline void *memcpy_safe(void *dst, const void *src, size_t n) {
+static inline void* memcpy_safe(void *dst, const void *src, size_t n) {
         if (n == 0)
                 return dst;
         assert(src);
@@ -28,12 +23,22 @@ static inline void *memcpy_safe(void *dst, const void *src, size_t n) {
 }
 
 /* Normal mempcpy() requires src to be nonnull. We do nothing if n is 0. */
-static inline void *mempcpy_safe(void *dst, const void *src, size_t n) {
+static inline void* mempcpy_safe(void *dst, const void *src, size_t n) {
         if (n == 0)
                 return dst;
         assert(src);
         return mempcpy(dst, src, n);
 }
+
+#define _mempcpy_typesafe(dst, src, n, sz)                              \
+        ({                                                              \
+                size_t sz;                                              \
+                assert_se(MUL_SAFE(&sz, sizeof((dst)[0]), n));          \
+                (typeof((dst)[0])*) mempcpy_safe(dst, src, sz);         \
+        })
+
+#define mempcpy_typesafe(dst, src, n)                                   \
+        _mempcpy_typesafe(dst, src, n, UNIQ_T(sz, UNIQ))
 
 /* Normal memcmp() requires s1 and s2 to be nonnull. We do nothing if n is 0. */
 static inline int memcmp_safe(const void *s1, const void *s2, size_t n) {
@@ -52,19 +57,19 @@ static inline int memcmp_nn(const void *s1, size_t n1, const void *s2, size_t n2
 
 #define zero(x) (memzero(&(x), sizeof(x)))
 
-bool memeqbyte(uint8_t byte, const void *data, size_t length);
+bool memeqbyte(uint8_t byte, const void *data, size_t length) _nonnull_if_nonzero_(2, 3);
 
 #define memeqzero(data, length) memeqbyte(0x00, data, length)
 
 #define eqzero(x) memeqzero(x, sizeof(x))
 
-static inline void *mempset(void *s, int c, size_t n) {
+static inline void* mempset(void *s, int c, size_t n) {
         memset(s, c, n);
-        return (uint8_t*)s + n;
+        return (uint8_t*) s + n;
 }
 
 /* Normal memmem() requires haystack to be nonnull, which is annoying for zero-length buffers */
-static inline void *memmem_safe(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
+static inline void* memmem_safe(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
 
         if (needlelen <= 0)
                 return (void*) haystack;
@@ -78,7 +83,7 @@ static inline void *memmem_safe(const void *haystack, size_t haystacklen, const 
         return memmem(haystack, haystacklen, needle, needlelen);
 }
 
-static inline void *mempmem_safe(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
+static inline void* mempmem_safe(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
         const uint8_t *p;
 
         p = memmem_safe(haystack, haystacklen, needle, needlelen);
@@ -88,16 +93,7 @@ static inline void *mempmem_safe(const void *haystack, size_t haystacklen, const
         return (uint8_t*) p + needlelen;
 }
 
-static inline void* erase_and_free(void *p) {
-        size_t l;
-
-        if (!p)
-                return NULL;
-
-        l = MALLOC_SIZEOF_SAFE(p);
-        explicit_bzero_safe(p, l);
-        return mfree(p);
-}
+void* erase_and_free(void *p);
 
 static inline void erase_and_freep(void *p) {
         erase_and_free(*(void**) p);
@@ -109,4 +105,4 @@ static inline void erase_char(char *p) {
 }
 
 /* Makes a copy of the buffer with reversed order of bytes */
-void *memdup_reverse(const void *mem, size_t size);
+void* memdup_reverse(const void *mem, size_t size);

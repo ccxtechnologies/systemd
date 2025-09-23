@@ -26,8 +26,8 @@ __contains_word () {
 
 __get_machines() {
     local a b
-    { machinectl list --full --max-addresses=0 --no-legend --no-pager 2>/dev/null; echo ".host"; } | \
-	{ while read a b; do echo " $a"; done; } | \
+    { machinectl list --full --max-addresses=0 --no-legend --no-pager 2>/dev/null; echo ".host"; } |
+        { while read -r a b; do echo " $a"; done; } |
         sort -u
 }
 
@@ -35,7 +35,7 @@ __get_busnames() {
     local mode=$1
     local a b
     busctl $mode list --no-legend --no-pager --full 2>/dev/null |
-        { while read a b; do echo " $a"; done; };
+        { while read -r a b; do echo " $a"; done; }
 }
 
 __get_objects() {
@@ -43,7 +43,7 @@ __get_objects() {
     local busname=$2
     local a b
     busctl $mode tree --list --no-legend --no-pager $busname 2>/dev/null |
-        { while read a b; do echo " $a"; done; };
+        { while read -r a b; do echo " $a"; done; }
 }
 
 __get_interfaces() {
@@ -52,7 +52,7 @@ __get_interfaces() {
     local path=$3
     local a b c
     busctl $mode introspect --list --no-legend --no-pager $busname $path 2>/dev/null |
-        { while read a b c; do [[ "$b" == "interface" ]] && echo " $a"; done; };
+        { while read -r a b c; do [[ "$b" == "interface" ]] && echo " $a"; done; }
 }
 
 __get_members() {
@@ -65,7 +65,7 @@ __get_members() {
     local a b c d e
     busctl $mode introspect --list --no-legend --no-pager $busname $path $interface 2>/dev/null |
         sed -e 's/^\.//' |
-        { while read a b c d e; do [[ "$b" == "$type" && ( -z $flags || "$e" == "$flags" ) ]] && echo " $a"; done; };
+        { while read -r a b c d e; do [[ "$b" == "$type" && ( -z $flags || "$e" == "$flags" ) ]] && echo " $a"; done; }
 }
 
 __get_signature() {
@@ -76,7 +76,7 @@ __get_signature() {
     local member=$5
     local a b c d
     busctl $mode introspect --list --no-legend --no-pager $busname $path $interface 2>/dev/null |
-        sed -e 's/^\.//' | { while read a b c d; do [[ "$a" == "$member" && "$c" != '-' ]] && echo " \"$c\""; done; };
+        sed -e 's/^\.//' | { while read -r a b c d; do [[ "$a" == "$member" && "$c" != '-' ]] && echo " \"$c\""; done; }
 }
 
 _busctl() {
@@ -89,7 +89,7 @@ _busctl() {
                       --allow-interactive-authorization=no --augment-creds=no
                       --watch-bind=yes -j -l --full --xml-interface'
         [ARG]='--address -H --host -M --machine --match --timeout --size --json
-                      --destination'
+                      --destination -N --limit-messages'
     )
 
     if __contains_word "--user" ${COMP_WORDS[*]}; then
@@ -128,6 +128,7 @@ _busctl() {
         [OBJECT]='introspect'
         [METHOD]='call'
         [EMIT]='emit'
+        [WAIT]='wait'
         [PROPERTY_GET]='get-property'
         [PROPERTY_SET]='set-property'
     )
@@ -174,6 +175,18 @@ _busctl() {
         fi
     elif __contains_word "$verb" ${VERBS[EMIT]}; then
         comps=''
+    elif __contains_word "$verb" ${VERBS[WAIT]}; then
+        if [[ $n -eq 1 ]] ; then
+            comps=$( __get_busnames $mode)
+        elif [[ $n -eq 2 ]] ; then
+            comps=$( __get_objects $mode ${COMP_WORDS[COMP_CWORD-1]})
+        elif [[ $n -eq 3 ]] ; then
+            comps=$( __get_interfaces $mode ${COMP_WORDS[COMP_CWORD-2]} ${COMP_WORDS[COMP_CWORD-1]})
+        elif [[ $n -eq 4 ]] ; then
+            comps=$( __get_members $mode ${COMP_WORDS[COMP_CWORD-3]} ${COMP_WORDS[COMP_CWORD-2]} ${COMP_WORDS[COMP_CWORD-1]} signal)
+        else
+            comps=''
+        fi
     elif __contains_word "$verb" ${VERBS[PROPERTY_GET]}; then
         if [[ $n -eq 1 ]] ; then
             comps=$( __get_busnames $mode)

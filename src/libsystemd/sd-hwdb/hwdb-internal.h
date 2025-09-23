@@ -1,11 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdint.h>
 #include <sys/stat.h>
 
-#include "constants.h"
-#include "hashmap.h"
+#include "forward.h"
+#include "iterator.h"
 #include "sparse-endian.h"
 
 #define HWDB_SIG { 'K', 'S', 'L', 'P', 'H', 'H', 'R', 'H' }
@@ -82,7 +81,7 @@ struct trie_value_entry2_f {
         le16_t padding;
 } _packed_;
 
-#define hwdb_bin_paths                          \
+#define HWDB_BIN_PATHS                          \
         "/etc/systemd/hwdb/hwdb.bin\0"          \
         "/etc/udev/hwdb.bin\0"                  \
         "/usr/lib/systemd/hwdb/hwdb.bin\0"      \

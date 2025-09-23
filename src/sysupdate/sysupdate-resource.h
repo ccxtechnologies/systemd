@@ -1,18 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <inttypes.h>
-#include <stdbool.h>
-#include <sys/types.h>
-
 #include "gpt.h"
-#include "hashmap.h"
-#include "macro.h"
-
-/* Forward declare this type so that the headers below can use it */
-typedef struct Resource Resource;
-
-#include "sysupdate-instance.h"
+#include "sysupdate-forward.h"
 
 typedef enum ResourceType {
         RESOURCE_URL_FILE,
@@ -73,11 +63,12 @@ typedef enum PathRelativeTo {
         PATH_RELATIVE_TO_ESP,
         PATH_RELATIVE_TO_XBOOTLDR,
         PATH_RELATIVE_TO_BOOT, /* Refers to $BOOT from the BLS. No direct counterpart in PartitionDesignator */
+        PATH_RELATIVE_TO_EXPLICIT,
         _PATH_RELATIVE_TO_MAX,
         _PATH_RELATIVE_TO_INVALID = -EINVAL,
 } PathRelativeTo;
 
-struct Resource {
+typedef struct Resource {
         ResourceType type;
 
         /* Where to look for instances, and what to match precisely */
@@ -94,7 +85,7 @@ struct Resource {
 
         /* If this is a partition resource (RESOURCE_PARTITION), then how many partition slots are currently unassigned, that we can use */
         size_t n_empty;
-};
+} Resource;
 
 void resource_destroy(Resource *rr);
 
@@ -102,10 +93,10 @@ int resource_load_instances(Resource *rr, bool verify, Hashmap **web_cache);
 
 Instance* resource_find_instance(Resource *rr, const char *version);
 
-int resource_resolve_path(Resource *rr, const char *root, const char *node);
+int resource_resolve_path(Resource *rr, const char *root, const char *relative_to_directory, const char *node);
 
 ResourceType resource_type_from_string(const char *s) _pure_;
-const char *resource_type_to_string(ResourceType t) _const_;
+const char* resource_type_to_string(ResourceType t) _const_;
 
 PathRelativeTo path_relative_to_from_string(const char *s) _pure_;
-const char *path_relative_to_to_string(PathRelativeTo r) _const_;
+const char* path_relative_to_to_string(PathRelativeTo r) _const_;

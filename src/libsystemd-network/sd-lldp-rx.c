@@ -1,24 +1,27 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <arpa/inet.h>
 #include <linux/sockios.h>
 #include <sys/ioctl.h>
 
+#include "sd-json.h"
 #include "sd-lldp-rx.h"
 
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "ether-addr-util.h"
 #include "event-util.h"
 #include "fd-util.h"
-#include "json.h"
+#include "hashmap.h"
 #include "lldp-neighbor.h"
 #include "lldp-network.h"
 #include "lldp-rx-internal.h"
 #include "memory-util.h"
 #include "network-common.h"
+#include "prioq.h"
 #include "socket-util.h"
 #include "sort-util.h"
 #include "string-table.h"
+#include "string-util.h"
 
 #define LLDP_DEFAULT_NEIGHBORS_MAX 128U
 
@@ -491,8 +494,8 @@ int sd_lldp_rx_get_neighbors(sd_lldp_rx *lldp_rx, sd_lldp_neighbor ***ret) {
         return k;
 }
 
-int lldp_rx_build_neighbors_json(sd_lldp_rx *lldp_rx, JsonVariant **ret) {
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+int lldp_rx_build_neighbors_json(sd_lldp_rx *lldp_rx, sd_json_variant **ret) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         int r;
 
         assert(lldp_rx);
@@ -500,13 +503,13 @@ int lldp_rx_build_neighbors_json(sd_lldp_rx *lldp_rx, JsonVariant **ret) {
 
         sd_lldp_neighbor *n;
         HASHMAP_FOREACH(n, lldp_rx->neighbor_by_id) {
-                _cleanup_(json_variant_unrefp) JsonVariant *w = NULL;
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *w = NULL;
 
                 r = lldp_neighbor_build_json(n, &w);
                 if (r < 0)
                         return r;
 
-                r = json_variant_append_array(&v, w);
+                r = sd_json_variant_append_array(&v, w);
                 if (r < 0)
                         return r;
         }

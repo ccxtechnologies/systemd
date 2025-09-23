@@ -1,23 +1,17 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "sd-bus.h"
-
-#include "set.h"
-#include "varlink.h"
-
-typedef struct DnsQueryCandidate DnsQueryCandidate;
-typedef struct DnsQuery DnsQuery;
-typedef struct DnsStubListenerExtra DnsStubListenerExtra;
-
-#include "resolved-dns-answer.h"
-#include "resolved-dns-question.h"
-#include "resolved-dns-search-domain.h"
+#include "in-addr-util.h"
+#include "list.h"
+#include "resolved-dns-browse-services.h"
+#include "resolved-dns-packet.h"
 #include "resolved-dns-transaction.h"
+#include "resolved-forward.h"
 
-struct DnsQueryCandidate {
+typedef struct DnsQueryCandidate {
         unsigned n_ref;
         int error_code;
+        uint64_t generation;
 
         DnsQuery *query;
         DnsScope *scope;
@@ -25,12 +19,13 @@ struct DnsQueryCandidate {
         DnsSearchDomain *search_domain;
 
         Set *transactions;
+        sd_event_source *timeout_event_source;
 
         LIST_FIELDS(DnsQueryCandidate, candidates_by_query);
         LIST_FIELDS(DnsQueryCandidate, candidates_by_scope);
-};
+} DnsQueryCandidate;
 
-struct DnsQuery {
+typedef struct DnsQuery {
         Manager *manager;
 
         /* The question, formatted in IDNA for use on classic DNS, and as UTF8 for use in LLMNR or mDNS. Note
@@ -97,7 +92,7 @@ struct DnsQuery {
 
         /* Bus + Varlink client information */
         sd_bus_message *bus_request;
-        Varlink *varlink_request;
+        sd_varlink *varlink_request;
         int request_family;
         union in_addr_union request_address;
         unsigned block_all_complete;
@@ -111,6 +106,10 @@ struct DnsQuery {
         DnsAnswer *reply_additional;
         DnsStubListenerExtra *stub_listener_extra;
 
+        /* Browser Service and Dnssd Discovered Service Information */
+        DnssdDiscoveredService *dnsservice_request;
+        DnsServiceBrowser *service_browser_request;
+
         /* Completion callback */
         void (*complete)(DnsQuery* q);
 
@@ -120,7 +119,7 @@ struct DnsQuery {
         LIST_FIELDS(DnsQuery, auxiliary_queries);
 
         /* Note: fields should be ordered to minimize alignment gaps. Use pahole! */
-};
+} DnsQuery;
 
 enum {
         DNS_QUERY_MATCH,
@@ -149,7 +148,7 @@ void dns_query_complete(DnsQuery *q, DnsTransactionState state);
 
 DnsQuestion* dns_query_question_for_protocol(DnsQuery *q, DnsProtocol protocol);
 
-const char *dns_query_string(DnsQuery *q);
+const char* dns_query_string(DnsQuery *q);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(DnsQuery*, dns_query_free);
 
@@ -157,12 +156,6 @@ bool dns_query_fully_authenticated(DnsQuery *q);
 bool dns_query_fully_confidential(DnsQuery *q);
 bool dns_query_fully_authoritative(DnsQuery *q);
 
-static inline uint64_t dns_query_reply_flags_make(DnsQuery *q) {
-        assert(q);
+int validate_and_mangle_query_flags(Manager *manager, uint64_t *flags, const char *name, uint64_t ok);
 
-        return SD_RESOLVED_FLAGS_MAKE(q->answer_protocol,
-                                      q->answer_family,
-                                      dns_query_fully_authenticated(q),
-                                      dns_query_fully_confidential(q)) |
-                (q->answer_query_flags & (SD_RESOLVED_FROM_MASK|SD_RESOLVED_SYNTHETIC));
-}
+uint64_t dns_query_reply_flags_make(DnsQuery *q);

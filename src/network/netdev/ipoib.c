@@ -3,10 +3,15 @@
 #include <linux/if_arp.h>
 #include <linux/if_link.h>
 
+#include "sd-netlink.h"
+
+#include "conf-parser.h"
 #include "ipoib.h"
+#include "networkd-link.h"
 #include "networkd-network.h"
 #include "parse-util.h"
 #include "string-table.h"
+#include "string-util.h"
 
 assert_cc((int) IP_OVER_INFINIBAND_MODE_DATAGRAM  == (int) IPOIB_MODE_DATAGRAM);
 assert_cc((int) IP_OVER_INFINIBAND_MODE_CONNECTED == (int) IPOIB_MODE_CONNECTED);
@@ -53,10 +58,6 @@ int ipoib_set_netlink_message(Link *link, sd_netlink_message *m) {
         assert(link->network);
         assert(m);
 
-        r = sd_netlink_message_set_flags(m, NLM_F_REQUEST | NLM_F_ACK);
-        if (r < 0)
-                return r;
-
         r = sd_netlink_message_open_container(m, IFLA_LINKINFO);
         if (r < 0)
                 return r;
@@ -94,7 +95,7 @@ static const char * const ipoib_mode_table[_IP_OVER_INFINIBAND_MODE_MAX] = {
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(ipoib_mode, IPoIBMode);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_ipoib_mode, ipoib_mode, IPoIBMode, "Failed to parse IPoIB mode");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_ipoib_mode, ipoib_mode, IPoIBMode);
 
 int config_parse_ipoib_pkey(
                 const char *unit,
@@ -137,7 +138,6 @@ int config_parse_ipoib_pkey(
         *pkey = u;
         return 0;
 }
-
 
 const NetDevVTable ipoib_vtable = {
         .object_size = sizeof(IPoIB),

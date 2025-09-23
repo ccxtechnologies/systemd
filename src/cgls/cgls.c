@@ -1,9 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <getopt.h>
 #include <stdio.h>
-#include <unistd.h>
 
 #include "sd-bus.h"
 
@@ -12,7 +10,6 @@
 #include "bus-util.h"
 #include "cgroup-show.h"
 #include "cgroup-util.h"
-#include "fileio.h"
 #include "log.h"
 #include "main-func.h"
 #include "output-mode.h"
@@ -20,6 +17,8 @@
 #include "parse-util.h"
 #include "path-util.h"
 #include "pretty-print.h"
+#include "runtime-scope.h"
+#include "string-util.h"
 #include "strv.h"
 #include "unit-name.h"
 
@@ -221,13 +220,12 @@ static int run(int argc, char *argv[]) {
                                         return log_error_errno(r, "Failed to mangle unit name: %m");
 
                                 if (!bus) {
+                                        RuntimeScope scope = arg_show_unit == SHOW_UNIT_USER ? RUNTIME_SCOPE_USER : RUNTIME_SCOPE_SYSTEM;
+
                                         /* Connect to the bus only if necessary */
-                                        r = bus_connect_transport_systemd(
-                                                        BUS_TRANSPORT_LOCAL, NULL,
-                                                        arg_show_unit == SHOW_UNIT_USER ? RUNTIME_SCOPE_USER : RUNTIME_SCOPE_SYSTEM,
-                                                        &bus);
+                                        r = bus_connect_transport_systemd(BUS_TRANSPORT_LOCAL, NULL, scope, &bus);
                                         if (r < 0)
-                                                return bus_log_connect_error(r, BUS_TRANSPORT_LOCAL);
+                                                return bus_log_connect_error(r, BUS_TRANSPORT_LOCAL, scope);
                                 }
 
                                 q = show_cgroup_get_unit_path_and_warn(bus, unit_name, &cgroup);

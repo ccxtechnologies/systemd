@@ -9,10 +9,13 @@ set -o pipefail
 
 export PAGER=
 
+TEST_CMDLINE="/tmp/proc-cmdline.$RANDOM"
+
 at_exit() {
     set +e
     umount -l -R /var/lib/confexts
-    rm -f /var/tmp/importtest /var/tmp/importtest2 /var/tmp/importtest.tar.gz /var/tmp/importtest2.tar.gz
+    rm -f /var/tmp/importtest /var/tmp/importtest2 /var/tmp/importtest.tar.gz /var/tmp/importtest2.tar.gz "$TEST_CMDLINE"
+    mountpoint -q /proc/cmdline && umount /proc/cmdline
 }
 
 trap at_exit EXIT
@@ -64,3 +67,30 @@ cmp /var/tmp/importtest /var/lib/confexts/importtest7/importtest
 
 importctl list-images
 importctl list-images -j
+
+varlinkctl call --more /run/systemd/io.systemd.Import io.systemd.Import.ListTransfers '{}' --graceful=io.systemd.Import.NoTransfers
+
+varlinkctl call --more /run/systemd/io.systemd.Import io.systemd.Import.Pull '{"class":"confext","remote":"file:///var/tmp/importtest.tar.gz","local":"importtest8","type":"tar","verify":"no"}'
+cmp /var/tmp/importtest /var/lib/confexts/importtest8/importtest
+
+echo -n "systemd.pull=tar,confext,verify=no:importtest9:file:///var/tmp/importtest.tar.gz " > "$TEST_CMDLINE"
+cat /proc/cmdline >> "$TEST_CMDLINE"
+mount --bind "$TEST_CMDLINE" /proc/cmdline
+
+cat /proc/cmdline
+
+systemctl daemon-reload
+
+systemctl start systemd-import@var-lib-confexts-importtest9.service
+cmp /var/tmp/importtest /var/lib/confexts/importtest9/importtest
+
+importctl export-raw --class=confext --format zstd importtest /var/tmp/importtest10.raw.zst
+importctl import-raw --class=confext /var/tmp/importtest10.raw.zst
+cmp /var/tmp/importtest /var/lib/confexts/importtest10.raw
+
+# Verify generic service calls, too
+varlinkctl call --more /run/systemd/io.systemd.Import io.systemd.service.Ping '{}'
+varlinkctl call --more /run/systemd/io.systemd.Import io.systemd.service.SetLogLevel '{"level":"7"}'
+varlinkctl call --more /run/systemd/io.systemd.Import io.systemd.service.SetLogLevel '{"level":"1"}'
+varlinkctl call --more /run/systemd/io.systemd.Import io.systemd.service.SetLogLevel '{"level":"7"}'
+varlinkctl call --more /run/systemd/io.systemd.Import io.systemd.service.GetEnvironment '{}'

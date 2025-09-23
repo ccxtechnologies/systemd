@@ -1,12 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <netinet/in.h>
 #include <linux/l2tp.h>
 
 #include "in-addr-util.h"
+#include "forward.h"
 #include "netdev.h"
-#include "networkd-util.h"
 
 typedef enum L2tpL2specType {
         NETDEV_L2TP_L2SPECTYPE_NONE = L2TP_L2SPECTYPE_NONE,
@@ -37,6 +36,7 @@ typedef struct L2tpSession {
         ConfigSection *section;
 
         char *name;
+        int ifindex;
 
         uint32_t session_id;
         uint32_t peer_session_id;

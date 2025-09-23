@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <unistd.h>
 
+#include "alloc-util.h"
 #include "fs-util.h"
 #include "generator.h"
 #include "initrd-util.h"
@@ -11,6 +11,7 @@
 #include "proc-cmdline.h"
 #include "special.h"
 #include "string-util.h"
+#include "strv.h"
 #include "unit-file.h"
 
 /*
@@ -20,22 +21,26 @@
 static const char *arg_dest = NULL;
 
 static int generate_symlink(void) {
+        int r;
+
         FOREACH_STRING(p, "/system-update", "/etc/system-update") {
-                if (laccess(p, F_OK) >= 0) {
-                        _cleanup_free_ char *j = NULL;
-
-                        j = path_join(arg_dest, SPECIAL_DEFAULT_TARGET);
-                        if (!j)
-                                return log_oom();
-
-                        if (symlink(SYSTEM_DATA_UNIT_DIR "/system-update.target", j) < 0)
-                                return log_error_errno(errno, "Failed to create symlink %s: %m", j);
-
-                        return 1;
+                r = access_nofollow(p, F_OK);
+                if (r < 0) {
+                        if (r != -ENOENT)
+                                log_warning_errno(r, "Failed to check if %s symlink exists, ignoring: %m", p);
+                        continue;
                 }
 
-                if (errno != ENOENT)
-                        log_warning_errno(errno, "Failed to check if %s symlink exists, ignoring: %m", p);
+                _cleanup_free_ char *j = NULL;
+
+                j = path_join(arg_dest, SPECIAL_DEFAULT_TARGET);
+                if (!j)
+                        return log_oom();
+
+                if (symlink(SYSTEM_DATA_UNIT_DIR "/system-update.target", j) < 0)
+                        return log_error_errno(errno, "Failed to create symlink %s: %m", j);
+
+                return 1;
         }
 
         return 0;

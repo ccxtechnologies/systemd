@@ -1,11 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <stddef.h>
-#include <sys/stat.h>
-
 #include "errno-util.h"
-#include "log.h"
-#include "macro.h"
 #include "tests.h"
 
 TEST(saturate_add) {
@@ -79,7 +74,7 @@ TEST(MAX) {
         /* CONST_MAX returns (void) instead of a value if the passed arguments
          * are not of the same type or not constant expressions. */
         assert_cc(__builtin_types_compatible_p(typeof(CONST_MAX(1, 10)), int));
-        assert_cc(__builtin_types_compatible_p(typeof(CONST_MAX(1, 1U)), void));
+        assert_cc(__builtin_types_compatible_p(typeof(CONST_MAX(1, 1U)), typeof(VOID_0)));
 
         assert_se(val1.a == 100);
         assert_se(MAX(++d, 0) == 1);
@@ -617,8 +612,8 @@ TEST(ALIGN_TO) {
         assert_cc(CONST_ALIGN_TO(513, 512) == 1024);
         assert_cc(CONST_ALIGN_TO(sizeof(int), 64) == 64);
 
-        assert_cc(__builtin_types_compatible_p(typeof(CONST_ALIGN_TO(4, 3)), void));
-        assert_cc(__builtin_types_compatible_p(typeof(CONST_ALIGN_TO(SIZE_MAX, 512)), void));
+        assert_cc(__builtin_types_compatible_p(typeof(CONST_ALIGN_TO(4, 3)), typeof(VOID_0)));
+        assert_cc(__builtin_types_compatible_p(typeof(CONST_ALIGN_TO(SIZE_MAX, 512)), typeof(VOID_0)));
 }
 
 TEST(align_down) {
@@ -1105,82 +1100,6 @@ TEST(u64_multiply_safe) {
         assert_se(u64_multiply_safe(3, UINT64_MAX / 2) == 0);
 
         assert_se(u64_multiply_safe(UINT64_MAX, UINT64_MAX) == 0);
-}
-
-TEST(ASSERT) {
-        char *null = NULL;
-
-        ASSERT_OK(0);
-        ASSERT_OK(255);
-        ASSERT_OK(printf("Hello world\n"));
-        ASSERT_SIGNAL(ASSERT_OK(-1), SIGABRT);
-        ASSERT_SIGNAL(ASSERT_OK(-ENOANO), SIGABRT);
-
-        ASSERT_OK_ERRNO(0 >= 0);
-        ASSERT_OK_ERRNO(255 >= 0);
-        ASSERT_OK_ERRNO(printf("Hello world\n"));
-        ASSERT_SIGNAL(ASSERT_OK_ERRNO(-1), SIGABRT);
-        ASSERT_SIGNAL(ASSERT_OK_ERRNO(-ENOANO), SIGABRT);
-
-        ASSERT_ERROR(-ENOENT, ENOENT);
-        ASSERT_ERROR(RET_NERRNO(mkdir("/i/will/fail/with/enoent", 666)), ENOENT);
-        ASSERT_SIGNAL(ASSERT_ERROR(0, ENOENT), SIGABRT);
-        ASSERT_SIGNAL(ASSERT_ERROR(RET_NERRNO(mkdir("/i/will/fail/with/enoent", 666)), ENOANO), SIGABRT);
-
-        errno = ENOENT;
-        ASSERT_ERROR_ERRNO(-1, ENOENT);
-        errno = 0;
-        ASSERT_ERROR_ERRNO(mkdir("/i/will/fail/with/enoent", 666), ENOENT);
-        ASSERT_SIGNAL(ASSERT_ERROR_ERRNO(0, ENOENT), SIGABRT);
-        errno = 0;
-        ASSERT_SIGNAL(ASSERT_ERROR_ERRNO(mkdir("/i/will/fail/with/enoent", 666), ENOANO), SIGABRT);
-
-        ASSERT_TRUE(true);
-        ASSERT_TRUE(255);
-        ASSERT_TRUE(getpid());
-        ASSERT_SIGNAL(ASSERT_TRUE(1 == 0), SIGABRT);
-
-        ASSERT_FALSE(false);
-        ASSERT_FALSE(1 == 0);
-        ASSERT_SIGNAL(ASSERT_FALSE(1 > 0), SIGABRT);
-
-        ASSERT_NULL(NULL);
-        ASSERT_SIGNAL(ASSERT_NULL(signal_to_string(SIGINT)), SIGABRT);
-
-        ASSERT_NOT_NULL(signal_to_string(SIGTERM));
-        ASSERT_SIGNAL(ASSERT_NOT_NULL(NULL), SIGABRT);
-
-        ASSERT_STREQ(NULL, null);
-        ASSERT_STREQ("foo", "foo");
-        ASSERT_SIGNAL(ASSERT_STREQ(null, "bar"), SIGABRT);
-        ASSERT_SIGNAL(ASSERT_STREQ("foo", "bar"), SIGABRT);
-
-        ASSERT_EQ(0, 0);
-        ASSERT_EQ(-1, -1);
-        ASSERT_SIGNAL(ASSERT_EQ(255, -1), SIGABRT);
-
-        ASSERT_GE(0, 0);
-        ASSERT_GE(1, -1);
-        ASSERT_SIGNAL(ASSERT_GE(-1, 1), SIGABRT);
-
-        ASSERT_LE(0, 0);
-        ASSERT_LE(-1, 1);
-        ASSERT_SIGNAL(ASSERT_LE(1, -1), SIGABRT);
-
-        ASSERT_NE(0, (int64_t) UINT_MAX);
-        ASSERT_NE(-1, 1);
-        ASSERT_SIGNAL(ASSERT_NE(0, 0), SIGABRT);
-        ASSERT_SIGNAL(ASSERT_NE(-1, -1), SIGABRT);
-
-        ASSERT_GT(1, 0);
-        ASSERT_GT(1, -1);
-        ASSERT_SIGNAL(ASSERT_GT(0, 0), SIGABRT);
-        ASSERT_SIGNAL(ASSERT_GT(-1, 1), SIGABRT);
-
-        ASSERT_LT(0, 1);
-        ASSERT_LT(-1, 1);
-        ASSERT_SIGNAL(ASSERT_LT(0, 0), SIGABRT);
-        ASSERT_SIGNAL(ASSERT_LT(1, -1), SIGABRT);
 }
 
 DEFINE_TEST_MAIN(LOG_INFO);

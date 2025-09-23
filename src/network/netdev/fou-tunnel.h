@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <netinet/in.h>
 #include <linux/fou.h>
 
 #include "in-addr-util.h"
+#include "forward.h"
 #include "netdev.h"
 
 typedef enum FooOverUDPEncapType {
@@ -34,9 +34,8 @@ typedef struct FouTunnel {
 DEFINE_NETDEV_CAST(FOU, FouTunnel);
 extern const NetDevVTable foutnl_vtable;
 
-const char *fou_encap_type_to_string(FooOverUDPEncapType d) _const_;
+const char* fou_encap_type_to_string(FooOverUDPEncapType d) _const_;
 FooOverUDPEncapType fou_encap_type_from_string(const char *d) _pure_;
 
 CONFIG_PARSER_PROTOTYPE(config_parse_fou_encap_type);
-CONFIG_PARSER_PROTOTYPE(config_parse_ip_protocol);
 CONFIG_PARSER_PROTOTYPE(config_parse_fou_tunnel_address);

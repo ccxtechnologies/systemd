@@ -16,7 +16,7 @@ it can attempt various things to make more memory available again ("reclaim"):
   pages are the many memory mapped executable files and shared libraries on
   disk, among others.
 
-* The kernel can flush out memory packages not backed by files on disk
+* The kernel can flush out memory pages not backed by files on disk
   ("anonymous" memory, i.e. memory allocated via `malloc()` and similar calls,
   or `tmpfs` file system contents) if there's swap to write it to.
 
@@ -227,12 +227,12 @@ handling, it's typically sufficient to add a line such as:
 
 Other programming environments might have native APIs to watch memory
 pressure/low memory events. Most notable is probably GLib's
-[GMemoryMonitor](https://developer-old.gnome.org/gio/stable/GMemoryMonitor.html). It
+[GMemoryMonitor](https://docs.gtk.org/gio/iface.MemoryMonitor.html). It
 currently uses the per-system Linux PSI interface as the backend, but operates
 differently than the above: memory pressure events are picked up by a system
 service, which then propagates this through D-Bus to the applications. This is
 typically less than ideal, since this means each notification event has to
 traverse three processes before being handled. This traversal creates
 additional latencies at a time where the system is already experiencing adverse
-latencies. Moreover, it focusses on system-wide PSI events, even though
+latencies. Moreover, it focuses on system-wide PSI events, even though
 service-local ones are generally the better approach.

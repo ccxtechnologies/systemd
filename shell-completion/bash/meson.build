@@ -11,7 +11,6 @@ if bashcompletiondir == ''
 endif
 
 custom_target(
-        'systemctl',
         input : 'systemctl.in',
         output : 'systemctl',
         command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
@@ -24,10 +23,11 @@ items = [['busctl',              ''],
          ['systemd-cat',         ''],
          ['systemd-cgls',        ''],
          ['systemd-cgtop',       ''],
+         ['systemd-creds',       ''],
          ['systemd-delta',       ''],
          ['systemd-detect-virt', ''],
          ['systemd-id128',       ''],
-         ['systemd-nspawn',      ''],
+         ['systemd-nspawn',      'ENABLE_NSPAWN'],
          ['systemd-path',        ''],
          ['systemd-run',         ''],
          ['systemd-vpick',       ''],
@@ -52,7 +52,8 @@ items = [['busctl',              ''],
          ['systemd-resolve',     'ENABLE_RESOLVE'],
          ['systemd-sysext',      'ENABLE_SYSEXT'],
          ['systemd-vmspawn',     'ENABLE_VMSPAWN'],
-         ['timedatectl',         'ENABLE_TIMEDATED']]
+         ['timedatectl',         'ENABLE_TIMEDATED'],
+         ['userdbctl',           'ENABLE_USERDB']]
 
 foreach item : items
         if bashcompletiondir != 'no' and (item[1] == '' or conf.get(item[1]) == 1)

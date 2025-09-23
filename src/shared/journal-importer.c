@@ -1,17 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <malloc.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
 #include "errno-util.h"
 #include "escape.h"
 #include "fd-util.h"
-#include "io-util.h"
 #include "journal-file.h"
 #include "journal-importer.h"
-#include "journal-util.h"
+#include "log.h"
 #include "parse-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -33,7 +30,7 @@ void journal_importer_cleanup(JournalImporter *imp) {
 
         free(imp->name);
         free(imp->buf);
-        iovw_free_contents(&imp->iovw, false);
+        iovw_done(&imp->iovw);
 }
 
 static char* realloc_buffer(JournalImporter *imp, size_t size) {
@@ -127,7 +124,7 @@ static int fill_fixed_size(JournalImporter *imp, void **data, size_t size) {
         assert(data);
 
         while (imp->filled - imp->offset < size) {
-                int n;
+                ssize_t n;
 
                 if (imp->passive_fd)
                         /* we have to wait for some data to come to us */
@@ -452,7 +449,7 @@ void journal_importer_drop_iovw(JournalImporter *imp) {
 
         /* This function drops processed data that along with the iovw that points at it */
 
-        iovw_free_contents(&imp->iovw, false);
+        iovw_done(&imp->iovw);
 
         /* possibly reset buffer position */
         remain = imp->filled - imp->offset;

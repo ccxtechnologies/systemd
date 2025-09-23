@@ -1,30 +1,21 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "forward.h"
 #include "in-addr-util.h"
-#include "json.h"
 #include "list.h"
-#include "resolve-util.h"
-#include "time-util.h"
-
-typedef struct DnsScope DnsScope;
-typedef struct DnsServer DnsServer;
-typedef struct DnsStream DnsStream;
-typedef struct DnsPacket DnsPacket;
-typedef struct Link Link;
-typedef struct Manager Manager;
-
+#include "resolved-conf.h"
 #include "resolved-dnstls.h"
+#include "resolved-forward.h"
 
 typedef enum DnsServerType {
         DNS_SERVER_SYSTEM,
         DNS_SERVER_FALLBACK,
         DNS_SERVER_LINK,
+        DNS_SERVER_DELEGATE,
         _DNS_SERVER_TYPE_MAX,
         _DNS_SERVER_TYPE_INVALID = -EINVAL,
 } DnsServerType;
-
-#include "resolved-conf.h"
 
 const char* dns_server_type_to_string(DnsServerType i) _const_;
 DnsServerType dns_server_type_from_string(const char *s) _pure_;
@@ -50,13 +41,14 @@ typedef enum DnsServerFeatureLevel {
 const char* dns_server_feature_level_to_string(DnsServerFeatureLevel i) _const_;
 DnsServerFeatureLevel dns_server_feature_level_from_string(const char *s) _pure_;
 
-struct DnsServer {
+typedef struct DnsServer {
         Manager *manager;
 
         unsigned n_ref;
 
         DnsServerType type;
         Link *link;
+        DnsDelegate *delegate;
 
         int family;
         union in_addr_union address;
@@ -105,13 +97,17 @@ struct DnsServer {
 
         /* Servers registered via D-Bus are not removed on reload */
         ResolveConfigSource config_source;
-};
+
+        /* Tri-state to indicate if the DNS server is accessible. */
+        int accessible;
+} DnsServer;
 
 int dns_server_new(
                 Manager *m,
                 DnsServer **ret,
                 DnsServerType type,
                 Link *link,
+                DnsDelegate *delegate,
                 int family,
                 const union in_addr_union *address,
                 uint16_t port,
@@ -139,8 +135,8 @@ DnsServerFeatureLevel dns_server_possible_feature_level(DnsServer *s);
 
 int dns_server_adjust_opt(DnsServer *server, DnsPacket *packet, DnsServerFeatureLevel level);
 
-const char *dns_server_string(DnsServer *server);
-const char *dns_server_string_full(DnsServer *server);
+const char* dns_server_string(DnsServer *server);
+const char* dns_server_string_full(DnsServer *server);
 int dns_server_ifindex(const DnsServer *s);
 uint16_t dns_server_port(const DnsServer *s);
 
@@ -154,6 +150,9 @@ void dns_server_unlink_all(DnsServer *first);
 void dns_server_unlink_on_reload(DnsServer *server);
 bool dns_server_unlink_marked(DnsServer *first);
 void dns_server_mark_all(DnsServer *first);
+
+int manager_parse_search_domains_and_warn(Manager *m, const char *string);
+int manager_parse_dns_server_string_and_warn(Manager *m, DnsServerType type, const char *string);
 
 DnsServer *manager_get_first_dns_server(Manager *m, DnsServerType t);
 
@@ -181,4 +180,15 @@ void dns_server_unref_stream(DnsServer *s);
 
 DnsScope *dns_server_scope(DnsServer *s);
 
-int dns_server_dump_state_to_json(DnsServer *server, JsonVariant **ret);
+static inline bool dns_server_is_fallback(DnsServer *s) {
+        return s && s->type == DNS_SERVER_FALLBACK;
+}
+
+int dns_server_dump_state_to_json(DnsServer *server, sd_json_variant **ret);
+int dns_server_dump_configuration_to_json(DnsServer *server, sd_json_variant **ret);
+
+int dns_server_is_accessible(DnsServer *s);
+static inline void dns_server_reset_accessible(DnsServer *s) {
+        s->accessible = -1;
+}
+void dns_server_reset_accessible_all(DnsServer *first);

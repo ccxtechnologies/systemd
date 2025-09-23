@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
+#include "forward.h"
 
 #define DROPIN_MARKER_START "### Anything between here and the comment below will become the contents of the drop-in file"
 #define DROPIN_MARKER_END "### Edits below this comment will be discarded"
@@ -15,7 +15,7 @@ typedef struct EditFileContext {
         const char *marker_end;
         bool remove_parent;
         bool overwrite_with_origin; /* Always overwrite target with original file. */
-        bool stdin;                 /* Read contents from stdin instead of launching an editor. */
+        bool read_from_stdin;       /* Read contents from stdin instead of launching an editor. */
 } EditFileContext;
 
 void edit_file_context_done(EditFileContext *context);

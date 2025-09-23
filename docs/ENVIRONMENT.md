@@ -23,17 +23,17 @@ All tools:
 * `$SYSTEMD_OFFLINE=[0|1]` — if set to `1`, then `systemctl` will refrain from
   talking to PID 1; this has the same effect as the historical detection of
   `chroot()`. Setting this variable to `0` instead has a similar effect as
-  `$SYSTEMD_IGNORE_CHROOT=1`; i.e. tools will try to communicate with PID 1
+  `$SYSTEMD_IN_CHROOT=0`; i.e. tools will try to communicate with PID 1
   even if a `chroot()` environment is detected. You almost certainly want to
   set this to `1` if you maintain a package build system or similar and are
   trying to use a modern container system and not plain `chroot()`.
 
-* `$SYSTEMD_IGNORE_CHROOT=1` — if set, don't check whether being invoked in a
-  `chroot()` environment. This is particularly relevant for systemctl, as it
-  will not alter its behaviour for `chroot()` environments if set. Normally it
-  refrains from talking to PID 1 in such a case; turning most operations such
-  as `start` into no-ops.  If that's what's explicitly desired, you might
-  consider setting `$SYSTEMD_OFFLINE=1`.
+* `$SYSTEMD_IN_CHROOT=0|1` — takes a boolean. If set, overrides chroot detection.
+  This is particularly relevant for systemctl, as it will not alter its behaviour
+  for `chroot()` environments if `SYSTEMD_IN_CHROOT=0`. Normally it refrains from
+  talking to PID 1 in such a case; turning most operations such as `start` into
+  no-ops. If that's what's explicitly desired, you might consider setting
+  `$SYSTEMD_OFFLINE=1`.
 
 * `$SYSTEMD_FIRST_BOOT=0|1` — if set, assume "first boot" condition to be false
   or true, instead of checking the flag file created by PID 1.
@@ -71,9 +71,6 @@ All tools:
 * `$SYSTEMD_VERITYTAB` — if set, use this path instead of
   `/etc/veritytab`. Only useful for debugging. Currently only supported by
   `systemd-veritysetup-generator`.
-
-* `$SYSTEMD_EFI_OPTIONS` — if set, used instead of the string in the
-  `SystemdOptions` EFI variable. Analogous to `$SYSTEMD_PROC_CMDLINE`.
 
 * `$SYSTEMD_DEFAULT_HOSTNAME` — override the compiled-in fallback hostname
   (relevant in particular for the system manager and `systemd-hostnamed`).
@@ -146,10 +143,12 @@ All tools:
   instead of reboot when a new root file system has been loaded in
   `/run/nextroot/`.
 
-`systemd-nspawn`:
+* `SYSTEMD_PRESET_BYPASS=1` — If set, execution of `systemctl preset` and
+  `systemctl preset-all` is skipped. This can be useful if either of these is
+  invoked unconditionally as a child process by another tool, such as package
+  managers running it in a postinstall script.
 
-* `$SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1` — if set, force `systemd-nspawn` into
-  unified cgroup hierarchy mode.
+`systemd-nspawn`:
 
 * `$SYSTEMD_NSPAWN_API_VFS_WRITABLE=1` — if set, make `/sys/`, `/proc/sys/`,
   and friends writable in the container. If set to "network", leave only
@@ -295,6 +294,9 @@ All tools:
   first existing unit listed in the environment variable, and
   `timedatectl set-ntp off` disables and stops all listed units.
 
+* `$SYSTEMD_ETC_ADJTIME` - override the path to the hardware clock settings
+  file. The default is `/etc/adjtime`.
+
 `systemd-sulogin-shell`:
 
 * `$SYSTEMD_SULOGIN_FORCE=1` — This skips asking for the root password if the
@@ -351,6 +353,14 @@ All tools:
   default is not appropriate for a given system. Defaults to `5`, accepts
   positive integers.
 
+* `$SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_INTERVAL_SEC` — can be set to override the
+  mount units interval rate limit for parsing `/proc/self/mountinfo`. Similar
+  to `$SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_BURST`, the interval limit maybe
+  adjusted when the default is not appropriate for a given system. The default
+  value is 1, the default application time unit is second, and the time unit
+  can be overridden as usual by specifying it explicitly, see the
+  systemd.time(7) man page.
+
 `systemd-remount-fs`:
 
 * `$SYSTEMD_REMOUNT_ROOT_RW=1` — if set and no entry for the root directory
@@ -404,7 +414,12 @@ All tools:
   subvolumes if the backing filesystem supports them. If set to `0`, these
   lines will always create directories.
 
-`systemd-sysusers`
+* `SYSTEMD_TMPFILES_BYPASS=1` — If set, execution of `systemd-tmpfiles` is
+  skipped. This can be useful if `systemd-tmpfiles` is invoked unconditionally
+  as a child process by another tool, such as package managers running it in a
+  postinstall script.
+
+`systemd-sysusers`:
 
 * `$SOURCE_DATE_EPOCH` — if unset, the field of the date of last password change
   in `/etc/shadow` will be the number of days from Jan 1, 1970 00:00 UTC until
@@ -413,6 +428,11 @@ All tools:
   support creating bit-by-bit reproducible system images by choosing a
   reproducible value for the field of the date of last password change in
   `/etc/shadow`. See: https://reproducible-builds.org/specs/source-date-epoch/
+
+* `SYSTEMD_SYSUSERS_BYPASS=1` — If set, execution of `systemd-sysusers` is
+  skipped. This can be useful if `systemd-sysusers` is invoked unconditionally
+  as a child process by another tool, such as package managers running it in a
+  postinstall script.
 
 `systemd-sysv-generator`:
 
@@ -433,6 +453,9 @@ systemd tests:
 * `$TESTFUNCS` – takes a colon separated list of test functions to invoke,
   causes all non-matching test functions to be skipped. Only applies to tests
   using our regular test boilerplate.
+
+* `$SYSTEMD_ASSERT_RETURN_IS_CRITICAL` — Takes a boolean to control if
+  `assert_return()` and friends call `abort()`.
 
 fuzzers:
 
@@ -509,6 +532,14 @@ disk images with `--image=` or similar:
   related directories) to authenticate signatures on Verity hashes of disk
   images. Defaults to true, i.e. userspace signature validation is allowed. If
   false, authentication can be done only via the kernel's internal keyring.
+
+* `$SYSTEMD_DISSECT_VERITY_GUESS` – takes a boolean. Controls whether to guess
+  the Verity root hash from the partition UUIDs of a suitable pair of data
+  partition and matching Verity partition: the UUIDs two are simply joined and
+  used as root hash, in accordance with the recommendations in [Discoverable
+  Partitions
+  Specification](https://uapi-group.org/specifications/specs/discoverable_partitions_specification). Defaults
+  to true.
 
 `systemd-cryptsetup`:
 
@@ -589,6 +620,18 @@ SYSTEMD_HOME_DEBUG_SUFFIX=foo \
   parts of the session continue running. Thus, we highly recommend that this variable
   isn't used unless necessary. Defaults to true.
 
+`homectl`:
+
+* `$SYSTEMD_HOME_FIRSTBOOT_OVERRIDE` – if set to "1" will make `homectl
+  firstboot --prompt-new-user` interactively ask for user creation, even if
+  there already exists at least one regular user on the system. If set to "0"
+  will make the tool skip any such query.
+
+* `$SYSTEMD_HOME_DRY_RUN` – if set to "1" will make `homectl create` and
+  `homectl update` operate in a "dry-run" mode: the new user record is
+  assembled, and displayed in JSON format, but not actually passed to
+  `systemd-homed` for execution of the operation.
+
 `kernel-install`:
 
 * `$KERNEL_INSTALL_BYPASS` – If set to "1", execution of kernel-install is skipped
@@ -634,6 +677,10 @@ SYSTEMD_HOME_DEBUG_SUFFIX=foo \
 
 * `$SYSTEMD_REPART_OVERRIDE_FSTYPE` – if set the value will override the file
   system type specified in Format= lines in partition definition files.
+  Additionally, the filesystem for all partitions with a specific designator can
+  be overridden via a correspondingly named environment variable. For example,
+  to override the filesystem type for all partitions with `Type=root`, you can
+  set `SYSTEMD_REPART_OVERRIDE_FSTYPE_ROOT=ext4`.
 
 `systemd-nspawn`, `systemd-networkd`:
 
@@ -647,6 +694,9 @@ SYSTEMD_HOME_DEBUG_SUFFIX=foo \
   systemd-networkd tries to open the persistent storage on start. To make this
   work, ProtectSystem=strict in systemd-networkd.service needs to be downgraded
   or disabled.
+
+* `$SYSTEMD_LLDP_SEND_MACHINE_ID` - takes a boolean, If true, systemd-networkd
+  sends machine ID as chassis ID through LLDP protocol.
 
 `systemd-storagetm`:
 
@@ -686,7 +736,8 @@ Tools using the Varlink protocol (such as `varlinkctl`) or sd-bus (such as
 * `$SYSTEMD_VARLINK_LISTEN` – interpreted by some tools that provide a Varlink
   service. Takes a file system path: if specified the tool will listen on an
   `AF_UNIX` stream socket on the specified path in addition to whatever else it
-  would listen on.
+  would listen on. If set to "-" the tool will turn stdin/stdout into a Varlink
+  connection.
 
 `systemd-mountfsd`:
 
@@ -713,3 +764,55 @@ Tools using the Varlink protocol (such as `varlinkctl`) or sd-bus (such as
   and `run0` invocations is turned off. Note that this environment variable has
   no effect if the background color is explicitly selected via the relevant
   `--background=` switch of the tool.
+
+* `$SYSTEMD_ADJUST_TERMINAL_TITLE` – Takes a boolean. When false the terminal
+  window title will not be updated for interactive invocation of the mentioned
+  tools.
+
+`systemd-hostnamed`, `systemd-importd`, `systemd-localed`, `systemd-machined`,
+`systemd-portabled`, `systemd-timedated`:
+
+* `SYSTEMD_EXIT_ON_IDLE` – Takes a boolean. When false, the exit-on-idle logic
+  of these services is disabled, making it easier to debug them.
+
+`systemd-ask-password`:
+
+* `$SYSTEMD_ASK_PASSWORD_KEYRING_TIMEOUT_SEC` - takes a timespan, which controls
+  the expiration time of keys stored in the kernel keyring by `systemd-ask-password`.
+  If unset, the default expiration of 150 seconds is used. If set to `0`, keys are
+  not cached in the kernel keyring. If set to `infinity`, keys are cached without an
+  expiration time in the kernel keyring.
+
+* `SYSTEMD_ASK_PASSWORD_KEYRING_TYPE` - takes a keyring ID or one of `thread`,
+  `process`, `session`, `user`, `user-session`, or `group`. Controls the kernel
+  keyring in which `systemd-ask-password` caches the queried password. Defaults
+  to `user`.
+
+`systemd-tpm2-clear`:
+
+* `SYSTEMD_TPM2_ALLOW_CLEAR` – takes a boolean. Overrides the effect of the
+  `systemd.factory_reset=` kernel command line option: if set to false,
+  requesting a TPM clearing is skipped, and the command immediately exits
+  successfully.
+
+`systemd-timedated`, `systemd-firstboot`, `systemd`:
+
+* `$SYSTEMD_ETC_LOCALTIME` - override the path to the timezone symlink. The
+  default is `/etc/localtime`. The directory of the path should exist and not
+  be removed.
+
+`systemd-hostnamed`, `systemd-firstboot`:
+
+* `$SYSTEMD_ETC_HOSTNAME` - override the path to local system name
+  configuration file. The default is `/etc/hostname`.
+
+* `$SYSTEMD_ETC_MACHINE_INFO` - override the path to the machine metadata file. The
+  default is `/etc/machine-info`.
+
+`systemd-localed`, `systemd-firstboot`:
+
+* `$SYSTEMD_ETC_LOCALE_CONF` - override the path to the system-wide locale
+  configuration file. The default is `/etc/locale.conf`.
+
+* `$SYSTEMD_ETC_VCONSOLE_CONF` - override the path to the virtual console
+  configuration file. The default is `/etc/vconsole.conf`.

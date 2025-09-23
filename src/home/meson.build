@@ -1,28 +1,10 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-systemd_homework_sources = files(
-        'home-util.c',
-        'homework-blob.c',
-        'homework-cifs.c',
-        'homework-directory.c',
-        'homework-fscrypt.c',
-        'homework-luks.c',
-        'homework-mount.c',
-        'homework-password-cache.c',
-        'homework-quota.c',
-        'homework.c',
-        'user-record-util.c',
-)
-
-if conf.get('HAVE_P11KIT') == 1
-        systemd_homework_sources += files('homework-pkcs11.c')
-endif
-if conf.get('HAVE_LIBFIDO2') == 1
-        systemd_homework_sources += files('homework-fido2.c')
+if conf.get('ENABLE_HOMED') != 1
+        subdir_done()
 endif
 
 systemd_homed_sources = files(
-        'home-util.c',
         'homed-bus.c',
         'homed-conf.c',
         'homed-home-bus.c',
@@ -32,27 +14,41 @@ systemd_homed_sources = files(
         'homed-operation.c',
         'homed-varlink.c',
         'homed.c',
-        'user-record-password-quality.c',
         'user-record-sign.c',
+)
+systemd_homed_extract_sources = files(
+        'home-util.c',
+        'user-record-password-quality.c',
         'user-record-util.c',
 )
 
+systemd_homework_sources = files(
+        'homework.c',
+        'homework-blob.c',
+        'homework-cifs.c',
+        'homework-directory.c',
+        'homework-fido2.c',
+        'homework-fscrypt.c',
+        'homework-luks.c',
+        'homework-mount.c',
+        'homework-password-cache.c',
+        'homework-pkcs11.c',
+        'homework-quota.c',
+)
+
 homed_gperf_c = custom_target(
-        'homed_gperf.c',
         input : 'homed-gperf.gperf',
         output : 'homed-gperf.c',
         command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
+generated_sources += [homed_gperf_c]
 systemd_homed_sources += [homed_gperf_c]
 
 homectl_sources = files(
-        'home-util.c',
         'homectl-fido2.c',
         'homectl-pkcs11.c',
         'homectl-recovery-key.c',
         'homectl.c',
-        'user-record-password-quality.c',
-        'user-record-util.c',
 )
 
 pam_systemd_home_sources = files(
@@ -63,9 +59,23 @@ pam_systemd_home_sources = files(
 
 executables += [
         libexec_template + {
+                'name' : 'systemd-homed',
+                'dbus' : true,
+                'sources' : systemd_homed_sources + systemd_homed_extract_sources,
+                'include_directories' : includes +
+                                        include_directories('.'),
+                'extract' : systemd_homed_extract_sources,
+                'dependencies' : [
+                        libcrypt,
+                        libm,
+                        libopenssl,
+                        threads,
+                ],
+        },
+        libexec_template + {
                 'name' : 'systemd-homework',
-                'conditions' : ['ENABLE_HOMED'],
                 'sources' : systemd_homework_sources,
+                'objects' : ['systemd-homed'],
                 'link_with' : [
                         libshared,
                         libshared_fdisk
@@ -79,25 +89,11 @@ executables += [
                         threads,
                 ],
         },
-        libexec_template + {
-                'name' : 'systemd-homed',
-                'dbus' : true,
-                'conditions' : ['ENABLE_HOMED'],
-                'sources' : systemd_homed_sources,
-                'include_directories' : includes +
-                                        include_directories('.'),
-                'dependencies' : [
-                        libcrypt,
-                        libm,
-                        libopenssl,
-                        threads,
-                ],
-        },
         executable_template + {
                 'name' : 'homectl',
                 'public' : true,
-                'conditions' : ['ENABLE_HOMED'],
                 'sources' : homectl_sources,
+                'objects' : ['systemd-homed'],
                 'dependencies' : [
                         libcrypt,
                         libdl,
@@ -108,7 +104,6 @@ executables += [
         },
         test_template + {
                 'sources' : files('test-homed-regression-31896.c'),
-                'conditions' : ['ENABLE_HOMED'],
                 'type' : 'manual',
         },
 ]
@@ -116,10 +111,7 @@ executables += [
 modules += [
         pam_template + {
                 'name' : 'pam_systemd_home',
-                'conditions' : [
-                        'ENABLE_HOMED',
-                        'HAVE_PAM',
-                ],
+                'conditions' : ['HAVE_PAM'],
                 'sources' : pam_systemd_home_sources,
                 'dependencies' : [
                         libcrypt,
@@ -131,20 +123,18 @@ modules += [
         },
 ]
 
-if conf.get('ENABLE_HOMED') == 1
-        install_data('org.freedesktop.home1.conf',
-                     install_dir : dbuspolicydir)
-        install_data('org.freedesktop.home1.service',
-                     install_dir : dbussystemservicedir)
-        install_data('org.freedesktop.home1.policy',
-                     install_dir : polkitpolicydir)
+install_data('org.freedesktop.home1.conf',
+             install_dir : dbuspolicydir)
+install_data('org.freedesktop.home1.service',
+             install_dir : dbussystemservicedir)
+install_data('org.freedesktop.home1.policy',
+             install_dir : polkitpolicydir)
 
-        if install_sysconfdir_samples
-                install_data('homed.conf',
-                             install_dir : pkgconfigfiledir)
-        endif
-
-        meson.add_install_script(sh, '-c',
-                                 ln_s.format(bindir / 'homectl',
-                                             bindir / 'systemd-home-fallback-shell'))
+if install_sysconfdir_samples
+        install_data('homed.conf',
+                     install_dir : pkgconfigfiledir)
 endif
+
+install_symlink('systemd-home-fallback-shell',
+                pointing_to : 'homectl',
+                install_dir : bindir)

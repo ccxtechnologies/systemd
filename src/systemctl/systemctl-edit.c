@@ -1,17 +1,24 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "bus-error.h"
+#include <unistd.h>
+
+#include "alloc-util.h"
+#include "bus-util.h"
 #include "edit-util.h"
-#include "fs-util.h"
+#include "hashmap.h"
+#include "label-util.h"
 #include "pager.h"
+#include "path-lookup.h"
 #include "path-util.h"
 #include "pretty-print.h"
-#include "selinux-util.h"
+#include "string-util.h"
+#include "strv.h"
+#include "systemctl.h"
 #include "systemctl-daemon-reload.h"
 #include "systemctl-edit.h"
 #include "systemctl-util.h"
-#include "systemctl.h"
 #include "terminal-util.h"
+#include "unit-name.h"
 
 int verb_cat(int argc, char *argv[], void *userdata) {
         _cleanup_hashmap_free_ Hashmap *cached_id_map = NULL, *cached_name_map = NULL;
@@ -69,8 +76,9 @@ int verb_cat(int argc, char *argv[], void *userdata) {
                         return r;
                 if (r == 0) {
                         /* Skip units which have no on-disk counterpart, but propagate the error to the
-                         * user */
-                        rc = -ENOENT;
+                         * user (if --force is set, eat the error, just like unit_find_paths()) */
+                        if (!arg_force)
+                                rc = -ENOENT;
                         continue;
                 }
 
@@ -316,14 +324,14 @@ int verb_edit(int argc, char *argv[], void *userdata) {
                 .marker_end = DROPIN_MARKER_END,
                 .remove_parent = !arg_full,
                 .overwrite_with_origin = true,
-                .stdin = arg_stdin,
+                .read_from_stdin = arg_stdin,
         };
         _cleanup_strv_free_ char **names = NULL;
         sd_bus *bus;
         int r;
 
         if (!on_tty() && !arg_stdin)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot edit units if not on a tty.");
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot edit units interactively if not on a tty.");
 
         if (arg_transport != BUS_TRANSPORT_LOCAL)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot edit units remotely.");
@@ -348,8 +356,8 @@ int verb_edit(int argc, char *argv[], void *userdata) {
 
         STRV_FOREACH(tmp, names) {
                 r = unit_is_masked(bus, *tmp);
-                if (r < 0)
-                        return r;
+                if (r < 0 && r != -ENOENT)
+                        return log_error_errno(r, "Failed to check if unit %s is masked: %m", *tmp);
                 if (r > 0)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot edit %s: unit is masked.", *tmp);
         }

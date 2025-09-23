@@ -43,6 +43,7 @@
  */
 
 #include <getopt.h>
+#include <stdio.h>
 
 #include "alloc-util.h"
 #include "build.h"
@@ -89,7 +90,7 @@ static bool verify_checksum(const uint8_t *buf, size_t len) {
  * Type-independent Stuff
  */
 
-static const char *dmi_string(const struct dmi_header *dm, uint8_t s) {
+static const char* dmi_string(const struct dmi_header *dm, uint8_t s) {
         const char *bp = (const char *) dm->data;
 
         if (s == 0)
@@ -399,7 +400,7 @@ static void dmi_memory_device_manufacturer_id(
         /* LSB is 7-bit Odd Parity number of continuation codes */
         if (code != 0)
                 printf("MEMORY_DEVICE_%u_%s=Bank %d, Hex 0x%02X\n", slot_num, attr_suffix,
-                       (code & 0x7F) + 1, code >> 8);
+                       (code & 0x7F) + 1, (uint16_t) (code >> 8));
 }
 
 static void dmi_memory_device_product_id(

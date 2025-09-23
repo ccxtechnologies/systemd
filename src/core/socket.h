@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-typedef struct Socket Socket;
-typedef struct SocketPeer SocketPeer;
-
-#include "mount.h"
+#include "cgroup.h"
+#include "core-forward.h"
+#include "execute.h"
+#include "list.h"
 #include "pidref.h"
 #include "socket-util.h"
 #include "unit.h"
@@ -66,7 +66,15 @@ typedef enum SocketTimestamping {
         _SOCKET_TIMESTAMPING_INVALID = -EINVAL,
 } SocketTimestamping;
 
-struct Socket {
+typedef enum SocketDeferTrigger {
+        SOCKET_DEFER_NO,
+        SOCKET_DEFER_YES,
+        SOCKET_DEFER_PATIENT,
+        _SOCKET_DEFER_MAX,
+        _SOCKET_DEFER_INVALID = -EINVAL,
+} SocketDeferTrigger;
+
+typedef struct Socket {
         Unit meta;
 
         LIST_HEAD(SocketPort, ports);
@@ -86,7 +94,7 @@ struct Socket {
         usec_t keep_alive_interval;
         usec_t defer_accept;
 
-        ExecCommand* exec_command[_SOCKET_EXEC_COMMAND_MAX];
+        ExecCommand *exec_command[_SOCKET_EXEC_COMMAND_MAX];
         ExecContext exec_context;
         KillContext kill_context;
         CGroupContext cgroup_context;
@@ -103,9 +111,11 @@ struct Socket {
 
         sd_event_source *timer_event_source;
 
-        ExecCommand* control_command;
+        ExecCommand *control_command;
         SocketExecCommand control_command_id;
         PidRef control_pid;
+
+        bool pass_fds_to_exec;
 
         mode_t directory_mode;
         mode_t socket_mode;
@@ -129,9 +139,10 @@ struct Socket {
         bool transparent;
         bool broadcast;
         bool pass_cred;
-        bool pass_fds_to_exec;
+        bool pass_pidfd;
         bool pass_sec;
         bool pass_pktinfo;
+        bool pass_rights;
         SocketTimestamping timestamping;
 
         /* Only for INET6 sockets: issue IPV6_V6ONLY sockopt */
@@ -161,9 +172,11 @@ struct Socket {
         char *fdname;
 
         RateLimit trigger_limit;
-        usec_t poll_limit_interval;
-        unsigned poll_limit_burst;
-};
+        RateLimit poll_limit;
+
+        usec_t defer_trigger_max_usec;
+        SocketDeferTrigger defer_trigger;
+} Socket;
 
 SocketPeer *socket_peer_ref(SocketPeer *p);
 SocketPeer *socket_peer_unref(SocketPeer *p);
@@ -177,7 +190,7 @@ int socket_collect_fds(Socket *s, int **ret);
 /* Called from the service code when a per-connection service ended */
 void socket_connection_unref(Socket *s);
 
-SocketPort *socket_port_free(SocketPort *p);
+SocketPort* socket_port_free(SocketPort *p);
 DEFINE_TRIVIAL_CLEANUP_FUNC(SocketPort*, socket_port_free);
 
 void socket_free_ports(Socket *s);
@@ -186,7 +199,7 @@ int socket_port_to_address(const SocketPort *s, char **ret);
 
 int socket_load_service_unit(Socket *s, int cfd, Unit **ret);
 
-char *socket_fdname(Socket *s);
+const char* socket_fdname(Socket *s);
 
 extern const UnitVTable socket_vtable;
 
@@ -202,5 +215,8 @@ SocketType socket_port_type_from_string(const char *p) _pure_;
 const char* socket_timestamping_to_string(SocketTimestamping p) _const_;
 SocketTimestamping socket_timestamping_from_string(const char *p) _pure_;
 SocketTimestamping socket_timestamping_from_string_harder(const char *p) _pure_;
+
+const char* socket_defer_trigger_to_string(SocketDeferTrigger i) _const_;
+SocketDeferTrigger socket_defer_trigger_from_string(const char *s) _pure_;
 
 DEFINE_CAST(SOCKET, Socket);

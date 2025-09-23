@@ -1,10 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "alloc-util.h"
 #include "analyze.h"
 #include "analyze-calendar.h"
+#include "ansi-color.h"
 #include "calendarspec.h"
+#include "errno-util.h"
 #include "format-table.h"
-#include "terminal-util.h"
+#include "log.h"
+#include "string-util.h"
+#include "strv.h"
+#include "time-util.h"
 
 static int test_calendar_one(usec_t n, const char *p) {
         _cleanup_(calendar_spec_freep) CalendarSpec *spec = NULL;
@@ -126,11 +132,7 @@ int verb_calendar(int argc, char *argv[], void *userdata) {
                 n = now(CLOCK_REALTIME); /* We want to use the same "base" for all expressions */
 
         STRV_FOREACH(p, strv_skip(argv, 1)) {
-                int k;
-
-                k = test_calendar_one(n, *p);
-                if (r == 0 && k < 0)
-                        r = k;
+                RET_GATHER(r, test_calendar_one(n, *p));
 
                 if (p[1])
                         putchar('\n');

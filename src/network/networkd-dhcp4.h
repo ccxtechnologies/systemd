@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "conf-parser.h"
-
-typedef struct Link Link;
-typedef struct Network Network;
+#include "networkd-forward.h"
 
 typedef enum DHCPClientIdentifier {
         DHCP_CLIENT_ID_MAC,
@@ -25,6 +22,7 @@ int dhcp4_lease_lost(Link *link);
 int dhcp4_check_ready(Link *link);
 
 int link_request_dhcp4_client(Link *link);
+int link_drop_dhcp4_config(Link *link, Network *network);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_client_identifier);
 CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_max_attempts);

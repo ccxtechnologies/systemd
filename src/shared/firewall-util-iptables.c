@@ -1,33 +1,26 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-/* Make sure the net/if.h header is included before any linux/ one */
-#include <net/if.h>
-#include <arpa/inet.h>
 #include <endian.h>
-#include <errno.h>
-#include <stddef.h>
-#include <string.h>
-#include <linux/if.h>
-#include <linux/netfilter_ipv4/ip_tables.h>
+#include <libiptc/libiptc.h>
 #include <linux/netfilter/nf_nat.h>
 #include <linux/netfilter/xt_addrtype.h>
-#include <libiptc/libiptc.h>
+#include <linux/netfilter_ipv4/ip_tables.h>
+#include <string.h>
 
 #include "alloc-util.h"
 #include "dlfcn-util.h"
-#include "firewall-util.h"
 #include "firewall-util-private.h"
 #include "in-addr-util.h"
-#include "macro.h"
+#include "log.h"
 #include "socket-util.h"
 
-static DLSYM_FUNCTION(iptc_check_entry);
-static DLSYM_FUNCTION(iptc_commit);
-static DLSYM_FUNCTION(iptc_delete_entry);
-static DLSYM_FUNCTION(iptc_free);
-static DLSYM_FUNCTION(iptc_init);
-static DLSYM_FUNCTION(iptc_insert_entry);
-static DLSYM_FUNCTION(iptc_strerror);
+static DLSYM_PROTOTYPE(iptc_check_entry) = NULL;
+static DLSYM_PROTOTYPE(iptc_commit) = NULL;
+static DLSYM_PROTOTYPE(iptc_delete_entry) = NULL;
+static DLSYM_PROTOTYPE(iptc_free) = NULL;
+static DLSYM_PROTOTYPE(iptc_init) = NULL;
+static DLSYM_PROTOTYPE(iptc_insert_entry) = NULL;
+static DLSYM_PROTOTYPE(iptc_strerror) = NULL;
 
 static void *iptc_dl = NULL;
 

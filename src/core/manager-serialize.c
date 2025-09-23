@@ -1,21 +1,26 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "clean-ipc.h"
-#include "core-varlink.h"
+#include "alloc-util.h"
 #include "dbus.h"
+#include "dynamic-user.h"
 #include "fd-util.h"
+#include "fdset.h"
 #include "fileio.h"
 #include "format-util.h"
+#include "glyph-util.h"
+#include "hashmap.h"
 #include "initrd-util.h"
-#include "macro.h"
-#include "manager-serialize.h"
 #include "manager.h"
+#include "manager-serialize.h"
 #include "parse-util.h"
 #include "serialize.h"
+#include "string-util.h"
+#include "strv.h"
 #include "syslog-util.h"
 #include "unit-serialize.h"
 #include "user-util.h"
-#include "varlink-internal.h"
+#include "varlink.h"
+#include "varlink-serialize.h"
 
 int manager_open_serialization(Manager *m, FILE **ret_f) {
         assert(ret_f);
@@ -90,7 +95,6 @@ int manager_serialize(
         (void) serialize_item_format(f, "current-job-id", "%" PRIu32, m->current_job_id);
         (void) serialize_item_format(f, "n-installed-jobs", "%u", m->n_installed_jobs);
         (void) serialize_item_format(f, "n-failed-jobs", "%u", m->n_failed_jobs);
-        (void) serialize_bool(f, "ready-sent", m->ready_sent);
         (void) serialize_bool(f, "taint-logged", m->taint_logged);
         (void) serialize_bool(f, "service-watchdogs", m->service_watchdogs);
 
@@ -136,12 +140,6 @@ int manager_serialize(
                 (void) serialize_item(f, "notify-socket", m->notify_socket);
         }
 
-        if (m->cgroups_agent_fd >= 0) {
-                r = serialize_fd(f, fds, "cgroups-agent-fd", m->cgroups_agent_fd);
-                if (r < 0)
-                        return r;
-        }
-
         if (m->user_lookup_fds[0] >= 0) {
                 r = serialize_fd_many(f, fds, "user-lookup", m->user_lookup_fds, 2);
                 if (r < 0)
@@ -157,6 +155,7 @@ int manager_serialize(
         (void) serialize_ratelimit(f, "dump-ratelimit", &m->dump_ratelimit);
         (void) serialize_ratelimit(f, "reload-reexec-ratelimit", &m->reload_reexec_ratelimit);
 
+        (void) serialize_id128(f, "bus-id", m->bus_id);
         bus_track_serialize(m->subscribed, f, "subscribed");
 
         r = dynamic_user_serialize(m, f, fds);
@@ -184,10 +183,6 @@ int manager_serialize(
                 if (r < 0)
                         return r;
         }
-
-        r = fflush_and_check(f);
-        if (r < 0)
-                return log_error_errno(r, "Failed to flush serialization: %m");
 
         r = bus_fdset_add_all(m, fds);
         if (r < 0)
@@ -305,10 +300,10 @@ int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
                                 r = fd_get_path(fd, &fn);
                                 if (r < 0)
                                         log_debug_errno(r, "Received serialized fd %i %s %m",
-                                                        fd, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT));
+                                                        fd, glyph(GLYPH_ARROW_RIGHT));
                                 else
                                         log_debug("Received serialized fd %i %s %s",
-                                                  fd, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), strna(fn));
+                                                  fd, glyph(GLYPH_ARROW_RIGHT), strna(fn));
                         }
                 }
         }
@@ -353,15 +348,6 @@ int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
                                 log_notice("Failed to parse failed jobs counter '%s', ignoring.", val);
                         else
                                 m->n_failed_jobs += n;
-
-                } else if ((val = startswith(l, "ready-sent="))) {
-                        int b;
-
-                        b = parse_boolean(val);
-                        if (b < 0)
-                                log_notice("Failed to parse ready-sent flag '%s', ignoring.", val);
-                        else
-                                m->ready_sent = m->ready_sent || b;
 
                 } else if ((val = startswith(l, "taint-logged="))) {
                         int b;
@@ -464,15 +450,6 @@ int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
                         if (r < 0)
                                 return r;
 
-                } else if ((val = startswith(l, "cgroups-agent-fd="))) {
-                        int fd;
-
-                        fd = deserialize_fd(fds, val);
-                        if (fd >= 0) {
-                                m->cgroups_agent_event_source = sd_event_source_disable_unref(m->cgroups_agent_event_source);
-                                close_and_replace(m->cgroups_agent_fd, fd);
-                        }
-
                 } else if ((val = startswith(l, "user-lookup="))) {
 
                         m->user_lookup_event_source = sd_event_source_disable_unref(m->user_lookup_event_source);
@@ -499,14 +476,19 @@ int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
                         manager_deserialize_gid_refs_one(m, val);
                 else if ((val = startswith(l, "exec-runtime=")))
                         (void) exec_shared_runtime_deserialize_one(m, val, fds);
-                else if ((val = startswith(l, "subscribed="))) {
+                else if ((val = startswith(l, "bus-id="))) {
 
-                        r = strv_extend(&m->deserialized_subscribed, val);
+                        r = sd_id128_from_string(val, &m->deserialized_bus_id);
+                        if (r < 0)
+                                return r;
+                } else if ((val = startswith(l, "subscribed="))) {
+
+                        r = strv_extend(&m->subscribed_as_strv, val);
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "varlink-server-socket-address="))) {
-                        if (!m->varlink_server && MANAGER_IS_SYSTEM(m)) {
-                                r = manager_varlink_init(m);
+                        if (!m->varlink_server) {
+                                r = manager_setup_varlink_server(m);
                                 if (r < 0) {
                                         log_warning_errno(r, "Failed to setup varlink server, ignoring: %m");
                                         continue;
@@ -556,7 +538,7 @@ int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
 
                         if (q < _MANAGER_TIMESTAMP_MAX) /* found it */
                                 (void) deserialize_dual_timestamp(val, m->timestamps + q);
-                        else if (!STARTSWITH_SET(l, "kdbus-fd=", "honor-device-enumeration=")) /* ignore deprecated values */
+                        else if (!STARTSWITH_SET(l, "kdbus-fd=", "honor-device-enumeration=", "ready-sent=", "cgroups-agent-fd=")) /* ignore deprecated values */
                                 log_notice("Unknown serialization item '%s', ignoring.", l);
                 }
         }

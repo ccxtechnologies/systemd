@@ -1,12 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "conf-parser.h"
-#include "time-util.h"
+#include <netinet/in.h>
 
-typedef struct Address Address;
-typedef struct Link Link;
-typedef struct Network Network;
+#include "dns-resolver-internal.h"
+#include "networkd-forward.h"
 
 typedef enum IPv6AcceptRAStartDHCP6Client {
         IPV6_ACCEPT_RA_START_DHCP6_CLIENT_NO,
@@ -49,9 +47,13 @@ typedef struct NDiscPREF64 {
         struct in6_addr prefix;
 } NDiscPREF64;
 
-static inline char* NDISC_DNSSL_DOMAIN(const NDiscDNSSL *n) {
-        return ((char*) n) + ALIGN(sizeof(NDiscDNSSL));
-}
+typedef struct NDiscDNR {
+        struct in6_addr router;
+        usec_t lifetime_usec;
+        sd_dns_resolver resolver;
+} NDiscDNR;
+
+char* ndisc_dnssl_domain(const NDiscDNSSL *n);
 
 bool link_ndisc_enabled(Link *link);
 
@@ -62,6 +64,7 @@ int ndisc_stop(Link *link);
 void ndisc_flush(Link *link);
 
 int link_request_ndisc(Link *link);
+int link_drop_ndisc_config(Link *link, Network *network);
 int ndisc_reconfigure_address(Address *address, Link *link);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_ndisc_start_dhcp6_client);

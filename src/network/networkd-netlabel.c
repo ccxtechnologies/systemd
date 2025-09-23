@@ -1,12 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "escape.h"
+#include "sd-netlink.h"
+
+#include "missing-network.h"
 #include "netlink-util.h"
 #include "networkd-address.h"
 #include "networkd-link.h"
 #include "networkd-manager.h"
 #include "networkd-netlabel.h"
-#include "networkd-network.h"
 
 static int netlabel_handler(sd_netlink *rtnl, sd_netlink_message *m, Link *link) {
         int r;
@@ -37,6 +38,9 @@ static int netlabel_command(uint16_t command, const char *label, const Address *
         assert(address->link->manager);
         assert(address->link->manager->genl);
         assert(IN_SET(address->family, AF_INET, AF_INET6));
+
+        if (address->link->manager->state == MANAGER_STOPPED)
+                return 0; /* We cannot call link_ref() below. */
 
         r = sd_genl_message_new(address->link->manager->genl, NETLBL_NLTYPE_UNLABELED_NAME, command, &m);
         if (r < 0)

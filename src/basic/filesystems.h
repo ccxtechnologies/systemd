@@ -1,9 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "nulstr-util.h"
+#include "forward.h"
 #include "stat-util.h"
-#include "string-util.h"
 
 #define FILESYSTEM_MAGIC_MAX 10
 
@@ -34,7 +33,7 @@ extern const FilesystemSet filesystem_sets[];
 
 const FilesystemSet *filesystem_set_find(const char *name);
 
-const char *fs_type_to_string(statfs_f_type_t magic);
+const char* fs_type_to_string(statfs_f_type_t magic);
 int fs_type_from_string(const char *name, const statfs_f_type_t **ret);
 bool fs_in_group(const struct statfs *s, enum FilesystemGroups fs_group);
 

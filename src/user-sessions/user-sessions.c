@@ -1,17 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
-#include "fileio.h"
-#include "fileio-label.h"
 #include "fs-util.h"
-#include "main-func.h"
+#include "label-util.h"
 #include "log.h"
-#include "selinux-util.h"
+#include "main-func.h"
+#include "reboot-util.h"
 #include "string-util.h"
 
 static int run(int argc, char *argv[]) {

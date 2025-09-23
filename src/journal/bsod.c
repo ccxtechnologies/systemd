@@ -1,12 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <getopt.h>
 #include <linux/vt.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
 
-#include "sd-id128.h"
 #include "sd-journal.h"
 
 #include "alloc-util.h"
@@ -20,9 +18,8 @@
 #include "parse-argument.h"
 #include "pretty-print.h"
 #include "qrcode-util.h"
-#include "sigbus.h"
 #include "signal-util.h"
-#include "sysctl-util.h"
+#include "stdio-util.h"
 #include "terminal-util.h"
 
 static bool arg_continuous = false;
@@ -144,7 +141,7 @@ static int display_emergency_message_fullscreen(const char *message) {
         unsigned qr_code_start_row = 1, qr_code_start_column = 1;
         char ttybuf[STRLEN("/dev/tty") + DECIMAL_STR_MAX(int) + 1];
         _cleanup_close_ int fd = -EBADF;
-        _cleanup_fclose_ FILE *stream = NULL;
+        _cleanup_fclose_ FILE *f = NULL;
         char read_character_buffer = '\0';
         struct winsize w = {
                 .ws_col = 80,
@@ -159,7 +156,7 @@ static int display_emergency_message_fullscreen(const char *message) {
         else {
                 fd = open_terminal("/dev/tty1", O_RDWR|O_NOCTTY|O_CLOEXEC);
                 if (fd < 0)
-                        return log_error_errno(fd, "Failed to open /dev/tty1: %m");
+                        return log_error_errno(fd, "Failed to open %s: %m", "/dev/tty1");
 
                 r = find_next_free_vt(fd, &free_vt, &original_vt);
                 if (r < 0)
@@ -185,7 +182,7 @@ static int display_emergency_message_fullscreen(const char *message) {
         if (r < 0)
                 log_warning_errno(r, "Failed to clear terminal, ignoring: %m");
 
-        r = set_terminal_cursor_position(fd, 2, 4);
+        r = terminal_set_cursor_position(fd, 2, 4);
         if (r < 0)
                 log_warning_errno(r, "Failed to move terminal cursor position, ignoring: %m");
 
@@ -197,7 +194,7 @@ static int display_emergency_message_fullscreen(const char *message) {
 
         qr_code_start_row = w.ws_row * 3U / 5U;
         qr_code_start_column = w.ws_col * 3U / 4U;
-        r = set_terminal_cursor_position(fd, 4, 4);
+        r = terminal_set_cursor_position(fd, 4, 4);
         if (r < 0)
                 log_warning_errno(r, "Failed to move terminal cursor position, ignoring: %m");
 
@@ -207,17 +204,19 @@ static int display_emergency_message_fullscreen(const char *message) {
                 goto cleanup;
         }
 
-        r = fdopen_independent(fd, "r+", &stream);
+        r = fdopen_independent(fd, "r+", &f);
         if (r < 0) {
                 r = log_error_errno(errno, "Failed to open output file: %m");
                 goto cleanup;
         }
 
-        r = print_qrcode_full(stream, "Scan the QR code", message, qr_code_start_row, qr_code_start_column, w.ws_col, w.ws_row);
+        r = print_qrcode_full(f, "Scan the error message",
+                              message, qr_code_start_row, qr_code_start_column, w.ws_col, w.ws_row,
+                              /* check_tty= */ false);
         if (r < 0)
                 log_warning_errno(r, "QR code could not be printed, ignoring: %m");
 
-        r = set_terminal_cursor_position(fd, w.ws_row - 1, w.ws_col * 2U / 5U);
+        r = terminal_set_cursor_position(fd, w.ws_row - 1, w.ws_col * 2U / 5U);
         if (r < 0)
                 log_warning_errno(r, "Failed to move terminal cursor position, ignoring: %m");
 
@@ -227,9 +226,9 @@ static int display_emergency_message_fullscreen(const char *message) {
                 goto cleanup;
         }
 
-        r = read_one_char(stream, &read_character_buffer, USEC_INFINITY, NULL);
+        r = read_one_char(f, &read_character_buffer, USEC_INFINITY, /* echo= */ true, /* need_nl= */ NULL);
         if (r < 0 && r != -EINTR)
-                log_error_errno(r, "Failed to read character: %m");
+                log_warning_errno(r, "Failed to read character, ignoring: %m");
 
         r = 0;
 
@@ -307,11 +306,11 @@ static int run(int argc, char *argv[]) {
 
         log_setup();
 
-        sigbus_install();
-
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
+
+        journal_browse_prepare();
 
         r = acquire_first_emergency_log_message(&message);
         if (r < 0)

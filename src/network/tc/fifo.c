@@ -3,10 +3,10 @@
 
 #include <linux/pkt_sched.h>
 
-#include "alloc-util.h"
-#include "conf-parser.h"
+#include "sd-netlink.h"
+
 #include "fifo.h"
-#include "netlink-util.h"
+#include "log.h"
 #include "parse-util.h"
 #include "string-util.h"
 
@@ -52,7 +52,7 @@ int config_parse_pfifo_size(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         Network *network = ASSERT_PTR(data);
         FirstInFirstOut *fifo;
         int r;
@@ -112,7 +112,7 @@ int config_parse_bfifo_size(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         Network *network = ASSERT_PTR(data);
         FirstInFirstOut *fifo;
         uint64_t u;

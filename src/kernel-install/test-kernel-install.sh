@@ -46,7 +46,13 @@ echo 'DTBDTBDTBDTB' >"$D/sources/subdir/whatever.dtb"
 
 export KERNEL_INSTALL_CONF_ROOT="$D/sources"
 # We "install" multiple plugins, but control which ones will be active via install.conf.
-export KERNEL_INSTALL_PLUGINS="${ukify_install} ${loaderentry_install} ${uki_copy_install}"
+KERNEL_INSTALL_PLUGINS="'${loaderentry_install}' '${uki_copy_install}'"
+if [[ -n "$ukify_install" ]]; then
+    # shellcheck disable=SC2089
+    KERNEL_INSTALL_PLUGINS="'${ukify_install}' $KERNEL_INSTALL_PLUGINS"
+fi
+# shellcheck disable=SC2090
+export KERNEL_INSTALL_PLUGINS
 export BOOT_ROOT="$D/boot"
 export BOOT_MNT="$D/boot"
 export MACHINE_ID='3e0484f3634a418b8e6a39e8828b03e3'
@@ -87,6 +93,13 @@ test -f "$BOOT_ROOT/the-token/1.1.1/linux"
 test -f "$BOOT_ROOT/the-token/1.1.1/initrd"
 
 "$kernel_install" -v remove 1.1.1 hoge foo bar
+test ! -e "$entry"
+test ! -e "$BOOT_ROOT/the-token/1.1.1/linux"
+test ! -e "$BOOT_ROOT/the-token/1.1.1/initrd"
+
+# Test --entry-type options
+"$kernel_install" -v add 1.1.1 "$D/sources/linux" "$D/sources/initrd"
+"$kernel_install" -v remove 1.1.1 --entry-type=type1
 test ! -e "$entry"
 test ! -e "$BOOT_ROOT/the-token/1.1.1/linux"
 test ! -e "$BOOT_ROOT/the-token/1.1.1/initrd"

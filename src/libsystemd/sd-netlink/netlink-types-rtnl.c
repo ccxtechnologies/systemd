@@ -1,32 +1,25 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include <linux/batman_adv.h>
 #include <linux/can/netlink.h>
 #include <linux/can/vxcan.h>
 #include <linux/cfm_bridge.h>
 #include <linux/fib_rules.h>
-#include <linux/fou.h>
 #include <linux/if.h>
 #include <linux/if_addr.h>
 #include <linux/if_addrlabel.h>
 #include <linux/if_bridge.h>
 #include <linux/if_link.h>
-#include <linux/if_macsec.h>
 #include <linux/if_tunnel.h>
-#include <linux/ip.h>
-#include <linux/l2tp.h>
 #include <linux/net_namespace.h>
-#include <linux/netlink.h>
 #include <linux/nexthop.h>
-#include <linux/nl80211.h>
 #include <linux/pkt_sched.h>
 #include <linux/rtnetlink.h>
 #include <linux/veth.h>
-#include <linux/wireguard.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
-#include "missing_network.h"
+#include "missing-network.h"
 #include "netlink-types-internal.h"
 
 enum {
@@ -173,6 +166,8 @@ static const NLAPolicy rtnl_link_info_data_bridge_policies[] = {
         [IFLA_BR_MCAST_MLD_VERSION]          = BUILD_POLICY(U8),
         [IFLA_BR_VLAN_STATS_PER_PORT]        = BUILD_POLICY(U8),
         [IFLA_BR_MULTI_BOOLOPT]              = BUILD_POLICY_WITH_SIZE(BINARY, sizeof(struct br_boolopt_multi)),
+        [IFLA_BR_FDB_N_LEARNED]              = BUILD_POLICY(U32),
+        [IFLA_BR_FDB_MAX_LEARNED]            = BUILD_POLICY(U32),
 };
 
 static const NLAPolicy rtnl_link_info_data_can_policies[] = {
@@ -235,6 +230,13 @@ static const NLAPolicy rtnl_link_info_data_gre_policies[] = {
         [IFLA_GRE_ERSPAN_VER]       = BUILD_POLICY(U8),
         [IFLA_GRE_ERSPAN_DIR]       = BUILD_POLICY(U8),
         [IFLA_GRE_ERSPAN_HWID]      = BUILD_POLICY(U16),
+};
+
+static const NLAPolicy rtnl_link_info_data_hsr_policies[] = {
+        [IFLA_HSR_SLAVE1]           = BUILD_POLICY(U32),
+        [IFLA_HSR_SLAVE2]           = BUILD_POLICY(U32),
+        [IFLA_HSR_MULTICAST_SPEC]   = BUILD_POLICY(U8),
+        [IFLA_HSR_PROTOCOL]         = BUILD_POLICY(U8),
 };
 
 static const NLAPolicy rtnl_link_info_data_ipoib_policies[] = {
@@ -388,6 +390,7 @@ static const NLAPolicy rtnl_link_info_data_vxlan_policies[] = {
         [IFLA_VXLAN_GPE]               = BUILD_POLICY(FLAG),
         [IFLA_VXLAN_TTL_INHERIT]       = BUILD_POLICY(FLAG),
         [IFLA_VXLAN_DF]                = BUILD_POLICY(U8),
+        [IFLA_VXLAN_VNIFILTER]         = BUILD_POLICY(U8),
 };
 
 static const NLAPolicy rtnl_link_info_data_xfrm_policies[] = {
@@ -410,8 +413,8 @@ static const NLAPolicySetUnionElement rtnl_link_info_data_policy_set_union_eleme
         BUILD_UNION_ELEMENT_BY_STRING("gretap",    rtnl_link_info_data_gre),
 /*
         BUILD_UNION_ELEMENT_BY_STRING("gtp",       rtnl_link_info_data_gtp),
-        BUILD_UNION_ELEMENT_BY_STRING("hsr",       rtnl_link_info_data_hsr),
 */
+        BUILD_UNION_ELEMENT_BY_STRING("hsr",       rtnl_link_info_data_hsr),
         BUILD_UNION_ELEMENT_BY_STRING("ip6erspan", rtnl_link_info_data_gre),
         BUILD_UNION_ELEMENT_BY_STRING("ip6gre",    rtnl_link_info_data_gre),
         BUILD_UNION_ELEMENT_BY_STRING("ip6gretap", rtnl_link_info_data_gre),
@@ -483,6 +486,8 @@ static const struct NLAPolicy rtnl_bridge_port_policies[] = {
         [IFLA_BRPORT_MRP_IN_OPEN]           = BUILD_POLICY(U8),
         [IFLA_BRPORT_MCAST_EHT_HOSTS_LIMIT] = BUILD_POLICY(U32),
         [IFLA_BRPORT_MCAST_EHT_HOSTS_CNT]   = BUILD_POLICY(U32),
+        [IFLA_BRPORT_LOCKED]                = BUILD_POLICY(U8),
+        [IFLA_BRPORT_MAB]                   = BUILD_POLICY(U8),
 };
 
 static const NLAPolicySetUnionElement rtnl_link_info_slave_data_policy_set_union_elements[] = {

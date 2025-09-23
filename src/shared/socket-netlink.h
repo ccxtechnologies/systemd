@@ -1,9 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "forward.h"
 #include "in-addr-util.h"
-#include "macro.h"
-#include "socket-util.h"
 
 int make_socket_fd(int log_level, const char* address, int type, int flags);
 
@@ -39,8 +38,11 @@ struct in_addr_full {
 
 struct in_addr_full *in_addr_full_free(struct in_addr_full *a);
 DEFINE_TRIVIAL_CLEANUP_FUNC(struct in_addr_full*, in_addr_full_free);
+void in_addr_full_array_free(struct in_addr_full *addrs[], size_t n);
 int in_addr_full_new(int family, const union in_addr_union *a, uint16_t port, int ifindex, const char *server_name, struct in_addr_full **ret);
 int in_addr_full_new_from_string(const char *s, struct in_addr_full **ret);
-const char *in_addr_full_to_string(struct in_addr_full *a);
+const char* in_addr_full_to_string(struct in_addr_full *a);
 
 int netns_get_nsid(int netnsfd, uint32_t *ret);
+
+int af_unix_get_qlen(int fd, uint32_t *ret);

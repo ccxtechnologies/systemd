@@ -4,47 +4,26 @@
 
 /* Generally speaking, the pstore contains a small number of files
  * that in turn contain a small amount of data.  */
-#include <errno.h>
 #include <stdio.h>
-#include <stdio_ext.h>
-#include <sys/prctl.h>
-#include <sys/xattr.h>
 #include <unistd.h>
 
-#include "sd-daemon.h"
 #include "sd-journal.h"
-#include "sd-login.h"
-#include "sd-messages.h"
 
-#include "acl-util.h"
 #include "alloc-util.h"
-#include "capability-util.h"
-#include "cgroup-util.h"
-#include "compress.h"
 #include "conf-parser.h"
 #include "copy.h"
 #include "dirent-util.h"
-#include "escape.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "fs-util.h"
 #include "iovec-util.h"
-#include "journal-importer.h"
 #include "log.h"
-#include "macro.h"
 #include "main-func.h"
 #include "mkdir.h"
 #include "parse-util.h"
-#include "process-util.h"
-#include "signal-util.h"
-#include "socket-util.h"
-#include "special.h"
 #include "sort-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
-#include "tmpfile-util.h"
-#include "user-util.h"
 
 /* Command line argument handling */
 typedef enum PStoreStorage {
@@ -62,7 +41,7 @@ static const char* const pstore_storage_table[_PSTORE_STORAGE_MAX] = {
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP(pstore_storage, PStoreStorage);
-static DEFINE_CONFIG_PARSE_ENUM(config_parse_pstore_storage, pstore_storage, PStoreStorage, "Failed to parse storage setting");
+static DEFINE_CONFIG_PARSE_ENUM(config_parse_pstore_storage, pstore_storage, PStoreStorage);
 
 static PStoreStorage arg_storage = PSTORE_STORAGE_EXTERNAL;
 

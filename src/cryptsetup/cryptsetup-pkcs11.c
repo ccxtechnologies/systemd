@@ -1,28 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
-
-#include <p11-kit/p11-kit.h>
-#include <p11-kit/uri.h>
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "ask-password-api.h"
 #include "cryptsetup-pkcs11.h"
-#include "escape.h"
-#include "fd-util.h"
+#include "cryptsetup-util.h"
 #include "fileio.h"
-#include "format-util.h"
-#include "hexdecoct.h"
-#include "json.h"
-#include "macro.h"
-#include "memory-util.h"
-#include "parse-util.h"
+#include "iovec-util.h"
+#include "log.h"
 #include "pkcs11-util.h"
 #include "random-util.h"
-#include "stat-util.h"
-#include "strv.h"
 
 int decrypt_pkcs11_key(
                 const char *volume_name,
@@ -31,13 +19,12 @@ int decrypt_pkcs11_key(
                 const char *key_file,         /* We either expect key_file and associated parameters to be set (for file keys) … */
                 size_t key_file_size,
                 uint64_t key_file_offset,
-                const void *key_data,         /* … or key_data and key_data_size (for literal keys) */
-                size_t key_data_size,
+                const struct iovec *key_data, /* … or literal keys via key_data */
                 usec_t until,
                 AskPasswordFlags askpw_flags,
                 void **ret_decrypted_key,
                 size_t *ret_decrypted_key_size) {
-
+#if HAVE_P11KIT
         _cleanup_(pkcs11_crypt_device_callback_data_release) pkcs11_crypt_device_callback_data data = {
                 .friendly_name = friendly_name,
                 .askpw_flags = askpw_flags,
@@ -47,15 +34,15 @@ int decrypt_pkcs11_key(
 
         assert(friendly_name);
         assert(pkcs11_uri);
-        assert(key_file || key_data);
+        assert(key_file || iovec_is_set(key_data));
         assert(ret_decrypted_key);
         assert(ret_decrypted_key_size);
 
         /* The functions called here log about all errors, except for EAGAIN which means "token not found right now" */
 
-        if (key_data) {
-                data.encrypted_key = (void*) key_data;
-                data.encrypted_key_size = key_data_size;
+        if (iovec_is_set(key_data)) {
+                data.encrypted_key = (void*) key_data->iov_base;
+                data.encrypted_key_size = key_data->iov_len;
 
                 data.free_encrypted_key = false;
         } else {
@@ -86,6 +73,9 @@ int decrypt_pkcs11_key(
         *ret_decrypted_key_size = data.decrypted_key_size;
 
         return 0;
+#else
+        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "PKCS#11 Token support not available.");
+#endif
 }
 
 int find_pkcs11_auto_data(
@@ -95,6 +85,7 @@ int find_pkcs11_auto_data(
                 size_t *ret_encrypted_key_size,
                 int *ret_keyslot) {
 
+#if HAVE_P11KIT
         _cleanup_free_ char *uri = NULL;
         _cleanup_free_ void *key = NULL;
         int r, keyslot = -1;
@@ -109,8 +100,8 @@ int find_pkcs11_auto_data(
         /* Loads PKCS#11 metadata from LUKS2 JSON token headers. */
 
         for (int token = 0; token < sym_crypt_token_max(CRYPT_LUKS2); token++) {
-                _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
-                JsonVariant *w;
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+                sd_json_variant *w;
                 int ks;
 
                 r = cryptsetup_get_token_as_json(cd, token, "systemd-pkcs11", &v);
@@ -134,12 +125,12 @@ int find_pkcs11_auto_data(
                 assert(keyslot < 0);
                 keyslot = ks;
 
-                w = json_variant_by_key(v, "pkcs11-uri");
-                if (!w || !json_variant_is_string(w))
+                w = sd_json_variant_by_key(v, "pkcs11-uri");
+                if (!w || !sd_json_variant_is_string(w))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "PKCS#11 token data lacks 'pkcs11-uri' field.");
 
-                uri = strdup(json_variant_string(w));
+                uri = strdup(sd_json_variant_string(w));
                 if (!uri)
                         return log_oom();
 
@@ -147,16 +138,16 @@ int find_pkcs11_auto_data(
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "PKCS#11 token data contains invalid PKCS#11 URI.");
 
-                w = json_variant_by_key(v, "pkcs11-key");
-                if (!w || !json_variant_is_string(w))
+                w = sd_json_variant_by_key(v, "pkcs11-key");
+                if (!w)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "PKCS#11 token data lacks 'pkcs11-key' field.");
 
                 assert(!key);
                 assert(key_size == 0);
-                r = unbase64mem(json_variant_string(w), &key, &key_size);
+                r = sd_json_variant_unbase64(w, &key, &key_size);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to decode base64 encoded key.");
+                        return log_error_errno(r, "Failed to decode base64 encoded key: %m");
         }
 
         if (!uri)
@@ -170,4 +161,7 @@ int find_pkcs11_auto_data(
         *ret_encrypted_key_size = key_size;
         *ret_keyslot = keyslot;
         return 0;
+#else
+        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "PKCS#11 Token support not available.");
+#endif
 }

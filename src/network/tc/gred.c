@@ -3,11 +3,11 @@
 
 #include <linux/pkt_sched.h>
 
-#include "alloc-util.h"
-#include "conf-parser.h"
-#include "netlink-util.h"
+#include "sd-netlink.h"
+
+#include "gred.h"
+#include "log.h"
 #include "parse-util.h"
-#include "qdisc.h"
 #include "string-util.h"
 
 static int generic_random_early_detection_init(QDisc *qdisc) {
@@ -77,7 +77,7 @@ int config_parse_generic_random_early_detection_u32(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         GenericRandomEarlyDetection *gred;
         Network *network = ASSERT_PTR(data);
         uint32_t *p;
@@ -143,7 +143,7 @@ int config_parse_generic_random_early_detection_bool(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         GenericRandomEarlyDetection *gred;
         Network *network = ASSERT_PTR(data);
         int r;

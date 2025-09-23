@@ -1,12 +1,21 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
+#include "alloc-util.h"
 #include "analyze.h"
 #include "analyze-dot.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-unit-util.h"
+#include "bus-util.h"
 #include "glob-util.h"
+#include "log.h"
+#include "runtime-scope.h"
+#include "string-util.h"
+#include "strv.h"
 #include "terminal-util.h"
+#include "unit-def.h"
 
 static int graph_one_property(
                 sd_bus *bus,
@@ -149,7 +158,7 @@ int verb_dot(int argc, char *argv[], void *userdata) {
 
         r = acquire_bus(&bus, NULL);
         if (r < 0)
-                return bus_log_connect_error(r, arg_transport);
+                return bus_log_connect_error(r, arg_transport, arg_runtime_scope);
 
         r = expand_patterns(bus, strv_skip(argv, 1), &expanded_patterns);
         if (r < 0)

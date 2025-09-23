@@ -6,17 +6,28 @@
 #include "conf-files.h"
 #include "constants.h"
 #include "dns-domain.h"
+#include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "hexdecoct.h"
+#include "log.h"
 #include "nulstr-util.h"
 #include "parse-util.h"
+#include "resolved-dns-answer.h"
 #include "resolved-dns-dnssec.h"
+#include "resolved-dns-rr.h"
 #include "resolved-dns-trust-anchor.h"
 #include "set.h"
-#include "sort-util.h"
 #include "string-util.h"
 #include "strv.h"
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                dns_answer_hash_ops_by_key,
+                DnsResourceKey,
+                dns_resource_key_hash_func,
+                dns_resource_key_compare_func,
+                DnsAnswer,
+                dns_answer_unref);
 
 static const char trust_anchor_dirs[] = CONF_PATHS_NULSTR("dnssec-trust-anchors.d");
 
@@ -24,6 +35,10 @@ static const char trust_anchor_dirs[] = CONF_PATHS_NULSTR("dnssec-trust-anchors.
 static const uint8_t root_digest2[] =
         { 0xE0, 0x6D, 0x44, 0xB8, 0x0B, 0x8F, 0x1D, 0x39, 0xA9, 0x5C, 0x0B, 0x0D, 0x7C, 0x65, 0xD0, 0x84,
           0x58, 0xE8, 0x80, 0x40, 0x9B, 0xBC, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37, 0xC7, 0xF8, 0xEC, 0x8D };
+
+static const uint8_t root_digest3[] =
+        { 0x68, 0x3D, 0x2D, 0x0A, 0xCB, 0x8C, 0x9B, 0x71, 0x2A, 0x19, 0x48, 0xB2, 0x7F, 0x74, 0x12, 0x19,
+          0x29, 0x8D, 0x0A, 0x45, 0x0D, 0x61, 0x2C, 0x48, 0x3A, 0xF4, 0x44, 0xA4, 0xC0, 0xFB, 0x2B, 0x16 };
 
 static bool dns_trust_anchor_knows_domain_positive(DnsTrustAnchor *d, const char *name) {
         assert(d);
@@ -74,10 +89,6 @@ static int dns_trust_anchor_add_builtin_positive(DnsTrustAnchor *d) {
 
         assert(d);
 
-        r = hashmap_ensure_allocated(&d->positive_by_key, &dns_resource_key_hash_ops);
-        if (r < 0)
-                return r;
-
         /* Only add the built-in trust anchor if there's neither a DS nor a DNSKEY defined for the root domain. That
          * way users have an easy way to override the root domain DS/DNSKEY data. */
         if (dns_trust_anchor_knows_domain_positive(d, "."))
@@ -95,12 +106,15 @@ static int dns_trust_anchor_add_builtin_positive(DnsTrustAnchor *d) {
         r = add_root_ksk(answer, key, 20326, DNSSEC_ALGORITHM_RSASHA256, DNSSEC_DIGEST_SHA256, root_digest2, sizeof(root_digest2));
         if (r < 0)
                 return r;
-
-        r = hashmap_put(d->positive_by_key, key, answer);
+        r = add_root_ksk(answer, key, 38696, DNSSEC_ALGORITHM_RSASHA256, DNSSEC_DIGEST_SHA256, root_digest3, sizeof(root_digest3));
         if (r < 0)
                 return r;
 
-        answer = NULL;
+        r = hashmap_ensure_put(&d->positive_by_key, &dns_answer_hash_ops_by_key, key, answer);
+        if (r < 0)
+                return r;
+
+        TAKE_PTR(answer);
         return 0;
 }
 
@@ -189,10 +203,6 @@ static int dns_trust_anchor_add_builtin_negative(DnsTrustAnchor *d) {
         if (!set_isempty(d->negative_by_name))
                 return 0;
 
-        r = set_ensure_allocated(&d->negative_by_name, &dns_name_hash_ops);
-        if (r < 0)
-                return r;
-
         /* We add a couple of domains as default negative trust
          * anchors, where it's very unlikely they will be installed in
          * the root zone. If they exist they must be private, and thus
@@ -202,7 +212,7 @@ static int dns_trust_anchor_add_builtin_negative(DnsTrustAnchor *d) {
                 if (dns_trust_anchor_knows_domain_positive(d, name))
                         continue;
 
-                r = set_put_strdup(&d->negative_by_name, name);
+                r = set_put_strdup_full(&d->negative_by_name, &dns_name_hash_ops_free, name);
                 if (r < 0)
                         return r;
         }
@@ -362,7 +372,7 @@ static int dns_trust_anchor_load_positive(DnsTrustAnchor *d, const char *path, u
                 return -EINVAL;
         }
 
-        r = hashmap_ensure_allocated(&d->positive_by_key, &dns_resource_key_hash_ops);
+        r = hashmap_ensure_allocated(&d->positive_by_key, &dns_answer_hash_ops_by_key);
         if (r < 0)
                 return log_oom();
 
@@ -378,7 +388,7 @@ static int dns_trust_anchor_load_positive(DnsTrustAnchor *d, const char *path, u
                 return log_error_errno(r, "Failed to add answer to trust anchor: %m");
 
         old_answer = dns_answer_unref(old_answer);
-        answer = NULL;
+        TAKE_PTR(answer);
 
         return 0;
 }
@@ -408,7 +418,7 @@ static int dns_trust_anchor_load_negative(DnsTrustAnchor *d, const char *path, u
                 return -EINVAL;
         }
 
-        r = set_ensure_consume(&d->negative_by_name, &dns_name_hash_ops, TAKE_PTR(domain));
+        r = set_ensure_consume(&d->negative_by_name, &dns_name_hash_ops_free, TAKE_PTR(domain));
         if (r < 0)
                 return log_oom();
 
@@ -470,10 +480,6 @@ static int dns_trust_anchor_load_files(
         return 0;
 }
 
-static int domain_name_cmp(char * const *a, char * const *b) {
-        return dns_name_compare_func(*a, *b);
-}
-
 static int dns_trust_anchor_dump(DnsTrustAnchor *d) {
         DnsAnswer *a;
 
@@ -496,11 +502,8 @@ static int dns_trust_anchor_dump(DnsTrustAnchor *d) {
         else {
                 _cleanup_free_ char **l = NULL, *j = NULL;
 
-                l = set_get_strv(d->negative_by_name);
-                if (!l)
+                if (set_dump_sorted(d->negative_by_name, (void***) &l, /* ret_n = */ NULL) < 0)
                         return log_oom();
-
-                typesafe_qsort(l, set_size(d->negative_by_name), domain_name_cmp);
 
                 j = strv_join(l, " ");
                 if (!j)
@@ -538,9 +541,9 @@ int dns_trust_anchor_load(DnsTrustAnchor *d) {
 void dns_trust_anchor_flush(DnsTrustAnchor *d) {
         assert(d);
 
-        d->positive_by_key = hashmap_free_with_destructor(d->positive_by_key, dns_answer_unref);
-        d->revoked_by_rr = set_free_with_destructor(d->revoked_by_rr, dns_resource_record_unref);
-        d->negative_by_name = set_free_free(d->negative_by_name);
+        d->positive_by_key = hashmap_free(d->positive_by_key);
+        d->revoked_by_rr = set_free(d->revoked_by_rr);
+        d->negative_by_name = set_free(d->negative_by_name);
 }
 
 int dns_trust_anchor_lookup_positive(DnsTrustAnchor *d, const DnsResourceKey *key, DnsAnswer **ret) {
@@ -630,11 +633,11 @@ static int dns_trust_anchor_remove_revoked(DnsTrustAnchor *d, DnsResourceRecord 
 
         /* We found the key! Warn the user */
         log_struct(LOG_WARNING,
-                   "MESSAGE_ID=" SD_MESSAGE_DNSSEC_TRUST_ANCHOR_REVOKED_STR,
+                   LOG_MESSAGE_ID(SD_MESSAGE_DNSSEC_TRUST_ANCHOR_REVOKED_STR),
                    LOG_MESSAGE("DNSSEC trust anchor %s has been revoked.\n"
                                "Please update the trust anchor, or upgrade your operating system.",
                                strna(dns_resource_record_to_string(rr))),
-                   "TRUST_ANCHOR=%s", dns_resource_record_to_string(rr));
+                   LOG_ITEM("TRUST_ANCHOR=%s", dns_resource_record_to_string(rr)));
 
         if (dns_answer_size(new_answer) <= 0) {
                 assert_se(hashmap_remove(d->positive_by_key, rr->key) == old_answer);

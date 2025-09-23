@@ -1,9 +1,17 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "ask-password-api.h"
+#include "forward.h"
 #include "iovec-util.h"
-#include "macro.h"
 #include "sha256.h"
+
+typedef enum CertificateSourceType {
+        OPENSSL_CERTIFICATE_SOURCE_FILE,
+        OPENSSL_CERTIFICATE_SOURCE_PROVIDER,
+        _OPENSSL_CERTIFICATE_SOURCE_MAX,
+        _OPENSSL_CERTIFICATE_SOURCE_INVALID = -EINVAL,
+} CertificateSourceType;
 
 typedef enum KeySourceType {
         OPENSSL_KEY_SOURCE_FILE,
@@ -13,30 +21,37 @@ typedef enum KeySourceType {
         _OPENSSL_KEY_SOURCE_INVALID = -EINVAL,
 } KeySourceType;
 
+typedef struct OpenSSLAskPasswordUI OpenSSLAskPasswordUI;
+
+int parse_openssl_certificate_source_argument(const char *argument, char **certificate_source, CertificateSourceType *certificate_source_type);
+
 int parse_openssl_key_source_argument(const char *argument, char **private_key_source, KeySourceType *private_key_source_type);
 
 #define X509_FINGERPRINT_SIZE SHA256_DIGEST_SIZE
 
 #if HAVE_OPENSSL
-#  include <openssl/bio.h>
-#  include <openssl/bn.h>
-#  include <openssl/crypto.h>
-#  include <openssl/err.h>
-#  include <openssl/evp.h>
-#  include <openssl/opensslv.h>
-#  include <openssl/pkcs7.h>
-#  include <openssl/ssl.h>
-#  include <openssl/x509v3.h>
+#  include <openssl/bio.h>              /* IWYU pragma: export */
+#  include <openssl/bn.h>               /* IWYU pragma: export */
+#  include <openssl/crypto.h>           /* IWYU pragma: export */
+#  include <openssl/err.h>              /* IWYU pragma: export */
+#  include <openssl/evp.h>              /* IWYU pragma: export */
+#  include <openssl/opensslv.h>         /* IWYU pragma: export */
+#  include <openssl/pkcs7.h>            /* IWYU pragma: export */
+#  include <openssl/ssl.h>              /* IWYU pragma: export */
+#  ifndef OPENSSL_NO_UI_CONSOLE
+#    include <openssl/ui.h>             /* IWYU pragma: export */
+#  endif
+#  include <openssl/x509v3.h>           /* IWYU pragma: export */
 #  ifndef OPENSSL_VERSION_MAJOR
 /* OPENSSL_VERSION_MAJOR macro was added in OpenSSL 3. Thus, if it doesn't exist,  we must be before OpenSSL 3. */
 #    define OPENSSL_VERSION_MAJOR 1
 #  endif
 #  if OPENSSL_VERSION_MAJOR >= 3
-#    include <openssl/core_names.h>
-#    include <openssl/kdf.h>
-#    include <openssl/param_build.h>
-#    include <openssl/provider.h>
-#    include <openssl/store.h>
+#    include <openssl/core_names.h>     /* IWYU pragma: export */
+#    include <openssl/kdf.h>            /* IWYU pragma: export */
+#    include <openssl/param_build.h>    /* IWYU pragma: export */
+#    include <openssl/provider.h>       /* IWYU pragma: export */
+#    include <openssl/store.h>          /* IWYU pragma: export */
 #  endif
 
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_MACRO(void*, OPENSSL_free, NULL);
@@ -49,10 +64,33 @@ DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(BIGNUM*, BN_free, NULL);
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(BN_CTX*, BN_CTX_free, NULL);
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(ECDSA_SIG*, ECDSA_SIG_free, NULL);
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(PKCS7*, PKCS7_free, NULL);
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(PKCS7_SIGNER_INFO*, PKCS7_SIGNER_INFO_free, NULL);
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(SSL*, SSL_free, NULL);
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(BIO*, BIO_free, NULL);
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(BIO*, BIO_free_all, NULL);
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(EVP_MD_CTX*, EVP_MD_CTX_free, NULL);
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(ASN1_OCTET_STRING*, ASN1_OCTET_STRING_free, NULL);
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(ASN1_TIME*, ASN1_TIME_free, NULL);
+
+static inline STACK_OF(X509_ALGOR) *x509_algor_free_many(STACK_OF(X509_ALGOR) *attrs) {
+        if (!attrs)
+                return NULL;
+
+        sk_X509_ALGOR_pop_free(attrs, X509_ALGOR_free);
+        return NULL;
+}
+
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(STACK_OF(X509_ALGOR)*, x509_algor_free_many, NULL);
+
+static inline STACK_OF(X509_ATTRIBUTE) *x509_attribute_free_many(STACK_OF(X509_ATTRIBUTE) *attrs) {
+        if (!attrs)
+                return NULL;
+
+        sk_X509_ATTRIBUTE_pop_free(attrs, X509_ATTRIBUTE_free);
+        return NULL;
+}
+
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(STACK_OF(X509_ATTRIBUTE)*, x509_attribute_free_many, NULL);
 
 #if OPENSSL_VERSION_MAJOR >= 3
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(EVP_CIPHER*, EVP_CIPHER_free, NULL);
@@ -78,7 +116,8 @@ static inline void sk_X509_free_allp(STACK_OF(X509) **sk) {
         sk_X509_pop_free(*sk, X509_free);
 }
 
-int openssl_pkey_from_pem(const void *pem, size_t pem_size, EVP_PKEY **ret);
+int openssl_pubkey_from_pem(const void *pem, size_t pem_size, EVP_PKEY **ret);
+int openssl_pubkey_to_pem(EVP_PKEY *pkey, char **ret);
 
 int openssl_digest_size(const char *digest_alg, size_t *ret_digest_size);
 
@@ -110,8 +149,6 @@ int rsa_oaep_encrypt_bytes(const EVP_PKEY *pkey, const char *digest_alg, const c
 
 int rsa_pkey_to_suitable_key_size(EVP_PKEY *pkey, size_t *ret_suitable_key_size);
 
-int rsa_pkey_new(size_t bits, EVP_PKEY **ret);
-
 int rsa_pkey_from_n_e(const void *n, size_t n_size, const void *e, size_t e_size, EVP_PKEY **ret);
 
 int rsa_pkey_to_n_e(const EVP_PKEY *pkey, void **ret_n, size_t *ret_n_size, void **ret_e, size_t *ret_e_size);
@@ -130,29 +167,40 @@ int pubkey_fingerprint(EVP_PKEY *pk, const EVP_MD *md, void **ret, size_t *ret_s
 
 int digest_and_sign(const EVP_MD *md, EVP_PKEY *privkey, const void *data, size_t size, void **ret, size_t *ret_size);
 
-int openssl_load_key_from_token(KeySourceType private_key_source_type, const char *private_key_source, const char *private_key, EVP_PKEY **ret);
+int pkcs7_new(X509 *certificate, EVP_PKEY *private_key, const char *hash_algorithm, PKCS7 **ret_p7, PKCS7_SIGNER_INFO **ret_si);
+
+int string_hashsum(const char *s, size_t len, const char *md_algorithm, char **ret);
 
 #else
 
 typedef struct X509 X509;
 typedef struct EVP_PKEY EVP_PKEY;
+typedef struct EVP_MD EVP_MD;
+typedef struct UI_METHOD UI_METHOD;
+typedef struct ASN1_TYPE ASN1_TYPE;
+typedef struct ASN1_STRING ASN1_STRING;
 
-static inline void *X509_free(X509 *p) {
+static inline void* X509_free(X509 *p) {
         assert(p == NULL);
         return NULL;
 }
 
-static inline void *EVP_PKEY_free(EVP_PKEY *p) {
+static inline void* EVP_PKEY_free(EVP_PKEY *p) {
         assert(p == NULL);
         return NULL;
 }
 
-static inline int openssl_load_key_from_token(
-                KeySourceType private_key_source_type,
-                const char *private_key_source,
-                const char *private_key,
-                EVP_PKEY **ret) {
+static inline void* ASN1_TYPE_free(ASN1_TYPE *p) {
+        assert(p == NULL);
+        return NULL;
+}
 
+static inline void* ASN1_STRING_free(ASN1_STRING *p) {
+        assert(p == NULL);
+        return NULL;
+}
+
+static inline int string_hashsum(const char *s, size_t len, const char *md_algorithm, char **ret) {
         return -EOPNOTSUPP;
 }
 
@@ -160,31 +208,33 @@ static inline int openssl_load_key_from_token(
 
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(X509*, X509_free, NULL);
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(EVP_PKEY*, EVP_PKEY_free, NULL);
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(ASN1_TYPE*, ASN1_TYPE_free, NULL);
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(ASN1_STRING*, ASN1_STRING_free, NULL);
+
+struct OpenSSLAskPasswordUI {
+        AskPasswordRequest request;
+        UI_METHOD *method;
+};
+
+OpenSSLAskPasswordUI* openssl_ask_password_ui_free(OpenSSLAskPasswordUI *ui);
+
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(OpenSSLAskPasswordUI*, openssl_ask_password_ui_free, NULL);
 
 int x509_fingerprint(X509 *cert, uint8_t buffer[static X509_FINGERPRINT_SIZE]);
 
-#if PREFER_OPENSSL
-/* The openssl definition */
-typedef const EVP_MD* hash_md_t;
-typedef const EVP_MD* hash_algorithm_t;
-typedef int elliptic_curve_t;
-typedef EVP_MD_CTX* hash_context_t;
-#  define OPENSSL_OR_GCRYPT(a, b) (a)
+int openssl_load_x509_certificate(
+                CertificateSourceType certificate_source_type,
+                const char *certificate_source,
+                const char *certificate,
+                X509 **ret);
 
-#elif HAVE_GCRYPT
-
-#  include <gcrypt.h>
-
-/* The gcrypt definition */
-typedef int hash_md_t;
-typedef const char* hash_algorithm_t;
-typedef const char* elliptic_curve_t;
-typedef gcry_md_hd_t hash_context_t;
-#  define OPENSSL_OR_GCRYPT(a, b) (b)
-#endif
-
-#if PREFER_OPENSSL
-int string_hashsum(const char *s, size_t len, const char *md_algorithm, char **ret);
+int openssl_load_private_key(
+                KeySourceType private_key_source_type,
+                const char *private_key_source,
+                const char *private_key,
+                const AskPasswordRequest *request,
+                EVP_PKEY **ret_private_key,
+                OpenSSLAskPasswordUI **ret_user_interface);
 
 static inline int string_hashsum_sha224(const char *s, size_t len, char **ret) {
         return string_hashsum(s, len, "SHA224", ret);
@@ -193,4 +243,3 @@ static inline int string_hashsum_sha224(const char *s, size_t len, char **ret) {
 static inline int string_hashsum_sha256(const char *s, size_t len, char **ret) {
         return string_hashsum(s, len, "SHA256", ret);
 }
-#endif

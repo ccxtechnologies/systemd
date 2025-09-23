@@ -1,13 +1,20 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <netinet/in.h>
 #include <linux/if_arp.h>
+#include <linux/rtnetlink.h>
+#include <netinet/in.h>
 
+#include "sd-bus.h"
+#include "sd-dhcp6-lease.h"
+#include "sd-dhcp6-option.h"
+
+#include "alloc-util.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "dhcp-option.h"
-#include "dhcp6-internal.h"
+#include "dhcp6-option.h"
 #include "escape.h"
+#include "extract-word.h"
 #include "hexdecoct.h"
 #include "in-addr-prefix-util.h"
 #include "networkd-dhcp-common.h"
@@ -16,8 +23,10 @@
 #include "networkd-network.h"
 #include "networkd-route-util.h"
 #include "parse-util.h"
+#include "set.h"
 #include "socket-util.h"
 #include "string-table.h"
+#include "string-util.h"
 #include "strv.h"
 #include "vrf.h"
 
@@ -53,8 +62,10 @@ bool link_dhcp_enabled(Link *link, int family) {
         assert(link);
         assert(IN_SET(family, AF_INET, AF_INET6));
 
-        /* Currently, sd-dhcp-client supports only ethernet and infiniband. */
-        if (family == AF_INET && !IN_SET(link->iftype, ARPHRD_ETHER, ARPHRD_INFINIBAND))
+        /* Currently, sd-dhcp-client supports only ethernet and infiniband.
+         * (ARMHRD_RAWIP and ARMHRD_NONE are typically wwan modems and will be
+         * treated as ethernet devices.) */
+        if (family == AF_INET && !IN_SET(link->iftype, ARPHRD_ETHER, ARPHRD_INFINIBAND, ARPHRD_RAWIP, ARPHRD_NONE))
                 return false;
 
         if (family == AF_INET6 && !socket_ipv6_is_supported())
@@ -69,7 +80,7 @@ bool link_dhcp_enabled(Link *link, int family) {
         if (!link->network)
                 return false;
 
-        return link->network->dhcp & (family == AF_INET ? ADDRESS_FAMILY_IPV4 : ADDRESS_FAMILY_IPV6);
+        return link->network->dhcp & AF_TO_ADDRESS_FAMILY(family);
 }
 
 void network_adjust_dhcp(Network *network) {
@@ -327,7 +338,7 @@ int link_get_captive_portal(Link *link, const char **ret) {
 }
 
 int config_parse_dhcp(
-                const char* unit,
+                const char *unit,
                 const char *filename,
                 unsigned line,
                 const char *section,
@@ -372,7 +383,7 @@ int config_parse_dhcp(
 }
 
 int config_parse_dhcp_route_metric(
-                const char* unit,
+                const char *unit,
                 const char *filename,
                 unsigned line,
                 const char *section,
@@ -481,7 +492,7 @@ int config_parse_ndisc_route_metric(
 }
 
 int config_parse_dhcp_send_hostname(
-                const char* unit,
+                const char *unit,
                 const char *filename,
                 unsigned line,
                 const char *section,

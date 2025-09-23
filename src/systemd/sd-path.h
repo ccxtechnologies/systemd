@@ -17,8 +17,6 @@
   along with systemd; If not, see <https://www.gnu.org/licenses/>.
 ***/
 
-#include <inttypes.h>
-
 #include "_sd-common.h"
 
 _SD_BEGIN_DECLARATIONS;
@@ -90,6 +88,7 @@ enum {
         SD_PATH_SYSTEMD_USER_UNIT,
         SD_PATH_SYSTEMD_USER_PRESET,
         SD_PATH_SYSTEMD_USER_CONF,
+        SD_PATH_SYSTEMD_INITRD_PRESET,
 
         SD_PATH_SYSTEMD_SEARCH_SYSTEM_UNIT,
         SD_PATH_SYSTEMD_SEARCH_USER_UNIT,
@@ -120,11 +119,21 @@ enum {
 
         SD_PATH_USER_STATE_PRIVATE,
 
+        /* credential store */
+        SD_PATH_SYSTEM_CREDENTIAL_STORE,
+        SD_PATH_SYSTEM_SEARCH_CREDENTIAL_STORE,
+        SD_PATH_SYSTEM_CREDENTIAL_STORE_ENCRYPTED,
+        SD_PATH_SYSTEM_SEARCH_CREDENTIAL_STORE_ENCRYPTED,
+        SD_PATH_USER_CREDENTIAL_STORE,
+        SD_PATH_USER_SEARCH_CREDENTIAL_STORE,
+        SD_PATH_USER_CREDENTIAL_STORE_ENCRYPTED,
+        SD_PATH_USER_SEARCH_CREDENTIAL_STORE_ENCRYPTED,
+
         _SD_PATH_MAX
 };
 
-int sd_path_lookup(uint64_t type, const char *suffix, char **path);
-int sd_path_lookup_strv(uint64_t type, const char *suffix, char ***paths);
+int sd_path_lookup(uint64_t type, const char *suffix, char **ret);
+int sd_path_lookup_strv(uint64_t type, const char *suffix, char ***ret);
 
 _SD_END_DECLARATIONS;
 

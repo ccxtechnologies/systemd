@@ -1,23 +1,35 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "af-list.h"
 #include "capability-util.h"
-#include "cgroup-setup.h"
+#include "cgroup.h"
+#include "dissect-image.h"
+#include "dynamic-user.h"
 #include "escape.h"
 #include "exec-credential.h"
+#include "execute.h"
 #include "execute-serialize.h"
-#include "hexdecoct.h"
+#include "extract-word.h"
 #include "fd-util.h"
-#include "fileio.h"
+#include "hexdecoct.h"
+#include "image-policy.h"
 #include "in-addr-prefix-util.h"
+#include "log.h"
+#include "nsflags.h"
+#include "open-file.h"
+#include "ordered-set.h"
 #include "parse-helpers.h"
 #include "parse-util.h"
-#include "percent-util.h"
+#include "path-util.h"
 #include "process-util.h"
 #include "rlimit-util.h"
 #include "serialize.h"
+#include "set.h"
 #include "string-util.h"
 #include "strv.h"
+#include "time-util.h"
 
 static int exec_cgroup_context_serialize(const CGroupContext *c, FILE *f) {
         _cleanup_free_ char *disable_controllers_str = NULL, *delegate_controllers_str = NULL,
@@ -32,15 +44,7 @@ static int exec_cgroup_context_serialize(const CGroupContext *c, FILE *f) {
         if (!c)
                 return 0;
 
-        r = serialize_bool_elide(f, "exec-cgroup-context-cpu-accounting", c->cpu_accounting);
-        if (r < 0)
-                return r;
-
         r = serialize_bool_elide(f, "exec-cgroup-context-io-accounting", c->io_accounting);
-        if (r < 0)
-                return r;
-
-        r = serialize_bool_elide(f, "exec-cgroup-context-block-io-accounting", c->blockio_accounting);
         if (r < 0)
                 return r;
 
@@ -68,18 +72,6 @@ static int exec_cgroup_context_serialize(const CGroupContext *c, FILE *f) {
 
         if (c->startup_cpu_weight != CGROUP_WEIGHT_INVALID) {
                 r = serialize_item_format(f, "exec-cgroup-context-startup-cpu-weight", "%" PRIu64, c->startup_cpu_weight);
-                if (r < 0)
-                        return r;
-        }
-
-        if (c->cpu_shares != CGROUP_CPU_SHARES_INVALID) {
-                r = serialize_item_format(f, "exec-cgroup-context-cpu-shares", "%" PRIu64, c->cpu_shares);
-                if (r < 0)
-                        return r;
-        }
-
-        if (c->startup_cpu_shares != CGROUP_CPU_SHARES_INVALID) {
-                r = serialize_item_format(f, "exec-cgroup-context-startup-cpu-shares", "%" PRIu64, c->startup_cpu_shares);
                 if (r < 0)
                         return r;
         }
@@ -136,18 +128,6 @@ static int exec_cgroup_context_serialize(const CGroupContext *c, FILE *f) {
 
         if (c->startup_io_weight != CGROUP_WEIGHT_INVALID) {
                 r = serialize_item_format(f, "exec-cgroup-context-startup-io-weight", "%" PRIu64, c->startup_io_weight);
-                if (r < 0)
-                        return r;
-        }
-
-        if (c->blockio_weight != CGROUP_BLKIO_WEIGHT_INVALID) {
-                r = serialize_item_format(f, "exec-cgroup-context-block-io-weight", "%" PRIu64, c->blockio_weight);
-                if (r < 0)
-                        return r;
-        }
-
-        if (c->startup_blockio_weight != CGROUP_BLKIO_WEIGHT_INVALID) {
-                r = serialize_item_format(f, "exec-cgroup-context-startup-block-io-weight", "%" PRIu64, c->startup_blockio_weight);
                 if (r < 0)
                         return r;
         }
@@ -233,12 +213,6 @@ static int exec_cgroup_context_serialize(const CGroupContext *c, FILE *f) {
         r = serialize_bool(f, "exec-cgroup-context-memory-zswap-writeback", c->memory_zswap_writeback);
         if (r < 0)
                 return r;
-
-        if (c->memory_limit != CGROUP_LIMIT_MAX) {
-                r = serialize_item_format(f, "exec-cgroup-context-memory-limit", "%" PRIu64, c->memory_limit);
-                if (r < 0)
-                        return r;
-        }
 
         if (c->tasks_max.value != UINT64_MAX) {
                 r = serialize_item_format(f, "exec-cgroup-context-tasks-max-value", "%" PRIu64, c->tasks_max.value);
@@ -328,6 +302,10 @@ static int exec_cgroup_context_serialize(const CGroupContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
+        r = serialize_usec(f, "exec-cgroup-context-managed-oom-memory-pressure-duration-usec", c->moom_mem_pressure_duration_usec);
+        if (r < 0)
+                return r;
+
         r = serialize_item(f, "exec-cgroup-context-managed-oom-preference", managed_oom_preference_to_string(c->moom_preference));
         if (r < 0)
                 return r;
@@ -386,31 +364,6 @@ static int exec_cgroup_context_serialize(const CGroupContext *c, FILE *f) {
                                 return r;
                 }
 
-        LIST_FOREACH(device_weights, w, c->blockio_device_weights) {
-                r = serialize_item_format(f, "exec-cgroup-context-blockio-device-weight", "%s %" PRIu64,
-                                          w->path,
-                                          w->weight);
-                if (r < 0)
-                        return r;
-        }
-
-        LIST_FOREACH(device_bandwidths, b, c->blockio_device_bandwidths) {
-                if (b->rbps != CGROUP_LIMIT_MAX) {
-                        r = serialize_item_format(f, "exec-cgroup-context-blockio-read-bandwidth", "%s %" PRIu64,
-                                                  b->path,
-                                                  b->rbps);
-                        if (r < 0)
-                                return r;
-                }
-                if (b->wbps != CGROUP_LIMIT_MAX) {
-                        r = serialize_item_format(f, "exec-cgroup-context-blockio-write-bandwidth", "%s %" PRIu64,
-                                                  b->path,
-                                                  b->wbps);
-                        if (r < 0)
-                                return r;
-                }
-        }
-
         SET_FOREACH(iaai, c->ip_address_allow) {
                 r = serialize_item(f,
                                    "exec-cgroup-context-ip-address-allow",
@@ -434,11 +387,11 @@ static int exec_cgroup_context_serialize(const CGroupContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
-        r = serialize_strv(f, "exec-cgroup-context-ip-ingress-filter-path=", c->ip_filters_ingress);
+        r = serialize_strv(f, "exec-cgroup-context-ip-ingress-filter-path", c->ip_filters_ingress);
         if (r < 0)
                 return r;
 
-        r = serialize_strv(f, "exec-cgroup-context-ip-egress-filter-path=", c->ip_filters_egress);
+        r = serialize_strv(f, "exec-cgroup-context-ip-egress-filter-path", c->ip_filters_egress);
         if (r < 0)
                 return r;
 
@@ -498,21 +451,11 @@ static int exec_cgroup_context_deserialize(CGroupContext *c, FILE *f) {
                 if (r == 0) /* eof or end marker */
                         break;
 
-                if ((val = startswith(l, "exec-cgroup-context-cpu-accounting="))) {
-                        r = parse_boolean(val);
-                        if (r < 0)
-                                return r;
-                        c->cpu_accounting = r;
-                } else if ((val = startswith(l, "exec-cgroup-context-io-accounting="))) {
+                if ((val = startswith(l, "exec-cgroup-context-io-accounting="))) {
                         r = parse_boolean(val);
                         if (r < 0)
                                 return r;
                         c->io_accounting = r;
-                } else if ((val = startswith(l, "exec-cgroup-context-block-io-accounting="))) {
-                        r = parse_boolean(val);
-                        if (r < 0)
-                                return r;
-                        c->blockio_accounting = r;
                 } else if ((val = startswith(l, "exec-cgroup-context-memory-accounting="))) {
                         r = parse_boolean(val);
                         if (r < 0)
@@ -541,14 +484,6 @@ static int exec_cgroup_context_deserialize(CGroupContext *c, FILE *f) {
                         r = safe_atou64(val, &c->startup_cpu_weight);
                         if (r < 0)
                                 return r;
-                } else if ((val = startswith(l, "exec-cgroup-context-cpu-shares="))) {
-                        r = safe_atou64(val, &c->cpu_shares);
-                        if (r < 0)
-                                return r;
-                } else if ((val = startswith(l, "exec-cgroup-context-startup-cpu-shares="))) {
-                        r = safe_atou64(val, &c->startup_cpu_shares);
-                        if (r < 0)
-                                return r;
                 } else if ((val = startswith(l, "exec-cgroup-context-cpu-quota-per-sec-usec="))) {
                         r = deserialize_usec(val, &c->cpu_quota_per_sec_usec);
                         if (r < 0)
@@ -561,56 +496,28 @@ static int exec_cgroup_context_deserialize(CGroupContext *c, FILE *f) {
                         if (c->cpuset_cpus.set)
                                 return -EINVAL; /* duplicated */
 
-                        r = parse_cpu_set_full(
-                                        val,
-                                        &c->cpuset_cpus,
-                                        /* warn= */ false,
-                                        /* unit= */ NULL,
-                                        /* filename= */ NULL,
-                                        /* line= */ 0,
-                                        /* lvalue= */ NULL);
+                        r = parse_cpu_set(val, &c->cpuset_cpus);
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-cgroup-context-startup-allowed-cpus="))) {
                         if (c->startup_cpuset_cpus.set)
                                 return -EINVAL; /* duplicated */
 
-                        r = parse_cpu_set_full(
-                                        val,
-                                        &c->startup_cpuset_cpus,
-                                        /* warn= */ false,
-                                        /* unit= */ NULL,
-                                        /* filename= */ NULL,
-                                        /* line= */ 0,
-                                        /* lvalue= */ NULL);
+                        r = parse_cpu_set(val, &c->startup_cpuset_cpus);
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-cgroup-context-allowed-memory-nodes="))) {
                         if (c->cpuset_mems.set)
                                 return -EINVAL; /* duplicated */
 
-                        r = parse_cpu_set_full(
-                                        val,
-                                        &c->cpuset_mems,
-                                        /* warn= */ false,
-                                        /* unit= */ NULL,
-                                        /* filename= */ NULL,
-                                        /* line= */ 0,
-                                        /* lvalue= */ NULL);
+                        r = parse_cpu_set(val, &c->cpuset_mems);
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-cgroup-context-startup-allowed-memory-nodes="))) {
                         if (c->startup_cpuset_mems.set)
                                 return -EINVAL; /* duplicated */
 
-                        r = parse_cpu_set_full(
-                                        val,
-                                        &c->startup_cpuset_mems,
-                                        /* warn= */ false,
-                                        /* unit= */ NULL,
-                                        /* filename= */ NULL,
-                                        /* line= */ 0,
-                                        /* lvalue= */ NULL);
+                        r = parse_cpu_set(val, &c->startup_cpuset_mems);
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-cgroup-context-io-weight="))) {
@@ -619,14 +526,6 @@ static int exec_cgroup_context_deserialize(CGroupContext *c, FILE *f) {
                                 return r;
                 } else if ((val = startswith(l, "exec-cgroup-context-startup-io-weight="))) {
                         r = safe_atou64(val, &c->startup_io_weight);
-                        if (r < 0)
-                                return r;
-                } else if ((val = startswith(l, "exec-cgroup-context-block-io-weight="))) {
-                        r = safe_atou64(val, &c->blockio_weight);
-                        if (r < 0)
-                                return r;
-                } else if ((val = startswith(l, "exec-cgroup-context-startup-block-io-weight="))) {
-                        r = safe_atou64(val, &c->startup_blockio_weight);
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-cgroup-context-default-memory-min="))) {
@@ -686,10 +585,6 @@ static int exec_cgroup_context_deserialize(CGroupContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
                         c->memory_zswap_writeback = r;
-                } else if ((val = startswith(l, "exec-cgroup-context-memory-limit="))) {
-                        r = safe_atou64(val, &c->memory_limit);
-                        if (r < 0)
-                                return r;
                 } else if ((val = startswith(l, "exec-cgroup-context-tasks-max-value="))) {
                         r = safe_atou64(val, &c->tasks_max.value);
                         if (r < 0)
@@ -781,6 +676,10 @@ static int exec_cgroup_context_deserialize(CGroupContext *c, FILE *f) {
                         c->moom_preference = managed_oom_preference_from_string(val);
                         if (c->moom_preference < 0)
                                 return -EINVAL;
+                } else if ((val = startswith(l, "exec-cgroup-context-managed-oom-memory-pressure-duration-usec="))) {
+                        r = deserialize_usec(val, &c->moom_mem_pressure_duration_usec);
+                        if (r < 0)
+                                return r;
                 } else if ((val = startswith(l, "exec-cgroup-context-memory-pressure-watch="))) {
                         c->memory_pressure_watch = cgroup_pressure_watch_from_string(val);
                         if (c->memory_pressure_watch < 0)
@@ -904,87 +803,6 @@ static int exec_cgroup_context_deserialize(CGroupContext *c, FILE *f) {
                         r = safe_atou64(limits, &limit->limits[t]);
                         if (r < 0)
                                 return r;
-                } else if ((val = startswith(l, "exec-cgroup-context-block-io-device-weight="))) {
-                        _cleanup_free_ char *path = NULL, *weight = NULL;
-                        CGroupBlockIODeviceWeight *a = NULL;
-
-                        r = extract_many_words(&val, " ", 0, &path, &weight);
-                        if (r < 0)
-                                return r;
-                        if (r != 2)
-                                return -EINVAL;
-
-                        a = new0(CGroupBlockIODeviceWeight, 1);
-                        if (!a)
-                                return log_oom_debug();
-
-                        a->path = TAKE_PTR(path);
-
-                        LIST_PREPEND(device_weights, c->blockio_device_weights, a);
-
-                        r = safe_atou64(weight, &a->weight);
-                        if (r < 0)
-                                return r;
-                } else if ((val = startswith(l, "exec-cgroup-context-block-io-read-bandwidth="))) {
-                        _cleanup_free_ char *path = NULL, *bw = NULL;
-                        CGroupBlockIODeviceBandwidth *a = NULL;
-
-                        r = extract_many_words(&val, " ", 0, &path, &bw);
-                        if (r < 0)
-                                return r;
-                        if (r != 2)
-                                return -EINVAL;
-
-                        LIST_FOREACH(device_bandwidths, b, c->blockio_device_bandwidths)
-                                if (path_equal(b->path, path)) {
-                                        a = b;
-                                        break;
-                                }
-
-                        if (!a) {
-                                a = new0(CGroupBlockIODeviceBandwidth, 1);
-                                if (!a)
-                                        return log_oom_debug();
-
-                                a->path = TAKE_PTR(path);
-                                a->wbps = CGROUP_LIMIT_MAX;
-
-                                LIST_PREPEND(device_bandwidths, c->blockio_device_bandwidths, a);
-                        }
-
-                        r = safe_atou64(bw, &a->rbps);
-                        if (r < 0)
-                                return r;
-                } else if ((val = startswith(l, "exec-cgroup-context-block-io-write-bandwidth="))) {
-                        _cleanup_free_ char *path = NULL, *bw = NULL;
-                        CGroupBlockIODeviceBandwidth *a = NULL;
-
-                        r = extract_many_words(&val, " ", 0, &path, &bw);
-                        if (r < 0)
-                                return r;
-                        if (r != 2)
-                                return -EINVAL;
-
-                        LIST_FOREACH(device_bandwidths, b, c->blockio_device_bandwidths)
-                                if (path_equal(b->path, path)) {
-                                        a = b;
-                                        break;
-                                }
-
-                        if (!a) {
-                                a = new0(CGroupBlockIODeviceBandwidth, 1);
-                                if (!a)
-                                        return log_oom_debug();
-
-                                a->path = TAKE_PTR(path);
-                                a->rbps = CGROUP_LIMIT_MAX;
-
-                                LIST_PREPEND(device_bandwidths, c->blockio_device_bandwidths, a);
-                        }
-
-                        r = safe_atou64(bw, &a->wbps);
-                        if (r < 0)
-                                return r;
                 } else if ((val = startswith(l, "exec-cgroup-context-ip-address-allow="))) {
                         struct in_addr_prefix a;
 
@@ -1081,10 +899,6 @@ static int exec_cgroup_context_deserialize(CGroupContext *c, FILE *f) {
 
                         LIST_PREPEND(socket_bind_items, c->socket_bind_deny, item);
                 } else if ((val = startswith(l, "exec-cgroup-context-restrict-network-interfaces="))) {
-                        r = set_ensure_allocated(&c->restrict_network_interfaces, &string_hash_ops);
-                        if (r < 0)
-                                return r;
-
                         r = set_put_strdup(&c->restrict_network_interfaces, val);
                         if (r < 0)
                                 return r;
@@ -1282,7 +1096,13 @@ static int exec_parameters_serialize(const ExecParameters *p, const ExecContext 
                                 return r;
                 }
 
-                r = serialize_fd_many(f, fds, "exec-parameters-fds", p->fds, p->n_socket_fds + p->n_storage_fds);
+                if (p->n_extra_fds > 0) {
+                        r = serialize_item_format(f, "exec-parameters-n-extra-fds", "%zu", p->n_extra_fds);
+                        if (r < 0)
+                                return r;
+                }
+
+                r = serialize_fd_many(f, fds, "exec-parameters-fds", p->fds, p->n_socket_fds + p->n_storage_fds + p->n_extra_fds);
                 if (r < 0)
                         return r;
         }
@@ -1377,6 +1197,10 @@ static int exec_parameters_serialize(const ExecParameters *p, const ExecContext 
         if (r < 0)
                 return r;
 
+        r = serialize_fd(f, fds, "exec-parameters-pidref-transport-fd", p->pidref_transport_fd);
+        if (r < 0)
+                return r;
+
         if (c && exec_context_restrict_filesystems_set(c)) {
                 r = serialize_fd(f, fds, "exec-parameters-bpf-outer-map-fd", p->bpf_restrict_fs_map_fd);
                 if (r < 0)
@@ -1419,22 +1243,23 @@ static int exec_parameters_serialize(const ExecParameters *p, const ExecContext 
         if (r < 0)
                 return r;
 
+        r = serialize_bool_elide(f, "exec-parameters-debug-invocation", p->debug_invocation);
+        if (r < 0)
+                return r;
+
         fputc('\n', f); /* End marker */
 
         return 0;
 }
 
 static int exec_parameters_deserialize(ExecParameters *p, FILE *f, FDSet *fds) {
-        int r, nr_open;
+        int r;
 
         assert(p);
         assert(f);
         assert(fds);
 
-        nr_open = read_nr_open();
-        if (nr_open < 3)
-                nr_open = HIGH_RLIMIT_NOFILE;
-        assert(nr_open > 0); /* For compilers/static analyzers */
+        unsigned nr_open = MAX(read_nr_open(), NR_OPEN_MINIMUM);
 
         for (;;) {
                 _cleanup_free_ char *l = NULL;
@@ -1462,7 +1287,7 @@ static int exec_parameters_deserialize(ExecParameters *p, FILE *f, FDSet *fds) {
                         if (r < 0)
                                 return r;
 
-                        if (p->n_socket_fds > (size_t) nr_open)
+                        if (p->n_socket_fds > nr_open)
                                 return -EINVAL; /* too many, someone is playing games with us */
                 } else if ((val = startswith(l, "exec-parameters-n-storage-fds="))) {
                         if (p->fds)
@@ -1472,29 +1297,39 @@ static int exec_parameters_deserialize(ExecParameters *p, FILE *f, FDSet *fds) {
                         if (r < 0)
                                 return r;
 
-                        if (p->n_storage_fds > (size_t) nr_open)
+                        if (p->n_storage_fds > nr_open)
+                                return -EINVAL; /* too many, someone is playing games with us */
+                } else if ((val = startswith(l, "exec-parameters-n-extra-fds="))) {
+                        if (p->fds)
+                                return -EINVAL; /* Already received */
+
+                        r = safe_atozu(val, &p->n_extra_fds);
+                        if (r < 0)
+                                return r;
+
+                        if (p->n_extra_fds > nr_open)
                                 return -EINVAL; /* too many, someone is playing games with us */
                 } else if ((val = startswith(l, "exec-parameters-fds="))) {
-                        if (p->n_socket_fds + p->n_storage_fds == 0)
+                        if (p->n_socket_fds + p->n_storage_fds + p->n_extra_fds == 0)
                                 return log_warning_errno(
                                                 SYNTHETIC_ERRNO(EINVAL),
                                                 "Got exec-parameters-fds= without "
-                                                "prior exec-parameters-n-socket-fds= or exec-parameters-n-storage-fds=");
-                        if (p->n_socket_fds + p->n_storage_fds > (size_t) nr_open)
+                                                "prior exec-parameters-n-socket-fds= or exec-parameters-n-storage-fds= or exec-parameters-n-extra-fds=");
+                        if (p->n_socket_fds + p->n_storage_fds + p->n_extra_fds > nr_open)
                                 return -EINVAL; /* too many, someone is playing games with us */
 
                         if (p->fds)
                                 return -EINVAL; /* duplicated */
 
-                        p->fds = new(int, p->n_socket_fds + p->n_storage_fds);
+                        p->fds = new(int, p->n_socket_fds + p->n_storage_fds + p->n_extra_fds);
                         if (!p->fds)
                                 return log_oom_debug();
 
                         /* Ensure we don't leave any FD uninitialized on error, it makes the fuzzer sad */
-                        FOREACH_ARRAY(i, p->fds, p->n_socket_fds + p->n_storage_fds)
+                        FOREACH_ARRAY(i, p->fds, p->n_socket_fds + p->n_storage_fds + p->n_extra_fds)
                                 *i = -EBADF;
 
-                        r = deserialize_fd_many(fds, val, p->n_socket_fds + p->n_storage_fds, p->fds);
+                        r = deserialize_fd_many(fds, val, p->n_socket_fds + p->n_storage_fds + p->n_extra_fds, p->fds);
                         if (r < 0)
                                 continue;
 
@@ -1632,6 +1467,14 @@ static int exec_parameters_deserialize(ExecParameters *p, FILE *f, FDSet *fds) {
                                 continue;
 
                         close_and_replace(p->handoff_timestamp_fd, fd);
+                } else if ((val = startswith(l, "exec-parameters-pidref-transport-fd="))) {
+                        int fd;
+
+                        fd = deserialize_fd(fds, val);
+                        if (fd < 0)
+                                continue;
+
+                        close_and_replace(p->pidref_transport_fd, fd);
                 } else if ((val = startswith(l, "exec-parameters-bpf-outer-map-fd="))) {
                         int fd;
 
@@ -1681,6 +1524,12 @@ static int exec_parameters_deserialize(ExecParameters *p, FILE *f, FDSet *fds) {
                                 return r;
 
                         sd_id128_to_string(p->invocation_id, p->invocation_id_string);
+                } else if ((val = startswith(l, "exec-parameters-debug-invocation="))) {
+                        r = parse_boolean(val);
+                        if (r < 0)
+                                return r;
+
+                        p->debug_invocation = r;
                 } else
                         log_warning("Failed to parse serialized line, ignoring: %s", l);
         }
@@ -1759,15 +1608,23 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
-        r = serialize_item(f, "exec-context-working-directory", c->working_directory);
+        r = serialize_item_escaped(f, "exec-context-working-directory", c->working_directory);
         if (r < 0)
                 return r;
 
-        r = serialize_item(f, "exec-context-root-directory", c->root_directory);
+        r = serialize_bool_elide(f, "exec-context-working-directory-missing-ok", c->working_directory_missing_ok);
         if (r < 0)
                 return r;
 
-        r = serialize_item(f, "exec-context-root-image", c->root_image);
+        r = serialize_bool_elide(f, "exec-context-working-directory-home", c->working_directory_home);
+        if (r < 0)
+                return r;
+
+        r = serialize_item_escaped(f, "exec-context-root-directory", c->root_directory);
+        if (r < 0)
+                return r;
+
+        r = serialize_item_escaped(f, "exec-context-root-image", c->root_image);
         if (r < 0)
                 return r;
 
@@ -1836,11 +1693,21 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
+        r = serialize_item_tristate(f, "exec-context-bind-log-sockets", c->bind_log_sockets);
+        if (r < 0)
+                return r;
+
         r = serialize_item_tristate(f, "exec-context-memory-ksm", c->memory_ksm);
         if (r < 0)
                 return r;
 
-        r = serialize_bool_elide(f, "exec-context-private-tmp", c->private_tmp);
+        r = serialize_item(f, "exec-context-private-tmp", private_tmp_to_string(c->private_tmp));
+        if (r < 0)
+                return r;
+
+        /* This must be set in unit_patch_contexts() before executing a command. */
+        assert(c->private_var_tmp >= 0 && c->private_var_tmp < _PRIVATE_TMP_MAX);
+        r = serialize_item(f, "exec-context-private-var-tmp", private_tmp_to_string(c->private_var_tmp));
         if (r < 0)
                 return r;
 
@@ -1864,7 +1731,7 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
-        r = serialize_bool_elide(f, "exec-context-protect-control-groups", c->protect_control_groups);
+        r = serialize_item(f, "exec-context-protect-control-groups", protect_control_groups_to_string(c->protect_control_groups));
         if (r < 0)
                 return r;
 
@@ -1872,11 +1739,15 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
-        r = serialize_bool_elide(f, "exec-context-private-users", c->private_users);
+        r = serialize_item(f, "exec-context-private-users", private_users_to_string(c->private_users));
         if (r < 0)
                 return r;
 
         r = serialize_bool_elide(f, "exec-context-private-ipc", c->private_ipc);
+        if (r < 0)
+                return r;
+
+        r = serialize_item(f, "exec-context-private-pids", private_pids_to_string(c->private_pids));
         if (r < 0)
                 return r;
 
@@ -1916,7 +1787,11 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
-        r = serialize_bool_elide(f, "exec-context-protect-hostname", c->protect_hostname);
+        r = serialize_item(f, "exec-context-protect-hostname", protect_hostname_to_string(c->protect_hostname));
+        if (r < 0)
+                return r;
+
+        r = serialize_item(f, "exec-context-private-hostname", c->private_hostname);
         if (r < 0)
                 return r;
 
@@ -1927,6 +1802,34 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
         r = serialize_item(f, "exec-context-proc-subset", proc_subset_to_string(c->proc_subset));
         if (r < 0)
                 return r;
+
+        r = serialize_item(f, "exec-context-private-bpf", private_bpf_to_string(c->private_bpf));
+        if (r < 0)
+                return r;
+
+        if (c->bpf_delegate_commands != 0) {
+                r = serialize_item_format(f, "exec-context-bpf-delegate-commands", "0x%"PRIx64, c->bpf_delegate_commands);
+                if (r < 0)
+                        return r;
+        }
+
+        if (c->bpf_delegate_maps != 0) {
+                r = serialize_item_format(f, "exec-context-bpf-delegate-maps", "0x%"PRIx64, c->bpf_delegate_maps);
+                if (r < 0)
+                        return r;
+        }
+
+        if (c->bpf_delegate_programs != 0) {
+                r = serialize_item_format(f, "exec-context-bpf-delegate-programs", "0x%"PRIx64, c->bpf_delegate_programs);
+                if (r < 0)
+                        return r;
+        }
+
+        if (c->bpf_delegate_attachments != 0) {
+                r = serialize_item_format(f, "exec-context-bpf-delegate-attachments", "0x%"PRIx64, c->bpf_delegate_attachments);
+                if (r < 0)
+                        return r;
+        }
 
         r = serialize_item(f, "exec-context-runtime-directory-preserve-mode", exec_preserve_mode_to_string(c->runtime_directory_preserve_mode));
         if (r < 0)
@@ -1952,7 +1855,10 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
                         if (!strextend(&value, " ", path_escaped))
                                 return log_oom_debug();
 
-                        if (!strextend(&value, ":", yes_no(i->only_create)))
+                        if (!strextend(&value, ":", yes_no(FLAGS_SET(i->flags, EXEC_DIRECTORY_ONLY_CREATE))))
+                                return log_oom_debug();
+
+                        if (!strextend(&value, ":", yes_no(FLAGS_SET(i->flags, EXEC_DIRECTORY_READ_ONLY))))
                                 return log_oom_debug();
 
                         STRV_FOREACH(d, i->symlinks) {
@@ -1970,6 +1876,28 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
                 r = serialize_item(f, key, value);
                 if (r < 0)
                         return r;
+
+                if (c->directories[dt].exec_quota.quota_enforce) {
+                        _cleanup_free_ char *key_quota = NULL;
+                        key_quota = strjoin("exec-context-quota-directories-", exec_directory_type_to_string(dt));
+                        if (!key_quota)
+                                return log_oom_debug();
+
+                        r = serialize_item_format(f, key_quota, "%" PRIu64 " %" PRIu32, c->directories[dt].exec_quota.quota_absolute,
+                                                                                        c->directories[dt].exec_quota.quota_scale);
+                        if (r < 0)
+                                return r;
+
+                } else if (c->directories[dt].exec_quota.quota_accounting) {
+                        _cleanup_free_ char *key_quota = NULL;
+                        key_quota = strjoin("exec-context-quota-accounting-directories-", exec_directory_type_to_string(dt));
+                        if (!key_quota)
+                                return log_oom_debug();
+
+                        r = serialize_bool(f, key_quota, c->directories[dt].exec_quota.quota_accounting);
+                        if (r < 0)
+                                return r;
+                }
         }
 
         r = serialize_usec(f, "exec-context-timeout-clean-usec", c->timeout_clean_usec);
@@ -1981,14 +1909,6 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
                 if (r < 0)
                         return r;
         }
-
-        r = serialize_bool_elide(f, "exec-context-working-directory-missing-ok", c->working_directory_missing_ok);
-        if (r < 0)
-                return r;
-
-        r = serialize_bool_elide(f, "exec-context-working-directory-home", c->working_directory_home);
-        if (r < 0)
-                return r;
 
         if (c->oom_score_adjust_set) {
                 r = serialize_item_format(f, "exec-context-oom-score-adjust", "%i", c->oom_score_adjust);
@@ -2021,7 +1941,7 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
                         return r;
         }
 
-        if (c->ioprio_set) {
+        if (c->ioprio_is_set) {
                 r = serialize_item_format(f, "exec-context-ioprio", "%d", c->ioprio);
                 if (r < 0)
                         return r;
@@ -2117,7 +2037,7 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
                 break;
 
         default:
-                break;
+                ;
         }
 
         r = serialize_std_out_err(c, f, STDOUT_FILENO);
@@ -2174,14 +2094,14 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
-        if (c->log_ratelimit_interval_usec > 0) {
-                r = serialize_usec(f, "exec-context-log-ratelimit-interval-usec", c->log_ratelimit_interval_usec);
+        if (c->log_ratelimit.interval > 0) {
+                r = serialize_usec(f, "exec-context-log-ratelimit-interval-usec", c->log_ratelimit.interval);
                 if (r < 0)
                         return r;
         }
 
-        if (c->log_ratelimit_burst > 0) {
-                r = serialize_item_format(f, "exec-context-log-ratelimit-burst", "%u", c->log_ratelimit_burst);
+        if (c->log_ratelimit.burst > 0) {
+                r = serialize_item_format(f, "exec-context-log-ratelimit-burst", "%u", c->log_ratelimit.burst);
                 if (r < 0)
                         return r;
         }
@@ -2327,18 +2247,6 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
-        r = serialize_bool_elide(f, "exec-context-selinux-context-ignore", c->selinux_context_ignore);
-        if (r < 0)
-                return r;
-
-        r = serialize_bool_elide(f, "exec-context-apparmor-profile-ignore", c->apparmor_profile_ignore);
-        if (r < 0)
-                return r;
-
-        r = serialize_bool_elide(f, "exec-context-smack-process-label-ignore", c->smack_process_label_ignore);
-        if (r < 0)
-                return r;
-
         if (c->selinux_context) {
                 r = serialize_item_format(f, "exec-context-selinux-context",
                                           "%s%s",
@@ -2421,6 +2329,12 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
 
         if (c->restrict_namespaces != NAMESPACE_FLAGS_INITIAL) {
                 r = serialize_item_format(f, "exec-context-restrict-namespaces", "%lu", c->restrict_namespaces);
+                if (r < 0)
+                        return r;
+        }
+
+        if (c->delegate_namespaces != NAMESPACE_FLAGS_INITIAL) {
+                r = serialize_item_format(f, "exec-context-delegate-namespaces", "%lu", c->delegate_namespaces);
                 if (r < 0)
                         return r;
         }
@@ -2566,13 +2480,14 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
                         return r;
         }
 
-        if (!set_isempty(c->import_credentials)) {
-                char *ic;
-                SET_FOREACH(ic, c->import_credentials) {
-                        r = serialize_item(f, "exec-context-import-credentials", ic);
-                        if (r < 0)
-                                return r;
-                }
+        ExecImportCredential *ic;
+        ORDERED_SET_FOREACH(ic, c->import_credentials) {
+                r = serialize_item_format(f, "exec-context-import-credentials", "%s%s%s",
+                                          ic->glob,
+                                          ic->rename ? " " : "",
+                                          strempty(ic->rename));
+                if (r < 0)
+                        return r;
         }
 
         r = serialize_image_policy(f, "exec-context-root-image-policy", c->root_image_policy);
@@ -2627,17 +2542,29 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-working-directory="))) {
-                        r = free_and_strdup(&c->working_directory, val);
-                        if (r < 0)
-                                return r;
+                        ssize_t k;
+                        char *p;
+
+                        k = cunescape(val, 0, &p);
+                        if (k < 0)
+                                return k;
+                        free_and_replace(c->working_directory, p);
                 } else if ((val = startswith(l, "exec-context-root-directory="))) {
-                        r = free_and_strdup(&c->root_directory, val);
-                        if (r < 0)
-                                return r;
+                        ssize_t k;
+                        char *p;
+
+                        k = cunescape(val, 0, &p);
+                        if (k < 0)
+                                return k;
+                        free_and_replace(c->root_directory, p);
                 } else if ((val = startswith(l, "exec-context-root-image="))) {
-                        r = free_and_strdup(&c->root_image, val);
-                        if (r < 0)
-                                return r;
+                        ssize_t k;
+                        char *p;
+
+                        k = cunescape(val, 0, &p);
+                        if (k < 0)
+                                return k;
+                        free_and_replace(c->root_image, p);
                 } else if ((val = startswith(l, "exec-context-root-image-options="))) {
                         for (;;) {
                                 _cleanup_free_ char *word = NULL, *mount_options = NULL, *partition = NULL;
@@ -2715,15 +2642,22 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         r = safe_atoi(val, &c->mount_apivfs);
                         if (r < 0)
                                 return r;
+                } else if ((val = startswith(l, "exec-context-bind-log-sockets="))) {
+                        r = safe_atoi(val, &c->bind_log_sockets);
+                        if (r < 0)
+                                return r;
                 } else if ((val = startswith(l, "exec-context-memory-ksm="))) {
                         r = safe_atoi(val, &c->memory_ksm);
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-private-tmp="))) {
-                        r = parse_boolean(val);
-                        if (r < 0)
-                                return r;
-                        c->private_tmp = r;
+                        c->private_tmp = private_tmp_from_string(val);
+                        if (c->private_tmp < 0)
+                                return c->private_tmp;
+                } else if ((val = startswith(l, "exec-context-private-var-tmp="))) {
+                        c->private_var_tmp = private_tmp_from_string(val);
+                        if (c->private_var_tmp < 0)
+                                return c->private_var_tmp;
                 } else if ((val = startswith(l, "exec-context-private-devices="))) {
                         r = parse_boolean(val);
                         if (r < 0)
@@ -2750,7 +2684,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                                 return r;
                         c->protect_clock = r;
                 } else if ((val = startswith(l, "exec-context-protect-control-groups="))) {
-                        r = parse_boolean(val);
+                        r = protect_control_groups_from_string(val);
                         if (r < 0)
                                 return r;
                         c->protect_control_groups = r;
@@ -2760,15 +2694,18 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                                 return r;
                         c->private_network = r;
                 } else if ((val = startswith(l, "exec-context-private-users="))) {
-                        r = parse_boolean(val);
-                        if (r < 0)
-                                return r;
-                        c->private_users = r;
+                        c->private_users = private_users_from_string(val);
+                        if (c->private_users < 0)
+                                return -EINVAL;
                 } else if ((val = startswith(l, "exec-context-private-ipc="))) {
                         r = parse_boolean(val);
                         if (r < 0)
                                 return r;
                         c->private_ipc = r;
+                } else if ((val = startswith(l, "exec-context-private-pids="))) {
+                        c->private_pids = private_pids_from_string(val);
+                        if (c->private_pids < 0)
+                                return -EINVAL;
                 } else if ((val = startswith(l, "exec-context-remove-ipc="))) {
                         r = parse_boolean(val);
                         if (r < 0)
@@ -2817,10 +2754,13 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (c->keyring_mode < 0)
                                 return -EINVAL;
                 } else if ((val = startswith(l, "exec-context-protect-hostname="))) {
-                        r = parse_boolean(val);
+                        c->protect_hostname = protect_hostname_from_string(val);
+                        if (c->protect_hostname < 0)
+                                return -EINVAL;
+                } else if ((val = startswith(l, "exec-context-private-hostname="))) {
+                        r = free_and_strdup(&c->private_hostname, val);
                         if (r < 0)
                                 return r;
-                        c->protect_hostname = r;
                 } else if ((val = startswith(l, "exec-context-protect-proc="))) {
                         c->protect_proc = protect_proc_from_string(val);
                         if (c->protect_proc < 0)
@@ -2829,6 +2769,26 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         c->proc_subset = proc_subset_from_string(val);
                         if (c->proc_subset < 0)
                                 return -EINVAL;
+                } else if ((val = startswith(l, "exec-context-private-bpf="))) {
+                        c->private_bpf = private_bpf_from_string(val);
+                        if (c->private_bpf < 0)
+                                return -EINVAL;
+                } else if ((val = startswith(l, "exec-context-bpf-delegate-commands="))) {
+                        r = safe_atoux64(val, &c->bpf_delegate_commands);
+                        if (r < 0)
+                                return r;
+                } else if ((val = startswith(l, "exec-context-bpf-delegate-maps="))) {
+                        r = safe_atoux64(val, &c->bpf_delegate_maps);
+                        if (r < 0)
+                                return r;
+                } else if ((val = startswith(l, "exec-context-bpf-delegate-programs="))) {
+                        r = safe_atoux64(val, &c->bpf_delegate_programs);
+                        if (r < 0)
+                                return r;
+                } else if ((val = startswith(l, "exec-context-bpf-delegate-attachments="))) {
+                        r = safe_atoux64(val, &c->bpf_delegate_attachments);
+                        if (r < 0)
+                                return r;
                 } else if ((val = startswith(l, "exec-context-runtime-directory-preserve-mode="))) {
                         c->runtime_directory_preserve_mode = exec_preserve_mode_from_string(val);
                         if (c->runtime_directory_preserve_mode < 0)
@@ -2845,14 +2805,15 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
 
                         dt = exec_directory_type_from_string(type);
                         if (dt < 0)
-                                return -EINVAL;
+                                return dt;
 
                         r = parse_mode(mode, &c->directories[dt].mode);
                         if (r < 0)
                                 return r;
 
                         for (;;) {
-                                _cleanup_free_ char *tuple = NULL, *path = NULL, *only_create = NULL;
+                                _cleanup_free_ char *tuple = NULL, *path = NULL, *only_create = NULL, *read_only = NULL;
+                                ExecDirectoryFlags exec_directory_flags = 0;
                                 const char *p;
 
                                 /* Use EXTRACT_UNESCAPE_RELAX here, as we unescape the colons in subsequent calls */
@@ -2863,20 +2824,27 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                                         break;
 
                                 p = tuple;
-                                r = extract_many_words(&p, ":", EXTRACT_UNESCAPE_SEPARATORS, &path, &only_create);
+                                r = extract_many_words(&p, ":", EXTRACT_UNESCAPE_SEPARATORS, &path, &only_create, &read_only);
                                 if (r < 0)
                                         return r;
                                 if (r < 2)
                                         continue;
 
-                                r = exec_directory_add(&c->directories[dt], path, NULL);
-                                if (r < 0)
-                                        return r;
-
                                 r = parse_boolean(only_create);
                                 if (r < 0)
                                         return r;
-                                c->directories[dt].items[c->directories[dt].n_items - 1].only_create = r;
+                                if (r > 0)
+                                        exec_directory_flags |= EXEC_DIRECTORY_ONLY_CREATE;
+
+                                r = parse_boolean(read_only);
+                                if (r < 0)
+                                        return r;
+                                if (r > 0)
+                                        exec_directory_flags |= EXEC_DIRECTORY_READ_ONLY;
+
+                                r = exec_directory_add(&c->directories[dt], path, /* symlink= */ NULL, exec_directory_flags);
+                                if (r < 0)
+                                        return r;
 
                                 if (isempty(p))
                                         continue;
@@ -2895,6 +2863,48 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                                                 return r;
                                 }
                         }
+                } else if ((val = startswith(l, "exec-context-quota-accounting-directories-"))) {
+                        _cleanup_free_ char *type = NULL, *quota_accounting = NULL;
+                        ExecDirectoryType dt;
+
+                        r = split_pair(val, "=", &type, &quota_accounting);
+                        if (r < 0)
+                                return r;
+
+                        dt = exec_directory_type_from_string(type);
+                        if (dt < 0)
+                                return dt;
+
+                        r = parse_boolean(quota_accounting);
+                        if (r < 0)
+                                return r;
+
+                        c->directories[dt].exec_quota.quota_accounting = r;
+                } else if ((val = startswith(l, "exec-context-quota-directories-"))) {
+                        _cleanup_free_ char *type = NULL, *quota_info = NULL, *quota_absolute = NULL, *quota_scale = NULL;
+                        ExecDirectoryType dt;
+
+                        r = split_pair(val, "=", &type, &quota_info);
+                        if (r < 0)
+                                return r;
+
+                        r = split_pair(quota_info, " ", &quota_absolute, &quota_scale);
+                        if (r < 0)
+                                return r;
+
+                        dt = exec_directory_type_from_string(type);
+                        if (dt < 0)
+                                return dt;
+
+                        r = safe_atou64(quota_absolute, &c->directories[dt].exec_quota.quota_absolute);
+                        if (r < 0)
+                               return r;
+
+                        r = safe_atou32(quota_scale, &c->directories[dt].exec_quota.quota_scale);
+                        if (r < 0)
+                               return r;
+
+                        c->directories[dt].exec_quota.quota_enforce = true;
                 } else if ((val = startswith(l, "exec-context-timeout-clean-usec="))) {
                         r = deserialize_usec(val, &c->timeout_clean_usec);
                         if (r < 0)
@@ -2958,7 +2968,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         r = safe_atoi(val, &c->ioprio);
                         if (r < 0)
                                 return r;
-                        c->ioprio_set = true;
+                        c->ioprio_is_set = true;
                 } else if ((val = startswith(l, "exec-context-cpu-scheduling-policy="))) {
                         c->cpu_sched_policy = sched_policy_from_string(val);
                         if (c->cpu_sched_policy < 0)
@@ -3112,11 +3122,11 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-log-ratelimit-interval-usec="))) {
-                        r = deserialize_usec(val, &c->log_ratelimit_interval_usec);
+                        r = deserialize_usec(val, &c->log_ratelimit.interval);
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-log-ratelimit-burst="))) {
-                        r = safe_atou(val, &c->log_ratelimit_burst);
+                        r = safe_atou(val, &c->log_ratelimit.burst);
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-log-filter-allowed-patterns="))) {
@@ -3346,26 +3356,12 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
                         c->no_new_privileges = r;
-                } else if ((val = startswith(l, "exec-context-selinux-context-ignore="))) {
-                        r = parse_boolean(val);
-                        if (r < 0)
-                                return r;
-                        c->selinux_context_ignore = r;
-                } else if ((val = startswith(l, "exec-context-apparmor-profile-ignore="))) {
-                        r = parse_boolean(val);
-                        if (r < 0)
-                                return r;
-                        c->apparmor_profile_ignore = r;
-                } else if ((val = startswith(l, "exec-context-smack-process-label-ignore="))) {
-                        r = parse_boolean(val);
-                        if (r < 0)
-                                return r;
-                        c->smack_process_label_ignore = r;
                 } else if ((val = startswith(l, "exec-context-selinux-context="))) {
                         if (val[0] == '-') {
                                 c->selinux_context_ignore = true;
                                 val++;
-                        }
+                        } else
+                                c->selinux_context_ignore = false;
 
                         r = free_and_strdup(&c->selinux_context, val);
                         if (r < 0)
@@ -3374,7 +3370,8 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (val[0] == '-') {
                                 c->apparmor_profile_ignore = true;
                                 val++;
-                        }
+                        } else
+                                c->apparmor_profile_ignore = false;
 
                         r = free_and_strdup(&c->apparmor_profile, val);
                         if (r < 0)
@@ -3383,7 +3380,8 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (val[0] == '-') {
                                 c->smack_process_label_ignore = true;
                                 val++;
-                        }
+                        } else
+                                c->smack_process_label_ignore = false;
 
                         r = free_and_strdup(&c->smack_process_label, val);
                         if (r < 0)
@@ -3420,7 +3418,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-syscall-archs="))) {
-                        unsigned int id;
+                        unsigned id;
 
                         r = safe_atou(val, &id);
                         if (r < 0)
@@ -3469,11 +3467,11 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         r = safe_atolu(val, &c->restrict_namespaces);
                         if (r < 0)
                                 return r;
-                } else if ((val = startswith(l, "exec-context-restrict-filesystems="))) {
-                        r = set_ensure_allocated(&c->restrict_filesystems, &string_hash_ops);
+                } else if ((val = startswith(l, "exec-context-delegate-namespaces="))) {
+                        r = safe_atolu(val, &c->delegate_namespaces);
                         if (r < 0)
                                 return r;
-
+                } else if ((val = startswith(l, "exec-context-restrict-filesystems="))) {
                         r = set_put_strdup(&c->restrict_filesystems, val);
                         if (r < 0)
                                 return r;
@@ -3673,8 +3671,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-set-credentials="))) {
-                        _cleanup_(exec_set_credential_freep) ExecSetCredential *sc = NULL;
-                        _cleanup_free_ char *id = NULL, *encrypted = NULL, *data = NULL;
+                        _cleanup_free_ char *id = NULL, *data = NULL, *encrypted = NULL;
 
                         r = extract_many_words(&val, " ", EXTRACT_DONT_COALESCE_SEPARATORS, &id, &data, &encrypted);
                         if (r < 0)
@@ -3685,28 +3682,20 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         r = parse_boolean(encrypted);
                         if (r < 0)
                                 return r;
+                        bool e = r;
 
-                        sc = new(ExecSetCredential, 1);
-                        if (!sc)
-                                return -ENOMEM;
+                        _cleanup_free_ void *d = NULL;
+                        size_t size;
 
-                        *sc = (ExecSetCredential) {
-                                .id =  TAKE_PTR(id),
-                                .encrypted = r,
-                        };
-
-                        r = unbase64mem(data, &sc->data, &sc->size);
+                        r = unbase64mem_full(data, SIZE_MAX, /* secure = */ true, &d, &size);
                         if (r < 0)
                                 return r;
 
-                        r = hashmap_ensure_put(&c->set_credentials, &exec_set_credential_hash_ops, sc->id, sc);
+                        r = exec_context_put_set_credential(c, id, TAKE_PTR(d), size, e);
                         if (r < 0)
                                 return r;
-
-                        TAKE_PTR(sc);
                 } else if ((val = startswith(l, "exec-context-load-credentials="))) {
-                        _cleanup_(exec_load_credential_freep) ExecLoadCredential *lc = NULL;
-                        _cleanup_free_ char *id = NULL, *encrypted = NULL, *path = NULL;
+                        _cleanup_free_ char *id = NULL, *path = NULL, *encrypted = NULL;
 
                         r = extract_many_words(&val, " ", EXTRACT_DONT_COALESCE_SEPARATORS, &id, &path, &encrypted);
                         if (r < 0)
@@ -3718,27 +3707,19 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
 
-                        lc = new(ExecLoadCredential, 1);
-                        if (!lc)
-                                return -ENOMEM;
-
-                        *lc = (ExecLoadCredential) {
-                                .id =  TAKE_PTR(id),
-                                .path = TAKE_PTR(path),
-                                .encrypted = r,
-                        };
-
-                        r = hashmap_ensure_put(&c->load_credentials, &exec_load_credential_hash_ops, lc->id, lc);
+                        r = exec_context_put_load_credential(c, id, path, r > 0);
                         if (r < 0)
                                 return r;
-
-                        TAKE_PTR(lc);
                 } else if ((val = startswith(l, "exec-context-import-credentials="))) {
-                        r = set_ensure_allocated(&c->import_credentials, &string_hash_ops);
+                        _cleanup_free_ char *glob = NULL, *rename = NULL;
+
+                        r = extract_many_words(&val, " ", EXTRACT_DONT_COALESCE_SEPARATORS, &glob, &rename);
                         if (r < 0)
                                 return r;
+                        if (r == 0)
+                                return -EINVAL;
 
-                        r = set_put_strdup(&c->import_credentials, val);
+                        r = exec_context_put_import_credential(c, glob, rename);
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-root-image-policy="))) {

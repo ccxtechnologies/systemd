@@ -1,8 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
+#include <locale.h>
+#include <unistd.h>
 
 #include "sd-bus.h"
+#include "sd-event.h"
 
 #include "alloc-util.h"
 #include "build.h"
@@ -12,23 +15,21 @@
 #include "discover-image.h"
 #include "fd-util.h"
 #include "format-table.h"
-#include "hostname-util.h"
 #include "import-common.h"
 #include "import-util.h"
-#include "locale-util.h"
 #include "log.h"
-#include "macro.h"
 #include "main-func.h"
 #include "os-util.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "polkit-agent.h"
 #include "pretty-print.h"
-#include "signal-util.h"
-#include "sort-util.h"
-#include "spawn-polkit-agent.h"
+#include "runtime-scope.h"
 #include "string-table.h"
+#include "string-util.h"
+#include "strv.h"
 #include "verbs.h"
 #include "web-util.h"
 
@@ -42,10 +43,10 @@ static bool arg_quiet = false;
 static bool arg_ask_password = true;
 static ImportVerify arg_verify = IMPORT_VERIFY_SIGNATURE;
 static const char* arg_format = NULL;
-static JsonFormatFlags arg_json_format_flags = JSON_FORMAT_OFF;
+static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 static ImageClass arg_image_class = _IMAGE_CLASS_INVALID;
 
-#define PROGRESS_PREFIX "Total: "
+#define PROGRESS_PREFIX "Total:"
 
 static int settle_image_class(void) {
 
@@ -179,7 +180,7 @@ static int transfer_image_common(sd_bus *bus, sd_bus_message *m) {
         assert(bus);
         assert(m);
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = sd_event_default(&event);
         if (r < 0)
@@ -195,7 +196,7 @@ static int transfer_image_common(sd_bus *bus, sd_bus_message *m) {
                         bus_import_mgr,
                         "TransferRemoved",
                         match_transfer_removed,
-                        /* add_callback= */ NULL,
+                        /* install_callback= */ NULL,
                         &c);
         if (r < 0)
                 return log_error_errno(r, "Failed to request match: %m");
@@ -204,11 +205,11 @@ static int transfer_image_common(sd_bus *bus, sd_bus_message *m) {
                         bus,
                         &slot_log_message,
                         "org.freedesktop.import1",
-                        /* object_path= */ NULL,
+                        /* path= */ NULL,
                         "org.freedesktop.import1.Transfer",
                         "LogMessage",
                         match_log_message,
-                        /* add_callback= */ NULL,
+                        /* install_callback= */ NULL,
                         &c);
         if (r < 0)
                 return log_error_errno(r, "Failed to request match: %m");
@@ -217,11 +218,11 @@ static int transfer_image_common(sd_bus *bus, sd_bus_message *m) {
                         bus,
                         &slot_progress_update,
                         "org.freedesktop.import1",
-                        /* object_path= */ NULL,
+                        /* path= */ NULL,
                         "org.freedesktop.import1.Transfer",
                         "ProgressUpdate",
                         match_progress_update,
-                        /* add_callback= */ NULL,
+                        /* install_callback= */ NULL,
                         &c);
         if (r < 0)
                 return log_error_errno(r, "Failed to request match: %m");
@@ -273,7 +274,7 @@ static int import_tar(int argc, char *argv[], void *userdata) {
                         return log_error_errno(r, "Cannot extract container name from filename: %m");
                 if (r == O_DIRECTORY)
                         return log_error_errno(SYNTHETIC_ERRNO(EISDIR),
-                                               "Path '%s' refers to directory, but we need a regular file: %m", path);
+                                               "Path '%s' refers to directory, but we need a regular file.", path);
 
                 local = fn;
         }
@@ -352,7 +353,7 @@ static int import_raw(int argc, char *argv[], void *userdata) {
                         return log_error_errno(r, "Cannot extract container name from filename: %m");
                 if (r == O_DIRECTORY)
                         return log_error_errno(SYNTHETIC_ERRNO(EISDIR),
-                                               "Path '%s' refers to directory, but we need a regular file: %m", path);
+                                               "Path '%s' refers to directory, but we need a regular file.", path);
 
                 local = fn;
         }
@@ -475,7 +476,6 @@ static int import_fs(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return bus_log_create_error(r);
 
-
         return transfer_image_common(bus, m);
 }
 
@@ -492,6 +492,8 @@ static void determine_compression_from_filename(const char *p) {
                 arg_format = "gzip";
         else if (endswith(p, ".bz2"))
                 arg_format = "bzip2";
+        else if (endswith(p, ".zst"))
+                arg_format = "zstd";
 }
 
 static int export_tar(int argc, char *argv[], void *userdata) {
@@ -849,7 +851,7 @@ static int list_transfers(int argc, char *argv[], void *userdata) {
         if (!table_isempty(t)) {
                 r = table_print_with_pager(t, arg_json_format_flags, arg_pager_flags, arg_legend);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to output table: %m");
+                        return r;
         }
 
         if (arg_legend) {
@@ -867,7 +869,7 @@ static int cancel_transfer(int argc, char *argv[], void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         for (int i = 1; i < argc; i++) {
                 uint32_t id;
@@ -912,6 +914,11 @@ static int list_images(int argc, char *argv[], void *userdata) {
         (void) table_hide_column_from_display(t, 8);
         (void) table_hide_column_from_display(t, 10);
 
+        /* Starting in v257, these fields would be automatically formatted with underscores. However, this
+         * command was introduced in v256, so changing the field name would be a breaking change. */
+        (void) table_set_json_field_name(t, 8, "usage-exclusive");
+        (void) table_set_json_field_name(t, 10, "limit-exclusive");
+
         for (;;) {
                 uint64_t crtime, mtime, usage, usage_exclusive, limit, limit_exclusive;
                 const char *class, *name, *type, *path;
@@ -932,7 +939,7 @@ static int list_images(int argc, char *argv[], void *userdata) {
                 if (r < 0)
                         return table_log_add_error(r);
 
-                if (FLAGS_SET(arg_json_format_flags, JSON_FORMAT_OFF))
+                if (!sd_json_format_enabled(arg_json_format_flags))
                         r = table_add_many(
                                         t,
                                         TABLE_STRING, read_only ? "ro" : "rw",
@@ -963,7 +970,7 @@ static int list_images(int argc, char *argv[], void *userdata) {
         if (!table_isempty(t)) {
                 r = table_print_with_pager(t, arg_json_format_flags, arg_pager_flags, arg_legend);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to output table: %m");
+                        return r;
         }
 
         if (arg_legend) {
@@ -1014,7 +1021,8 @@ static int help(int argc, char *argv[], void *userdata) {
                "                              otherwise\n"
                "     --verify=MODE            Verification mode for downloaded images (no,\n"
                "                               checksum, signature)\n"
-               "     --format=xz|gzip|bzip2   Desired output format for export\n"
+               "     --format=xz|gzip|bzip2|zstd\n"
+               "                              Desired output format for export\n"
                "     --force                  Install image even if already exists\n"
                "  -m --class=machine          Install as machine image\n"
                "  -P --class=portable         Install as portable service image\n"
@@ -1104,8 +1112,9 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case 'M':
-                        arg_transport = BUS_TRANSPORT_MACHINE;
-                        arg_host = optarg;
+                        r = parse_machine_argument(optarg, &arg_host, &arg_transport);
+                        if (r < 0)
+                                return r;
                         break;
 
                 case ARG_READ_ONLY:
@@ -1135,7 +1144,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_FORMAT:
-                        if (!STR_IN_SET(optarg, "uncompressed", "xz", "gzip", "bzip2"))
+                        if (!STR_IN_SET(optarg, "uncompressed", "xz", "gzip", "bzip2", "zstd"))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Unknown format: %s", optarg);
 
@@ -1151,7 +1160,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case 'j':
-                        arg_json_format_flags = JSON_FORMAT_PRETTY_AUTO|JSON_FORMAT_COLOR_AUTO;
+                        arg_json_format_flags = SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO;
                         arg_legend = false;
                         break;
 
@@ -1235,7 +1244,7 @@ static int run(int argc, char *argv[]) {
 
         r = bus_connect_transport(arg_transport, arg_host, RUNTIME_SCOPE_SYSTEM, &bus);
         if (r < 0)
-                return bus_log_connect_error(r, arg_transport);
+                return bus_log_connect_error(r, arg_transport, RUNTIME_SCOPE_SYSTEM);
 
         (void) sd_bus_set_allow_interactive_authorization(bus, arg_ask_password);
 

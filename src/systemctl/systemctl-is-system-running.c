@@ -1,15 +1,19 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "sd-event.h"
+#include "sd-bus.h"
 #include "sd-daemon.h"
+#include "sd-event.h"
 
-#include "systemctl-util.h"
-#include "systemctl-is-system-running.h"
-#include "virt.h"
-#include "systemctl.h"
-#include "bus-util.h"
-#include "bus-locator.h"
+#include "alloc-util.h"
 #include "bus-error.h"
+#include "bus-locator.h"
+#include "bus-util.h"
+#include "string-util.h"
+#include "strv.h"
+#include "systemctl.h"
+#include "systemctl-is-system-running.h"
+#include "systemctl-util.h"
+#include "virt.h"
 
 static int match_startup_finished(sd_bus_message *m, void *userdata, sd_bus_error *error) {
         char **state = ASSERT_PTR(userdata);
@@ -66,6 +70,10 @@ int verb_is_system_running(int argc, char *argv[], void *userdata) {
         }
 
         if (arg_wait && STR_IN_SET(state, "initializing", "starting")) {
+                /* The signal handler will allocate memory and assign to 'state', hence need to free previous
+                 * one before entering the event loop. */
+                state = mfree(state);
+
                 r = sd_event_loop(event);
                 if (r < 0) {
                         log_warning_errno(r, "Failed to get property from event loop: %m");
@@ -73,6 +81,8 @@ int verb_is_system_running(int argc, char *argv[], void *userdata) {
                                 puts("unknown");
                         return EXIT_FAILURE;
                 }
+
+                assert(state);
         }
 
         if (!arg_quiet)

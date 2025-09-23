@@ -209,12 +209,11 @@ testcase_vc_keymap() {
     assert_in "VC Keymap:" "$(localectl)"
 
     for i in $(localectl list-keymaps); do
-        # clear previous conversion from VC -> X11 keymap
-        systemctl stop systemd-localed.service
-        wait_vconsole_setup
-        rm -f /etc/vconsole.conf /etc/X11/xorg.conf.d/00-keyboard.conf /etc/default/keyboard
-
         # set VC keymap
+
+        # Skip lv keymap and friends, otherwise the sanitizer detects heap-buffer-overflow in libxkbcommon.
+        [[ "$i" =~ ^lv ]] && continue
+
         assert_rc 0 localectl set-keymap "$i"
         output=$(localectl)
 
@@ -652,10 +651,75 @@ testcase_locale_gen_leading_space() {
     localectl set-locale en_US.UTF-8
 }
 
+teardown_localed_alternate_paths() {
+    set +eu
+
+    rm -rf /run/systemd/system/systemd-localed.service.d
+    systemctl daemon-reload
+    systemctl restart systemd-localed
+}
+
+testcase_localed_alternate_paths() {
+    trap teardown_localed_alternate_paths RETURN
+
+    mkdir -p /run/alternate-path
+
+    mkdir -p /run/systemd/system/systemd-localed.service.d
+    cat >/run/systemd/system/systemd-localed.service.d/override.conf <<EOF
+[Service]
+Environment=SYSTEMD_ETC_LOCALE_CONF=/run/alternate-path/mylocale.conf
+Environment=SYSTEMD_ETC_VCONSOLE_CONF=/run/alternate-path/myvconsole.conf
+EOF
+    systemctl daemon-reload
+    systemctl restart systemd-localed
+
+    if localectl list-locales | grep "^de_DE.UTF-8$"; then
+        assert_rc 0 localectl set-locale "LANG=de_DE.UTF-8" "LC_CTYPE=C"
+    else
+        skip_locale=1
+    fi
+
+    if localectl list-keymaps | grep -F "^no$"; then
+        assert_rc 0 localectl set-keymap "no"
+    else
+        skip_keymap=1
+    fi
+
+    output=$(localectl)
+
+    if [[ -z "${skip_locale-}" ]]; then
+        assert_in "System Locale: LANG=de_DE.UTF-8" "$output"
+        assert_in "LANG=de_DE.UTF-8" "$(cat /run/alternate-path/mylocale.conf)"
+    fi
+
+    if [[ -z "${skip_keymap-}" ]]; then
+        assert_in "VC Keymap: no" "$output"
+        assert_in "KEYMAP=no" "$(cat /run/alternate-path/myvconsole.conf)"
+    fi
+}
+
 # Make sure the content of kbd-model-map is the one that the tests expect
 # regardless of the version installed on the distro where the testsuite is
 # running on.
 export SYSTEMD_KBD_MODEL_MAP=/usr/lib/systemd/tests/testdata/test-keymap-util/kbd-model-map
+
+# On Debian and derivatives writing calls to localed are blocked as other tools are used to change settings,
+# override that policy
+mkdir -p /etc/dbus-1/system.d/
+cat >/etc/dbus-1/system.d/systemd-localed-read-only.conf <<EOF
+<?xml version="1.0"?>
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+        "https://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+        <policy user="root">
+                <allow send_destination="org.freedesktop.locale1" send_interface="org.freedesktop.locale1" send_member="SetLocale"/>
+                <allow send_destination="org.freedesktop.locale1" send_interface="org.freedesktop.locale1" send_member="SetVConsoleKeyboard"/>
+                <allow send_destination="org.freedesktop.locale1" send_interface="org.freedesktop.locale1" send_member="SetX11Keyboard"/>
+        </policy>
+</busconfig>
+EOF
+trap 'rm -f /etc/dbus-1/system.d/systemd-localed-read-only.conf' EXIT
+systemctl reload dbus.service
 
 enable_debug
 run_testcases

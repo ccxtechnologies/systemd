@@ -123,6 +123,18 @@ Documentation: sd-login(3)
 
 Stanowisko @SEAT_ID@ zostało usunięte i nie jest już dostępne.
 
+-- b2bcbaf5edf948e093ce50bbea0e81ec
+Subject: Klawisz SAK (Secure Attention Key) został naciśnięty na stanowisku @SEAT_ID@
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd-logind.service(8)
+
+Klawisz SAK (Secure Attention Key), Ctrl+Alt+Shift+Esc, został naciśnięty
+na stanowisku @SEAT_ID@.
+
+Naciśnięcie klawisza SAK wskazuje na bezpośrednie żądanie użytkownika,
+aby system wyświetlił zabezpieczone okno lub ekran logowania.
+
 -- c7a787079b354eaaa9e77b371893cd27
 Subject: Zmiana czasu
 Defined-By: systemd
@@ -185,7 +197,7 @@ Defined-By: systemd
 Support: %SUPPORT_URL%
 
 Zainicjowano wyłączenie systemu. Wyłączenie zostało rozpoczęte i wszystkie
-usługi systemowe zostały zakończone, a wszystkie systemy plików odmontowane.
+usługi systemowe zostaną zakończone, a wszystkie systemy plików odmontowane.
 
 -- c14aaf76ec284a5fa1f105f88dfb061c
 Subject: Zainicjowano przywrócenie danych fabrycznych systemu
@@ -457,6 +469,19 @@ wpływa to na montowanie, ale wcześniej istniejące pliki w tym katalogu staj�
 się niedostępne. Aby zobaczyć te pliki, proszę ręcznie zamontować system
 plików w innym położeniu.
 
+-- 1edabb4eda2a49c19bc0206f24b43889
+Subject: Ścieżka do punktu montowania zawiera dowiązania symboliczne
+Defined-By: systemd
+Support: %SUPPORT_URL%
+
+Ścieżka @WHERE@ została podana jako ścieżka do punktu montowania (drugie pole
+w pliku /etc/fstab lub pole Where= w pliku jednostki systemd) i nie jest
+kanoniczna, tzn. zawiera co najmniej jedno dowiązanie symboliczne jako element
+ścieżki. Zazwyczaj nie jest to obsługiwane, a takie próby montowania są
+odrzucane, ponieważ informacje tabeli montowania wystawiane przez jądro
+i żądana ścieżka odbiegłyby od siebie po postawieniu. Należy kanonizować
+ścieżki przed żądaniem postawienia punktu montowania.
+
 -- 24d8d4452573402496068381a6312df2
 Subject: Uruchomiono maszynę wirtualną lub kontener
 Defined-By: systemd
@@ -723,16 +748,6 @@ Support: %SUPPORT_URL%
 Po raz pierwszy podczas obecnego uruchomienia uzyskano synchronizację NTP
 i zainicjowano regulację lokalnego zegara systemowego.
 
--- 7db73c8af0d94eeb822ae04323fe6ab6
-Subject: Początkowe przestawienie zegara
-Defined-By: systemd
-Support: %SUPPORT_URL%
-
-Przestawiono zegar systemowy na podstawie pliku ze znacznikiem czasu na dysku
-w celu zapewnienia, że nadal jest w przybliżeniu monotoniczny — nawet między
-ponownymi uruchomieniami — jeśli zegar czasu rzeczywistego jest niedostępny
-lub zawodny.
-
 -- 3f7d5ef3e54f4302b4f0b143bb270cab
 Subject: Rozszerzono PCR układu TPM
 Defined-By: systemd
@@ -801,3 +816,183 @@ Documentation: https://systemd.io/PORTABLE_SERVICES/
 Z systemu odłączono usługę przenośną @PORTABLE_ROOT@ (z rozszerzeniami:
 @PORTABLE_EXTENSION@) i nie jest już dostępna do użytku. Polecenie
 „portablectl list” wyświetli listę dołączonych usług przenośnych.
+
+-- ad7089f928ac4f7ea00c07457d47ba8a
+Subject: Niepowodzenie upoważnienia podczas próby zapisania klucza SRK w układzie TPM
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd-tpm2-setup.service(8)
+
+Wystąpiło niepowodzenie upoważnienia podczas próby zapisania klucza
+SRK (Storage Root Key) na układzie TPM (Trusted Platform Module).
+Najprawdopodobniej oznacza to, że kod PIN/hasło (authValue) zostało
+ustawione na hierarchii właściciela (Owner) układu TPM.
+
+Automatyczny zapis klucza SRK na układach TPM w takich przypadkach
+nie jest obsługiwany. Aby usunąć ustawienie ochrony kodem PIN/hasłem
+na hierarchii właściciela, należy wykonać to polecenie:
+„tpm2_changeauth -c o -p <POPRZEDNIE-HASŁO> ""”.
+
+-- 9cf56b8baf9546cf9478783a8de42113
+Subject: Obcy proces zmienił sysctl zarządzane przez systemd-networkd
+Defined-By: systemd
+Support: %SUPPORT_URL%
+
+Ustawienie konfiguracji sysctl @SYSCTL@, które jest zarządzane przez
+systemd-networkd, zostało zmienione przez inny, niepowiązany proces
+(„@OBJECT_COMM@”, PID @OBJECT_PID@). To tworzy konflikt właścicielstwa,
+co prawdopodobnie spowoduje problemy w późniejszym czasie.
+
+Wartość zmieniła się na „@NEWVALUE@”, a powinna wynosić „@OURVALUE@”.
+
+-- 438188861e0b427a9d638a90487a0ca6
+Subject: Zażądano wyczyszczenia układu TPM
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd-tpm2-clear.service(8)
+
+Żądanie wyczyszczenia układu bezpieczeństwa TPM zostało wydane oprogramowaniu
+sprzętowemu. Jest to zazwyczaj wykonywane jako część pełnego przywrócenia
+danych fabrycznych i zapewnia, że podczas następnego uruchomienia
+oprogramowanie sprzętowe przywróci układ TPM po interaktywnej prośbie
+o potwierdzenie przez użytkownika.
+
+Wyczyszczenie układu TPM powoduje unieważnienie wszystkich kluczy
+zablokowanych na układzie TPM, w tym kluczy szyfrowania całego dysku.
+Z tego powodu należy zadbać, aby dostęp do właściwych zasobów został
+zachowany w inny sposób.
+
+-- 1f4e0a44a88649939aaea34fc6da8c95
+Subject: Proces @COREDUMP_PID@ (@COREDUMP_COMM@) nieprawidłowo zakończył działanie
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd-coredump(8)
+
+Proces @COREDUMP_PID@ (@COREDUMP_COMM@) nieprawidłowo zakończył działanie
+i utworzył ślad stosu.
+
+Zwykle wskazuje to na błąd programistyczny w danym programie i powinno zostać
+zgłoszone jego producentowi jako błąd. Dostępny jest ślad stosu programu,
+który wskazuje, gdzie wystąpił błąd, co może być przydatne do ustalenia
+szczegółów problemu.
+
+-- d989611b15e44c9dbf31e3c81256e4ed
+Subject: Usługa systemd-oomd zakończyła co najmniej jeden proces w jednostce @UNIT@
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd-oomd.service(8)
+
+Co najmniej jeden proces w jednostce @UNIT@ został zakończony przez usługę
+systemd-oomd w celu przeciwdziałania sytuacji braku pamięci w systemie. Zwykle
+wskazuje to, że system ma mało pamięci i usługa systemd-oomd zdecydowała się
+zakończyć co najmniej jeden proces, aby zmniejszyć brak pamięci.
+
+Proszę zauważyć, że brak pamięci mógł nie zostać spowodowany
+przez jednostkę @UNIT@.
+
+-- 010190138f494e29a0ef6669749531aa
+Subject: Dla urządzenia @DEVICE@ nie można utworzyć prawidłowej nazwy jednostki
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd(1)
+
+Wykryto urządzenie jądra @DEVICE@, którego identyfikacji nie można zamienić
+na prawidłową nazwę jednostki systemd. Zwykle wskazuje to na problematyczną
+hierarchię urządzeń (tzn. za dużo poziomów zagnieżdżenia magistrali) lub
+problematyczne sterowniki.
+
+Dla takich urządzeń nie zostaną utworzone jednostki .device korzystające ze
+stanu urządzenia jądra, więc nie można wypełnić zależności na takiej jednostce.
+
+-- 7db73c8af0d94eeb822ae04323fe6ab6
+Subject: Zegar systemowy został zmieniony
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd(1) man:systemd-timesyncd.service(8)
+
+Zegar systemowy został przesunięty @DIRECTION@, nowy czas wynosi
+@REALTIME_USEC@ ms po epoce.
+
+Zazwyczaj powinno to się stać tylko po znaczącej błędnej konfiguracji zegara
+systemowego lub jeśli komputer nie ma zegara sprzętowego buforowanego
+akumulatorem (albo akumulator się wyczerpał).
+
+-- 8739789eca064325af15a8ed0ecfc556
+Subject: Wysłanie komunikatu „keep-alive” do sprzętowego urządzenia watchdog się nie powiodło
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd(1)
+
+Wystąpił błąd podczas wysyłania komunikatu „keep-alive” do sprzętowego
+urządzenia watchdog @WATCHDOG_DEVICE@. Zwykle wskazuje to na problemy
+ze sterownikiem lub sprzętem.
+
+Regularne niepowodzenia wysłania komunikatów „keep-alive” do sprzętowego
+urządzenia watchdog może powodować automatyczne ponowne uruchamianie komputera.
+
+-- 375ac151ef9d4de39068b3efbfed0cee
+Subject: Otwarcie skonfigurowanego urządzenia watchdog się nie powiodło
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd(1)
+
+Wystąpił błąd podczas otwierania sprzętowego urządzenia watchdog
+@WATCHDOG_DEVICE@. Zwykle wskazuje to na nieprawidłową konfigurację
+(tzn. konfiguracja nie pasuje do lokalnego systemu) lub problemy
+ze sterownikiem albo sprzętem.
+
+Jeśli obsługa urządzenia watchdog jest skonfigurowana, ale nie można otworzyć
+sprzętowego urządzenia watchdog, to system nie będzie chroniony przez logikę
+urządzenia watchdog.
+
+-- f27a3f94406a4783b946a9bc849e9452
+Subject: Znaleziono cykliczną kolejność jednostek
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd(1)
+
+Zainicjowano transakcję jednostki zawierającą cykliczną kolejność, tzn.
+zażądano uruchomienie jakiejś jednostki (bezpośrednio lub niebezpośrednio przez
+zależność wymagania, taką jak Wants= lub Requires=) w kolejności przed jakąś
+inną jednostką, ale ta druga jednostka jest także w kolejności przed pierwszą
+przez jakąś zależność (bezpośrednio lub niebezpośrednio).
+
+Cykliczna kolejność składa się z co najmniej dwóch jednostek, ale może
+dotyczyć wielu więcej. Zwykle wskazuje to na błąd w definicjach jednostek,
+jako że w teorii jednostka nie może być wykonywana zarówno przed, jak i po
+jakiejś innej jednostce, tylko musi być ściśle w kolejności przed lub po.
+
+Cykliczna kolejność jest widoczna w komunikacie dziennika. Zostanie wykonana
+próba usunięcia zadania jednostki z transakcji, aby transakcja powiodła się
+chociaż częściowo. Proszę zauważyć, że tego rodzaju przerwanie cykliczności
+nie naprawi problemu, a tylko spróbuje zmniejszyć problematyczność wyniku.
+
+Prawdziwa poprawka wiąże się z analizą cykliczności i przerwaniem jej we
+właściwym miejscu przez usunięcie właściwych wierszy After= lub Before=
+z co najmniej jednego pliku jednostki, którego to dotyczy.
+
+-- 5084367542f7472dbc6a94125d5debce
+Subject: Usunięto zadanie jednostki z powodu cyklicznej kolejności
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd(1)
+
+Zadanie zostało usunięte z transakcji w celu częściowego rozwiązania
+cyklicznej kolejności między dodanymi do niej jednostkami.
+
+Usunięte zadanie to „@DELETED_TYPE@”dla jednostki @DELETED_UNIT@.
+
+Usunięcie zadania jest wykonywane w celu zminimalizowania negatywnych skutków
+cyklicznej kolejności — nie spowoduje naprawienia zasadniczego problemu, jakim
+jest błąd w plikach jednostek. Usunięte zadanie może być niezbędne do działania
+pozostałych jednostek w transakcji, która może z tego powodu się nie powieść.
+
+-- b3112ddad19045538c76685ba5918a80
+Subject: Nie można przerwać cyklicznej kolejności między jednostkami
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd(1)
+
+Nastąpiła próba przerwania cyklicznej kolejności między jednostkami, dla
+których zadania zostały zakolejkowane jako część transakcji, ale się nie
+powiodła. Transakcja się nie powiedzie.

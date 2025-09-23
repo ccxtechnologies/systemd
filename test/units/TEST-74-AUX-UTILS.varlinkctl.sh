@@ -25,16 +25,27 @@ varlinkctl info -j /run/systemd/journal/io.systemd.journal | jq .
 varlinkctl list-interfaces /run/systemd/journal/io.systemd.journal
 varlinkctl list-interfaces -j /run/systemd/journal/io.systemd.journal | jq .
 
+varlinkctl list-methods /run/systemd/journal/io.systemd.journal
+varlinkctl list-methods -j /run/systemd/journal/io.systemd.journal | jq .
+
+varlinkctl list-methods /run/systemd/journal/io.systemd.journal io.systemd.Journal
+varlinkctl list-methods -j /run/systemd/journal/io.systemd.journal io.systemd.Journal | jq .
+
+varlinkctl introspect /run/systemd/journal/io.systemd.journal
+varlinkctl introspect -j /run/systemd/journal/io.systemd.journal | jq --seq .
+
 varlinkctl introspect /run/systemd/journal/io.systemd.journal io.systemd.Journal
 varlinkctl introspect -j /run/systemd/journal/io.systemd.journal io.systemd.Journal | jq .
 
 if command -v userdbctl >/dev/null; then
     systemctl start systemd-userdbd
     varlinkctl call /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetUserRecord '{ "userName" : "testuser", "service" : "io.systemd.Multiplexer" }'
+    varlinkctl call -q /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetUserRecord '{ "userName" : "testuser", "service" : "io.systemd.Multiplexer" }'
     varlinkctl call -j /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetUserRecord '{ "userName" : "testuser", "service" : "io.systemd.Multiplexer" }' | jq .
     # We ignore the return value of the following two calls, since if no memberships are defined at all this will return a NotFound error, which is OK
-    (varlinkctl call --more /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetMemberships '{ "service" : "io.systemd.Multiplexer" }' ||:)
-    (varlinkctl call --more -j /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetMemberships '{ "service" : "io.systemd.Multiplexer" }' ||:) | jq --seq .
+    varlinkctl call --more /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetMemberships '{ "service" : "io.systemd.Multiplexer" }' --graceful=io.systemd.UserDatabase.NoRecordFound
+    varlinkctl call --quiet --more /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetMemberships '{ "service" : "io.systemd.Multiplexer" }' --graceful=io.systemd.UserDatabase.NoRecordFound
+    varlinkctl call --more -j /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetMemberships '{ "service" : "io.systemd.Multiplexer" }' --graceful=io.systemd.UserDatabase.NoRecordFound | jq --seq .
     varlinkctl call --oneway /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetMemberships '{ "service" : "io.systemd.Multiplexer" }'
     (! varlinkctl call --oneway /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetMemberships '{ "service" : "io.systemd.Multiplexer" }' | grep .)
 fi
@@ -52,6 +63,21 @@ if [[ -x /usr/lib/systemd/systemd-pcrextend ]]; then
     varlinkctl info exec:/usr/lib/systemd/systemd-pcrextend
     varlinkctl list-interfaces /usr/lib/systemd/systemd-pcrextend
     varlinkctl introspect /usr/lib/systemd/systemd-pcrextend io.systemd.PCRExtend
+    varlinkctl introspect /usr/lib/systemd/systemd-pcrextend
+fi
+
+# Test various varlink socket units to make sure that we can still connect to the varlink sockets even if the
+# services are currently stopped (or restarting).
+systemctl stop \
+    systemd-networkd.service \
+    systemd-hostnamed.service \
+    systemd-machined.service \
+    systemd-udevd.service
+varlinkctl introspect /run/systemd/netif/io.systemd.Network
+varlinkctl introspect /run/systemd/io.systemd.Hostname
+varlinkctl introspect /run/systemd/machine/io.systemd.Machine
+if ! systemd-detect-virt -qc; then
+    varlinkctl introspect /run/udev/io.systemd.Udev
 fi
 
 # SSH transport
@@ -63,7 +89,7 @@ rm_rf_sshbindir() {
 
 trap rm_rf_sshbindir EXIT
 
-# Create a fake "ssh" binary that validates everything works as expected
+# Create a fake "ssh" binary that validates everything works as expected if invoked for the "ssh-unix:" Varlink transport
 cat > "$SSHBINDIR"/ssh <<'EOF'
 #!/bin/sh
 
@@ -75,18 +101,45 @@ test "$3" = "foobar"
 
 exec socat - UNIX-CONNECT:/run/systemd/journal/io.systemd.journal
 EOF
-
 chmod +x "$SSHBINDIR"/ssh
 
-SYSTEMD_SSH="$SSHBINDIR/ssh" varlinkctl info ssh:foobar:/run/systemd/journal/io.systemd.journal
+SYSTEMD_SSH="$SSHBINDIR/ssh" varlinkctl info ssh-unix:foobar:/run/systemd/journal/io.systemd.journal
+
+# Now build another fake "ssh" binary that does the same for "ssh-exec:"
+cat > "$SSHBINDIR"/ssh <<'EOF'
+#!/bin/sh
+
+set -xe
+
+test "$1" = "-e"
+test "$2" = "none"
+test "$3" = "-T"
+test "$4" = "foobar"
+test "$5" = "env"
+test "$6" = "SYSTEMD_VARLINK_LISTEN=-"
+test "$7" = "systemd-sysext"
+
+SYSTEMD_VARLINK_LISTEN=- exec systemd-sysext
+EOF
+chmod +x "$SSHBINDIR"/ssh
+
+SYSTEMD_SSH="$SSHBINDIR/ssh" varlinkctl info ssh-exec:foobar:systemd-sysext
 
 # Go through all varlink sockets we can find under /run/systemd/ for some extra coverage
 find /run/systemd/ -name "io.systemd*" -type s | while read -r socket; do
     varlinkctl info "$socket"
+    varlinkctl info -j "$socket"
+    varlinkctl list-interfaces "$socket"
+    varlinkctl list-interfaces -j "$socket"
+    varlinkctl list-methods "$socket"
+    varlinkctl list-methods -j "$socket"
+    varlinkctl introspect "$socket"
+    varlinkctl introspect -j "$socket"
 
     varlinkctl list-interfaces "$socket" | while read -r interface; do
         varlinkctl introspect "$socket" "$interface"
     done
+
 done
 
 (! varlinkctl)
@@ -104,17 +157,54 @@ done
 (! varlinkctl list-interfaces)
 (! varlinkctl list-interfaces "")
 (! varlinkctl introspect)
-(! varlinkctl introspect /run/systemd/journal/io.systemd.journal)
 (! varlinkctl introspect /run/systemd/journal/io.systemd.journal "")
 (! varlinkctl introspect "" "")
+(! varlinkctl list-methods /run/systemd/journal/io.systemd.journal "")
+(! varlinkctl list-methods -j /run/systemd/journal/io.systemd.journal "")
+(! varlinkctl list-methods "")
+(! varlinkctl list-methods -j "")
 (! varlinkctl call)
 (! varlinkctl call "")
 (! varlinkctl call "" "")
 (! varlinkctl call "" "" "")
-(! varlinkctl call /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetUserRecord </dev/null)
+(! varlinkctl call /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetUserRecord '{ "service" : "io.systemd.ShouldNotExist" }')
 (! varlinkctl validate-idl "")
 (! varlinkctl validate-idl </dev/null)
 
 varlinkctl info /run/systemd/io.systemd.Hostname
 varlinkctl introspect /run/systemd/io.systemd.Hostname io.systemd.Hostname
 varlinkctl call /run/systemd/io.systemd.Hostname io.systemd.Hostname.Describe '{}'
+
+# Validate that --exec results in the very same values
+varlinkctl call /run/systemd/io.systemd.Hostname io.systemd.Hostname.Describe '{}' | jq > /tmp/describe1.json
+varlinkctl --exec call /run/systemd/io.systemd.Hostname io.systemd.Hostname.Describe '{}' -- jq > /tmp/describe2.json
+cmp /tmp/describe1.json /tmp/describe2.json
+rm /tmp/describe1.json /tmp/describe2.json
+
+# test io.systemd.Manager
+varlinkctl info /run/systemd/io.systemd.Manager
+varlinkctl introspect /run/systemd/io.systemd.Manager io.systemd.Manager
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Manager.Describe '{}'
+
+# test io.systemd.Unit
+varlinkctl info /run/systemd/io.systemd.Manager
+varlinkctl introspect /run/systemd/io.systemd.Manager io.systemd.Unit
+varlinkctl --more call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{}'
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{"name": "multi-user.target"}'
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{"pid": {"pid": 0}}'
+(! varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{"name": ""}')
+(! varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{"name": "non-existent.service"}')
+(! varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{"pid": {"pid": -1}}' )
+
+# test io.systemd.Manager in user manager
+testuser_uid=$(id -u testuser)
+systemd-run --wait --pipe --user --machine testuser@ \
+        varlinkctl info "/run/user/$testuser_uid/systemd/io.systemd.Manager"
+systemd-run --wait --pipe --user --machine testuser@ \
+        varlinkctl introspect "/run/user/$testuser_uid/systemd/io.systemd.Manager"
+systemd-run --wait --pipe --user --machine testuser@ \
+        varlinkctl call "/run/user/$testuser_uid/systemd/io.systemd.Manager" io.systemd.Manager.Describe '{}'
+
+# test io.systemd.Unit in user manager
+systemd-run --wait --pipe --user --machine testuser@ \
+        varlinkctl --more call "/run/user/$testuser_uid/systemd/io.systemd.Manager" io.systemd.Unit.List '{}'

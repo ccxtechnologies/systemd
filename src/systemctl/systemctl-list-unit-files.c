@@ -1,34 +1,64 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <fnmatch.h>
+
+#include "sd-bus.h"
+
+#include "alloc-util.h"
+#include "ansi-color.h"
 #include "bus-error.h"
 #include "bus-locator.h"
+#include "bus-util.h"
+#include "format-table.h"
+#include "hashmap.h"
+#include "install.h"
+#include "path-util.h"
 #include "sort-util.h"
+#include "string-util.h"
+#include "strv.h"
+#include "systemctl.h"
 #include "systemctl-list-unit-files.h"
 #include "systemctl-util.h"
-#include "systemctl.h"
-#include "terminal-util.h"
 
 static int compare_unit_file_list(const UnitFileList *a, const UnitFileList *b) {
         const char *d1, *d2;
+        int r, s;
+
+        assert(a);
+        assert(a->path);
+        assert(b);
+        assert(b->path);
 
         d1 = strrchr(a->path, '.');
         d2 = strrchr(b->path, '.');
 
         if (d1 && d2) {
-                int r;
-
                 r = strcasecmp(d1, d2);
                 if (r != 0)
                         return r;
         }
 
-        return strcasecmp(basename(a->path), basename(b->path));
+        _cleanup_free_ char *f1 = NULL, *f2 = NULL;
+        r = path_extract_filename(a->path, &f1);
+        s = path_extract_filename(b->path, &f2);
+        if (r < 0 || s < 0)
+                return CMP(r, s);
+
+        return strcasecmp(f1, f2);
 }
 
-static bool output_show_unit_file(const UnitFileList *u, char **states, char **patterns) {
-        assert(u);
+static int output_show_unit_file(const UnitFileList *u, char **states, char **patterns) {
+        int r;
 
-        if (!strv_fnmatch_or_empty(patterns, basename(u->path), FNM_NOESCAPE))
+        assert(u);
+        assert(u->path);
+
+        _cleanup_free_ char *id = NULL;
+        r = path_extract_filename(u->path, &id);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to extract unit name from path %s: %m", u->path);
+
+        if (!strv_fnmatch_or_empty(patterns, id, FNM_NOESCAPE))
                 return false;
 
         if (!strv_isempty(arg_types)) {
@@ -80,7 +110,7 @@ static int output_unit_file_list(const UnitFileList *units, unsigned c) {
         table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
 
         FOREACH_ARRAY(u, units, c) {
-                const char *on_underline = NULL, *on_unit_color = NULL, *id;
+                const char *on_underline = NULL, *on_unit_color = NULL;
                 bool underline;
 
                 underline = u + 1 < units + c &&
@@ -102,7 +132,10 @@ static int output_unit_file_list(const UnitFileList *units, unsigned c) {
                 else
                         on_unit_color = on_underline;
 
-                id = basename(u->path);
+                _cleanup_free_ char *id = NULL;
+                r = path_extract_filename(u->path, &id);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to extract unit name from path %s: %m", u->path);
 
                 r = table_add_many(table,
                                    TABLE_STRING, id,
@@ -142,23 +175,15 @@ static int output_unit_file_list(const UnitFileList *units, unsigned c) {
 
 int verb_list_unit_files(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        _cleanup_free_ UnitFileList *units = NULL;
         _cleanup_hashmap_free_ Hashmap *h = NULL;
+        _cleanup_free_ UnitFileList *units = NULL;
         unsigned c = 0;
-        const char *state;
-        char *path;
         int r;
-        bool fallback = false;
 
         if (install_client_side()) {
-                UnitFileList *u;
                 unsigned n_units;
 
-                h = hashmap_new(&unit_file_list_hash_ops_free);
-                if (!h)
-                        return log_oom();
-
-                r = unit_file_get_list(arg_runtime_scope, arg_root, h, arg_states, strv_skip(argv, 1));
+                r = unit_file_get_list(arg_runtime_scope, arg_root, arg_states, strv_skip(argv, 1), &h);
                 if (r < 0)
                         return log_error_errno(r, "Failed to get unit file list: %m");
 
@@ -168,8 +193,9 @@ int verb_list_unit_files(int argc, char *argv[], void *userdata) {
                 if (!units)
                         return log_oom();
 
+                UnitFileList *u;
                 HASHMAP_FOREACH(u, h) {
-                        if (!output_show_unit_file(u, NULL, NULL))
+                        if (output_show_unit_file(u, NULL, NULL) <= 0)
                                 continue;
 
                         units[c++] = *u;
@@ -179,6 +205,8 @@ int verb_list_unit_files(int argc, char *argv[], void *userdata) {
         } else {
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                const char *path, *state;
+                bool fallback = false;
                 sd_bus *bus;
 
                 r = acquire_bus(BUS_MANAGER, &bus);
@@ -201,19 +229,17 @@ int verb_list_unit_files(int argc, char *argv[], void *userdata) {
                                 return log_error_errno(r, "Failed to append unit dependencies: %m");
 
                         r = sd_bus_message_append_strv(m, names_with_deps);
-                        if (r < 0)
-                                return bus_log_create_error(r);
-                } else {
+                } else
                         r = sd_bus_message_append_strv(m, strv_skip(argv, 1));
-                        if (r < 0)
-                                return bus_log_create_error(r);
-                }
+                if (r < 0)
+                        return bus_log_create_error(r);
 
                 r = sd_bus_call(bus, m, 0, &error, &reply);
                 if (r < 0 && sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_METHOD)) {
                         /* Fallback to legacy ListUnitFiles method */
+                        log_debug_errno(r, "Unable to list unit files through ListUnitFilesByPatterns, falling back to ListUnitsFiles method.");
+
                         fallback = true;
-                        log_debug_errno(r, "Failed to list unit files: %s Falling back to ListUnitsFiles method.", bus_error_message(&error, r));
                         m = sd_bus_message_unref(m);
                         sd_bus_error_free(&error);
 
@@ -235,16 +261,15 @@ int verb_list_unit_files(int argc, char *argv[], void *userdata) {
                         if (!GREEDY_REALLOC(units, c + 1))
                                 return log_oom();
 
-                        units[c] = (struct UnitFileList) {
-                                path,
-                                unit_file_state_from_string(state)
+                        units[c] = (UnitFileList) {
+                                .path = (char*) path,
+                                .state = unit_file_state_from_string(state),
                         };
 
                         if (output_show_unit_file(&units[c],
                             fallback ? arg_states : NULL,
-                            fallback ? strv_skip(argv, 1) : NULL))
+                            fallback ? strv_skip(argv, 1) : NULL) > 0)
                                 c++;
-
                 }
                 if (r < 0)
                         return bus_log_parse_error(r);

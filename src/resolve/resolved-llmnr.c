@@ -2,10 +2,17 @@
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <resolv.h>
+
+#include "sd-event.h"
 
 #include "errno-util.h"
 #include "fd-util.h"
+#include "hashmap.h"
+#include "log.h"
+#include "resolved-dns-packet.h"
+#include "resolved-dns-scope.h"
+#include "resolved-dns-transaction.h"
+#include "resolved-link.h"
 #include "resolved-llmnr.h"
 #include "resolved-manager.h"
 
@@ -23,6 +30,19 @@ void manager_llmnr_stop(Manager *m) {
 
         m->llmnr_ipv6_tcp_event_source = sd_event_source_disable_unref(m->llmnr_ipv6_tcp_event_source);
         m->llmnr_ipv6_tcp_fd = safe_close(m->llmnr_ipv6_tcp_fd);
+}
+
+void manager_llmnr_maybe_stop(Manager *m) {
+        assert(m);
+
+        /* This stops LLMNR only when no interface enables LLMNR. */
+
+        Link *l;
+        HASHMAP_FOREACH(l, m->links)
+                if (link_get_llmnr_support(l) != RESOLVE_SUPPORT_NO)
+                        return;
+
+        manager_llmnr_stop(m);
 }
 
 int manager_llmnr_start(Manager *m) {

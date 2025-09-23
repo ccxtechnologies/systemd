@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-
-#include "errno-list.h"
-#include "glyph-util.h"
-#include "macro.h"
+#include "forward.h"
 
 /* The enum order is used to order unit jobs in the job queue
  * when other criteria (cpu weight, nice level) are identical.
@@ -47,6 +43,7 @@ typedef enum UnitActiveState {
         UNIT_ACTIVATING,
         UNIT_DEACTIVATING,
         UNIT_MAINTENANCE,
+        UNIT_REFRESHING,
         _UNIT_ACTIVE_STATE_MAX,
         _UNIT_ACTIVE_STATE_INVALID = -EINVAL,
 } UnitActiveState;
@@ -133,17 +130,19 @@ typedef enum ServiceState {
         SERVICE_START,
         SERVICE_START_POST,
         SERVICE_RUNNING,
-        SERVICE_EXITED,            /* Nothing is running anymore, but RemainAfterExit is true hence this is OK */
-        SERVICE_RELOAD,            /* Reloading via ExecReload= */
-        SERVICE_RELOAD_SIGNAL,     /* Reloading via SIGHUP requested */
-        SERVICE_RELOAD_NOTIFY,     /* Waiting for READY=1 after RELOADING=1 notify */
-        SERVICE_STOP,              /* No STOP_PRE state, instead just register multiple STOP executables */
+        SERVICE_EXITED,                 /* Nothing is running anymore, but RemainAfterExit is true hence this is OK */
+        SERVICE_RELOAD,                 /* Reloading via ExecReload= */
+        SERVICE_RELOAD_SIGNAL,          /* Reloading via SIGHUP requested */
+        SERVICE_RELOAD_NOTIFY,          /* Waiting for READY=1 after RELOADING=1 notify */
+        SERVICE_REFRESH_EXTENSIONS,     /* Refreshing extensions for a reload request */
+        SERVICE_MOUNTING,               /* Performing a live mount into the namespace of the service */
+        SERVICE_STOP,                   /* No STOP_PRE state, instead just register multiple STOP executables */
         SERVICE_STOP_WATCHDOG,
         SERVICE_STOP_SIGTERM,
         SERVICE_STOP_SIGKILL,
         SERVICE_STOP_POST,
-        SERVICE_FINAL_WATCHDOG,    /* In case the STOP_POST executable needs to be aborted. */
-        SERVICE_FINAL_SIGTERM,     /* In case the STOP_POST executable hangs, we shoot that down, too */
+        SERVICE_FINAL_WATCHDOG,         /* In case the STOP_POST executable needs to be aborted. */
+        SERVICE_FINAL_SIGTERM,          /* In case the STOP_POST executable hangs, we shoot that down, too */
         SERVICE_FINAL_SIGKILL,
         SERVICE_FAILED,
         SERVICE_DEAD_BEFORE_AUTO_RESTART,
@@ -166,9 +165,11 @@ typedef enum SliceState {
 typedef enum SocketState {
         SOCKET_DEAD,
         SOCKET_START_PRE,
+        SOCKET_START_OPEN,
         SOCKET_START_CHOWN,
         SOCKET_START_POST,
         SOCKET_LISTENING,
+        SOCKET_DEFERRED,
         SOCKET_RUNNING,
         SOCKET_STOP_PRE,
         SOCKET_STOP_PRE_SIGTERM,
@@ -280,28 +281,52 @@ typedef enum NotifyAccess {
         _NOTIFY_ACCESS_INVALID = -EINVAL,
 } NotifyAccess;
 
-char *unit_dbus_path_from_name(const char *name);
+typedef enum JobMode {
+        JOB_FAIL,                 /* Fail if a conflicting job is already queued */
+        JOB_LENIENT,              /* Fail if any conflicting unit is active (even weaker than JOB_FAIL) */
+        JOB_REPLACE,              /* Replace an existing conflicting job */
+        JOB_REPLACE_IRREVERSIBLY, /* Like JOB_REPLACE + produce irreversible jobs */
+        JOB_ISOLATE,              /* Start a unit, and stop all others */
+        JOB_FLUSH,                /* Flush out all other queued jobs when queueing this one */
+        JOB_IGNORE_DEPENDENCIES,  /* Ignore both requirement and ordering dependencies */
+        JOB_IGNORE_REQUIREMENTS,  /* Ignore requirement dependencies */
+        JOB_TRIGGERING,           /* Adds TRIGGERED_BY dependencies to the same transaction */
+        JOB_RESTART_DEPENDENCIES, /* A "start" job for the specified unit becomes "restart" for depending units */
+        _JOB_MODE_MAX,
+        _JOB_MODE_INVALID = -EINVAL,
+} JobMode;
+
+typedef enum ExecDirectoryType {
+        EXEC_DIRECTORY_RUNTIME,
+        EXEC_DIRECTORY_STATE,
+        EXEC_DIRECTORY_CACHE,
+        EXEC_DIRECTORY_LOGS,
+        EXEC_DIRECTORY_CONFIGURATION,
+        _EXEC_DIRECTORY_TYPE_MAX,
+        _EXEC_DIRECTORY_TYPE_INVALID = -EINVAL,
+} ExecDirectoryType;
+
+char* unit_dbus_path_from_name(const char *name);
 int unit_name_from_dbus_path(const char *path, char **name);
 
 const char* unit_dbus_interface_from_type(UnitType t);
-const char *unit_dbus_interface_from_name(const char *name);
+const char* unit_dbus_interface_from_name(const char *name);
 
-const char *unit_type_to_string(UnitType i) _const_;
+const char* unit_type_to_string(UnitType i) _const_;
 UnitType unit_type_from_string(const char *s) _pure_;
+void unit_types_list(void);
 
-const char* unit_type_to_capitalized_string(UnitType t);
-
-const char *unit_load_state_to_string(UnitLoadState i) _const_;
+const char* unit_load_state_to_string(UnitLoadState i) _const_;
 UnitLoadState unit_load_state_from_string(const char *s) _pure_;
 
-const char *unit_active_state_to_string(UnitActiveState i) _const_;
+const char* unit_active_state_to_string(UnitActiveState i) _const_;
 UnitActiveState unit_active_state_from_string(const char *s) _pure_;
 
-const char *freezer_state_to_string(FreezerState i) _const_;
+const char* freezer_state_to_string(FreezerState i) _const_;
 FreezerState freezer_state_from_string(const char *s) _pure_;
 FreezerState freezer_state_finish(FreezerState i) _const_;
 
-const char *unit_marker_to_string(UnitMarker m) _const_;
+const char* unit_marker_to_string(UnitMarker m) _const_;
 UnitMarker unit_marker_from_string(const char *s) _pure_;
 
 const char* automount_state_to_string(AutomountState i) _const_;
@@ -334,13 +359,19 @@ SwapState swap_state_from_string(const char *s) _pure_;
 const char* target_state_to_string(TargetState i) _const_;
 TargetState target_state_from_string(const char *s) _pure_;
 
-const char *timer_state_to_string(TimerState i) _const_;
+const char* timer_state_to_string(TimerState i) _const_;
 TimerState timer_state_from_string(const char *s) _pure_;
 
-const char *unit_dependency_to_string(UnitDependency i) _const_;
+const char* unit_dependency_to_string(UnitDependency i) _const_;
 UnitDependency unit_dependency_from_string(const char *s) _pure_;
 
 const char* notify_access_to_string(NotifyAccess i) _const_;
 NotifyAccess notify_access_from_string(const char *s) _pure_;
 
-SpecialGlyph unit_active_state_to_glyph(UnitActiveState state);
+const char* job_mode_to_string(JobMode t) _const_;
+JobMode job_mode_from_string(const char *s) _pure_;
+
+const char* exec_directory_type_to_string(ExecDirectoryType i) _const_;
+ExecDirectoryType exec_directory_type_from_string(const char *s) _pure_;
+
+Glyph unit_active_state_to_glyph(UnitActiveState state);

@@ -7,16 +7,15 @@
  */
 
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
+
+#include "sd-bus.h"
 
 #include "alloc-util.h"
+#include "argv-util.h"
 #include "bus-common-errors.h"
 #include "bus-locator.h"
-#include "path-util.h"
-#include "string-util.h"
-#include "terminal-util.h"
 #include "tests.h"
+#include "time-util.h"
 
 static const char *arg_tty = NULL;
 
@@ -42,11 +41,11 @@ TEST(set_type) {
         assert_se(bus_call_method(bus, &session, "TakeControl", NULL, NULL, "b", true) >= 0);
 
         /* All defined session types can be set */
-        for (size_t i = 0; i < ELEMENTSOF(types); i++) {
+        FOREACH_ELEMENT(i, types) {
                 type = mfree(type);
-                assert_se(bus_call_method(bus, &session, "SetType", NULL, NULL, "s", types[i]) >= 0);
+                assert_se(bus_call_method(bus, &session, "SetType", NULL, NULL, "s", *i) >= 0);
                 assert_se(bus_get_property_string(bus, &session, "Type", NULL, &type) >= 0);
-                assert_se(streq(type, types[i]));
+                assert_se(streq(type, *i));
         }
 
         /* An unknown type is rejected */

@@ -5,13 +5,12 @@
   Copyright © 2013 Intel Corporation. All rights reserved.
 ***/
 
-#include "sd-dhcp-client.h"
+#include "sd-dhcp-lease.h"
 
-#include "alloc-util.h"
 #include "dhcp-client-id-internal.h"
 #include "dhcp-option.h"
+#include "forward.h"
 #include "list.h"
-#include "time-util.h"
 
 struct sd_dhcp_route {
         struct in_addr dst_addr;
@@ -54,6 +53,9 @@ struct sd_dhcp_lease {
         bool rapid_commit;
 
         DHCPServerData servers[_SD_DHCP_LEASE_SERVER_TYPE_MAX];
+
+        sd_dns_resolver *dnr;
+        size_t n_dnr;
 
         struct sd_dhcp_route *static_routes;
         size_t n_static_routes;

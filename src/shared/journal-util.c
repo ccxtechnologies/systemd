@@ -1,6 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
+#include "sd-bus.h"
+#include "sd-journal.h"
+
 #include "acl-util.h"
+#include "alloc-util.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-util.h"
@@ -34,7 +40,7 @@ static int access_check_var_log_journal(sd_journal *j, bool want_other_users) {
         _cleanup_strv_free_ char **g = NULL;
         const char* dir;
 
-        if (laccess("/run/log/journal", F_OK) >= 0)
+        if (access_nofollow("/run/log/journal", F_OK) >= 0)
                 dir = "/run/log/journal";
         else
                 dir = "/var/log/journal";
@@ -58,8 +64,7 @@ static int access_check_var_log_journal(sd_journal *j, bool want_other_users) {
                 if (r < 0)
                         return log_oom();
 
-                strv_sort(g);
-                strv_uniq(g);
+                strv_sort_uniq(g);
 
                 s = strv_join(g, "', '");
                 if (!s)
@@ -112,7 +117,7 @@ int journal_access_check_and_warn(sd_journal *j, bool quiet, bool want_other_use
         HASHMAP_FOREACH_KEY(path, code, j->errors) {
                 int err;
 
-                err = abs(PTR_TO_INT(code));
+                err = ABS(PTR_TO_INT(code));
 
                 switch (err) {
                 case EACCES:
@@ -138,7 +143,6 @@ int journal_access_check_and_warn(sd_journal *j, bool quiet, bool want_other_use
 
                 default:
                         log_warning_errno(err, "An error was encountered while opening journal file or directory %s, ignoring file: %m", path);
-                        break;
                 }
         }
 

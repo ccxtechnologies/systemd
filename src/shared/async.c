@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stddef.h>
+#include <sched.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -10,11 +9,11 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "log.h"
-#include "macro.h"
 #include "process-util.h"
+#include "rm-rf.h"
 #include "signal-util.h"
 
-int asynchronous_sync(pid_t *ret_pid) {
+int asynchronous_sync(PidRef *ret_pid) {
         int r;
 
         /* This forks off an invocation of fork() as a child process, in order to initiate synchronization to
@@ -22,12 +21,36 @@ int asynchronous_sync(pid_t *ret_pid) {
          * original process ever, and a thread would do that as the process can't exit with threads hanging in blocking
          * syscalls. */
 
-        r = safe_fork("(sd-sync)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|(ret_pid ? 0 : FORK_DETACH), ret_pid);
+        r = pidref_safe_fork("(sd-sync)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|(ret_pid ? 0 : FORK_DETACH), ret_pid);
         if (r < 0)
                 return r;
         if (r == 0) {
                 /* Child process */
                 sync();
+                _exit(EXIT_SUCCESS);
+        }
+
+        return 0;
+}
+
+int asynchronous_fsync(int fd, PidRef *ret_pid) {
+        int r;
+
+        assert(fd >= 0);
+        /* Same as asynchronous_sync() above, but calls fsync() on a specific fd */
+
+        r = pidref_safe_fork_full(
+                        "(sd-fsync)",
+                        /* stdio_fds= */ NULL,
+                        /* except_fds= */ &fd,
+                        /* n_except_fds= */ 1,
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|(ret_pid ? 0 : FORK_DETACH),
+                        ret_pid);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                /* Child process */
+                (void) fsync(fd);
                 _exit(EXIT_SUCCESS);
         }
 
@@ -111,6 +134,13 @@ int asynchronous_close(int fd) {
         return -EBADF; /* return an invalidated fd */
 }
 
+void asynchronous_close_many(const int fds[], size_t n_fds) {
+        assert(fds || n_fds == 0);
+
+        FOREACH_ARRAY(i, fds, n_fds)
+                asynchronous_close(*i);
+}
+
 int asynchronous_rm_rf(const char *p, RemoveFlags flags) {
         int r;
 
@@ -124,6 +154,10 @@ int asynchronous_rm_rf(const char *p, RemoveFlags flags) {
                 return r;
 
         /* Child */
+
+        /* Let's block SIGTERM here, to grant the operation more time on e.g. final killing spree
+         * during shutdown. If this gets stalled pid1 would eventually send SIGKILL to us. */
+        BLOCK_SIGNALS(SIGTERM);
 
         r = rm_rf(p, flags);
         if (r < 0) {

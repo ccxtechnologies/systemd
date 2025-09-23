@@ -2,18 +2,16 @@
  * Copyright © 2019 VMware, Inc. */
 
 #include <linux/pkt_sched.h>
-#include <math.h>
 
-#include "alloc-util.h"
-#include "conf-parser.h"
-#include "netem.h"
-#include "netlink-util.h"
-#include "networkd-manager.h"
+#include "sd-netlink.h"
+
+#include "log-link.h"
+#include "networkd-link.h"
 #include "parse-util.h"
-#include "qdisc.h"
-#include "string-util.h"
 #include "strv.h"
+#include "tbf.h"
 #include "tc-util.h"
+#include "string-util.h"
 
 static int token_bucket_filter_fill_message(Link *link, QDisc *qdisc, sd_netlink_message *req) {
         uint32_t rtab[256], ptab[256];
@@ -122,7 +120,7 @@ int config_parse_token_bucket_filter_size(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         Network *network = ASSERT_PTR(data);
         TokenBucketFilter *tbf;
         uint64_t k;
@@ -195,7 +193,7 @@ int config_parse_token_bucket_filter_rate(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         Network *network = ASSERT_PTR(data);
         TokenBucketFilter *tbf;
         uint64_t k, *p;
@@ -256,7 +254,7 @@ int config_parse_token_bucket_filter_latency(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         Network *network = ASSERT_PTR(data);
         TokenBucketFilter *tbf;
         usec_t u;

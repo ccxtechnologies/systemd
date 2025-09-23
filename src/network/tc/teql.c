@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "macro.h"
+#include <stdio.h>
+
+#include "alloc-util.h"
+#include "log.h"
 #include "networkd-link.h"
 #include "parse-util.h"
 #include "string-util.h"
@@ -50,7 +53,7 @@ int config_parse_trivial_link_equalizer_id(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         TrivialLinkEqualizer *teql;
         Network *network = ASSERT_PTR(data);
         unsigned id;

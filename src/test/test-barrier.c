@@ -9,7 +9,7 @@
  * increase it at the slightly cost of lengthen test-duration on other machines.
  */
 
-#include <stdio.h>
+#include <stdlib.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -414,7 +414,6 @@ TEST_BARRIER(barrier_pending_exit,
                 assert_se(barrier_place(&b));
         }),
         TEST_BARRIER_WAIT_SUCCESS(pid2));
-
 
 static int intro(void) {
         if (!slow_tests_enabled())

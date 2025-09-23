@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdlib.h>
 #include "env-util.h"
-#include "fd-util.h"
-#include "fileio.h"
 #include "random-util.h"
 #include "serialize.h"
 #include "string-util.h"
@@ -393,32 +392,37 @@ TEST(format_timestamp) {
 static void test_format_timestamp_impl(usec_t x) {
         bool success, override;
         const char *xx, *yy;
-        usec_t y;
+        usec_t y, x_sec, y_sec;
 
         xx = FORMAT_TIMESTAMP(x);
-        assert_se(xx);
-        assert_se(parse_timestamp(xx, &y) >= 0);
+        ASSERT_NOT_NULL(xx);
+        ASSERT_OK(parse_timestamp(xx, &y));
         yy = FORMAT_TIMESTAMP(y);
-        assert_se(yy);
+        ASSERT_NOT_NULL(yy);
 
-        success = (x / USEC_PER_SEC == y / USEC_PER_SEC) && streq(xx, yy);
-        /* Workaround for https://github.com/systemd/systemd/issues/28472 */
+        x_sec = x / USEC_PER_SEC;
+        y_sec = y / USEC_PER_SEC;
+        success = (x_sec == y_sec) && streq(xx, yy);
+        /* Workaround for https://github.com/systemd/systemd/issues/28472
+         * and https://github.com/systemd/systemd/pull/35471. */
         override = !success &&
-                   (STRPTR_IN_SET(tzname[0], "CAT", "EAT") ||
-                    STRPTR_IN_SET(tzname[1], "CAT", "EAT")) &&
-                   DIV_ROUND_UP(y - x, USEC_PER_SEC) == 3600; /* 1 hour, ignore fractional second */
+                   (STRPTR_IN_SET(tzname[0], "CAT", "EAT", "WET") ||
+                    STRPTR_IN_SET(tzname[1], "CAT", "EAT", "WET")) &&
+                   (x_sec > y_sec ? x_sec - y_sec : y_sec - x_sec) == 3600; /* 1 hour, ignore fractional second */
         log_full(success ? LOG_DEBUG : override ? LOG_WARNING : LOG_ERR,
                  "@" USEC_FMT " → %s → @" USEC_FMT " → %s%s",
                  x, xx, y, yy,
                  override ? ", ignoring." : "");
         if (!override) {
-                assert_se(x / USEC_PER_SEC == y / USEC_PER_SEC);
+                if (!success)
+                        log_warning("tzname[0]=\"%s\", tzname[1]=\"%s\"", tzname[0], tzname[1]);
+                ASSERT_EQ(x_sec, y_sec);
                 ASSERT_STREQ(xx, yy);
         }
 }
 
 static void test_format_timestamp_loop(void) {
-        test_format_timestamp_impl(USEC_PER_SEC);
+        test_format_timestamp_impl(USEC_PER_DAY + USEC_PER_SEC);
         test_format_timestamp_impl(USEC_TIMESTAMP_FORMATTABLE_MAX_32BIT-1);
         test_format_timestamp_impl(USEC_TIMESTAMP_FORMATTABLE_MAX_32BIT);
         test_format_timestamp_impl(USEC_TIMESTAMP_FORMATTABLE_MAX-1);
@@ -721,7 +725,7 @@ static void test_parse_timestamp_impl(const char *tz) {
         test_parse_timestamp_one("1996-12-20T00:39:57Z", 0, 851042397 * USEC_PER_SEC + 000000);
         test_parse_timestamp_one("1990-12-31T23:59:60Z", 0, 662688000 * USEC_PER_SEC + 000000);
         test_parse_timestamp_one("1990-12-31T15:59:60-08:00", 0, 662688000 * USEC_PER_SEC + 000000);
-        assert_se(parse_timestamp("1937-01-01T12:00:27.87+00:20", NULL) == -EINVAL); /* we don't support pre-epoch timestamps */
+        assert_se(parse_timestamp("1937-01-01T12:00:27.87+00:20", NULL) == -ERANGE); /* we don't support pre-epoch timestamps */
         /* We accept timestamps without seconds as well */
         test_parse_timestamp_one("1996-12-20T00:39Z", 0, (851042397 - 57) * USEC_PER_SEC + 000000);
         test_parse_timestamp_one("1990-12-31T15:59-08:00", 0, (662688000-60) * USEC_PER_SEC + 000000);
@@ -857,6 +861,29 @@ static void test_parse_timestamp_impl(const char *tz) {
                 test_parse_timestamp_one("69-12-31 19:00:01.0010 EST", 0, USEC_PER_SEC + 1000);
         }
 
+        if (timezone_is_valid("NZ", LOG_DEBUG)) {
+                /* NZ (+1200) */
+                test_parse_timestamp_one("Thu 1970-01-01 12:01 NZ", 0, USEC_PER_MINUTE);
+                test_parse_timestamp_one("Thu 1970-01-01 12:00:01 NZ", 0, USEC_PER_SEC);
+                test_parse_timestamp_one("Thu 1970-01-01 12:00:01.001 NZ", 0, USEC_PER_SEC + 1000);
+                test_parse_timestamp_one("Thu 1970-01-01 12:00:01.0010 NZ", 0, USEC_PER_SEC + 1000);
+
+                test_parse_timestamp_one("Thu 70-01-01 12:01 NZ", 0, USEC_PER_MINUTE);
+                test_parse_timestamp_one("Thu 70-01-01 12:00:01 NZ", 0, USEC_PER_SEC);
+                test_parse_timestamp_one("Thu 70-01-01 12:00:01.001 NZ", 0, USEC_PER_SEC + 1000);
+                test_parse_timestamp_one("Thu 70-01-01 12:00:01.0010 NZ", 0, USEC_PER_SEC + 1000);
+
+                test_parse_timestamp_one("1970-01-01 12:01 NZ", 0, USEC_PER_MINUTE);
+                test_parse_timestamp_one("1970-01-01 12:00:01 NZ", 0, USEC_PER_SEC);
+                test_parse_timestamp_one("1970-01-01 12:00:01.001 NZ", 0, USEC_PER_SEC + 1000);
+                test_parse_timestamp_one("1970-01-01 12:00:01.0010 NZ", 0, USEC_PER_SEC + 1000);
+
+                test_parse_timestamp_one("70-01-01 12:01 NZ", 0, USEC_PER_MINUTE);
+                test_parse_timestamp_one("70-01-01 12:00:01 NZ", 0, USEC_PER_SEC);
+                test_parse_timestamp_one("70-01-01 12:00:01.001 NZ", 0, USEC_PER_SEC + 1000);
+                test_parse_timestamp_one("70-01-01 12:00:01.0010 NZ", 0, USEC_PER_SEC + 1000);
+        }
+
         /* -06 */
         test_parse_timestamp_one("Wed 1969-12-31 18:01 -06", 0, USEC_PER_MINUTE);
         test_parse_timestamp_one("Wed 1969-12-31 18:00:01 -06", 0, USEC_PER_SEC);
@@ -932,6 +959,14 @@ static void test_parse_timestamp_impl(const char *tz) {
                         test_parse_timestamp_one("tomorrow", 0, today + USEC_PER_DAY);
                 if (timezone_equal(today, today - USEC_PER_DAY) && time_is_zero(today - USEC_PER_DAY))
                         test_parse_timestamp_one("yesterday", 0, today - USEC_PER_DAY);
+        }
+
+        /* with timezone */
+        if (tz) {
+                _cleanup_free_ char *s = NULL;
+
+                ASSERT_NOT_NULL((s = strjoin("Fri 2012-11-23 23:02:15 ", tz)));
+                ASSERT_OK(parse_timestamp(s, NULL));
         }
 
         /* relative */
@@ -1168,6 +1203,33 @@ TEST(timezone_offset_change) {
 
         assert_se(set_unset_env("TZ", tz, true) == 0);
         tzset();
+}
+
+static usec_t absdiff(usec_t a, usec_t b) {
+        return a > b ? a - b : b - a;
+}
+
+TEST(mktime_or_timegm_usec) {
+
+        usec_t n = now(CLOCK_REALTIME), m;
+        struct tm tm;
+
+        assert_se(localtime_or_gmtime_usec(n, /* utc= */ false, &tm) >= 0);
+        assert_se(mktime_or_timegm_usec(&tm, /* utc= */ false, &m) >= 0);
+        assert_se(absdiff(n, m) < 2 * USEC_PER_DAY);
+
+        assert_se(localtime_or_gmtime_usec(n, /* utc= */ true, &tm) >= 0);
+        assert_se(mktime_or_timegm_usec(&tm, /* utc= */ true, &m) >= 0);
+        assert_se(absdiff(n, m) < USEC_PER_SEC);
+
+        /* This definitely should fail, because we refuse dates before the UNIX epoch */
+        tm = (struct tm) {
+                .tm_mday = 15,
+                .tm_mon = 11,
+                .tm_year = 1969 - 1900,
+        };
+
+        assert_se(mktime_or_timegm_usec(&tm, /* utc= */ true, NULL) == -ERANGE);
 }
 
 static int intro(void) {

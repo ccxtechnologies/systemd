@@ -1,22 +1,23 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdlib.h>
+
 #include "alloc-util.h"
 #include "chase.h"
 #include "dirent-util.h"
 #include "env-file.h"
-#include "env-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "fs-util.h"
 #include "glyph-util.h"
-#include "macro.h"
+#include "log.h"
 #include "os-util.h"
-#include "parse-util.h"
 #include "path-util.h"
 #include "stat-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
+#include "time-util.h"
 #include "utf8.h"
 #include "xattr-util.h"
 
@@ -97,8 +98,9 @@ int path_is_extension_tree(ImageClass image_class, const char *path, const char 
         /* Does the path exist at all? If not, generate an error immediately. This is useful so that a missing root dir
          * always results in -ENOENT, and we can properly distinguish the case where the whole root doesn't exist from
          * the case where just the os-release file is missing. */
-        if (laccess(path, F_OK) < 0)
-                return -errno;
+        r = access_nofollow(path, F_OK);
+        if (r < 0)
+                return r;
 
         /* We use /usr/lib/extension-release.d/extension-release[.NAME] as flag for something being a system extension,
          * /etc/extension-release.d/extension-release[.NAME] as flag for something being a system configuration, and finally,
@@ -120,7 +122,7 @@ static int extension_release_strict_xattr_value(int extension_release_fd, const 
         assert(filename);
 
         /* No xattr or cannot parse it? Then skip this. */
-        r = getxattr_at_bool(extension_release_fd, /* path= */ NULL, "user.extension-release.strict", /* flags= */ 0);
+        r = getxattr_at_bool(extension_release_fd, /* path= */ NULL, "user.extension-release.strict", /* at_flags= */ 0);
         if (ERRNO_IS_NEG_XATTR_ABSENT(r))
                 return log_debug_errno(r, "%s/%s does not have user.extension-release.strict xattr, ignoring.",
                                        extension_release_dir_path, filename);
@@ -137,7 +139,7 @@ static int extension_release_strict_xattr_value(int extension_release_fd, const 
 
         log_debug("%s/%s: 'user.extension-release.strict' attribute is false%s",
                   extension_release_dir_path, filename,
-                  special_glyph(SPECIAL_GLYPH_ELLIPSIS));
+                  glyph(GLYPH_ELLIPSIS));
 
         return false;
 }
@@ -259,13 +261,7 @@ int open_extension_release_at(
                 }
 
                 if (!relax_extension_release_check) {
-                        _cleanup_free_ char *base_image_name = NULL, *base_extension = NULL;
-
-                        r = path_extract_image_name(image_name, &base_image_name);
-                        if (r < 0) {
-                                log_debug_errno(r, "Failed to extract image name from %s/%s, ignoring: %m", dir_path, de->d_name);
-                                continue;
-                        }
+                        _cleanup_free_ char *base_extension = NULL;
 
                         r = path_extract_image_name(extension, &base_extension);
                         if (r < 0) {
@@ -273,7 +269,7 @@ int open_extension_release_at(
                                 continue;
                         }
 
-                        if (!streq(base_image_name, base_extension) &&
+                        if (!streq(image_name, base_extension) &&
                             extension_release_strict_xattr_value(fd, dir_path, image_name) != 0)
                                 continue;
                 }
@@ -456,27 +452,32 @@ int os_release_support_ended(const char *support_end, bool quiet, usec_t *ret_eo
                 support_end = _support_end_alloc;
         }
 
-        if (isempty(support_end)) /* An empty string is a explicit way to say "no EOL exists" */
+        if (isempty(support_end)) { /* An empty string is a explicit way to say "no EOL exists" */
+                if (ret_eol)
+                        *ret_eol = USEC_INFINITY;
+
                 return false;  /* no end date defined */
+        }
 
         struct tm tm = {};
         const char *k = strptime(support_end, "%Y-%m-%d", &tm);
         if (!k || *k)
                 return log_full_errno(quiet ? LOG_DEBUG : LOG_WARNING, SYNTHETIC_ERRNO(EINVAL),
-                                      "Failed to parse SUPPORT_END= in os-release file, ignoring: %m");
+                                      "Failed to parse SUPPORT_END= from os-release file, ignoring: %s", support_end);
 
-        time_t eol = timegm(&tm);
-        if (eol == (time_t) -1)
-                return log_full_errno(quiet ? LOG_DEBUG : LOG_WARNING, SYNTHETIC_ERRNO(EINVAL),
-                                      "Failed to convert SUPPORT_END= in os-release file, ignoring: %m");
+        usec_t eol;
+        r = mktime_or_timegm_usec(&tm, /* utc= */ true, &eol);
+        if (r < 0)
+                return log_full_errno(quiet ? LOG_DEBUG : LOG_WARNING, r,
+                                      "Failed to convert SUPPORT_END= time from os-release file, ignoring: %m");
 
         if (ret_eol)
-                *ret_eol = eol * USEC_PER_SEC;
+                *ret_eol = eol;
 
-        return DIV_ROUND_UP(now(CLOCK_REALTIME), USEC_PER_SEC) > (usec_t) eol;
+        return now(CLOCK_REALTIME) > eol;
 }
 
-const char *os_release_pretty_name(const char *pretty_name, const char *name) {
+const char* os_release_pretty_name(const char *pretty_name, const char *name) {
         /* Distills a "pretty" name to show from os-release data. First argument is supposed to be the
          * PRETTY_NAME= field, the second one the NAME= field. This function is trivial, of course, and
          * exists mostly to ensure we use the same logic wherever possible. */

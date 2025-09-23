@@ -1,20 +1,28 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <sys/stat.h>
+
 #include "sd-daemon.h"
+#include "sd-event.h"
 
 #include "alloc-util.h"
 #include "btrfs-util.h"
 #include "export-tar.h"
 #include "fd-util.h"
+#include "format-util.h"
 #include "import-common.h"
+#include "log.h"
+#include "pretty-print.h"
 #include "process-util.h"
 #include "ratelimit.h"
 #include "string-util.h"
+#include "terminal-util.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
 
 #define COPY_BUFFER_SIZE (16*1024)
 
-struct TarExport {
+typedef struct TarExport {
         sd_event *event;
 
         TarExportFinished on_finished;
@@ -47,7 +55,7 @@ struct TarExport {
 
         bool eof;
         bool tried_splice;
-};
+} TarExport;
 
 TarExport *tar_export_unref(TarExport *e) {
         if (!e)
@@ -132,7 +140,16 @@ static void tar_export_report_progress(TarExport *e) {
                 return;
 
         sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
-        log_info("Exported %u%%.", percent);
+
+        if (isatty_safe(STDERR_FILENO))
+                (void) draw_progress_barf(
+                                percent,
+                                "%s %s/%s",
+                                glyph(GLYPH_ARROW_RIGHT),
+                                FORMAT_BYTES(e->written_uncompressed),
+                                FORMAT_BYTES(e->quota_referenced));
+        else
+                log_info("Exported %u%%.", percent);
 
         e->last_percent = percent;
 }
@@ -229,6 +246,9 @@ static int tar_export_process(TarExport *e) {
         return 0;
 
 finish:
+        if (r >= 0 && isatty_safe(STDERR_FILENO))
+                clear_progress_bar(/* prefix= */ NULL);
+
         if (e->on_finished)
                 e->on_finished(e, r, e->userdata);
         else

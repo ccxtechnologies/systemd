@@ -7,10 +7,8 @@
 #endif
 #include <pwd.h>
 #include <shadow.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <sys/types.h>
-#include <unistd.h>
+
+#include "forward.h"
 
 /* Users managed by systemd-homed. See https://systemd.io/UIDS-GIDS for details how this range fits into the rest of the world */
 #define HOME_UID_MIN ((uid_t) 60001)
@@ -20,7 +18,7 @@
 #define MAP_UID_MIN ((uid_t) 60514)
 #define MAP_UID_MAX ((uid_t) 60577)
 
-bool uid_is_valid(uid_t uid);
+bool uid_is_valid(uid_t uid) _const_;
 
 static inline bool gid_is_valid(gid_t gid) {
         return uid_is_valid((uid_t) gid);
@@ -36,10 +34,17 @@ static inline int parse_gid(const char *s, gid_t *ret_gid) {
 char* getlogname_malloc(void);
 char* getusername_malloc(void);
 
+const char* default_root_shell_at(int rfd);
+const char* default_root_shell(const char *root);
+
+bool is_nologin_shell(const char *shell) _pure_;
+bool shell_is_placeholder(const char *shell) _pure_;
+
 typedef enum UserCredsFlags {
-        USER_CREDS_PREFER_NSS    = 1 << 0,  /* if set, only synthesize user records if database lacks them. Normally we bypass the userdb entirely for the records we can synthesize */
-        USER_CREDS_ALLOW_MISSING = 1 << 1,  /* if a numeric UID string is resolved, be OK if there's no record for it */
-        USER_CREDS_CLEAN         = 1 << 2,  /* try to clean up shell and home fields with invalid data */
+        USER_CREDS_PREFER_NSS           = 1 << 0,  /* if set, only synthesize user records if database lacks them. Normally we bypass the userdb entirely for the records we can synthesize */
+        USER_CREDS_ALLOW_MISSING        = 1 << 1,  /* if a numeric UID string is resolved, be OK if there's no record for it */
+        USER_CREDS_CLEAN                = 1 << 2,  /* try to clean up shell and home fields with invalid data */
+        USER_CREDS_SUPPRESS_PLACEHOLDER = 1 << 3,  /* suppress home and/or shell fields if value is placeholder (root/empty/nologin) */
 } UserCredsFlags;
 
 int get_user_creds(const char **username, uid_t *ret_uid, gid_t *ret_gid, const char **ret_home, const char **ret_shell, UserCredsFlags flags);
@@ -52,7 +57,7 @@ int in_gid(gid_t gid);
 int in_group(const char *name);
 
 int merge_gid_lists(const gid_t *list1, size_t size1, const gid_t *list2, size_t size2, gid_t **result);
-int getgroups_alloc(gid_t** gids);
+int getgroups_alloc(gid_t **ret);
 
 int get_home_dir(char **ret);
 int get_shell(char **ret);
@@ -94,10 +99,6 @@ int take_etc_passwd_lock(const char *root);
 #define PTR_TO_GID(p) ((gid_t) (((uintptr_t) (p))-1))
 #define GID_TO_PTR(u) ((void*) (((uintptr_t) (u))+1))
 
-static inline bool userns_supported(void) {
-        return access("/proc/self/uid_map", F_OK) >= 0;
-}
-
 typedef enum ValidUserFlags {
         VALID_USER_RELAX         = 1 << 0,
         VALID_USER_WARN          = 1 << 1,
@@ -108,15 +109,7 @@ bool valid_user_group_name(const char *u, ValidUserFlags flags);
 bool valid_gecos(const char *d);
 char* mangle_gecos(const char *d);
 bool valid_home(const char *p);
-
-static inline bool valid_shell(const char *p) {
-        /* We have the same requirements, so just piggy-back on the home check.
-         *
-         * Let's ignore /etc/shells because this is only applicable to real and
-         * not system users. It is also incompatible with the idea of empty /etc.
-         */
-        return valid_home(p);
-}
+bool valid_shell(const char *p);
 
 int maybe_setgroups(size_t size, const gid_t *list);
 
@@ -132,10 +125,6 @@ int putgrent_sane(const struct group *gr, FILE *stream);
 int fgetsgent_sane(FILE *stream, struct sgrp **sg);
 int putsgent_sane(const struct sgrp *sg, FILE *stream);
 #endif
-
-bool is_nologin_shell(const char *shell);
-const char* default_root_shell_at(int rfd);
-const char* default_root_shell(const char *root);
 
 int is_this_me(const char *username);
 

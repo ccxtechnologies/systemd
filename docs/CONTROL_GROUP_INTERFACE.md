@@ -12,8 +12,8 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 Starting with version 205 systemd provides a number of interfaces that may be used to create and manage labelled groups of processes for the purpose of monitoring and controlling them and their resource usage.
 This is built on top of the Linux kernel Control Groups ("cgroups") facility.
 
-Previously, the kernel's cgroups API was exposed directly as shared application API, following the rules of the [Pax Control Groups](/PAX_CONTROL_GROUPS) document.
-However, the kernel cgroup interface has been reworked into an API that requires that each individual cgroup is managed by a single writer only.
+Previously, the kernel's cgroups API (cgroup v1) was exposed directly as shared application API. That, however, turned out to be undesirable and semantically broken to manage.
+The superseding cgroup v2 interface therefore requires that each individual cgroup is managed by a single writer only.
 
 With this change the main cgroup tree becomes private property of that userspace component and is no longer a shared resource.
 
@@ -54,19 +54,13 @@ Nothing. This page is about systemd's cgroups APIs. If you don't use systemd the
 
 On systemd systems use the systemd APIs as described below. At this time we are not aware of any component that would take the cgroup managing role on Upstart/sysvinit systems, so we cannot help you with this. Sorry.
 
-### What's the timeframe of this? Do I need to care now?
-
-In the short-term future writing directly to the control group tree from applications should still be OK, as long as the [Pax Control Groups](/PAX_CONTROL_GROUPS) document is followed. In the medium-term future it will still be supported to alter/read individual attributes of cgroups directly, but no longer to create/delete cgroups without using the systemd API. In the longer-term future altering/reading attributes will also be unavailable to userspace applications, unless done via systemd's APIs (either D-Bus based IPC APIs or shared library APIs for _passive_ operations).
-
-It is recommended to use the new systemd APIs described below in any case. Note that the kernel cgroup interface is currently being reworked (available when the "sane_behaviour" kernel option is used). This will change the cgroupfs interface. By using systemd's APIs this change is abstracted away and invisible to applications.
-
 ## systemd's Resource Control Concepts
 
 Systemd provides three unit types that are useful for the purpose of resource control:
 
 - [_Services_](http://www.freedesktop.org/software/systemd/man/systemd.service.html) encapsulate a number of processes that are started and stopped by systemd based on configuration. Services are named in the style of `quux.service`.
 - [_Scopes_](http://www.freedesktop.org/software/systemd/man/systemd.scope.html) encapsulate a number of processes that are started and stopped by arbitrary processes via fork(), and then registered at runtime with PID1. Scopes are named in the style of `wuff.scope`.
-- [_Slices_](http://www.freedesktop.org/software/systemd/man/systemd.slice.html) may be used to group a number of services and scopes together in a hierarchial tree. Slices do not contain processes themselves, but the services and slices contained in them do. Slices are named in the style of `foobar-waldo.slice`, where the path to the location of the slice in the tree is encoded in the name with "-" as separator for the path components (`foobar-waldo.slice` is hence a subslice of `foobar.slice`). There's one special slices defined, `-.slice`, which is the root slice of all slices (`foobar.slice` is hence subslice of `-.slice`). This is similar how in regular file paths, "/" denotes the root directory.
+- [_Slices_](http://www.freedesktop.org/software/systemd/man/systemd.slice.html) may be used to group a number of services and scopes together in a hierarchial tree. Slices do not contain processes themselves, but the services and scopes contained in them do. Slices are named in the style of `foobar-waldo.slice`, where the path to the location of the slice in the tree is encoded in the name with "-" as separator for the path components (`foobar-waldo.slice` is hence a subslice of `foobar.slice`). There's one special slices defined, `-.slice`, which is the root slice of all slices (`foobar.slice` is hence subslice of `-.slice`). This is similar how in regular file paths, "/" denotes the root directory.
 
 Service, scope and slice units directly map to objects in the cgroup tree. When these units are activated they each map to directly (modulo some character escaping) to cgroup paths built from the unit names. For example, a service `quux.service` in a slice `foobar-waldo.slice` is found in the cgroup `foobar.slice/foobar-waldo.slice/quux.service/`.
 
@@ -223,7 +217,7 @@ Use these APIs to register any kind of process workload with systemd to be place
 
 ### Reading Accounting Information
 
-Note that there's currently no systemd API to retrieve accounting information from cgroups. For now, if you need to retrieve this information use `/proc/$PID/cgroup` to determine the cgroup path for your process in the `cpuacct` controller (or whichever controller matters to you), and then read the attributes directly from the cgroup tree.
+Accounting information is available via the `MemoryCurrent`, `MemoryPeak`, `MemorySwapCurrent`, `MemorySwapPeak`, `MemoryZSwapCurrent`, `MemoryAvailable`, `EffectiveMemoryMax`, `EffectiveMemoryHigh`, `CPUUsageNSec`, `EffectiveCPUs`, `EffectiveMemoryNodes`, `TasksCurrent`, `EffectiveTasksMax`, `IPIngressBytes`, `IPIngressPackets`, `IPEgressBytes`, `IPEgressPackets`, `IOReadBytes`, `IOReadOperations`, `IOWriteBytes`, and `IOWriteOperations` D-Bus properties.  To read this and other information directly from the cgroup tree, get the unit's cgroup path (relative to `/sys/fs/cgroup`) from the `ControlGroup` property, by calling [`sd_pid_get_cgroup()`](https://www.freedesktop.org/software/systemd/man/latest/sd_pid_get_cgroup.html), or by parsing `/proc/$PID/cgroup`.
 
 If you want to collect the exit status and other runtime parameters of your transient scope or service unit after the processes in them ended set the `RemainAfterExit` boolean property when creating it. This will has the effect that the unit will stay around even after all processes in it died, in the `SubState="exited"` state. Simply watch for state changes until this state is reached, then read the status details from the various properties you need, and finally terminate the unit via `StopUnit()` on the `Manager` object or `Stop()` on the `Unit` object itself.
 
@@ -247,4 +241,4 @@ Note that scope units created by `machined`'s `CreateMachine()` call have this f
 
 ### Example
 
-Please see the [systemd-run sources](http://cgit.freedesktop.org/systemd/systemd/plain/src/run/run.c) for a relatively simple example how to create scope or service units transiently and pass properties to them.
+Please see the [systemd-run sources](https://github.com/systemd/systemd/blob/main/src/run/run.c) for a relatively simple example how to create scope or service units transiently and pass properties to them.

@@ -225,7 +225,7 @@ be (re-)established, but is instead started when the network has connectivity,
 and if the network goes away, it fails and relies on the system manager to
 restart it if appropriate.
 
-## Modyfing the meaning of `network-online.target`
+## Modifying the meaning of `network-online.target`
 
 As described above, the meaning of this target is defined first by which
 implementing services are enabled (`NetworkManager-wait-online.service`,
@@ -243,7 +243,7 @@ that matches various links, but also by settings like
 [systemd.network(5)](https://www.freedesktop.org/software/systemd/man/systemd.network.html).
 
 It is also possible to plug in additional checks for network state. For
-example, to delay `network-online.target` until some a specific host is
+example, to delay `network-online.target` until a specific host is
 reachable (the name can be resolved over DNS and the appropriate route has been
 established), the following simple service could be used:
 

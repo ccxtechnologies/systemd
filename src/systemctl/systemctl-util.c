@@ -1,38 +1,45 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sys/reboot.h>
+#include <fnmatch.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
 #include "sd-daemon.h"
 
+#include "ask-password-agent.h"
 #include "bus-common-errors.h"
 #include "bus-locator.h"
 #include "bus-map-properties.h"
 #include "bus-unit-util.h"
+#include "bus-util.h"
 #include "chase.h"
 #include "dropin.h"
 #include "env-util.h"
 #include "exit-status.h"
-#include "fs-util.h"
+#include "format-table.h"
+#include "format-util.h"
 #include "glob-util.h"
-#include "macro.h"
+#include "install.h"
+#include "output-mode.h"
+#include "path-lookup.h"
 #include "path-util.h"
 #include "pidref.h"
+#include "polkit-agent.h"
 #include "process-util.h"
 #include "reboot-util.h"
+#include "runtime-scope.h"
 #include "set.h"
-#include "spawn-ask-password-agent.h"
-#include "spawn-polkit-agent.h"
-#include "stat-util.h"
-#include "systemctl-util.h"
+#include "string-util.h"
+#include "strv.h"
 #include "systemctl.h"
-#include "terminal-util.h"
+#include "systemctl-util.h"
+#include "unit-file.h"
+#include "unit-name.h"
 #include "verbs.h"
 
 static sd_bus *buses[_BUS_FOCUS_MAX] = {};
 
-int acquire_bus(BusFocus focus, sd_bus **ret) {
+int acquire_bus_full(BusFocus focus, bool graceful, sd_bus **ret) {
         int r;
 
         assert(focus < _BUS_FOCUS_MAX);
@@ -54,7 +61,8 @@ int acquire_bus(BusFocus focus, sd_bus **ret) {
                 else
                         r = bus_connect_transport(arg_transport, arg_host, arg_runtime_scope, &buses[focus]);
                 if (r < 0)
-                        return bus_log_connect_error(r, arg_transport);
+                        return bus_log_connect_full(graceful && focus == BUS_FULL && r == -ECONNREFUSED ? LOG_DEBUG : LOG_ERR,
+                                                    r, arg_transport, arg_runtime_scope);
 
                 (void) sd_bus_set_allow_interactive_authorization(buses[focus], arg_ask_password);
         }
@@ -86,7 +94,7 @@ void polkit_agent_open_maybe(void) {
         if (arg_runtime_scope != RUNTIME_SCOPE_SYSTEM)
                 return;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 }
 
 int translate_bus_error_to_exit_status(int r, const sd_bus_error *error) {
@@ -327,14 +335,15 @@ int get_active_triggering_units(sd_bus *bus, const char *unit, bool ignore_maske
         if (r < 0)
                 return r;
 
+        if (unit_name_is_valid(name, UNIT_NAME_TEMPLATE))
+                goto skip;
+
         if (ignore_masked) {
                 r = unit_is_masked(bus, name);
                 if (r < 0)
                         return r;
-                if (r > 0) {
-                        *ret = NULL;
-                        return 0;
-                }
+                if (r > 0)
+                        goto skip;
         }
 
         dbus_path = unit_dbus_path_from_name(name);
@@ -360,7 +369,7 @@ int get_active_triggering_units(sd_bus *bus, const char *unit, bool ignore_maske
                 if (r < 0)
                         return r;
 
-                if (!IN_SET(active_state, UNIT_ACTIVE, UNIT_RELOADING))
+                if (!IN_SET(active_state, UNIT_ACTIVE, UNIT_RELOADING, UNIT_REFRESHING))
                         continue;
 
                 r = strv_extend(&active, *i);
@@ -369,6 +378,10 @@ int get_active_triggering_units(sd_bus *bus, const char *unit, bool ignore_maske
         }
 
         *ret = TAKE_PTR(active);
+        return 0;
+
+skip:
+        *ret = NULL;
         return 0;
 }
 
@@ -383,8 +396,8 @@ void warn_triggering_units(sd_bus *bus, const char *unit, const char *operation,
 
         r = get_active_triggering_units(bus, unit, ignore_masked, &triggered_by);
         if (r < 0) {
-                log_warning_errno(r,
-                                  "Failed to get triggering units for '%s', ignoring: %m", unit);
+                if (r != -ENOENT) /* A linked unit might have disappeared after disabling */
+                        log_warning_errno(r, "Failed to get triggering units for '%s', ignoring: %m", unit);
                 return;
         }
 
@@ -563,15 +576,14 @@ int unit_find_paths(
                                 return log_error_errno(r, "Failed to get DropInPaths: %s", bus_error_message(&error, r));
                 }
         } else {
-                const char *_path;
-                _cleanup_set_free_free_ Set *names = NULL;
-
                 if (!*cached_name_map) {
                         r = unit_file_build_name_map(lp, NULL, cached_id_map, cached_name_map, NULL);
                         if (r < 0)
                                 return r;
                 }
 
+                const char *_path;
+                _cleanup_set_free_ Set *names = NULL;
                 r = unit_file_find_fragment(*cached_id_map, *cached_name_map, unit_name, &_path, &names);
                 if (r < 0)
                         return log_error_errno(r, "Failed to find fragment for '%s': %m", unit_name);
@@ -726,7 +738,6 @@ int unit_exists(LookupPaths *lp, const char *unit) {
         return !streq_ptr(info.load_state, "not-found") || !streq_ptr(info.active_state, "inactive");
 }
 
-
 int append_unit_dependencies(sd_bus *bus, char **names, char ***ret) {
         _cleanup_strv_free_ char **with_deps = NULL;
 
@@ -734,14 +745,14 @@ int append_unit_dependencies(sd_bus *bus, char **names, char ***ret) {
         assert(ret);
 
         STRV_FOREACH(name, names) {
-                _cleanup_strv_free_ char **deps = NULL;
+                char **deps;
 
                 if (strv_extend(&with_deps, *name) < 0)
                         return log_oom();
 
                 (void) unit_get_dependencies(bus, *name, &deps);
 
-                if (strv_extend_strv(&with_deps, deps, true) < 0)
+                if (strv_extend_strv_consume(&with_deps, deps, /* filter_duplicates = */ true) < 0)
                         return log_oom();
         }
 
@@ -897,7 +908,7 @@ int output_table(Table *table) {
         assert(table);
 
         if (OUTPUT_MODE_IS_JSON(arg_output))
-                r = table_print_json(table, NULL, output_mode_to_json_format_flags(arg_output) | JSON_FORMAT_COLOR_AUTO);
+                r = table_print_json(table, NULL, output_mode_to_json_format_flags(arg_output) | SD_JSON_FORMAT_COLOR_AUTO);
         else
                 r = table_print(table, NULL);
         if (r < 0)

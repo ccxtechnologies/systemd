@@ -3,14 +3,15 @@
 #include <sys/utsname.h>
 
 #include "alloc-util.h"
-#include "cgroup-util.h"
 #include "clock-util.h"
+#include "constants.h"
 #include "errno-util.h"
 #include "fileio.h"
 #include "fs-util.h"
 #include "log.h"
 #include "os-util.h"
 #include "path-util.h"
+#include "string-util.h"
 #include "strv.h"
 #include "taint.h"
 #include "uid-range.h"
@@ -31,8 +32,8 @@ static int short_uid_gid_range(UIDRangeUsernsMode mode) {
         return !uid_range_covers(p, 0, 65535);
 }
 
-char* taint_string(void) {
-        const char *stage[12] = {};
+char** taint_strv(void) {
+        const char *stage[11] = {};
         size_t n = 0;
 
         /* Returns a "taint string", e.g. "local-hwclock:var-run-bad". Only things that are detected at
@@ -51,9 +52,6 @@ char* taint_string(void) {
 
         if (readlink_malloc("/var/run", &var_run) < 0 || !PATH_IN_SET(var_run, "../run", "/run"))
                 stage[n++] = "var-run-bad";
-
-        if (cg_all_unified() == 0)
-                stage[n++] = "cgroupsv1";
 
         if (clock_is_localtime(NULL) > 0)
                 stage[n++] = "local-hwclock";
@@ -81,5 +79,15 @@ char* taint_string(void) {
 
         assert(n < ELEMENTSOF(stage) - 1);  /* One extra for NULL terminator */
 
-        return strv_join((char**) stage, ":");
+        return strv_copy((char *const *) stage);
+}
+
+char* taint_string(void) {
+        _cleanup_strv_free_ char **taints = NULL;
+
+        taints = taint_strv();
+        if (!taints)
+                return NULL;
+
+        return strv_join(taints, ":");
 }

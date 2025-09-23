@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-typedef struct Mount Mount;
-
-#include "dynamic-user.h"
+#include "cgroup.h"
+#include "core-forward.h"
+#include "execute.h"
 #include "kill.h"
 #include "pidref.h"
 #include "unit.h"
@@ -42,7 +42,7 @@ typedef enum MountProcFlags {
         MOUNT_PROC_JUST_CHANGED = 1 << 2,
 } MountProcFlags;
 
-struct Mount {
+typedef struct Mount {
         Unit meta;
 
         char *where;
@@ -50,8 +50,6 @@ struct Mount {
         MountParameters parameters_proc_self_mountinfo;
         MountParameters parameters_fragment;
 
-        bool invalidated_state:1; /* Set when the 'state' of the mount unit may be outdated, and we need to
-                                   * re-read /proc/self/mountinfo. */
         bool from_proc_self_mountinfo:1;
         bool from_fragment:1;
 
@@ -83,21 +81,20 @@ struct Mount {
 
         MountState state, deserialized_state;
 
-        ExecCommand* control_command;
+        ExecCommand *control_command;
         MountExecCommand control_command_id;
         PidRef control_pid;
 
         sd_event_source *timer_event_source;
 
         unsigned n_retry_umount;
-};
+} Mount;
 
 extern const UnitVTable mount_vtable;
 
 void mount_fd_event(Manager *m, int events);
 
-int mount_invalidate_state_by_path(Manager *manager, const char *path);
-
+char* mount_get_where_escaped(const Mount *m);
 char* mount_get_what_escaped(const Mount *m);
 char* mount_get_options_escaped(const Mount *m);
 const char* mount_get_fstype(const Mount *m);

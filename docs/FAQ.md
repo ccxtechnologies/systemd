@@ -11,13 +11,7 @@ Also check out the [Tips & Tricks](/TIPS_AND_TRICKS)!
 
 **Q: How do I change the current runlevel?**
 
-A: In systemd runlevels are exposed via "target units". You can change them like this:
-
-```sh
-# systemctl isolate runlevel5.target
-```
-
-Note however, that the concept of runlevels is a bit out of date, and it is usually nicer to use modern names for this. e.g.:
+A: The concept of runlevels is obsolete. A set of target units are exposed that carry similar semantics, e.g. runlevel 5 -> `graphical.target`:
 
 ```sh
 # systemctl isolate graphical.target
@@ -46,8 +40,6 @@ A: Note that there might be more than one target active at the same time. So the
 ```sh
 $ systemctl list-units --type=target
 ```
-
-If you are just interested in a single number, you can use the venerable _runlevel_ command, but again, its output might be misleading.
 
 **Q: I want to change a service file, but rpm keeps overwriting it in /usr/lib/systemd/system all the time, how should I handle this?**
 
@@ -104,7 +96,7 @@ A: Use:
 
 **Q: Whenever my service tries to acquire RT scheduling for one of its threads this is refused with EPERM even though my service is running with full privileges. This works fine on my non-systemd system!**
 
-A: By default, systemd places all systemd daemons in their own cgroup in the "cpu" hierarchy. Unfortunately, due to a kernel limitation, this has the effect of disallowing RT entirely for the service. See [My Service Can't Get Realtime!](/MY_SERVICE_CANT_GET_REATLIME) for a longer discussion and what to do about this.
+A: By default, systemd places all systemd daemons in their own cgroup in the "cpu" hierarchy. Unfortunately, due to a kernel limitation, this has the effect of disallowing RT entirely for the service. See [My Service Can't Get Realtime!](/MY_SERVICE_CANT_GET_REALTIME) for a longer discussion and what to do about this.
 
 **Q: My service is ordered after `network.target` but at boot it is still called before the network is up. What's going on?**
 

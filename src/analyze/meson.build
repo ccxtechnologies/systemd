@@ -6,6 +6,7 @@ systemd_analyze_sources = files(
         'analyze-calendar.c',
         'analyze-capability.c',
         'analyze-cat-config.c',
+        'analyze-chid.c',
         'analyze-compare-versions.c',
         'analyze-condition.c',
         'analyze-critical-chain.c',
@@ -14,6 +15,7 @@ systemd_analyze_sources = files(
         'analyze-exit-status.c',
         'analyze-fdstore.c',
         'analyze-filesystems.c',
+        'analyze-has-tpm2.c',
         'analyze-image-policy.c',
         'analyze-inspect-elf.c',
         'analyze-log-control.c',
@@ -22,6 +24,7 @@ systemd_analyze_sources = files(
         'analyze-plot.c',
         'analyze-security.c',
         'analyze-service-watchdogs.c',
+        'analyze-smbios11.c',
         'analyze-srk.c',
         'analyze-syscall-filter.c',
         'analyze-time.c',
@@ -29,17 +32,22 @@ systemd_analyze_sources = files(
         'analyze-timespan.c',
         'analyze-timestamp.c',
         'analyze-unit-files.c',
+        'analyze-unit-gdb.c',
         'analyze-unit-paths.c',
+        'analyze-unit-shell.c',
         'analyze-verify.c',
-        'analyze-verify-util.c',
         'analyze.c',
+)
+systemd_analyze_extract_sources = files(
+        'analyze-verify-util.c'
 )
 
 executables += [
         executable_template + {
                 'name' : 'systemd-analyze',
                 'public' : conf.get('ENABLE_ANALYZE') == 1,
-                'sources' : systemd_analyze_sources,
+                'sources' : systemd_analyze_sources + systemd_analyze_extract_sources,
+                'extract' : systemd_analyze_extract_sources,
                 'include_directories' : core_includes,
                 'link_with' : [
                         libcore,
@@ -49,9 +57,7 @@ executables += [
                 'install' : conf.get('ENABLE_ANALYZE') == 1,
         },
         core_test_template + {
-                'sources' : files(
-                        'test-verify.c',
-                        'analyze-verify-util.c',
-                ),
+                'sources' : files('test-verify.c'),
+                'objects' : ['systemd-analyze'],
         },
 ]

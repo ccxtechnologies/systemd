@@ -1,13 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-#include <stdint.h>
-
-#include "sd-netlink.h"
-
 #include "firewall-util.h"
-#include "in-addr-util.h"
+#include "forward.h"
 
 typedef enum FirewallBackend {
         FW_BACKEND_NONE,
@@ -24,7 +19,7 @@ struct FirewallContext {
         sd_netlink *nfnl;
 };
 
-const char *firewall_backend_to_string(FirewallBackend b) _const_;
+const char* firewall_backend_to_string(FirewallBackend b) _const_;
 
 int fw_nftables_init(FirewallContext *ctx);
 int fw_nftables_init_full(FirewallContext *ctx, bool init_tables);

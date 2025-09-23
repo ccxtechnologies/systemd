@@ -1,22 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <inttypes.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdio.h>
 #include <time.h>
 
-typedef uint64_t usec_t;
-typedef uint64_t nsec_t;
+#include "forward.h"
 
 #define PRI_NSEC PRIu64
 #define PRI_USEC PRIu64
 #define NSEC_FMT "%" PRI_NSEC
 #define USEC_FMT "%" PRI_USEC
-
-#include "macro.h"
 
 typedef struct dual_timestamp {
         usec_t realtime;
@@ -176,9 +168,10 @@ bool clock_supported(clockid_t clock);
 usec_t usec_shift_clock(usec_t, clockid_t from, clockid_t to);
 
 int get_timezone(char **ret);
+const char* etc_localtime(void);
 
-time_t mktime_or_timegm(struct tm *tm, bool utc);
-struct tm *localtime_or_gmtime_r(const time_t *t, struct tm *tm, bool utc);
+int mktime_or_timegm_usec(struct tm *tm, bool utc, usec_t *ret);
+int localtime_or_gmtime_usec(usec_t t, bool utc, struct tm *ret);
 
 uint32_t usec_to_jiffies(usec_t usec);
 usec_t jiffies_to_usec(uint32_t jiffies);
@@ -188,11 +181,7 @@ bool in_utc_timezone(void);
 static inline usec_t usec_add(usec_t a, usec_t b) {
         /* Adds two time values, and makes sure USEC_INFINITY as input results as USEC_INFINITY in output,
          * and doesn't overflow. */
-
-        if (a > USEC_INFINITY - b) /* overflow check */
-                return USEC_INFINITY;
-
-        return a + b;
+        return saturate_add(a, b, USEC_INFINITY);
 }
 
 static inline usec_t usec_sub_unsigned(usec_t timestamp, usec_t delta) {
@@ -226,8 +215,8 @@ static inline int usleep_safe(usec_t usec) {
         if (usec == 0)
                 return 0;
 
-        // FIXME: use RET_NERRNO() macro here. Currently, this header cannot include errno-util.h.
-        return clock_nanosleep(CLOCK_MONOTONIC, 0, TIMESPEC_STORE(usec), NULL) < 0 ? -errno : 0;
+        /* `clock_nanosleep()` does not use `errno`, but returns positive error codes. */
+        return -clock_nanosleep(CLOCK_MONOTONIC, 0, TIMESPEC_STORE(usec), NULL);
 }
 
 /* The last second we can format is 31. Dec 9999, 1s before midnight, because otherwise we'd enter 5 digit

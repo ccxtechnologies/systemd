@@ -6,18 +6,70 @@ set -o pipefail
 # shellcheck source=test/units/util.sh
 . "$(dirname "$0")"/util.sh
 
-at_exit() {
-    # Since the soft-reboot drops the enqueued end.service, we won't shutdown
-    # the test VM if the test fails and have to wait for the watchdog to kill
-    # us (which may take quite a long time). Let's just forcibly kill the machine
-    # instead to save CI resources.
-    if [[ $? -ne 0 ]]; then
-        echo >&2 "Test failed, shutting down the machine..."
-        systemctl poweroff -ff
+# Because this test tests soft-reboot, we have to get rid of the symlink we put at
+# /run/nextroot to allow rebooting into the previous snapshot if the test fails for
+# the duration of the test. However, let's make sure we put the symlink back in place
+# if the test fails.
+if [[ -L /run/nextroot ]]; then
+    at_error() {
+        mountpoint -q /run/nextroot && umount -R /run/nextroot
+        rm -rf /run/nextroot
+        ln -sf /snapshot /run/nextroot
+    }
+
+    trap at_error ERR
+    rm -f /run/nextroot
+fi
+
+trigger_uevent() {
+    local rule=/run/udev/rules.d/99-softreboot.rules
+
+    if [[ ! -f "$rule" ]]; then
+        mkdir -p /run/udev/rules.d
+        cat >"$rule" <<EOF
+SUBSYSTEM!="mem", GOTO="end"
+KERNEL!="null", GOTO="end"
+ACTION=="remove", GOTO="end"
+
+IMPORT{db}="HISTORY"
+IMPORT{program}="/bin/bash -c 'systemctl show --property=SoftRebootsCount'"
+ENV{HISTORY}+="%E{ACTION}_%E{SEQNUM}_%E{SoftRebootsCount}"
+
+LABEL="end"
+EOF
+        udevadm control --reload
     fi
+
+    systemd-run \
+        --unit=TEST-82-SOFTREBOOT-trigger.service \
+        --property DefaultDependencies=no \
+        --property Conflicts=soft-reboot.target \
+        --property Before=soft-reboot.target \
+        --property Before=systemd-soft-reboot.service \
+        --property Before=systemd-udevd.service \
+        --property RemainAfterExit=yes \
+        --property 'ExecStop=udevadm trigger --action bind /dev/null' \
+        true
 }
 
-trap at_exit EXIT
+check_device_property() {
+    local expected_count=${1:?}
+
+    udevadm info --no-pager /dev/null
+
+    local action seqnum softreboot_count
+    local previous_seqnum=0
+    local count=0
+    while read -r action seqnum softreboot_count; do
+        test "$seqnum" -gt "$previous_seqnum"
+        assert_eq "$action" "bind"
+        assert_eq "$softreboot_count" "$((++count))"
+
+        previous_seqnum="$seqnum"
+    done < <(udevadm info -q property --property=HISTORY --value /dev/null | sed -e 's/ /\n/g; s/_/ /g')
+
+    assert_eq "$count" "$expected_count"
+}
 
 systemd-analyze log-level debug
 
@@ -54,6 +106,8 @@ if [ -f /run/TEST-82-SOFTREBOOT.touch3 ]; then
     # Check journals
     journalctl -o short-monotonic --no-hostname --grep '(will soft-reboot|KILL|corrupt)'
     assert_eq "$(journalctl -q -o short-monotonic -u systemd-journald.service --grep 'corrupt')" ""
+
+    check_device_property 3
 
     # All succeeded, exit cleanly now
 
@@ -94,6 +148,9 @@ elif [ -f /run/TEST-82-SOFTREBOOT.touch2 ]; then
 
     # Restart the unit that is not supposed to survive
     systemd-run --collect --service-type=exec --unit=TEST-82-SOFTREBOOT-nosurvive.service sleep infinity
+
+    check_device_property 2
+    trigger_uevent
 
     # Now issue the soft reboot. We should be right back soon.
     touch /run/TEST-82-SOFTREBOOT.touch3
@@ -142,9 +199,9 @@ elif [ -f /run/TEST-82-SOFTREBOOT.touch ]; then
 
     # Copy os-release away, so that we can manipulate it and check that it is updated in the propagate
     # directory across soft reboots. Try to cover corner cases by truncating it.
-    mkdir -p /tmp/nextroot-lower/usr/lib
-    grep ID /etc/os-release >/tmp/nextroot-lower/usr/lib/os-release
-    echo MARKER=1 >>/tmp/nextroot-lower/usr/lib/os-release
+    mkdir -p /tmp/nextroot-lower/etc
+    grep ID /etc/os-release >/tmp/nextroot-lower/etc/os-release
+    echo MARKER=1 >>/tmp/nextroot-lower/etc/os-release
     cmp /etc/os-release /run/systemd/propagate/.os-release-stage/os-release
     (! grep -q MARKER=1 /etc/os-release)
 
@@ -160,6 +217,9 @@ elif [ -f /run/TEST-82-SOFTREBOOT.touch ]; then
     for _ in $(seq 1 25); do
         systemd-run --wait true
     done
+
+    check_device_property 1
+    trigger_uevent
 
     # Now issue the soft reboot. We should be right back soon. Given /run/nextroot exists, we should
     # automatically do a softreboot instead of normal reboot.
@@ -199,7 +259,7 @@ exec -a @sleep sleep infinity
 EOF
     chmod +x "$survive_argv"
     # This sets DefaultDependencies=no so that they remain running until the very end, and
-    # IgnoreOnIsolate=yes so that they aren't stopped via the "testsuite.target" isolation we do on next boot,
+    # IgnoreOnIsolate=yes so that they aren't stopped via isolation on next boot,
     # and will be killed by the final sigterm/sigkill spree.
     systemd-run --collect --service-type=notify -p DefaultDependencies=no -p IgnoreOnIsolate=yes --unit=TEST-82-SOFTREBOOT-nosurvive-sigterm.service "$survive_sigterm"
     systemd-run --collect --service-type=exec -p DefaultDependencies=no -p IgnoreOnIsolate=yes -p SetCredential=gone:hoge --unit=TEST-82-SOFTREBOOT-nosurvive.service sleep infinity
@@ -227,9 +287,6 @@ EOF
     systemd-run --service-type=exec --unit=TEST-82-SOFTREBOOT-survive.service \
         --property TemporaryFileSystem="/run /tmp /var" \
         --property RootImage=/tmp/minimal_0.raw \
-        --property BindReadOnlyPaths=/dev/log \
-        --property BindReadOnlyPaths=/run/systemd/journal/socket \
-        --property BindReadOnlyPaths=/run/systemd/journal/stdout \
         --property SurviveFinalKillSignal=yes \
         --property IgnoreOnIsolate=yes \
         --property DefaultDependencies=no \
@@ -254,9 +311,15 @@ EOF
         systemd-run --wait false || true
     done
 
+    trigger_uevent
+
     # Now issue the soft reboot. We should be right back soon.
     touch /run/TEST-82-SOFTREBOOT.touch
     systemctl --no-block --check-inhibitors=yes soft-reboot
+
+    # Ensure the property works too
+    type="$(busctl --json=short get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager PreparingForShutdownWithMetadata | jq -r '.data.type.data')"
+    test "$type" = "soft-reboot"
 
     # Now block until the soft-boot killing spree kills us
     exec sleep infinity

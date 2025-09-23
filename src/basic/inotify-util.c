@@ -2,7 +2,8 @@
 
 #include "fd-util.h"
 #include "inotify-util.h"
-#include "stat-util.h"
+#include "log.h"
+#include "memory-util.h"
 
 bool inotify_event_next(
                 union inotify_event_buffer *buffer,
@@ -42,7 +43,10 @@ bool inotify_event_next(
 }
 
 int inotify_add_watch_fd(int fd, int what, uint32_t mask) {
-        int wd, r;
+        int wd;
+
+        assert(fd >= 0);
+        assert(what >= 0);
 
         /* This is like inotify_add_watch(), except that the file to watch is not referenced by a path, but by an fd */
         wd = inotify_add_watch(fd, FORMAT_PROC_FD_PATH(what), mask);
@@ -50,14 +54,7 @@ int inotify_add_watch_fd(int fd, int what, uint32_t mask) {
                 if (errno != ENOENT)
                         return -errno;
 
-                /* Didn't work with ENOENT? If so, then either /proc/ isn't mounted, or the fd is bad */
-                r = proc_mounted();
-                if (r == 0)
-                        return -ENOSYS;
-                if (r > 0)
-                        return -EBADF;
-
-                return -ENOENT; /* OK, no clue, let's propagate the original error */
+                return proc_fd_enoent_errno();
         }
 
         return wd;

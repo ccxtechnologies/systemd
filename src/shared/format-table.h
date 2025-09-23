@@ -1,12 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-#include <stdio.h>
-#include <sys/types.h>
+#include "sd-json.h"
 
-#include "json.h"
-#include "macro.h"
+#include "forward.h"
+#include "log.h"
 #include "pager.h"
 
 typedef enum TableDataType {
@@ -73,6 +71,7 @@ typedef enum TableDataType {
         TABLE_SET_BOTH_UNDERLINES,
         TABLE_SET_URL,
         TABLE_SET_UPPERCASE,
+        TABLE_SET_JSON_FIELD_NAME,
 
         _TABLE_DATA_TYPE_INVALID = -EINVAL,
 } TableDataType;
@@ -83,6 +82,7 @@ typedef enum TableErsatz {
         TABLE_ERSATZ_UNSET,
         TABLE_ERSATZ_NA,
         _TABLE_ERSATZ_MAX,
+        _TABLE_ERSATZ_INVALID = -EINVAL,
 } TableErsatz;
 
 typedef struct Table Table;
@@ -159,11 +159,12 @@ TableCell *table_get_cell(Table *t, size_t row, size_t column);
 const void *table_get(Table *t, TableCell *cell);
 const void *table_get_at(Table *t, size_t row, size_t column);
 
-int table_to_json(Table *t, JsonVariant **ret);
-int table_print_json(Table *t, FILE *f, JsonFormatFlags json_flags);
+int table_to_json(Table *t, sd_json_variant **ret);
+int table_print_json(Table *t, FILE *f, sd_json_format_flags_t json_flags);
 
-int table_print_with_pager(Table *t, JsonFormatFlags json_format_flags, PagerFlags pager_flags, bool show_header);
+int table_print_with_pager(Table *t, sd_json_format_flags_t json_format_flags, PagerFlags pager_flags, bool show_header);
 
+char* table_mangle_to_json_field_name(const char *str);
 int table_set_json_field_name(Table *t, size_t idx, const char *name);
 
 #define table_log_add_error(r) \

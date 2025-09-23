@@ -2,16 +2,12 @@
 
 #pragma once
 
-typedef struct Wireguard Wireguard;
-
-#include <netinet/in.h>
 #include <linux/wireguard.h>
 
-#include "sd-event.h"
-#include "sd-resolve.h"
-
 #include "in-addr-util.h"
+#include "list.h"
 #include "netdev.h"
+#include "networkd-forward.h"
 #include "socket-util.h"
 
 typedef struct WireguardIPmask {
@@ -28,6 +24,7 @@ typedef struct WireguardPeer {
 
         uint8_t public_key[WG_KEY_LEN];
         uint8_t preshared_key[WG_KEY_LEN];
+        char *public_key_file;
         char *preshared_key_file;
         uint32_t flags;
         uint16_t persistent_keepalive_interval;
@@ -49,7 +46,7 @@ typedef struct WireguardPeer {
         LIST_FIELDS(struct WireguardPeer, peers);
 } WireguardPeer;
 
-struct Wireguard {
+typedef struct Wireguard {
         NetDev meta;
         unsigned last_peer_section;
 
@@ -65,7 +62,7 @@ struct Wireguard {
         Set *routes;
         uint32_t route_table;
         uint32_t route_priority;
-};
+} Wireguard;
 
 DEFINE_NETDEV_CAST(WIREGUARD, Wireguard);
 extern const NetDevVTable wireguard_vtable;
@@ -74,9 +71,9 @@ CONFIG_PARSER_PROTOTYPE(config_parse_wireguard_allowed_ips);
 CONFIG_PARSER_PROTOTYPE(config_parse_wireguard_endpoint);
 CONFIG_PARSER_PROTOTYPE(config_parse_wireguard_listen_port);
 CONFIG_PARSER_PROTOTYPE(config_parse_wireguard_peer_key);
+CONFIG_PARSER_PROTOTYPE(config_parse_wireguard_peer_key_file);
 CONFIG_PARSER_PROTOTYPE(config_parse_wireguard_private_key);
 CONFIG_PARSER_PROTOTYPE(config_parse_wireguard_private_key_file);
-CONFIG_PARSER_PROTOTYPE(config_parse_wireguard_preshared_key_file);
 CONFIG_PARSER_PROTOTYPE(config_parse_wireguard_keepalive);
 CONFIG_PARSER_PROTOTYPE(config_parse_wireguard_route_table);
 CONFIG_PARSER_PROTOTYPE(config_parse_wireguard_peer_route_table);

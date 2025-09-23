@@ -1,16 +1,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "fd-util.h"
+#include "sd-netlink.h"
+
+#include "alloc-util.h"
 #include "bpf-restrict-ifaces.h"
+#include "cgroup.h"
+#include "fd-util.h"
+#include "fdset.h"
 #include "netlink-util.h"
+#include "set.h"
+#include "unit.h"
 
 #if BPF_FRAMEWORK
 /* libbpf, clang and llc compile time dependencies are satisfied */
 
 #include "bpf-dlopen.h"
 #include "bpf-link.h"
-#include "bpf-util.h"
-#include "bpf/restrict_ifaces/restrict-ifaces-skel.h"
+#include "bpf/restrict-ifaces/restrict-ifaces-skel.h"
 
 static struct restrict_ifaces_bpf *restrict_ifaces_bpf_free(struct restrict_ifaces_bpf *obj) {
         restrict_ifaces_bpf__destroy(obj);
@@ -80,13 +86,8 @@ int bpf_restrict_ifaces_supported(void) {
         if (supported >= 0)
                 return supported;
 
-        if (!cgroup_bpf_supported())
+        if (dlopen_bpf_full(LOG_WARNING) < 0)
                 return (supported = false);
-
-        if (!compat_libbpf_probe_bpf_prog_type(BPF_PROG_TYPE_CGROUP_SKB, /*opts=*/NULL)) {
-                log_debug("restrict-interfaces: BPF program type cgroup_skb is not supported");
-                return (supported = false);
-        }
 
         r = prepare_restrict_ifaces_bpf(NULL, true, NULL, &obj);
         if (r < 0) {
@@ -128,7 +129,7 @@ static int restrict_ifaces_install_impl(Unit *u) {
         if (r < 0)
                 return r;
 
-        cgroup_fd = open(cgroup_path, O_RDONLY | O_CLOEXEC | O_DIRECTORY, 0);
+        cgroup_fd = open(cgroup_path, O_PATH | O_CLOEXEC | O_DIRECTORY, 0);
         if (cgroup_fd < 0)
                 return -errno;
 
@@ -159,7 +160,7 @@ int bpf_restrict_ifaces_install(Unit *u) {
                 return 0;
 
         r = restrict_ifaces_install_impl(u);
-        fdset_close(crt->initial_restrict_ifaces_link_fds);
+        fdset_close(crt->initial_restrict_ifaces_link_fds, /* async= */ false);
         return r;
 }
 
@@ -210,7 +211,7 @@ int bpf_restrict_ifaces_supported(void) {
 
 int bpf_restrict_ifaces_install(Unit *u) {
         return log_unit_debug_errno(u, SYNTHETIC_ERRNO(EOPNOTSUPP),
-                        "restrict-interfaces: Failed to install; BPF programs built from source code are not supported: %m");
+                        "restrict-interfaces: Failed to install; BPF programs built from source code are not supported.");
 }
 
 int bpf_restrict_ifaces_serialize(Unit *u, FILE *f, FDSet *fds) {

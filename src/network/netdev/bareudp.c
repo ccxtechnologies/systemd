@@ -1,12 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later
  * Copyright © 2020 VMware, Inc. */
 
-#include <netinet/in.h>
 #include <linux/if_arp.h>
 
+#include "sd-netlink.h"
+
 #include "bareudp.h"
-#include "netlink-util.h"
-#include "networkd-manager.h"
+#include "conf-parser.h"
 #include "string-table.h"
 
 static const char* const bare_udp_protocol_table[_BARE_UDP_PROTOCOL_MAX] = {
@@ -17,8 +17,7 @@ static const char* const bare_udp_protocol_table[_BARE_UDP_PROTOCOL_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP(bare_udp_protocol, BareUDPProtocol);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_bare_udp_iftype, bare_udp_protocol, BareUDPProtocol,
-                         "Failed to parse EtherType=");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_bare_udp_iftype, bare_udp_protocol, BareUDPProtocol);
 
 static int netdev_bare_udp_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *m) {
         assert(m);
@@ -33,6 +32,12 @@ static int netdev_bare_udp_fill_message_create(NetDev *netdev, Link *link, sd_ne
         r = sd_netlink_message_append_u16(m, IFLA_BAREUDP_PORT, htobe16(u->dest_port));
         if (r < 0)
                 return r;
+
+        if (u->min_port > 0) {
+                r = sd_netlink_message_append_u16(m, IFLA_BAREUDP_SRCPORT_MIN, u->min_port);
+                if (r < 0)
+                        return r;
+        }
 
         return 0;
 }
@@ -67,4 +72,5 @@ const NetDevVTable bare_udp_vtable = {
         .fill_message_create = netdev_bare_udp_fill_message_create,
         .create_type = NETDEV_CREATE_INDEPENDENT,
         .iftype = ARPHRD_NONE,
+        .keep_existing = true,
 };

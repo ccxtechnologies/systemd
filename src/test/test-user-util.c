@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "alloc-util.h"
 #include "format-util.h"
 #include "libcrypt-util.h"
 #include "log.h"
-#include "macro.h"
 #include "memory-util.h"
 #include "path-util.h"
 #include "string-util.h"
@@ -318,6 +319,24 @@ TEST(valid_home) {
         assert_se(valid_home("/"));
         assert_se(valid_home("/home"));
         assert_se(valid_home("/home/foo"));
+        assert_se(valid_home("/home/foo/"));
+}
+
+TEST(valid_shell) {
+        assert_se(!valid_shell(NULL));
+        assert_se(!valid_shell(""));
+        assert_se(!valid_shell("."));
+        assert_se(!valid_shell("/shell/.."));
+        assert_se(!valid_shell("/shell/../"));
+        assert_se(!valid_shell("/shell\n/foo"));
+        assert_se(!valid_shell("./piep"));
+        assert_se(!valid_shell("piep"));
+        assert_se(!valid_shell("/shell/user:lennart"));
+        assert_se(!valid_shell("/"));
+        assert_se(!valid_shell("/bin/sh/"));
+        assert_se(valid_shell("/shell"));
+        assert_se(valid_shell("/shell/foo"));
+        assert_se(valid_shell("/bin/sh"));
 }
 
 static void test_get_user_creds_one(const char *id, const char *name, uid_t uid, gid_t gid, const char *home, const char *shell) {
@@ -426,9 +445,8 @@ TEST(gid_lists_ops) {
         assert_se(nresult >= 0);
         assert_se(memcmp_nn(result2, ELEMENTSOF(result2), res4, nresult) == 0);
 
-        nresult = getgroups_alloc(&gids);
-        assert_se(nresult >= 0 || nresult == -EINVAL || nresult == -ENOMEM);
-        assert_se(gids);
+        ASSERT_OK(nresult = getgroups_alloc(&gids));
+        assert_se(gids || nresult == 0);
 }
 
 TEST(parse_uid_range) {

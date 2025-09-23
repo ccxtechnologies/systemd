@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <endian.h>
+#include <grp.h>
 #include <poll.h>
 #include <stdlib.h>
+#include <sys/inotify.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
@@ -12,21 +14,21 @@
 #include "bus-internal.h"
 #include "bus-message.h"
 #include "bus-socket.h"
+#include "errno-util.h"
 #include "escape.h"
 #include "fd-util.h"
-#include "format-util.h"
 #include "fs-util.h"
 #include "hexdecoct.h"
 #include "io-util.h"
 #include "iovec-util.h"
-#include "macro.h"
+#include "log.h"
 #include "memory-util.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "random-util.h"
-#include "signal-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
+#include "time-util.h"
 #include "user-util.h"
 #include "utf8.h"
 
@@ -62,7 +64,7 @@ static int append_iovec(sd_bus_message *m, const void *p, size_t sz) {
 }
 
 static int bus_message_setup_iovec(sd_bus_message *m) {
-        struct bus_body_part *part;
+        BusMessageBodyPart *part;
         unsigned n, i;
         int r;
 
@@ -553,6 +555,52 @@ static int bus_socket_write_auth(sd_bus *b) {
         return bus_socket_auth_verify(b);
 }
 
+static int bus_process_cmsg(sd_bus *bus, struct msghdr *mh, bool allow_fds) {
+        _cleanup_close_ int pidfd = -EBADF;
+        const int *fds = NULL;
+        size_t n_fds = 0;
+
+        assert(bus);
+        assert(mh);
+
+        CLEANUP_ARRAY(fds, n_fds, close_many);
+
+        struct cmsghdr *cmsg;
+        CMSG_FOREACH(cmsg, mh)
+                if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+                        assert(!fds);
+                        fds = CMSG_TYPED_DATA(cmsg, int);
+                        n_fds = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+
+                } else if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_PIDFD) {
+                        log_debug("Got unexpected auxiliary pidfd, ignoring.");
+                        assert(pidfd < 0);
+                        pidfd = *CMSG_TYPED_DATA(cmsg, int);
+
+                } else
+                        log_debug("Got unexpected auxiliary data with level=%d and type=%d, ignoring.",
+                                  cmsg->cmsg_level, cmsg->cmsg_type);
+
+        if (!allow_fds) {
+                if (fds)
+                        /* Whut? We received fds during the auth protocol or so? Somebody is playing games
+                         * with us. Close them all, and fail */
+                        return -EIO;
+
+                return 0;
+        }
+
+        if (!GREEDY_REALLOC(bus->fds, bus->n_fds + n_fds))
+                return -ENOMEM;
+
+        FOREACH_ARRAY(i, fds, n_fds)
+                bus->fds[bus->n_fds++] = fd_move_above_stdio(*i);
+
+        TAKE_PTR(fds);
+        n_fds = 0;
+        return 0;
+}
+
 static int bus_socket_read_auth(sd_bus *b) {
         struct msghdr mh;
         struct iovec iov = {};
@@ -620,22 +668,9 @@ static int bus_socket_read_auth(sd_bus *b) {
         b->rbuffer_size += k;
 
         if (handle_cmsg) {
-                struct cmsghdr *cmsg;
-
-                CMSG_FOREACH(cmsg, &mh)
-                        if (cmsg->cmsg_level == SOL_SOCKET &&
-                            cmsg->cmsg_type == SCM_RIGHTS) {
-                                int j;
-
-                                /* Whut? We received fds during the auth
-                                 * protocol? Somebody is playing games with
-                                 * us. Close them all, and fail */
-                                j = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-                                close_many(CMSG_TYPED_DATA(cmsg, int), j);
-                                return -EIO;
-                        } else
-                                log_debug("Got unexpected auxiliary data with level=%d and type=%d",
-                                          cmsg->cmsg_level, cmsg->cmsg_type);
+                r = bus_process_cmsg(b, &mh, /* allow_fds = */ false);
+                if (r < 0)
+                        return r;
         }
 
         r = bus_socket_auth_verify(b);
@@ -977,7 +1012,7 @@ static int bind_description(sd_bus *b, int fd, int family) {
 }
 
 static int connect_as(int fd, const struct sockaddr *sa, socklen_t salen, uid_t uid, gid_t gid) {
-        _cleanup_(close_pairp) int pfd[2] = EBADF_PAIR;
+        _cleanup_close_pair_ int pfd[2] = EBADF_PAIR;
         ssize_t n;
         int r;
 
@@ -1250,8 +1285,8 @@ static int bus_socket_read_message_need(sd_bus *bus, size_t *need) {
         assert(need);
         assert(IN_SET(bus->state, BUS_RUNNING, BUS_HELLO));
 
-        if (bus->rbuffer_size < sizeof(struct bus_header)) {
-                *need = sizeof(struct bus_header) + 8;
+        if (bus->rbuffer_size < sizeof(BusMessageHeader)) {
+                *need = sizeof(BusMessageHeader) + 8;
 
                 /* Minimum message size:
                  *
@@ -1285,7 +1320,7 @@ static int bus_socket_read_message_need(sd_bus *bus, size_t *need) {
         } else
                 return -EBADMSG;
 
-        sum = (uint64_t) sizeof(struct bus_header) + (uint64_t) ALIGN8(b) + (uint64_t) a;
+        sum = (uint64_t) sizeof(BusMessageHeader) + (uint64_t) ALIGN8(b) + (uint64_t) a;
         if (sum >= BUS_MESSAGE_SIZE_MAX)
                 return -ENOBUFS;
 
@@ -1405,36 +1440,9 @@ int bus_socket_read_message(sd_bus *bus) {
         bus->rbuffer_size += k;
 
         if (handle_cmsg) {
-                struct cmsghdr *cmsg;
-
-                CMSG_FOREACH(cmsg, &mh)
-                        if (cmsg->cmsg_level == SOL_SOCKET &&
-                            cmsg->cmsg_type == SCM_RIGHTS) {
-                                int n, *f, i;
-
-                                n = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-
-                                if (!bus->can_fds) {
-                                        /* Whut? We received fds but this
-                                         * isn't actually enabled? Close them,
-                                         * and fail */
-
-                                        close_many(CMSG_TYPED_DATA(cmsg, int), n);
-                                        return -EIO;
-                                }
-
-                                f = reallocarray(bus->fds, bus->n_fds + n, sizeof(int));
-                                if (!f) {
-                                        close_many(CMSG_TYPED_DATA(cmsg, int), n);
-                                        return -ENOMEM;
-                                }
-
-                                for (i = 0; i < n; i++)
-                                        f[bus->n_fds++] = fd_move_above_stdio(CMSG_TYPED_DATA(cmsg, int)[i]);
-                                bus->fds = f;
-                        } else
-                                log_debug("Got unexpected auxiliary data with level=%d and type=%d",
-                                          cmsg->cmsg_level, cmsg->cmsg_type);
+                r = bus_process_cmsg(bus, &mh, bus->can_fds);
+                if (r < 0)
+                        return r;
         }
 
         r = bus_socket_read_message_need(bus, &need);

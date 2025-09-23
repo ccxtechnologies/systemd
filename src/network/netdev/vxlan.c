@@ -1,17 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-/* Make sure the net/if.h header is included before any linux/ one */
-#include <net/if.h>
-#include <netinet/in.h>
 #include <linux/if_arp.h>
 
+#include "sd-netlink.h"
+
 #include "conf-parser.h"
-#include "alloc-util.h"
-#include "extract-word.h"
+#include "in-addr-util.h"
+#include "networkd-link.h"
+#include "parse-util.h"
 #include "string-table.h"
 #include "string-util.h"
-#include "strv.h"
-#include "parse-util.h"
+#include "time-util.h"
 #include "vxlan.h"
 
 static const char* const df_table[_NETDEV_VXLAN_DF_MAX] = {
@@ -21,7 +20,7 @@ static const char* const df_table[_NETDEV_VXLAN_DF_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(df, VxLanDF, NETDEV_VXLAN_DF_YES);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_df, df, VxLanDF, "Failed to parse VXLAN IPDoNotFragment= setting");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_df, df, VxLanDF);
 
 static int vxlan_get_local_address(VxLan *v, Link *link, int *ret_family, union in_addr_union *ret_address) {
         assert(v);
@@ -43,12 +42,6 @@ static int netdev_vxlan_fill_message_create(NetDev *netdev, Link *link, sd_netli
         union in_addr_union local;
         int local_family, r;
         VxLan *v = VXLAN(netdev);
-
-        if (v->vni <= VXLAN_VID_MAX) {
-                r = sd_netlink_message_append_u32(m, IFLA_VXLAN_ID, v->vni);
-                if (r < 0)
-                        return r;
-        }
 
         if (in_addr_is_set(v->group_family, &v->group)) {
                 if (v->group_family == AF_INET)
@@ -83,18 +76,46 @@ static int netdev_vxlan_fill_message_create(NetDev *netdev, Link *link, sd_netli
         if (r < 0)
                 return r;
 
-        if (v->inherit) {
-                r = sd_netlink_message_append_flag(m, IFLA_VXLAN_TTL_INHERIT);
-                if (r < 0)
-                        return r;
-        } else {
-                r = sd_netlink_message_append_u8(m, IFLA_VXLAN_TTL, v->ttl);
+        r = sd_netlink_message_append_u8(m, IFLA_VXLAN_TTL, v->ttl);
+        if (r < 0)
+                return r;
+
+        if (v->fdb_ageing != 0) {
+                r = sd_netlink_message_append_u32(m, IFLA_VXLAN_AGEING, v->fdb_ageing / USEC_PER_SEC);
                 if (r < 0)
                         return r;
         }
 
         if (v->tos != 0) {
                 r = sd_netlink_message_append_u8(m, IFLA_VXLAN_TOS, v->tos);
+                if (r < 0)
+                        return r;
+        }
+
+        r = sd_netlink_message_append_u32(m, IFLA_VXLAN_LABEL, htobe32(v->flow_label));
+        if (r < 0)
+                return r;
+
+        if (v->df != _NETDEV_VXLAN_DF_INVALID) {
+                r = sd_netlink_message_append_u8(m, IFLA_VXLAN_DF, v->df);
+                if (r < 0)
+                        return r;
+        }
+
+        if (netdev->ifindex > 0)
+                return 0;
+
+        /* The properties below cannot be updated, and the kernel refuses the whole request if one of the
+         * following attributes is set for an existing interface. */
+
+        if (!v->external && v->vni <= VXLAN_VID_MAX) {
+                r = sd_netlink_message_append_u32(m, IFLA_VXLAN_ID, v->vni);
+                if (r < 0)
+                        return r;
+        }
+
+        if (v->inherit) {
+                r = sd_netlink_message_append_flag(m, IFLA_VXLAN_TTL_INHERIT);
                 if (r < 0)
                         return r;
         }
@@ -118,12 +139,6 @@ static int netdev_vxlan_fill_message_create(NetDev *netdev, Link *link, sd_netli
         r = sd_netlink_message_append_u8(m, IFLA_VXLAN_L3MISS, v->l3miss);
         if (r < 0)
                 return r;
-
-        if (v->fdb_ageing != 0) {
-                r = sd_netlink_message_append_u32(m, IFLA_VXLAN_AGEING, v->fdb_ageing / USEC_PER_SEC);
-                if (r < 0)
-                        return r;
-        }
 
         if (v->max_fdb != 0) {
                 r = sd_netlink_message_append_u32(m, IFLA_VXLAN_LIMIT, v->max_fdb);
@@ -166,10 +181,6 @@ static int netdev_vxlan_fill_message_create(NetDev *netdev, Link *link, sd_netli
                         return r;
         }
 
-        r = sd_netlink_message_append_u32(m, IFLA_VXLAN_LABEL, htobe32(v->flow_label));
-        if (r < 0)
-                return r;
-
         if (v->group_policy) {
                 r = sd_netlink_message_append_flag(m, IFLA_VXLAN_GBP);
                 if (r < 0)
@@ -182,13 +193,28 @@ static int netdev_vxlan_fill_message_create(NetDev *netdev, Link *link, sd_netli
                         return r;
         }
 
-        if (v->df != _NETDEV_VXLAN_DF_INVALID) {
-                r = sd_netlink_message_append_u8(m, IFLA_VXLAN_DF, v->df);
+        r = sd_netlink_message_append_u8(m, IFLA_VXLAN_COLLECT_METADATA, v->external);
+        if (r < 0)
+                return r;
+
+        if (v->external) {
+                r = sd_netlink_message_append_u8(m, IFLA_VXLAN_VNIFILTER, v->vnifilter);
                 if (r < 0)
                         return r;
         }
 
         return 0;
+}
+
+static bool vxlan_can_set_mac(NetDev *netdev, const struct hw_addr_data *hw_addr) {
+        return true;
+}
+
+static bool vxlan_can_set_mtu(NetDev *netdev, uint32_t mtu) {
+        assert(netdev);
+
+        /* MTU cannot be updated. Even unchanged, IFLA_MTU attribute cannot be set in the message. */
+        return netdev->ifindex <= 0;
 }
 
 int config_parse_vxlan_address(
@@ -376,11 +402,6 @@ static int netdev_vxlan_verify(NetDev *netdev, const char *filename) {
 
         VxLan *v = VXLAN(netdev);
 
-        if (v->vni > VXLAN_VID_MAX)
-                return log_netdev_warning_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
-                                                "%s: VXLAN without valid VNI (or VXLAN Segment ID) configured. Ignoring.",
-                                                filename);
-
         if (v->ttl > 255)
                 return log_netdev_warning_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
                                                 "%s: VXLAN TTL must be <= 255. Ignoring.",
@@ -399,7 +420,27 @@ static int netdev_vxlan_verify(NetDev *netdev, const char *filename) {
                                               "The local address cannot be '%s' when Independent= is enabled, ignoring.",
                                               strna(netdev_local_address_type_to_string(v->local_type)));
 
+        if (v->external) {
+                if (v->vni <= VXLAN_VID_MAX)
+                        log_netdev_warning(netdev, "VNI= is set while External= is enabled. VNI= setting will be ignored.");
+        } else {
+                if (v->vnifilter)
+                        log_netdev_warning(netdev, "VNIFilter= is enabled while External= is disabled. VNIFilter= setting will be ignored.");
+                if (v->vni > VXLAN_VID_MAX)
+                        return log_netdev_warning_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
+                                                        "%s: VXLAN without valid VNI (or VXLAN Segment ID) configured. Ignoring.",
+                                                        filename);
+        }
+
         return 0;
+}
+
+static bool vxlan_needs_reconfigure(NetDev *netdev, NetDevLocalAddressType type) {
+        assert(type >= 0 && type < _NETDEV_LOCAL_ADDRESS_TYPE_MAX);
+
+        VxLan *v = VXLAN(netdev);
+
+        return v->local_type == type;
 }
 
 static int netdev_vxlan_is_ready_to_create(NetDev *netdev, Link *link) {
@@ -421,6 +462,8 @@ static void vxlan_init(NetDev *netdev) {
         v->udpcsum = false;
         v->udp6zerocsumtx = false;
         v->udp6zerocsumrx = false;
+        v->external = false;
+        v->vnifilter = false;
 }
 
 const NetDevVTable vxlan_vtable = {
@@ -431,6 +474,9 @@ const NetDevVTable vxlan_vtable = {
         .create_type = NETDEV_CREATE_STACKED,
         .is_ready_to_create = netdev_vxlan_is_ready_to_create,
         .config_verify = netdev_vxlan_verify,
+        .can_set_mac = vxlan_can_set_mac,
+        .can_set_mtu = vxlan_can_set_mtu,
+        .needs_reconfigure = vxlan_needs_reconfigure,
         .iftype = ARPHRD_ETHER,
         .generate_mac = true,
 };

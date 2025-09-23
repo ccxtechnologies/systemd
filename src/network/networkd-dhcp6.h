@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "conf-parser.h"
-#include "macro.h"
+#include "networkd-forward.h"
 
 typedef enum DHCP6ClientStartMode {
         DHCP6_CLIENT_START_MODE_NO,
@@ -12,8 +11,6 @@ typedef enum DHCP6ClientStartMode {
         _DHCP6_CLIENT_START_MODE_INVALID = -EINVAL,
 } DHCP6ClientStartMode;
 
-typedef struct Link Link;
-
 bool link_dhcp6_with_address_enabled(Link *link);
 int dhcp6_check_ready(Link *link);
 int dhcp6_update_mac(Link *link);
@@ -21,6 +18,7 @@ int dhcp6_start(Link *link);
 int dhcp6_start_on_ra(Link *link, bool information_request);
 
 int link_request_dhcp6_client(Link *link);
+int link_drop_dhcp6_config(Link *link, Network *network);
 
 int link_serialize_dhcp6_client(Link *link, FILE *f);
 

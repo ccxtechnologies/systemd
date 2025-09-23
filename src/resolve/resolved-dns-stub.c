@@ -1,18 +1,34 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <net/if_arp.h>
 #include <netinet/tcp.h>
 
+#include "sd-event.h"
+#include "sd-id128.h"
+
+#include "alloc-util.h"
 #include "capability-util.h"
+#include "dns-type.h"
 #include "errno-util.h"
 #include "fd-util.h"
-#include "missing_network.h"
-#include "missing_socket.h"
+#include "log.h"
+#include "missing-network.h"
+#include "resolve-util.h"
+#include "resolved-dns-answer.h"
+#include "resolved-dns-packet.h"
+#include "resolved-dns-query.h"
+#include "resolved-dns-question.h"
+#include "resolved-dns-rr.h"
+#include "resolved-dns-stream.h"
 #include "resolved-dns-stub.h"
-#include "socket-netlink.h"
+#include "resolved-dns-transaction.h"
+#include "resolved-manager.h"
+#include "set.h"
+#include "siphash24.h"
 #include "socket-util.h"
 #include "stdio-util.h"
 #include "string-table.h"
+#include "string-util.h"
+#include "time-util.h"
 
 /* The MTU of the loopback device is 64K on Linux, advertise that as maximum datagram size, but subtract the Ethernet,
  * IP and UDP header sizes */
@@ -462,10 +478,6 @@ static int dns_stub_finish_reply_packet(
                         rcode = DNS_RCODE_SERVFAIL;
         }
 
-        /* Don't set the CD bit unless DO is on, too */
-        if (!edns0_do)
-                cd = false;
-
         /* Note that we allow the AD bit to be set even if client didn't signal DO, as per RFC 6840, section
          * 5.7 */
 
@@ -565,7 +577,7 @@ static int dns_stub_reply_with_edns0_do(DnsQuery *q) {
          * ourselves, or consider the data fully authenticated because we generated it locally, or the client
          * set cd */
 
-         return DNS_PACKET_DO(q->request_packet) &&
+         return dns_packet_do(q->request_packet) &&
                  (q->answer_dnssec_result >= 0 ||        /* we did proper DNSSEC validation … */
                   dns_query_fully_authenticated(q) ||    /* … or we considered it authentic otherwise … */
                   DNS_PACKET_CD(q->request_packet));     /* … or client set CD */
@@ -603,7 +615,7 @@ static int dns_stub_send_reply(
 
         r = dns_stub_make_reply_packet(
                         &reply,
-                        DNS_PACKET_PAYLOAD_SIZE_MAX(q->request_packet),
+                        dns_packet_payload_size_max(q->request_packet),
                         q->request_packet->question,
                         &truncated);
         if (r < 0)
@@ -630,8 +642,8 @@ static int dns_stub_send_reply(
                         DNS_PACKET_RD(q->request_packet),
                         !!q->request_packet->opt,
                         edns0_do,
-                        (DNS_PACKET_AD(q->request_packet) || DNS_PACKET_DO(q->request_packet)) && dns_query_fully_authenticated(q),
-                        DNS_PACKET_CD(q->request_packet),
+                        (DNS_PACKET_AD(q->request_packet) || dns_packet_do(q->request_packet)) && dns_query_fully_authenticated(q),
+                        FLAGS_SET(q->flags, SD_RESOLVED_NO_VALIDATE),
                         q->stub_listener_extra ? ADVERTISE_EXTRA_DATAGRAM_SIZE_MAX : ADVERTISE_DATAGRAM_SIZE_MAX,
                         dns_packet_has_nsid_request(q->request_packet) > 0 && !q->stub_listener_extra);
         if (r < 0)
@@ -657,7 +669,7 @@ static int dns_stub_send_failure(
 
         r = dns_stub_make_reply_packet(
                         &reply,
-                        DNS_PACKET_PAYLOAD_SIZE_MAX(p),
+                        dns_packet_payload_size_max(p),
                         p->question,
                         &truncated);
         if (r < 0)
@@ -671,8 +683,8 @@ static int dns_stub_send_failure(
                         false,
                         DNS_PACKET_RD(p),
                         !!p->opt,
-                        DNS_PACKET_DO(p),
-                        (DNS_PACKET_AD(p) || DNS_PACKET_DO(p)) && authenticated,
+                        dns_packet_do(p),
+                        (DNS_PACKET_AD(p) || dns_packet_do(p)) && authenticated,
                         DNS_PACKET_CD(p),
                         l ? ADVERTISE_EXTRA_DATAGRAM_SIZE_MAX : ADVERTISE_DATAGRAM_SIZE_MAX,
                         dns_packet_has_nsid_request(p) > 0 && !l);
@@ -685,7 +697,9 @@ static int dns_stub_send_failure(
 static int dns_stub_patch_bypass_reply_packet(
                 DnsPacket **ret,       /* Where to place the patched packet */
                 DnsPacket *original,   /* The packet to patch */
-                DnsPacket *request) {  /* The packet the patched packet shall look like a reply to */
+                DnsPacket *request,    /* The packet the patched packet shall look like a reply to */
+                bool validated,
+                bool authenticated) {
         _cleanup_(dns_packet_unrefp) DnsPacket *c = NULL;
         int r;
 
@@ -719,11 +733,20 @@ static int dns_stub_patch_bypass_reply_packet(
 
         /* Our upstream connection might have supported larger DNS requests than our downstream one, hence
          * set the TC bit if our reply is larger than what the client supports, and truncate. */
-        if (c->size > DNS_PACKET_PAYLOAD_SIZE_MAX(request)) {
+        if (c->size > dns_packet_payload_size_max(request)) {
                 log_debug("Artificially truncating stub response, as advertised size of client is smaller than upstream one.");
-                dns_packet_truncate(c, DNS_PACKET_PAYLOAD_SIZE_MAX(request));
+                dns_packet_truncate(c, dns_packet_payload_size_max(request));
                 DNS_PACKET_HEADER(c)->flags = htobe16(be16toh(DNS_PACKET_HEADER(c)->flags) | DNS_PACKET_FLAG_TC);
         }
+
+        /* Patch the cd bit to reflect the state of validation: set when both we and the upstream
+         * resolver have checking disabled. */
+        DNS_PACKET_HEADER(c)->flags = htobe16(UPDATE_FLAG(be16toh(DNS_PACKET_HEADER(c)->flags),
+                                DNS_PACKET_FLAG_CD, DNS_PACKET_CD(original) && !validated));
+
+        /* Ensure we don't pass along an untrusted ad flag for bypass packets */
+        DNS_PACKET_HEADER(c)->flags = htobe16(UPDATE_FLAG(be16toh(DNS_PACKET_HEADER(c)->flags),
+                                DNS_PACKET_FLAG_AD, authenticated));
 
         *ret = TAKE_PTR(c);
         return 0;
@@ -745,7 +768,9 @@ static void dns_stub_query_complete(DnsQuery *query) {
                     q->answer_full_packet->protocol == DNS_PROTOCOL_DNS) {
                         _cleanup_(dns_packet_unrefp) DnsPacket *reply = NULL;
 
-                        r = dns_stub_patch_bypass_reply_packet(&reply, q->answer_full_packet, q->request_packet);
+                        r = dns_stub_patch_bypass_reply_packet(&reply, q->answer_full_packet, q->request_packet,
+                                        /* validated = */ !FLAGS_SET(q->flags, SD_RESOLVED_NO_VALIDATE),
+                                        FLAGS_SET(q->answer_query_flags, SD_RESOLVED_AUTHENTICATED));
                         if (r < 0)
                                 log_debug_errno(r, "Failed to patch bypass reply packet: %m");
                         else
@@ -925,7 +950,7 @@ static void dns_stub_process_query(Manager *m, DnsStubListenerExtra *l, DnsStrea
                 return;
         }
 
-        if (!DNS_PACKET_VERSION_SUPPORTED(p)) {
+        if (!dns_packet_version_supported(p)) {
                 log_debug("Got EDNS OPT field with unsupported version number.");
                 dns_stub_send_failure(m, l, s, p, DNS_RCODE_BADVERS, false);
                 return;
@@ -966,7 +991,7 @@ static void dns_stub_process_query(Manager *m, DnsStubListenerExtra *l, DnsStrea
                 log_debug("Got request to DNS proxy address 127.0.0.54, enabling bypass logic.");
                 bypass = true;
                 protocol_flags = SD_RESOLVED_DNS|SD_RESOLVED_NO_ZONE; /* Turn off mDNS/LLMNR for proxy stub. */
-        } else if (DNS_PACKET_DO(p)) {
+        } else if (dns_packet_do(p)) {
                 log_debug("Got request with DNSSEC enabled, enabling bypass logic.");
                 bypass = true;
         }
@@ -976,7 +1001,7 @@ static void dns_stub_process_query(Manager *m, DnsStubListenerExtra *l, DnsStrea
                                   protocol_flags|
                                   SD_RESOLVED_NO_CNAME|
                                   SD_RESOLVED_NO_SEARCH|
-                                  SD_RESOLVED_NO_VALIDATE|
+                                  (DNS_PACKET_CD(p) ? SD_RESOLVED_NO_VALIDATE | SD_RESOLVED_NO_CACHE : 0)|
                                   SD_RESOLVED_REQUIRE_PRIMARY|
                                   SD_RESOLVED_CLAMP_TTL|
                                   SD_RESOLVED_RELAX_SINGLE_LABEL);
@@ -984,8 +1009,11 @@ static void dns_stub_process_query(Manager *m, DnsStubListenerExtra *l, DnsStrea
                 r = dns_query_new(m, &q, p->question, p->question, NULL, 0,
                                   protocol_flags|
                                   SD_RESOLVED_NO_SEARCH|
-                                  (DNS_PACKET_DO(p) ? SD_RESOLVED_REQUIRE_PRIMARY : 0)|
+                                  (DNS_PACKET_CD(p) ? SD_RESOLVED_NO_VALIDATE | SD_RESOLVED_NO_CACHE : 0)|
+                                  (dns_packet_do(p) ? SD_RESOLVED_REQUIRE_PRIMARY : 0)|
                                   SD_RESOLVED_CLAMP_TTL);
+        if (r == -ENOANO) /* Refuse query if there is -ENOANO */
+                return (void) dns_stub_send_failure(m, l, s, p, DNS_RCODE_REFUSED, false);
         if (r < 0) {
                 log_error_errno(r, "Failed to generate query object: %m");
                 dns_stub_send_failure(m, l, s, p, DNS_RCODE_SERVFAIL, false);
@@ -1299,7 +1327,7 @@ static int manager_dns_stub_fd_extra(Manager *m, DnsStubListenerExtra *l, int ty
                         log_debug_errno(r, "Failed to enable fragment size reception, ignoring: %m");
         }
 
-        r = RET_NERRNO(bind(fd, &sa.sa, SOCKADDR_LEN(sa)));
+        r = RET_NERRNO(bind(fd, &sa.sa, sockaddr_len(&sa)));
         if (r < 0)
                 goto fail;
 
@@ -1366,23 +1394,23 @@ int manager_dns_stub_start(Manager *m) {
                           m->dns_stub_listener_mode == DNS_STUB_LISTENER_TCP ? "TCP" :
                           "UDP/TCP");
 
-                for (size_t i = 0; i < ELEMENTSOF(stub_sockets); i++) {
+                FOREACH_ELEMENT(s, stub_sockets) {
                         union in_addr_union a = {
-                                .in.s_addr = htobe32(stub_sockets[i].addr),
+                                .in.s_addr = htobe32(s->addr),
                         };
 
-                        if (m->dns_stub_listener_mode == DNS_STUB_LISTENER_UDP && stub_sockets[i].socket_type == SOCK_STREAM)
+                        if (m->dns_stub_listener_mode == DNS_STUB_LISTENER_UDP && s->socket_type == SOCK_STREAM)
                                 continue;
-                        if (m->dns_stub_listener_mode == DNS_STUB_LISTENER_TCP && stub_sockets[i].socket_type == SOCK_DGRAM)
+                        if (m->dns_stub_listener_mode == DNS_STUB_LISTENER_TCP && s->socket_type == SOCK_DGRAM)
                                 continue;
 
-                        r = manager_dns_stub_fd(m, AF_INET, &a, stub_sockets[i].socket_type);
+                        r = manager_dns_stub_fd(m, AF_INET, &a, s->socket_type);
                         if (r < 0) {
                                 _cleanup_free_ char *busy_socket = NULL;
 
                                 if (asprintf(&busy_socket,
                                              "%s socket " IPV4_ADDRESS_FMT_STR ":53",
-                                             stub_sockets[i].socket_type == SOCK_DGRAM ? "UDP" : "TCP",
+                                             s->socket_type == SOCK_DGRAM ? "UDP" : "TCP",
                                              IPV4_ADDRESS_FMT_VAL(a.in)) < 0)
                                         return log_oom();
 
@@ -1391,7 +1419,7 @@ int manager_dns_stub_start(Manager *m) {
                                                           r == -EADDRINUSE ? "Another process is already listening on %s.\n"
                                                           "Turning off local DNS stub support." :
                                                           "Failed to listen on %s: %m.\n"
-                                          "Turning off local DNS stub support.",
+                                                          "Turning off local DNS stub support.",
                                                           busy_socket);
                                         manager_dns_stub_stop(m);
                                         break;

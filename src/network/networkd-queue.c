@@ -1,10 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-netlink.h"
+
+#include "alloc-util.h"
 #include "netdev.h"
 #include "netlink-util.h"
 #include "networkd-link.h"
 #include "networkd-manager.h"
 #include "networkd-queue.h"
+#include "ordered-set.h"
+#include "siphash24.h"
 #include "string-table.h"
 
 #define REPLY_CALLBACK_COUNT_THRESHOLD 128
@@ -58,7 +63,11 @@ static void request_hash_func(const Request *req, struct siphash *state) {
 
         siphash24_compress_typesafe(req->type, state);
 
-        if (!IN_SET(req->type, REQUEST_TYPE_NEXTHOP, REQUEST_TYPE_ROUTE)) {
+        if (!IN_SET(req->type,
+                    REQUEST_TYPE_NEXTHOP,
+                    REQUEST_TYPE_ROUTE,
+                    REQUEST_TYPE_ROUTING_POLICY_RULE)) {
+
                 siphash24_compress_boolean(req->link, state);
                 if (req->link)
                         siphash24_compress_typesafe(req->link->ifindex, state);
@@ -81,7 +90,11 @@ static int request_compare_func(const struct Request *a, const struct Request *b
         if (r != 0)
                 return r;
 
-        if (!IN_SET(a->type, REQUEST_TYPE_NEXTHOP, REQUEST_TYPE_ROUTE)) {
+        if (!IN_SET(a->type,
+                    REQUEST_TYPE_NEXTHOP,
+                    REQUEST_TYPE_ROUTE,
+                    REQUEST_TYPE_ROUTING_POLICY_RULE)) {
+
                 r = CMP(!!a->link, !!b->link);
                 if (r != 0)
                         return r;
@@ -134,6 +147,15 @@ static int request_new(
         assert(manager);
         assert(process);
 
+        /* Note, requests will be processed only when the manager is in MANAGER_RUNNING. If a new operation
+         * is requested when the manager is in MANAGER_TERMINATING or MANAGER_RESTARTING, the request will be
+         * successfully queued but will never be processed. Then, here why we refuse new requests when the
+         * manager is in MANAGER_STOPPED? This is because we cannot call link_ref() in that case, as this may
+         * be called during link_free(), that means the reference counter of the link is already 0 and
+         * calling link_ref() below triggers assertion. */
+        if (manager->state == MANAGER_STOPPED)
+                return -EBUSY;
+
         req = new(Request, 1);
         if (!req)
                 return -ENOMEM;
@@ -185,6 +207,7 @@ int netdev_queue_request(
         int r;
 
         assert(netdev);
+        assert(netdev->manager);
 
         r = request_new(netdev->manager, NULL, REQUEST_TYPE_NETDEV_INDEPENDENT,
                         netdev, (mfree_func_t) netdev_unref,
@@ -212,6 +235,23 @@ int link_queue_request_full(
         assert(link);
 
         return request_new(link->manager, link, type,
+                           userdata, free_func, hash_func, compare_func,
+                           process, counter, netlink_handler, ret);
+}
+
+int manager_queue_request_full(
+                Manager *manager,
+                RequestType type,
+                void *userdata,
+                mfree_func_t free_func,
+                hash_func_t hash_func,
+                compare_func_t compare_func,
+                request_process_func_t process,
+                unsigned *counter,
+                request_netlink_handler_t netlink_handler,
+                Request **ret) {
+
+        return request_new(manager, NULL, type,
                            userdata, free_func, hash_func, compare_func,
                            process, counter, netlink_handler, ret);
 }
@@ -349,7 +389,12 @@ static const char *const request_type_table[_REQUEST_TYPE_MAX] = {
         [REQUEST_TYPE_SET_LINK_MAC]                     = "MAC address",
         [REQUEST_TYPE_SET_LINK_MASTER]                  = "master interface",
         [REQUEST_TYPE_SET_LINK_MTU]                     = "MTU",
-        [REQUEST_TYPE_SRIOV]                            = "SR-IOV",
+        [REQUEST_TYPE_SRIOV_VF_MAC]                     = "SR-IOV VF MAC address",
+        [REQUEST_TYPE_SRIOV_VF_SPOOFCHK]                = "SR-IOV VF spoof check",
+        [REQUEST_TYPE_SRIOV_VF_RSS_QUERY_EN]            = "SR-IOV VF RSS query",
+        [REQUEST_TYPE_SRIOV_VF_TRUST]                   = "SR-IOV VF trust",
+        [REQUEST_TYPE_SRIOV_VF_LINK_STATE]              = "SR-IOV VF link state",
+        [REQUEST_TYPE_SRIOV_VF_VLAN_LIST]               = "SR-IOV VF vlan list",
         [REQUEST_TYPE_TC_QDISC]                         = "QDisc",
         [REQUEST_TYPE_TC_CLASS]                         = "TClass",
         [REQUEST_TYPE_UP_DOWN]                          = "bring link up or down",
@@ -400,6 +445,12 @@ int remove_request_add(
         assert(netlink);
         assert(message);
 
+        /* Unlike request_new(), remove requests will be also processed when the manager is in
+         * MANAGER_TERMINATING or MANAGER_RESTARTING. When the manager is in MANAGER_STOPPED, we cannot
+         * queue new remove requests anymore with the same reason explained in request_new(). */
+        if (manager->state == MANAGER_STOPPED)
+                return 0; /* ignored */
+
         req = new(RemoveRequest, 1);
         if (!req)
                 return -ENOMEM;
@@ -421,7 +472,7 @@ int remove_request_add(
         req->unref_func = unref_func;
 
         TAKE_PTR(req);
-        return 0;
+        return 1; /* queued */
 }
 
 int manager_process_remove_requests(Manager *manager) {

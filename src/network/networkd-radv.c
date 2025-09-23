@@ -4,12 +4,15 @@
 ***/
 
 #include <netinet/icmp6.h>
-#include <arpa/inet.h>
 
+#include "sd-radv.h"
+
+#include "conf-parser.h"
 #include "dns-domain.h"
+#include "extract-word.h"
 #include "ndisc-router-internal.h"
-#include "networkd-address-generation.h"
 #include "networkd-address.h"
+#include "networkd-address-generation.h"
 #include "networkd-dhcp-prefix-delegation.h"
 #include "networkd-link.h"
 #include "networkd-manager.h"
@@ -17,25 +20,27 @@
 #include "networkd-queue.h"
 #include "networkd-radv.h"
 #include "networkd-route-util.h"
+#include "ordered-set.h"
 #include "parse-util.h"
 #include "radv-internal.h"
-#include "string-util.h"
+#include "set.h"
 #include "string-table.h"
+#include "string-util.h"
 #include "strv.h"
 
 bool link_radv_enabled(Link *link) {
         assert(link);
 
-        if (!link_may_have_ipv6ll(link, /* check_multicast = */ true))
+        if (!link_multicast_enabled(link))
                 return false;
 
-        if (link->hw_addr.length != ETH_ALEN)
+        if (!link_ipv6ll_enabled_harder(link))
                 return false;
 
         return link->network->router_prefix_delegation;
 }
 
-Prefix* prefix_free(Prefix *prefix) {
+static Prefix* prefix_free(Prefix *prefix) {
         if (!prefix)
                 return NULL;
 
@@ -51,6 +56,11 @@ Prefix* prefix_free(Prefix *prefix) {
 }
 
 DEFINE_SECTION_CLEANUP_FUNCTIONS(Prefix, prefix_free);
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                prefix_hash_ops_by_section,
+                ConfigSection, config_section_hash_func, config_section_compare_func,
+                Prefix, prefix_free);
 
 static int prefix_new_static(Network *network, const char *filename, unsigned section_line, Prefix **ret) {
         _cleanup_(config_section_freep) ConfigSection *n = NULL;
@@ -87,7 +97,7 @@ static int prefix_new_static(Network *network, const char *filename, unsigned se
                 .prefix.preferred_until = USEC_INFINITY,
         };
 
-        r = hashmap_ensure_put(&network->prefixes_by_section, &config_section_hash_ops, prefix->section, prefix);
+        r = hashmap_ensure_put(&network->prefixes_by_section, &prefix_hash_ops_by_section, prefix->section, prefix);
         if (r < 0)
                 return r;
 
@@ -95,7 +105,7 @@ static int prefix_new_static(Network *network, const char *filename, unsigned se
         return 0;
 }
 
-RoutePrefix* route_prefix_free(RoutePrefix *prefix) {
+static RoutePrefix* route_prefix_free(RoutePrefix *prefix) {
         if (!prefix)
                 return NULL;
 
@@ -110,6 +120,11 @@ RoutePrefix* route_prefix_free(RoutePrefix *prefix) {
 }
 
 DEFINE_SECTION_CLEANUP_FUNCTIONS(RoutePrefix, route_prefix_free);
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                route_prefix_hash_ops_by_section,
+                ConfigSection, config_section_hash_func, config_section_compare_func,
+                RoutePrefix, route_prefix_free);
 
 static int route_prefix_new_static(Network *network, const char *filename, unsigned section_line, RoutePrefix **ret) {
         _cleanup_(config_section_freep) ConfigSection *n = NULL;
@@ -143,7 +158,7 @@ static int route_prefix_new_static(Network *network, const char *filename, unsig
                 .route.valid_until = USEC_INFINITY,
         };
 
-        r = hashmap_ensure_put(&network->route_prefixes_by_section, &config_section_hash_ops, prefix->section, prefix);
+        r = hashmap_ensure_put(&network->route_prefixes_by_section, &route_prefix_hash_ops_by_section, prefix->section, prefix);
         if (r < 0)
                 return r;
 
@@ -151,7 +166,7 @@ static int route_prefix_new_static(Network *network, const char *filename, unsig
         return 0;
 }
 
-Prefix64* prefix64_free(Prefix64 *prefix) {
+static Prefix64* prefix64_free(Prefix64 *prefix) {
         if (!prefix)
                 return NULL;
 
@@ -166,6 +181,11 @@ Prefix64* prefix64_free(Prefix64 *prefix) {
 }
 
 DEFINE_SECTION_CLEANUP_FUNCTIONS(Prefix64, prefix64_free);
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                prefix64_hash_ops_by_section,
+                ConfigSection, config_section_hash_func, config_section_compare_func,
+                Prefix64, prefix64_free);
 
 static int prefix64_new_static(Network *network, const char *filename, unsigned section_line, Prefix64 **ret) {
         _cleanup_(config_section_freep) ConfigSection *n = NULL;
@@ -199,7 +219,7 @@ static int prefix64_new_static(Network *network, const char *filename, unsigned 
                 .prefix64.valid_until = USEC_INFINITY,
         };
 
-        r = hashmap_ensure_put(&network->pref64_prefixes_by_section, &config_section_hash_ops, prefix->section, prefix);
+        r = hashmap_ensure_put(&network->pref64_prefixes_by_section, &prefix64_hash_ops_by_section, prefix->section, prefix);
         if (r < 0)
                 return r;
 
@@ -275,83 +295,6 @@ int link_reconfigure_radv_address(Address *address, Link *link) {
         }
 
         return 0;
-}
-
-static int radv_set_prefix(Link *link, Prefix *prefix) {
-        _cleanup_(sd_radv_prefix_unrefp) sd_radv_prefix *p = NULL;
-        int r;
-
-        assert(link);
-        assert(link->radv);
-        assert(prefix);
-
-        r = sd_radv_prefix_new(&p);
-        if (r < 0)
-                return r;
-
-        r = sd_radv_prefix_set_prefix(p, &prefix->prefix.address, prefix->prefix.prefixlen);
-        if (r < 0)
-                return r;
-
-        r = sd_radv_prefix_set_preferred_lifetime(p, prefix->prefix.preferred_lifetime, prefix->prefix.preferred_until);
-        if (r < 0)
-                return r;
-
-        r = sd_radv_prefix_set_valid_lifetime(p, prefix->prefix.valid_lifetime, prefix->prefix.valid_until);
-        if (r < 0)
-                return r;
-
-        r = sd_radv_prefix_set_onlink(p, FLAGS_SET(prefix->prefix.flags, ND_OPT_PI_FLAG_ONLINK));
-        if (r < 0)
-                return r;
-
-        r = sd_radv_prefix_set_address_autoconfiguration(p, FLAGS_SET(prefix->prefix.flags, ND_OPT_PI_FLAG_AUTO));
-        if (r < 0)
-                return r;
-
-        return sd_radv_add_prefix(link->radv, p);
-}
-
-static int radv_set_route_prefix(Link *link, RoutePrefix *prefix) {
-        _cleanup_(sd_radv_route_prefix_unrefp) sd_radv_route_prefix *p = NULL;
-        int r;
-
-        assert(link);
-        assert(link->radv);
-        assert(prefix);
-
-        r = sd_radv_route_prefix_new(&p);
-        if (r < 0)
-                return r;
-
-        r = sd_radv_route_prefix_set_prefix(p, &prefix->route.address, prefix->route.prefixlen);
-        if (r < 0)
-                return r;
-
-        r = sd_radv_route_prefix_set_lifetime(p, prefix->route.lifetime, prefix->route.valid_until);
-        if (r < 0)
-                return r;
-
-        return sd_radv_add_route_prefix(link->radv, p);
-}
-
-static int radv_set_pref64_prefix(Link *link, Prefix64 *prefix) {
-        _cleanup_(sd_radv_pref64_prefix_unrefp) sd_radv_pref64_prefix *p = NULL;
-        int r;
-
-        assert(link);
-        assert(link->radv);
-        assert(prefix);
-
-        r = sd_radv_pref64_prefix_new(&p);
-        if (r < 0)
-                return r;
-
-        r = sd_radv_pref64_prefix_set_prefix(p, &prefix->prefix64.prefix, prefix->prefix64.prefixlen, prefix->prefix64.lifetime);
-        if (r < 0)
-                return r;
-
-        return sd_radv_add_pref64_prefix(link->radv, p);
 }
 
 static int network_get_ipv6_dns(Network *network, struct in6_addr **ret_addresses, size_t *ret_size) {
@@ -430,9 +373,12 @@ static int radv_set_dns(Link *link, Link *uplink) {
         return 0;
 
 set_dns:
-        return sd_radv_set_rdnss(link->radv,
-                                 link->network->router_dns_lifetime_usec,
-                                 dns, n_dns);
+        return sd_radv_add_rdnss(
+                        link->radv,
+                        n_dns,
+                        dns,
+                        link->network->router_dns_lifetime_usec,
+                        /* valid_until = */ USEC_INFINITY);
 }
 
 static int radv_set_domains(Link *link, Link *uplink) {
@@ -466,10 +412,11 @@ set_domains:
         if (!s)
                 return log_oom();
 
-        return sd_radv_set_dnssl(link->radv,
-                                 link->network->router_dns_lifetime_usec,
-                                 s);
-
+        return sd_radv_add_dnssl(
+                        link->radv,
+                        s,
+                        link->network->router_dns_lifetime_usec,
+                        /* valid_until = */ USEC_INFINITY);
 }
 
 static int radv_find_uplink(Link *link, Link **ret) {
@@ -556,21 +503,40 @@ static int radv_configure(Link *link) {
 
         Prefix *p;
         HASHMAP_FOREACH(p, link->network->prefixes_by_section) {
-                r = radv_set_prefix(link, p);
+                r = sd_radv_add_prefix(
+                                link->radv,
+                                &p->prefix.address,
+                                p->prefix.prefixlen,
+                                p->prefix.flags,
+                                p->prefix.valid_lifetime,
+                                p->prefix.preferred_lifetime,
+                                p->prefix.valid_until,
+                                p->prefix.preferred_until);
                 if (r < 0 && r != -EEXIST)
                         return r;
         }
 
         RoutePrefix *q;
         HASHMAP_FOREACH(q, link->network->route_prefixes_by_section) {
-                r = radv_set_route_prefix(link, q);
+                r = sd_radv_add_route(
+                                link->radv,
+                                &q->route.address,
+                                q->route.prefixlen,
+                                q->route.preference,
+                                q->route.lifetime,
+                                q->route.valid_until);
                 if (r < 0 && r != -EEXIST)
                         return r;
         }
 
         Prefix64 *n;
         HASHMAP_FOREACH(n, link->network->pref64_prefixes_by_section) {
-                r = radv_set_pref64_prefix(link, n);
+                r = sd_radv_add_prefix64(
+                                link->radv,
+                                &n->prefix64.prefix,
+                                n->prefix64.prefixlen,
+                                n->prefix64.lifetime,
+                                n->prefix64.valid_until);
                 if (r < 0 && r != -EEXIST)
                         return r;
         }
@@ -585,17 +551,15 @@ static int radv_configure(Link *link) {
         if (r < 0)
                 return log_link_debug_errno(link, r, "Could not set RA Domains: %m");
 
-        r = sd_radv_set_home_agent_information(link->radv, link->network->router_home_agent_information);
-        if (r < 0)
-                return r;
-
-        r = sd_radv_set_home_agent_preference(link->radv, link->network->router_home_agent_preference);
-        if (r < 0)
-                return r;
-
-        r = sd_radv_set_home_agent_lifetime(link->radv, link->network->home_agent_lifetime_usec);
-        if (r < 0)
-                return r;
+        if (link->network->router_home_agent_information) {
+                r = sd_radv_set_home_agent(
+                                link->radv,
+                                link->network->router_home_agent_preference,
+                                link->network->home_agent_lifetime_usec,
+                                /* valid_until = */ USEC_INFINITY);
+                if (r < 0)
+                        return r;
+        }
 
         return 0;
 }
@@ -700,6 +664,22 @@ int link_request_radv(Link *link) {
         return 0;
 }
 
+int link_drop_radv_config(Link *link, Network *network) {
+        int ret = 0;
+
+        assert(link);
+        assert(link->network);
+
+        if (link->network == network)
+                return 0; /* .network file is unchanged. It is not necessary to reconfigure the server. */
+
+        // FIXME: check detailed settings and do not stop if nothing changed.
+        // FIXME: save dynamic prefixes acquired by DHCP-PD.
+        ret = sd_radv_stop(link->radv);
+        link->radv = sd_radv_unref(link->radv);
+        return ret;
+}
+
 int radv_start(Link *link) {
         int r;
 
@@ -739,38 +719,30 @@ int radv_add_prefix(
                 usec_t lifetime_preferred_usec,
                 usec_t lifetime_valid_usec) {
 
-        _cleanup_(sd_radv_prefix_unrefp) sd_radv_prefix *p = NULL;
         int r;
 
         assert(link);
+        assert(prefix);
 
         if (!link->radv)
                 return 0;
 
-        r = sd_radv_prefix_new(&p);
-        if (r < 0)
-                return r;
-
-        r = sd_radv_prefix_set_prefix(p, prefix, prefix_len);
-        if (r < 0)
-                return r;
-
-        r = sd_radv_prefix_set_preferred_lifetime(p, RADV_DEFAULT_PREFERRED_LIFETIME_USEC, lifetime_preferred_usec);
-        if (r < 0)
-                return r;
-
-        r = sd_radv_prefix_set_valid_lifetime(p, RADV_DEFAULT_VALID_LIFETIME_USEC, lifetime_valid_usec);
-        if (r < 0)
-                return r;
-
-        r = sd_radv_add_prefix(link->radv, p);
+        r = sd_radv_add_prefix(
+                        link->radv,
+                        prefix,
+                        prefix_len,
+                        ND_OPT_PI_FLAG_ONLINK | ND_OPT_PI_FLAG_AUTO,
+                        RADV_DEFAULT_VALID_LIFETIME_USEC,
+                        RADV_DEFAULT_PREFERRED_LIFETIME_USEC,
+                        lifetime_valid_usec,
+                        lifetime_preferred_usec);
         if (r == -EEXIST)
                 return 0;
         if (r < 0)
                 return r;
 
         if (sd_radv_is_running(link->radv)) {
-                /* Announce updated prefixe now. */
+                /* Announce updated prefix now. */
                 r = sd_radv_send(link->radv);
                 if (r < 0)
                         return r;
@@ -857,9 +829,9 @@ void network_adjust_radv(Network *network) {
         }
 
         if (!FLAGS_SET(network->router_prefix_delegation, RADV_PREFIX_DELEGATION_STATIC)) {
-                network->prefixes_by_section = hashmap_free_with_destructor(network->prefixes_by_section, prefix_free);
-                network->route_prefixes_by_section = hashmap_free_with_destructor(network->route_prefixes_by_section, route_prefix_free);
-                network->pref64_prefixes_by_section = hashmap_free_with_destructor(network->pref64_prefixes_by_section, prefix64_free);
+                network->prefixes_by_section = hashmap_free(network->prefixes_by_section);
+                network->route_prefixes_by_section = hashmap_free(network->route_prefixes_by_section);
+                network->pref64_prefixes_by_section = hashmap_free(network->pref64_prefixes_by_section);
         }
 
         if (!network->router_prefix_delegation)
@@ -880,7 +852,6 @@ void network_adjust_radv(Network *network) {
         HASHMAP_FOREACH(prefix, network->prefixes_by_section)
                 if (prefix_section_verify(prefix) < 0)
                         prefix_free(prefix);
-
 
         RoutePrefix *route;
         HASHMAP_FOREACH(route, network->route_prefixes_by_section)
@@ -1182,6 +1153,37 @@ int config_parse_route_prefix_lifetime(
         return 0;
 }
 
+int config_parse_route_prefix_preference(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        _cleanup_(route_prefix_free_or_set_invalidp) RoutePrefix *p = NULL;
+        Network *network = ASSERT_PTR(userdata);
+        int r;
+
+        assert(filename);
+
+        r = route_prefix_new_static(network, filename, section_line, &p);
+        if (r < 0)
+                return log_oom();
+
+        r = config_parse_router_preference(unit, filename, line, section, section_line,
+                                           lvalue, ltype, rvalue, &p->route.preference, NULL);
+        if (r <= 0)
+                return r;
+
+        TAKE_PTR(p);
+        return 0;
+}
+
 int config_parse_pref64_prefix(
                 const char *unit,
                 const char *filename,
@@ -1332,13 +1334,10 @@ int config_parse_radv_dns(
                         }
                 }
 
-                struct in6_addr *m;
-                m = reallocarray(n->router_dns, n->n_router_dns + 1, sizeof(struct in6_addr));
-                if (!m)
+                if (!GREEDY_REALLOC(n->router_dns, n->n_router_dns + 1))
                         return log_oom();
 
-                m[n->n_router_dns++] = a.in6;
-                n->router_dns = m;
+                n->router_dns[n->n_router_dns++] = a.in6;
         }
 }
 
@@ -1439,7 +1438,7 @@ int config_parse_router_prefix_delegation(
                 }
 
                 /* When IPv6SendRA= is enabled, only static prefixes are sent by default, and users
-                 * need to explicitly enable DHCPv6PrefixDelegation=. */
+                 * need to explicitly enable DHCPPrefixDelegation=. */
                 *ra = r ? RADV_PREFIX_DELEGATION_STATIC : RADV_PREFIX_DELEGATION_NONE;
                 return 0;
         }
@@ -1562,25 +1561,18 @@ int config_parse_router_preference(
                 void *data,
                 void *userdata) {
 
-        Network *network = userdata;
+        uint8_t *preference = ASSERT_PTR(data);
 
-        assert(filename);
-        assert(section);
-        assert(lvalue);
-        assert(rvalue);
-        assert(data);
-
-        if (streq(rvalue, "high"))
-                network->router_preference = SD_NDISC_PREFERENCE_HIGH;
-        else if (STR_IN_SET(rvalue, "medium", "normal", "default"))
-                network->router_preference = SD_NDISC_PREFERENCE_MEDIUM;
+        if (isempty(rvalue) || STR_IN_SET(rvalue, "medium", "normal", "default"))
+                *preference = SD_NDISC_PREFERENCE_MEDIUM;
+        else if (streq(rvalue, "high"))
+                *preference = SD_NDISC_PREFERENCE_HIGH;
         else if (streq(rvalue, "low"))
-                network->router_preference = SD_NDISC_PREFERENCE_LOW;
+                *preference = SD_NDISC_PREFERENCE_LOW;
         else
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Invalid router preference, ignoring assignment: %s", rvalue);
+                return log_syntax_parse_error(unit, filename, line, 0, lvalue, rvalue);
 
-        return 0;
+        return 1;
 }
 
 int config_parse_router_home_agent_lifetime(

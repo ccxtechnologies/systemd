@@ -1,21 +1,24 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <fcntl.h>
-#include <sys/ioctl.h>
 #include <unistd.h>
 
+#include "alloc-util.h"
 #include "creds-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "generator.h"
 #include "install.h"
-#include "missing_socket.h"
+#include "log.h"
 #include "parse-util.h"
+#include "path-lookup.h"
 #include "path-util.h"
 #include "proc-cmdline.h"
 #include "socket-netlink.h"
 #include "socket-util.h"
 #include "special.h"
+#include "string-util.h"
+#include "strv.h"
 #include "virt.h"
 
 /* A small generator binding potentially five or more SSH sockets:
@@ -107,10 +110,11 @@ static int make_sshd_template_unit(
                         "[Unit]\n"
                         "Description=OpenSSH Per-Connection Server Daemon\n"
                         "Documentation=man:systemd-ssh-generator(8) man:sshd(8)\n"
+                        "\n"
                         "[Service]\n"
                         "ExecStart=-%s -i -o \"AuthorizedKeysFile ${CREDENTIALS_DIRECTORY}/ssh.ephemeral-authorized_keys-all .ssh/authorized_keys\"\n"
                         "StandardInput=socket\n"
-                        "ImportCredential=ssh.ephemeral-authorized_keys-all",
+                        "ImportCredential=ssh.ephemeral-authorized_keys-all\n",
                         sshd_binary);
 
                 r = fflush_and_check(f);
@@ -130,6 +134,7 @@ static int write_socket_unit(
                 const char *unit,
                 const char *listen_stream,
                 const char *comment,
+                const char *extra,
                 bool with_ssh_access_target_dependency) {
 
         int r;
@@ -167,6 +172,9 @@ static int write_socket_unit(
                 "PollLimitIntervalSec=30s\n"
                 "PollLimitBurst=50\n",
                 listen_stream);
+
+        if (extra)
+                fputs(extra, f);
 
         r = fflush_and_check(f);
         if (r < 0)
@@ -241,12 +249,14 @@ static int add_vsock_socket(
                         "sshd-vsock.socket",
                         "vsock::22",
                         "AF_VSOCK",
+                        "ExecStartPost=-/usr/lib/systemd/systemd-ssh-issue --make-vsock\n"
+                        "ExecStopPre=-/usr/lib/systemd/systemd-ssh-issue --rm-vsock\n",
                         /* with_ssh_access_target_dependency= */ true);
         if (r < 0)
                 return r;
 
-        log_info("Binding SSH to AF_VSOCK vsock::22.\n"
-                 "→ connect via 'ssh vsock/%u' from host", local_cid);
+        log_debug("Binding SSH to AF_VSOCK vsock::22.\n"
+                  "→ connect via 'ssh vsock/%u' from host", local_cid);
         return 0;
 }
 
@@ -276,13 +286,13 @@ static int add_local_unix_socket(
                         "sshd-unix-local.socket",
                         "/run/ssh-unix-local/socket",
                         "AF_UNIX Local",
+                        /* extra= */ NULL,
                         /* with_ssh_access_target_dependency= */ false);
         if (r < 0)
                 return r;
 
-
-        log_info("Binding SSH to AF_UNIX socket /run/ssh-unix-local/socket.\n"
-                 "→ connect via 'ssh .host' locally");
+        log_debug("Binding SSH to AF_UNIX socket /run/ssh-unix-local/socket.\n"
+                  "→ connect via 'ssh .host' locally");
         return 0;
 }
 
@@ -311,7 +321,7 @@ static int add_export_unix_socket(
                         log_debug("Container manager does not provide /run/host/unix-export/ mount, not binding AF_UNIX socket there.");
                         return 0;
                 }
-                if (errno == EROFS || ERRNO_IS_PRIVILEGE(errno)) {
+                if (ERRNO_IS_FS_WRITE_REFUSED(errno)) {
                         log_debug("Container manager does not provide write access to /run/host/unix-export/, not binding AF_UNIX socket there.");
                         return 0;
                 }
@@ -333,12 +343,13 @@ static int add_export_unix_socket(
                         "sshd-unix-export.socket",
                         "/run/host/unix-export/ssh",
                         "AF_UNIX Export",
+                        /* extra= */ NULL,
                         /* with_ssh_access_target_dependency= */ true);
         if (r < 0)
                 return r;
 
-        log_info("Binding SSH to AF_UNIX socket /run/host/unix-export/ssh\n"
-                 "→ connect via 'ssh unix/run/systemd/nspawn/unix-export/\?\?\?/ssh' from host");
+        log_debug("Binding SSH to AF_UNIX socket /run/host/unix-export/ssh\n"
+                  "→ connect via 'ssh unix/run/systemd/nspawn/unix-export/\?\?\?/ssh' from host");
 
         return 0;
 }
@@ -384,11 +395,12 @@ static int add_extra_sockets(
                                 socket ?: "sshd-extra.socket",
                                 *i,
                                 *i,
+                                /* extra= */ NULL,
                                 /* with_ssh_access_target_dependency= */ true);
                 if (r < 0)
                         return r;
 
-                log_info("Binding SSH to socket %s.", *i);
+                log_debug("Binding SSH to socket %s.", *i);
                 n++;
         }
 
@@ -453,18 +465,17 @@ static int run(const char *dest, const char *dest_early, const char *dest_late) 
 
         (void) parse_credentials();
 
-        strv_sort(arg_listen_extra);
-        strv_uniq(arg_listen_extra);
+        strv_sort_uniq(arg_listen_extra);
 
         if (!arg_auto && strv_isempty(arg_listen_extra)) {
-                log_debug("Disabling SSH generator logic, because as it has been turned off explicitly.");
+                log_debug("Disabling SSH generator logic, because it has been turned off explicitly.");
                 return 0;
         }
 
         _cleanup_free_ char *sshd_binary = NULL;
         r = find_executable("sshd", &sshd_binary);
         if (r == -ENOENT) {
-                log_info("Disabling SSH generator logic, since sshd is not installed.");
+                log_debug("Disabling SSH generator logic, since sshd is not installed.");
                 return 0;
         }
         if (r < 0)

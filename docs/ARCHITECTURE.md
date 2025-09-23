@@ -20,6 +20,9 @@ There are many, and more are constantly added, so we will not enumerate them all
 
 The code that is shared between components is split into a few directories, each with a different purpose:
 
+- 'src/include/uapi/' contains copy of kernel headers we use.
+  'src/include/override/' contains wrappers for libc and kernel headers, to provide several missing symbols.
+
 - `src/basic/` and `src/fundamental/` — those directories contain code primitives that are used by all other code.
   `src/fundamental/` is stricter, because it used for EFI and user-space code, while `src/basic/` is only used for user-space code.
   The code in `src/fundamental/` cannot depend on any other code in the tree, and `src/basic/` can depend only on itself and `src/fundamental/`.
@@ -39,9 +42,15 @@ Thus code that is used by "higher-level" components (e.g. our binaries which are
 would go to a subdirectory specific to that component if it is only used there.
 If the code is to be shared between components, it'd go to `src/shared/`.
 Shared code that is used by multiple components that do not link to `libsystemd-shared-<nnn>.so` may live either in `src/libsystemd/`, `src/basic/`, or `src/fundamental/`.
-Any code that is used only for EFI goes under `src/boot/efi/`, and `src/fundamental/` if is shared with non-EFI compoenents.
+Any code that is used only for EFI goes under `src/boot/efi/`, and `src/fundamental/` if is shared with non-EFI components.
 
 To summarize:
+
+`src/include/uapi/`
+- copy of kernel headers
+
+`src/include/override/`
+- wrappers for libc and kernel headers
 
 `src/fundamental/`
 - may be used by all code in the tree
@@ -118,13 +127,11 @@ For testing and debugging, fuzzers can be executed as any other program, includi
 ## Integration Tests
 
 Sources in `test/TEST-*` implement system-level testing for executables, libraries and daemons that are shipped by the project.
-They require privileges to run, and are not safe to execute directly on a host.
-By default they will build an image and run the test under it via `qemu` or `systemd-nspawn`.
 
 Most of those tests should be able to run via `systemd-nspawn`, which is orders-of-magnitude faster than `qemu`, but some tests require privileged operations like using `dm-crypt` or `loopdev`.
 They are clearly marked if that is the case.
 
-See [`test/README.testsuite`](https://github.com/systemd/systemd/blob/main/test/README.testsuite) for more specific details.
+See [`test/integration-tests/README.md`](https://github.com/systemd/systemd/blob/main/test/integration-tests/README.md) for more specific details.
 
 ## hwdb
 

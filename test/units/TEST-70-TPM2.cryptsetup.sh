@@ -49,10 +49,10 @@ chmod 0600 /tmp/passphrase
 cryptsetup luksFormat -q --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --use-urandom "$IMAGE" /tmp/passphrase
 
 # Unlocking via keyfile
-systemd-cryptenroll --unlock-key-file=/tmp/passphrase --tpm2-device=auto "$IMAGE"
+systemd-cryptenroll --unlock-key-file=/tmp/passphrase --tpm2-device=auto --tpm2-pcrs=7 "$IMAGE"
 
-# Enroll unlock with default PCR policy
-PASSWORD=passphrase systemd-cryptenroll --tpm2-device=auto "$IMAGE"
+# Enroll unlock with SecureBoot (PCR 7) PCR policy
+PASSWORD=passphrase systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 "$IMAGE"
 systemd-cryptsetup attach test-volume "$IMAGE" - tpm2-device=auto,headless=1
 systemd-cryptsetup detach test-volume
 
@@ -62,7 +62,7 @@ tpm2_pcrextend 7:sha256=00000000000000000000000000000000000000000000000000000000
 
 # Enroll unlock with PCR+PIN policy
 systemd-cryptenroll --wipe-slot=tpm2 "$IMAGE"
-PASSWORD=passphrase NEWPIN=123456 systemd-cryptenroll --tpm2-device=auto --tpm2-with-pin=true "$IMAGE"
+PASSWORD=passphrase NEWPIN=123456 systemd-cryptenroll --tpm2-device=auto --tpm2-with-pin=true --tpm2-pcrs=7 "$IMAGE"
 PIN=123456 systemd-cryptsetup attach test-volume "$IMAGE" - tpm2-device=auto,headless=1
 systemd-cryptsetup detach test-volume
 
@@ -210,7 +210,7 @@ Format=ext4
 CopyFiles=/tmp/dditest:/
 Encrypt=tpm2
 EOF
-    PASSWORD=passphrase systemd-repart --tpm2-device-key=/tmp/srk.pub --definitions=/tmp/dditest --empty=create --size=50M /tmp/dditest.raw --tpm2-pcrs=
+    PASSWORD=passphrase systemd-repart --tpm2-device-key=/tmp/srk.pub --definitions=/tmp/dditest --empty=create --size=80M /tmp/dditest.raw --tpm2-pcrs=
     DEVICE="$(systemd-dissect --attach /tmp/dditest.raw)"
     udevadm wait --settle --timeout=10 "$DEVICE"p1
     systemd-cryptsetup attach dditest "$DEVICE"p1 - tpm2-device=auto,headless=yes

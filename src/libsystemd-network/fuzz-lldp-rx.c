@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "sd-event.h"
+#include "sd-json.h"
 #include "sd-lldp-rx.h"
 
 #include "fd-util.h"
@@ -24,7 +25,7 @@ int lldp_network_bind_raw_socket(int ifindex) {
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
         _cleanup_(sd_lldp_rx_unrefp) sd_lldp_rx *lldp_rx = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         _cleanup_(memstream_done) MemStream m = {};
         FILE *f;
 
@@ -44,7 +45,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
         assert_se(lldp_rx_build_neighbors_json(lldp_rx, &v) >= 0);
         assert_se(f = memstream_init(&m));
-        (void) json_variant_dump(v, JSON_FORMAT_PRETTY|JSON_FORMAT_COLOR, f, NULL);
+        (void) sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY|SD_JSON_FORMAT_COLOR, f, NULL);
 
         assert_se(sd_lldp_rx_stop(lldp_rx) >= 0);
         assert_se(sd_lldp_rx_detach_event(lldp_rx) >= 0);

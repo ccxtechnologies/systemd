@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <sys/socket.h>
+
 #include "af-list.h"
+#include "alloc-util.h"
 #include "extract-word.h"
 #include "ip-protocol-list.h"
 #include "log.h"
@@ -8,7 +11,24 @@
 #include "parse-helpers.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "string-util.h"
 #include "utf8.h"
+
+static bool validate_api_vfs(const char *path, PathSimplifyWarnFlags flags) {
+
+        assert(path);
+
+        if ((flags & (PATH_CHECK_NON_API_VFS|PATH_CHECK_NON_API_VFS_DEV_OK)) == 0)
+                return true;
+
+        if (!path_below_api_vfs(path))
+                return true;
+
+        if (FLAGS_SET(flags, PATH_CHECK_NON_API_VFS_DEV_OK) && path_startswith(path, "/dev"))
+                return true;
+
+        return false;
+}
 
 int path_simplify_and_warn(
                 char *path,
@@ -23,6 +43,7 @@ int path_simplify_and_warn(
 
         assert(path);
         assert(!FLAGS_SET(flags, PATH_CHECK_ABSOLUTE | PATH_CHECK_RELATIVE));
+        assert(!FLAGS_SET(flags, PATH_CHECK_NON_API_VFS | PATH_CHECK_NON_API_VFS_DEV_OK));
         assert(lvalue);
 
         if (!utf8_is_valid(path))
@@ -56,7 +77,7 @@ int path_simplify_and_warn(
                                   "%s= path is not normalized%s: %s",
                                   lvalue, fatal ? "" : ", ignoring", path);
 
-        if (FLAGS_SET(flags, PATH_CHECK_NON_API_VFS) && path_below_api_vfs(path))
+        if (!validate_api_vfs(path, flags))
                 return log_syntax(unit, level, filename, line, SYNTHETIC_ERRNO(EINVAL),
                                   "%s= path is below API VFS%s: %s",
                                   lvalue, fatal ? ", refusing" : ", ignoring",

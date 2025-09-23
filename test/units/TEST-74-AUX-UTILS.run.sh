@@ -200,11 +200,23 @@ grep -q "^SocketMode=0644$" "/run/systemd/transient/$UNIT.socket"
 grep -qE "^ExecStart=.*/bin/true.*$" "/run/systemd/transient/$UNIT.service"
 systemctl stop "$UNIT.socket" "$UNIT.service" || :
 
+: "Job mode"
+systemd-run --job-mode=help
+(! systemd-run --job-mode=foo --scope true)
+systemd-run --no-block --unit=slowly-activating.service --collect \
+    --service-type=oneshot --remain-after-exit \
+    sleep 30
+(! systemd-run --scope --property=Conflicts=slowly-activating.service true)
+(! systemd-run --scope --property=Conflicts=slowly-activating.service --job-mode=fail true)
+systemd-run --scope --property=Conflicts=slowly-activating.service --job-mode=replace true
+
 : "Interactive options"
 SHELL=/bin/true systemd-run --shell
 SHELL=/bin/true systemd-run --scope --shell
 systemd-run --wait --pty true
 systemd-run --wait --machine=.host --pty true
+systemd-run --json=short /bin/true | jq . >/dev/null
+systemd-run --json=pretty /bin/true | jq . >/dev/null
 (! SHELL=/bin/false systemd-run --quiet --shell)
 
 (! systemd-run)
@@ -236,12 +248,56 @@ if [[ -e /usr/lib/pam.d/systemd-run0 ]] || [[ -e /etc/pam.d/systemd-run0 ]]; the
     run0 ls /
     assert_eq "$(run0 echo foo)" "foo"
     # Check if we set some expected environment variables
-    for arg in "" "--user=root" "--user=testuser"; do
-        assert_eq "$(run0 ${arg:+"$arg"} bash -c 'echo $SUDO_USER')" "$USER"
-        assert_eq "$(run0 ${arg:+"$arg"} bash -c 'echo $SUDO_UID')" "$(id -u "$USER")"
-        assert_eq "$(run0 ${arg:+"$arg"} bash -c 'echo $SUDO_GID')" "$(id -u "$USER")"
+    for tu in "" "root" "0" "testuser"; do
+        assert_eq "$(run0 ${tu:+"--user=$tu"} bash -c 'echo $SUDO_USER')" "$USER"
+        assert_eq "$(run0 ${tu:+"--user=$tu"} bash -c 'echo $SUDO_UID')" "$(id -u "$USER")"
+        assert_eq "$(run0 ${tu:+"--user=$tu"} bash -c 'echo $SUDO_GID')" "$(id -u "$USER")"
+
+        # Validate that we actually went properly through PAM (XDG_SESSION_TYPE is set by pam_systemd)
+        assert_eq "$(run0 ${tu:+"--user=$tu"} bash -c 'echo $XDG_SESSION_TYPE')" "unspecified"
+
+        # Test spawning via shell
+        assert_eq "$(run0 ${tu:+"--user=$tu"} --setenv=SHLVL=10 printenv SHLVL)" "10"
+        if [[ ! -v ASAN_OPTIONS ]]; then
+            assert_eq "$(run0 ${tu:+"--user=$tu"} --setenv=SHLVL=10 --via-shell echo \$SHLVL)" "11"
+        fi
+
+        if [[ -n "$tu" ]]; then
+            # Validate that $SHELL is set to login shell of target user when cmdline is supplied (not invoking shell)
+            TARGET_LOGIN_SHELL="$(getent passwd "$tu" | cut -d: -f7)"
+            assert_eq "$(run0 --user="$tu" printenv SHELL)" "$TARGET_LOGIN_SHELL"
+            # ... or when the command is chained by login shell
+            if [[ ! -v ASAN_OPTIONS ]]; then
+                assert_eq "$(run0 --user="$tu" -i printenv SHELL)" "$TARGET_LOGIN_SHELL"
+            fi
+        fi
     done
     # Let's chain a couple of run0 calls together, for fun
     readarray -t cmdline < <(printf "%.0srun0\n" {0..31})
     assert_eq "$("${cmdline[@]}" bash -c 'echo $SUDO_USER')" "$USER"
+
+    # Tests for working directory, especially for specifying "/" (see PR #34771).
+    cd /
+    assert_eq "$(run0 pwd)" "/"
+    assert_eq "$(run0 -D /tmp pwd)" "/tmp"
+    assert_eq "$(run0 --user=testuser pwd)" "/home/testuser"
+    assert_eq "$(run0 -D /tmp --user=testuser pwd)" "/tmp"
+    cd /tmp
+    assert_eq "$(run0 pwd)" "/tmp"
+    assert_eq "$(run0 -D / pwd)" "/"
+    assert_eq "$(run0 --user=testuser pwd)" "/home/testuser"
+    assert_eq "$(run0 -D / --user=testuser pwd)" "/"
+
+    # Verify that all combinations of --pty/--pipe come to the sam results
+    assert_eq "$(run0 echo -n foo)" "foo"
+    assert_eq "$(run0 --pty echo -n foo)" "foo"
+    assert_eq "$(run0 --pipe echo -n foo)" "foo"
+    assert_eq "$(run0 --pipe --pty echo -n foo)" "foo"
+
+    # Validate when we invoke run0 without a tty, that depending on --pty it either allocates a tty or not
+    assert_neq "$(run0 --pty tty < /dev/null)" "not a tty"
+    assert_eq "$(run0 --pipe tty < /dev/null)" "not a tty"
 fi
+
+# Tests whether intermediate disconnects corrupt us (modified testcase from https://github.com/systemd/systemd/issues/27204)
+assert_rc "37" timeout 300 systemd-run --unit=disconnecttest --wait --pipe --user -M testuser@.host bash -ec 'systemctl --user daemon-reexec; sleep 3; exit 37'

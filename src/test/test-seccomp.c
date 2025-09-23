@@ -7,8 +7,8 @@
 #include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/shm.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #if HAVE_VALGRIND_VALGRIND_H
 #include <valgrind/valgrind.h>
@@ -16,12 +16,11 @@
 
 #include "alloc-util.h"
 #include "capability-util.h"
+#include "errno-list.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "macro.h"
+#include "fs-util.h"
 #include "memory-util.h"
-#include "missing_sched.h"
-#include "missing_syscall.h"
 #include "nsflags.h"
 #include "nulstr-util.h"
 #include "process-util.h"
@@ -294,7 +293,7 @@ TEST(restrict_namespace) {
         s = mfree(s);
 
         assert_se(namespace_flags_to_string(NAMESPACE_FLAGS_ALL, &s) == 0);
-        ASSERT_STREQ(s, "cgroup ipc net mnt pid user uts");
+        ASSERT_STREQ(s, "cgroup ipc net mnt pid user uts time");
         assert_se(namespace_flags_from_string(s, &ul) == 0 && ul == NAMESPACE_FLAGS_ALL);
         s = mfree(s);
 
@@ -381,7 +380,7 @@ TEST(protect_sysctl) {
                 return;
         }
 
-        assert_se(get_proc_field("/proc/self/status", "Seccomp", WHITESPACE, &seccomp) == 0);
+        assert_se(get_proc_field("/proc/self/status", "Seccomp", &seccomp) == 0);
         if (!streq(seccomp, "0"))
                 log_warning("Warning: seccomp filter detected, results may be unreliable for %s", __func__);
 
@@ -486,7 +485,7 @@ TEST(restrict_address_families) {
                 safe_close(fd);
 
                 assert_se(s = set_new(NULL));
-                assert_se(set_put(s, INT_TO_PTR(AF_UNIX)) >= 0);
+                ASSERT_OK(set_put(s, INT_TO_PTR(AF_UNIX)));
 
                 assert_se(seccomp_restrict_address_families(s, false) >= 0);
 
@@ -509,7 +508,7 @@ TEST(restrict_address_families) {
 
                 set_clear(s);
 
-                assert_se(set_put(s, INT_TO_PTR(AF_INET)) >= 0);
+                ASSERT_OK(set_put(s, INT_TO_PTR(AF_INET)));
 
                 assert_se(seccomp_restrict_address_families(s, true) >= 0);
 
@@ -750,7 +749,7 @@ TEST(restrict_archs) {
                 assert_se(s = set_new(NULL));
 
 #ifdef __x86_64__
-                assert_se(set_put(s, UINT32_TO_PTR(SCMP_ARCH_X86+1)) >= 0);
+                ASSERT_OK(set_put(s, UINT32_TO_PTR(SCMP_ARCH_X86+1)));
 #endif
                 assert_se(seccomp_restrict_archs(s) >= 0);
 
@@ -900,7 +899,7 @@ TEST(native_syscalls_filtered) {
                 /* Passing "native" or an empty set is equivalent, just do both here. */
                 assert_se(arch_s = set_new(NULL));
                 assert_se(seccomp_restrict_archs(arch_s) >= 0);
-                assert_se(set_put(arch_s, SCMP_ARCH_NATIVE) >= 0);
+                ASSERT_OK(set_put(arch_s, (void*) SCMP_ARCH_NATIVE));
                 assert_se(seccomp_restrict_archs(arch_s) >= 0);
 
                 assert_se(access("/", F_OK) >= 0);
@@ -1227,6 +1226,57 @@ TEST(restrict_suid_sgid) {
         }
 
         assert_se(wait_for_terminate_and_check("suidsgidseccomp", pid, WAIT_LOG) == EXIT_SUCCESS);
+}
+
+static void test_seccomp_suppress_sync_child(void) {
+        _cleanup_(unlink_and_freep) char *path = NULL;
+        _cleanup_close_ int fd = -EBADF;
+
+        ASSERT_OK(tempfn_random("/tmp/seccomp_suppress_sync", NULL, &path));
+        ASSERT_OK_ERRNO(fd = open(path, O_RDWR | O_CREAT | O_SYNC | O_CLOEXEC, 0666));
+        fd = safe_close(fd);
+
+        ASSERT_ERROR_ERRNO(fdatasync(-1), EBADF);
+        ASSERT_ERROR_ERRNO(fsync(-1), EBADF);
+        ASSERT_ERROR_ERRNO(syncfs(-1), EBADF);
+
+        ASSERT_ERROR_ERRNO(fdatasync(INT_MAX), EBADF);
+        ASSERT_ERROR_ERRNO(fsync(INT_MAX), EBADF);
+        ASSERT_ERROR_ERRNO(syncfs(INT_MAX), EBADF);
+
+        ASSERT_OK(seccomp_suppress_sync());
+
+        ASSERT_ERROR_ERRNO(fd = open(path, O_RDWR | O_CREAT | O_SYNC | O_CLOEXEC, 0666), EINVAL);
+
+        ASSERT_OK_ERRNO(fdatasync(INT_MAX));
+        ASSERT_OK_ERRNO(fsync(INT_MAX));
+        ASSERT_OK_ERRNO(syncfs(INT_MAX));
+
+        ASSERT_ERROR_ERRNO(fdatasync(-1), EBADF);
+        ASSERT_ERROR_ERRNO(fsync(-1), EBADF);
+        ASSERT_ERROR_ERRNO(syncfs(-1), EBADF);
+}
+
+TEST(seccomp_suppress_sync) {
+        pid_t pid;
+
+        if (!is_seccomp_available()) {
+                log_notice("Seccomp not available, skipping %s", __func__);
+                return;
+        }
+        if (!have_seccomp_privs()) {
+                log_notice("Not privileged, skipping %s", __func__);
+                return;
+        }
+
+        ASSERT_OK_ERRNO(pid = fork());
+
+        if (pid == 0) {
+                test_seccomp_suppress_sync_child();
+                _exit(EXIT_SUCCESS);
+        }
+
+        ASSERT_EQ(wait_for_terminate_and_check("seccomp_suppress_sync", pid, WAIT_LOG), EXIT_SUCCESS);
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

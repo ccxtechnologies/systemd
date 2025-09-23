@@ -88,6 +88,8 @@
         name labels), or a sequence of such labels separated by single dots that forms a valid DNS FQDN. The
         hostname must be at most 64 characters, which is a Linux limitation (DNS allows longer names).</para>
 
+        <xi:include href="hostname.xml" xpointer="question-mark-hostname-pattern"/>
+
         <xi:include href="version-info.xml" xpointer="v249"/></listitem>
       </varlistentry>
 
@@ -173,15 +175,6 @@
 
     <variablelist>
       <varlistentry>
-        <term><option>--no-ask-password</option></term>
-
-        <listitem><para>Do not query the user for authentication for
-        privileged operations.</para>
-
-        <xi:include href="version-info.xml" xpointer="v195"/></listitem>
-      </varlistentry>
-
-      <varlistentry>
         <term><option>--static</option></term>
         <term><option>--transient</option></term>
         <term><option>--pretty</option></term>
@@ -198,6 +191,7 @@
       <xi:include href="user-system-options.xml" xpointer="host" />
       <xi:include href="user-system-options.xml" xpointer="machine" />
 
+      <xi:include href="standard-options.xml" xpointer="no-ask-password" />
       <xi:include href="standard-options.xml" xpointer="help" />
       <xi:include href="standard-options.xml" xpointer="version" />
       <xi:include href="standard-options.xml" xpointer="json" />

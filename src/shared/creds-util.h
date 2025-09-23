@@ -1,14 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <inttypes.h>
-#include <stdbool.h>
-#include <sys/types.h>
-
 #include "sd-id128.h"
 
 #include "fd-util.h"
-#include "time-util.h"
+#include "forward.h"
 
 #define CREDENTIAL_NAME_MAX FDNAME_MAX
 
@@ -58,8 +54,11 @@ int get_credential_host_secret(CredentialSecretFlags flags, struct iovec *ret);
 int get_credential_user_password(const char *username, char **ret_password, bool *ret_is_hashed);
 
 typedef enum CredentialFlags {
-        CREDENTIAL_ALLOW_NULL = 1 << 0, /* allow decryption of NULL key, even if TPM is around */
-        CREDENTIAL_ANY_SCOPE  = 1 << 1, /* allow decryption of both system and user credentials */
+        CREDENTIAL_ALLOW_NULL            = 1 << 0, /* allow decryption of NULL key, even if TPM is around */
+        CREDENTIAL_ANY_SCOPE             = 1 << 1, /* allow decryption of both system and user credentials */
+
+        /* Only used by ipc_{encrypt,decrypt}_credential */
+        CREDENTIAL_IPC_ALLOW_INTERACTIVE = 1 << 2,
 } CredentialFlags;
 
 /* The four modes we support: keyed only by on-disk key, only by TPM2 HMAC key, and by the combination of
@@ -93,6 +92,8 @@ int decrypt_credential_and_warn(const char *validate_name, usec_t validate_times
 
 int ipc_encrypt_credential(const char *name, usec_t timestamp, usec_t not_after, uid_t uid, const struct iovec *input, CredentialFlags flags, struct iovec *ret);
 int ipc_decrypt_credential(const char *validate_name, usec_t validate_timestamp, uid_t uid, const struct iovec *input, CredentialFlags flags, struct iovec *ret);
+
+int get_global_boot_credentials_path(char **ret);
 
 typedef struct PickUpCredential {
         const char *credential_prefix;

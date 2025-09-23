@@ -1,69 +1,71 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "libfido2-util.h"
+#include "log.h"
 
 #if HAVE_LIBFIDO2
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "ask-password-api.h"
 #include "dlfcn-util.h"
 #include "format-table.h"
 #include "glyph-util.h"
-#include "log.h"
-#include "memory-util.h"
-#include "random-util.h"
+#include "iovec-util.h"
+#include "plymouth-util.h"
+#include "string-util.h"
 #include "strv.h"
 #include "unistd.h"
 
 static void *libfido2_dl = NULL;
 
-DLSYM_FUNCTION(fido_assert_allow_cred);
-DLSYM_FUNCTION(fido_assert_free);
-DLSYM_FUNCTION(fido_assert_hmac_secret_len);
-DLSYM_FUNCTION(fido_assert_hmac_secret_ptr);
-DLSYM_FUNCTION(fido_assert_new);
-DLSYM_FUNCTION(fido_assert_set_clientdata_hash);
-DLSYM_FUNCTION(fido_assert_set_extensions);
-DLSYM_FUNCTION(fido_assert_set_hmac_salt);
-DLSYM_FUNCTION(fido_assert_set_rp);
-DLSYM_FUNCTION(fido_assert_set_up);
-DLSYM_FUNCTION(fido_assert_set_uv);
-DLSYM_FUNCTION(fido_cbor_info_extensions_len);
-DLSYM_FUNCTION(fido_cbor_info_extensions_ptr);
-DLSYM_FUNCTION(fido_cbor_info_free);
-DLSYM_FUNCTION(fido_cbor_info_new);
-DLSYM_FUNCTION(fido_cbor_info_options_len);
-DLSYM_FUNCTION(fido_cbor_info_options_name_ptr);
-DLSYM_FUNCTION(fido_cbor_info_options_value_ptr);
-DLSYM_FUNCTION(fido_cred_free);
-DLSYM_FUNCTION(fido_cred_id_len);
-DLSYM_FUNCTION(fido_cred_id_ptr);
-DLSYM_FUNCTION(fido_cred_new);
-DLSYM_FUNCTION(fido_cred_set_clientdata_hash);
-DLSYM_FUNCTION(fido_cred_set_extensions);
-DLSYM_FUNCTION(fido_cred_set_prot);
-DLSYM_FUNCTION(fido_cred_set_rk);
-DLSYM_FUNCTION(fido_cred_set_rp);
-DLSYM_FUNCTION(fido_cred_set_type);
-DLSYM_FUNCTION(fido_cred_set_user);
-DLSYM_FUNCTION(fido_cred_set_uv);
-DLSYM_FUNCTION(fido_dev_free);
-DLSYM_FUNCTION(fido_dev_get_assert);
-DLSYM_FUNCTION(fido_dev_get_cbor_info);
-DLSYM_FUNCTION(fido_dev_info_free);
-DLSYM_FUNCTION(fido_dev_info_manifest);
-DLSYM_FUNCTION(fido_dev_info_manufacturer_string);
-DLSYM_FUNCTION(fido_dev_info_product_string);
-DLSYM_FUNCTION(fido_dev_info_new);
-DLSYM_FUNCTION(fido_dev_info_path);
-DLSYM_FUNCTION(fido_dev_info_ptr);
-DLSYM_FUNCTION(fido_dev_is_fido2);
-DLSYM_FUNCTION(fido_dev_make_cred);
-DLSYM_FUNCTION(fido_dev_new);
-DLSYM_FUNCTION(fido_dev_open);
-DLSYM_FUNCTION(fido_dev_close);
-DLSYM_FUNCTION(fido_init);
-DLSYM_FUNCTION(fido_set_log_handler);
-DLSYM_FUNCTION(fido_strerr);
+DLSYM_PROTOTYPE(fido_assert_allow_cred) = NULL;
+DLSYM_PROTOTYPE(fido_assert_free) = NULL;
+DLSYM_PROTOTYPE(fido_assert_hmac_secret_len) = NULL;
+DLSYM_PROTOTYPE(fido_assert_hmac_secret_ptr) = NULL;
+DLSYM_PROTOTYPE(fido_assert_new) = NULL;
+DLSYM_PROTOTYPE(fido_assert_set_clientdata_hash) = NULL;
+DLSYM_PROTOTYPE(fido_assert_set_extensions) = NULL;
+DLSYM_PROTOTYPE(fido_assert_set_hmac_salt) = NULL;
+DLSYM_PROTOTYPE(fido_assert_set_rp) = NULL;
+DLSYM_PROTOTYPE(fido_assert_set_up) = NULL;
+DLSYM_PROTOTYPE(fido_assert_set_uv) = NULL;
+DLSYM_PROTOTYPE(fido_cbor_info_extensions_len) = NULL;
+DLSYM_PROTOTYPE(fido_cbor_info_extensions_ptr) = NULL;
+DLSYM_PROTOTYPE(fido_cbor_info_free) = NULL;
+DLSYM_PROTOTYPE(fido_cbor_info_new) = NULL;
+DLSYM_PROTOTYPE(fido_cbor_info_options_len) = NULL;
+DLSYM_PROTOTYPE(fido_cbor_info_options_name_ptr) = NULL;
+DLSYM_PROTOTYPE(fido_cbor_info_options_value_ptr) = NULL;
+DLSYM_PROTOTYPE(fido_cred_free) = NULL;
+DLSYM_PROTOTYPE(fido_cred_id_len) = NULL;
+DLSYM_PROTOTYPE(fido_cred_id_ptr) = NULL;
+DLSYM_PROTOTYPE(fido_cred_new) = NULL;
+DLSYM_PROTOTYPE(fido_cred_set_clientdata_hash) = NULL;
+DLSYM_PROTOTYPE(fido_cred_set_extensions) = NULL;
+DLSYM_PROTOTYPE(fido_cred_set_prot) = NULL;
+DLSYM_PROTOTYPE(fido_cred_set_rk) = NULL;
+DLSYM_PROTOTYPE(fido_cred_set_rp) = NULL;
+DLSYM_PROTOTYPE(fido_cred_set_type) = NULL;
+DLSYM_PROTOTYPE(fido_cred_set_user) = NULL;
+DLSYM_PROTOTYPE(fido_cred_set_uv) = NULL;
+DLSYM_PROTOTYPE(fido_dev_close) = NULL;
+DLSYM_PROTOTYPE(fido_dev_free) = NULL;
+DLSYM_PROTOTYPE(fido_dev_get_assert) = NULL;
+DLSYM_PROTOTYPE(fido_dev_get_cbor_info) = NULL;
+DLSYM_PROTOTYPE(fido_dev_info_free) = NULL;
+DLSYM_PROTOTYPE(fido_dev_info_manifest) = NULL;
+DLSYM_PROTOTYPE(fido_dev_info_manufacturer_string) = NULL;
+DLSYM_PROTOTYPE(fido_dev_info_new) = NULL;
+DLSYM_PROTOTYPE(fido_dev_info_path) = NULL;
+DLSYM_PROTOTYPE(fido_dev_info_product_string) = NULL;
+DLSYM_PROTOTYPE(fido_dev_info_ptr) = NULL;
+DLSYM_PROTOTYPE(fido_dev_is_fido2) = NULL;
+DLSYM_PROTOTYPE(fido_dev_make_cred) = NULL;
+DLSYM_PROTOTYPE(fido_dev_new) = NULL;
+DLSYM_PROTOTYPE(fido_dev_open) = NULL;
+DLSYM_PROTOTYPE(fido_init) = NULL;
+DLSYM_PROTOTYPE(fido_set_log_handler) = NULL;
+DLSYM_PROTOTYPE(fido_strerr) = NULL;
 
 static void fido_log_propagate_handler(const char *s) {
         log_debug("libfido2: %s", strempty(s));
@@ -109,6 +111,7 @@ int dlopen_libfido2(void) {
                         DLSYM_ARG(fido_cred_set_type),
                         DLSYM_ARG(fido_cred_set_user),
                         DLSYM_ARG(fido_cred_set_uv),
+                        DLSYM_ARG(fido_dev_close),
                         DLSYM_ARG(fido_dev_free),
                         DLSYM_ARG(fido_dev_get_assert),
                         DLSYM_ARG(fido_dev_get_cbor_info),
@@ -123,7 +126,6 @@ int dlopen_libfido2(void) {
                         DLSYM_ARG(fido_dev_make_cred),
                         DLSYM_ARG(fido_dev_new),
                         DLSYM_ARG(fido_dev_open),
-                        DLSYM_ARG(fido_dev_close),
                         DLSYM_ARG(fido_init),
                         DLSYM_ARG(fido_set_log_handler),
                         DLSYM_ARG(fido_strerr));
@@ -362,6 +364,26 @@ static int fido2_is_cred_in_specific_token(
         }
 }
 
+static void plymouth_start_interaction(const char *text, bool *ret_displayed) {
+        assert(ret_displayed);
+
+        if (plymouth_send_msg(text, /* pause_spinner= */ true) < 0)
+                return;
+
+        *ret_displayed = true;
+}
+
+static void plymouth_end_interaction(bool *displayed) {
+        assert(displayed);
+
+        if (!*displayed)
+                return;
+
+        /* In theory 'm' should hide a message, but it doesn't work (long standing issue).
+         * As a workaround, sending a single NUL byte hides the previous messages. */
+        (void) plymouth_send_msg("", /* pause_spinner= */ false);
+}
+
 static int fido2_use_hmac_hash_specific_token(
                 const char *path,
                 const char *rp_id,
@@ -374,6 +396,7 @@ static int fido2_use_hmac_hash_specific_token(
                 void **ret_hmac,
                 size_t *ret_hmac_size) {
 
+        _cleanup_(plymouth_end_interaction) bool plymouth_displayed = false;
         _cleanup_(fido_assert_free_wrapper) fido_assert_t *a = NULL;
         _cleanup_(fido_dev_free_wrapper) fido_dev_t *d = NULL;
         _cleanup_(erase_and_freep) void *hmac_copy = NULL;
@@ -445,10 +468,12 @@ static int fido2_use_hmac_hash_specific_token(
                                                enable_disable(FLAGS_SET(required, FIDO2ENROLL_UP)),
                                                sym_fido_strerr(r));
 
-                if (FLAGS_SET(required, FIDO2ENROLL_UP))
+                if (FLAGS_SET(required, FIDO2ENROLL_UP)) {
                         log_notice("%s%sPlease confirm presence on security token to unlock.",
-                                   emoji_enabled() ? special_glyph(SPECIAL_GLYPH_TOUCH) : "",
+                                   emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                    emoji_enabled() ? " " : "");
+                        plymouth_start_interaction("Please confirm presence on security token to unlock.", &plymouth_displayed);
+                }
         }
 
         if (has_uv && !FLAGS_SET(required, FIDO2ENROLL_UV_OMIT)) {
@@ -459,10 +484,12 @@ static int fido2_use_hmac_hash_specific_token(
                                                enable_disable(FLAGS_SET(required, FIDO2ENROLL_UV)),
                                                sym_fido_strerr(r));
 
-                if (FLAGS_SET(required, FIDO2ENROLL_UV))
+                if (FLAGS_SET(required, FIDO2ENROLL_UV)) {
                         log_notice("%s%sPlease verify user on security token to unlock.",
-                                   emoji_enabled() ? special_glyph(SPECIAL_GLYPH_TOUCH) : "",
+                                   emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                    emoji_enabled() ? " " : "");
+                        plymouth_start_interaction("Please verify user on security token to unlock.", &plymouth_displayed);
+                }
         }
 
         for (;;) {
@@ -500,8 +527,9 @@ static int fido2_use_hmac_hash_specific_token(
 
                         if (FLAGS_SET(required, FIDO2ENROLL_UP_IF_NEEDED)) {
                                 log_notice("%s%sPlease confirm presence on security to unlock.",
-                                           emoji_enabled() ? special_glyph(SPECIAL_GLYPH_TOUCH) : "",
+                                           emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                            emoji_enabled() ? " " : "");
+                                plymouth_start_interaction("Please confirm presence on security token to unlock.", &plymouth_displayed);
                                 retry_with_up = true;
                         }
 
@@ -513,7 +541,7 @@ static int fido2_use_hmac_hash_specific_token(
 
                         if (has_up && (required & (FIDO2ENROLL_UP|FIDO2ENROLL_UP_IF_NEEDED)) == FIDO2ENROLL_UP_IF_NEEDED) {
                                 log_notice("%s%sGot unsupported option error when user presence test is turned off. Trying with user presence test turned on.",
-                                           emoji_enabled() ? special_glyph(SPECIAL_GLYPH_TOUCH) : "",
+                                           emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                            emoji_enabled() ? " " : "");
                                 retry_with_up = true;
                         }
@@ -541,7 +569,7 @@ static int fido2_use_hmac_hash_specific_token(
                         break;
 
                 default:
-                        break;
+                        ;
                 }
 
                 if (!retry_with_up && !retry_with_pin)
@@ -683,8 +711,6 @@ finish:
         return r;
 }
 
-#define FIDO2_SALT_SIZE 32
-
 int fido2_generate_hmac_hash(
                 const char *device,
                 const char *rp_id,
@@ -697,13 +723,13 @@ int fido2_generate_hmac_hash(
                 const char *askpw_credential,
                 Fido2EnrollFlags lock_with,
                 int cred_alg,
+                const struct iovec *salt,
                 void **ret_cid, size_t *ret_cid_size,
-                void **ret_salt, size_t *ret_salt_size,
                 void **ret_secret, size_t *ret_secret_size,
                 char **ret_usedpin,
                 Fido2EnrollFlags *ret_locked_with) {
 
-        _cleanup_(erase_and_freep) void *salt = NULL, *secret_copy = NULL;
+        _cleanup_(erase_and_freep) void *secret_copy = NULL;
         _cleanup_(fido_assert_free_wrapper) fido_assert_t *a = NULL;
         _cleanup_(fido_cred_free_wrapper) fido_cred_t *c = NULL;
         _cleanup_(fido_dev_free_wrapper) fido_dev_t *d = NULL;
@@ -717,12 +743,10 @@ int fido2_generate_hmac_hash(
         assert(device);
         assert(ret_cid);
         assert(ret_cid_size);
-        assert(ret_salt);
-        assert(ret_salt_size);
         assert(ret_secret);
         assert(ret_secret_size);
 
-        /* Construction is like this: we generate a salt of 32 bytes. We then ask the FIDO2 device to
+        /* Construction is like this: we read or generate a salt of 32 bytes. We then ask the FIDO2 device to
          * HMAC-SHA256 it for us with its internal key. The result is the key used by LUKS and account
          * authentication. LUKS and UNIX password auth all do their own salting before hashing, so that FIDO2
          * device never sees the volume key.
@@ -731,24 +755,17 @@ int fido2_generate_hmac_hash(
          *
          * with: S → LUKS/account authentication key                                         (never stored)
          *       I → internal key on FIDO2 device                              (stored in the FIDO2 device)
-         *       D → salt we generate here               (stored in the privileged part of the JSON record)
+         *       D → salt     (stored in the privileged part of the JSON record or read from a file/socket)
          *
          */
 
         assert(device);
         assert((lock_with & ~(FIDO2ENROLL_PIN|FIDO2ENROLL_UP|FIDO2ENROLL_UV)) == 0);
+        assert(iovec_is_set(salt));
 
         r = dlopen_libfido2();
         if (r < 0)
                 return log_error_errno(r, "FIDO2 token support is not installed.");
-
-        salt = malloc(FIDO2_SALT_SIZE);
-        if (!salt)
-                return log_oom();
-
-        r = crypto_random_bytes(salt, FIDO2_SALT_SIZE);
-        if (r < 0)
-                return log_error_errno(r, "Failed to generate salt: %m");
 
         d = sym_fido_dev_new();
         if (!d)
@@ -845,7 +862,7 @@ int fido2_generate_hmac_hash(
 
         if (has_uv || has_up)
                 log_notice("%s%s(Hint: This might require confirmation of user presence on security token.)",
-                           emoji_enabled() ? special_glyph(SPECIAL_GLYPH_TOUCH) : "",
+                           emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                            emoji_enabled() ? " " : "");
 
         /* If we are using the user PIN, then we must pass that PIN to the get_assertion call below, or
@@ -865,18 +882,25 @@ int fido2_generate_hmac_hash(
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Token asks for PIN but doesn't advertise 'clientPin' feature.");
 
+                AskPasswordFlags askpw_flags = ASK_PASSWORD_ACCEPT_CACHED;
+
                 for (;;) {
                         _cleanup_strv_free_erase_ char **pin = NULL;
                         AskPasswordRequest req = {
+                                .tty_fd = -EBADF,
                                 .message = "Please enter security token PIN:",
                                 .icon = askpw_icon,
                                 .keyring = "fido2-pin",
                                 .credential = askpw_credential,
+                                .until = USEC_INFINITY,
+                                .hup_fd = -EBADF,
                         };
 
-                        r = ask_password_auto(&req, USEC_INFINITY, /* flags= */ 0, &pin);
+                        r = ask_password_auto(&req, askpw_flags, &pin);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to acquire user PIN: %m");
+
+                        askpw_flags &= ~ASK_PASSWORD_ACCEPT_CACHED;
 
                         r = FIDO_ERR_PIN_INVALID;
                         STRV_FOREACH(i, pin) {
@@ -915,7 +939,7 @@ int fido2_generate_hmac_hash(
                                        "Token action timeout. (User didn't interact with token quickly enough.)");
         if (r == FIDO_ERR_UNSUPPORTED_ALGORITHM)
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                        "Token doesn't support credential algorithm %s.", fido2_algorithm_to_string(cred_alg));
+                                       "Token doesn't support credential algorithm %s.", fido2_algorithm_to_string(cred_alg));
         if (r != FIDO_OK)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to generate FIDO2 credential: %s", sym_fido_strerr(r));
@@ -935,7 +959,7 @@ int fido2_generate_hmac_hash(
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to enable HMAC-SECRET extension on FIDO2 assertion: %s", sym_fido_strerr(r));
 
-        r = sym_fido_assert_set_hmac_salt(a, salt, FIDO2_SALT_SIZE);
+        r = sym_fido_assert_set_hmac_salt(a, salt->iov_base, salt->iov_len);
         if (r != FIDO_OK)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to set salt on FIDO2 assertion: %s", sym_fido_strerr(r));
@@ -956,7 +980,7 @@ int fido2_generate_hmac_hash(
 
                 if (FLAGS_SET(lock_with, FIDO2ENROLL_UP))
                         log_notice("%s%sIn order to allow secret key generation, please confirm presence on security token.",
-                                   emoji_enabled() ? special_glyph(SPECIAL_GLYPH_TOUCH) : "",
+                                   emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                    emoji_enabled() ? " " : "");
         }
 
@@ -970,7 +994,7 @@ int fido2_generate_hmac_hash(
 
                 if (FLAGS_SET(lock_with, FIDO2ENROLL_UV))
                         log_notice("%s%sIn order to allow secret key generation, please verify user on security token.",
-                                   emoji_enabled() ? special_glyph(SPECIAL_GLYPH_TOUCH) : "",
+                                   emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                    emoji_enabled() ? " " : "");
         }
 
@@ -994,7 +1018,7 @@ int fido2_generate_hmac_hash(
                                                        "Token asks for user presence test but was already enabled.");
 
                         log_notice("%s%sLocking without user presence test requested, but FIDO2 device %s requires it, enabling.",
-                                   emoji_enabled() ? special_glyph(SPECIAL_GLYPH_TOUCH) : "",
+                                   emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                    emoji_enabled() ? " " : "",
                                    device);
 
@@ -1010,7 +1034,7 @@ int fido2_generate_hmac_hash(
 
                         if (has_up && !FLAGS_SET(lock_with, FIDO2ENROLL_UP)) {
                                 log_notice("%s%sGot unsupported option error when user presence test is turned off. Trying with user presence test turned on.",
-                                           emoji_enabled() ? special_glyph(SPECIAL_GLYPH_TOUCH) : "",
+                                           emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                            emoji_enabled() ? " " : "");
                                 retry_with_up = true;
                         }
@@ -1031,7 +1055,7 @@ int fido2_generate_hmac_hash(
                         break;
 
                 default:
-                        break;
+                        ;
                 }
 
                 if (!retry_with_up && !retry_with_pin)
@@ -1072,8 +1096,6 @@ int fido2_generate_hmac_hash(
 
         *ret_cid = TAKE_PTR(cid_copy);
         *ret_cid_size = cid_size;
-        *ret_salt = TAKE_PTR(salt);
-        *ret_salt_size = FIDO2_SALT_SIZE;
         *ret_secret = TAKE_PTR(secret_copy);
         *ret_secret_size = secret_size;
 
@@ -1088,7 +1110,13 @@ int fido2_generate_hmac_hash(
 #endif
 
 #if HAVE_LIBFIDO2
-static int check_device_is_fido2_with_hmac_secret(const char *path) {
+static int check_device_is_fido2_with_hmac_secret(
+                const char *path,
+                bool *ret_has_rk,
+                bool *ret_has_client_pin,
+                bool *ret_has_up,
+                bool *ret_has_uv) {
+
         _cleanup_(fido_dev_free_wrapper) fido_dev_t *d = NULL;
         int r;
 
@@ -1101,9 +1129,11 @@ static int check_device_is_fido2_with_hmac_secret(const char *path) {
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                        "Failed to open FIDO2 device %s: %s", path, sym_fido_strerr(r));
 
-        r = verify_features(d, path, LOG_DEBUG, NULL, NULL, NULL, NULL);
-        if (r == -ENODEV) /* Not a FIDO2 device, or not implementing 'hmac-secret' */
+        r = verify_features(d, path, LOG_DEBUG, ret_has_rk, ret_has_client_pin, ret_has_up, ret_has_uv);
+        if (r == -ENODEV) { /* Not a FIDO2 device, or not implementing 'hmac-secret' */
+                *ret_has_rk = *ret_has_client_pin = *ret_has_up = *ret_has_uv = false;
                 return false;
+        }
         if (r < 0)
                 return r;
 
@@ -1114,6 +1144,7 @@ static int check_device_is_fido2_with_hmac_secret(const char *path) {
 int fido2_list_devices(void) {
 #if HAVE_LIBFIDO2
         _cleanup_(table_unrefp) Table *t = NULL;
+
         size_t allocated = 64, found = 0;
         fido_dev_info_t *di = NULL;
         int r;
@@ -1138,7 +1169,7 @@ int fido2_list_devices(void) {
                 goto finish;
         }
 
-        t = table_new("path", "manufacturer", "product");
+        t = table_new("path", "manufacturer", "product", "compatible", "rk", "clientpin", "up", "uv");
         if (!t) {
                 r = log_oom();
                 goto finish;
@@ -1146,6 +1177,7 @@ int fido2_list_devices(void) {
 
         for (size_t i = 0; i < found; i++) {
                 const fido_dev_info_t *entry;
+                bool has_rk, has_client_pin, has_up, has_uv;
 
                 entry = sym_fido_dev_info_ptr(di, i);
                 if (!entry) {
@@ -1154,17 +1186,21 @@ int fido2_list_devices(void) {
                         goto finish;
                 }
 
-                r = check_device_is_fido2_with_hmac_secret(sym_fido_dev_info_path(entry));
+                r = check_device_is_fido2_with_hmac_secret(sym_fido_dev_info_path(entry), &has_rk, &has_client_pin, &has_up, &has_uv);
                 if (r < 0)
                         goto finish;
-                if (!r)
-                        continue;
+                bool compatible = r > 0;
 
                 r = table_add_many(
                                 t,
                                 TABLE_PATH, sym_fido_dev_info_path(entry),
                                 TABLE_STRING, sym_fido_dev_info_manufacturer_string(entry),
-                                TABLE_STRING, sym_fido_dev_info_product_string(entry));
+                                TABLE_STRING, sym_fido_dev_info_product_string(entry),
+                                TABLE_BOOLEAN_CHECKMARK, compatible,
+                                TABLE_BOOLEAN_CHECKMARK, has_rk,
+                                TABLE_BOOLEAN_CHECKMARK, has_client_pin,
+                                TABLE_BOOLEAN_CHECKMARK, has_up,
+                                TABLE_BOOLEAN_CHECKMARK, has_uv);
                 if (r < 0) {
                         table_log_add_error(r);
                         goto finish;
@@ -1176,6 +1212,16 @@ int fido2_list_devices(void) {
                 log_error_errno(r, "Failed to show device table: %m");
                 goto finish;
         }
+
+        if (table_get_rows(t) > 1)
+                printf("\n"
+                       "%1$sLegend: RK        %2$s Resident key%3$s\n"
+                       "%1$s        CLIENTPIN %2$s PIN request%3$s\n"
+                       "%1$s        UP        %2$s User presence%3$s\n"
+                       "%1$s        UV        %2$s User verification%3$s\n",
+                       ansi_grey(),
+                       glyph(GLYPH_ARROW_RIGHT),
+                       ansi_normal());
 
         r = 0;
 
@@ -1227,7 +1273,12 @@ int fido2_find_device_auto(char **ret) {
                 goto finish;
         }
 
-        r = check_device_is_fido2_with_hmac_secret(sym_fido_dev_info_path(entry));
+        r = check_device_is_fido2_with_hmac_secret(
+                        sym_fido_dev_info_path(entry),
+                        /* ret_has_rk= */ NULL,
+                        /* ret_has_client_pin= */ NULL,
+                        /* ret_has_up= */ NULL,
+                        /* ret_has_uv= */ NULL);
         if (r < 0)
                 goto finish;
         if (!r) {

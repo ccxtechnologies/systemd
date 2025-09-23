@@ -2,22 +2,18 @@
 
 #include <net/if.h>
 #include <net/if_arp.h>
-#include <unistd.h>
 
-#include "fd-util.h"
-#include "fileio.h"
-#include "fs-util.h"
+#include "sd-lldp-rx.h"
+
+#include "conf-parser.h"
 #include "networkd-link.h"
 #include "networkd-lldp-rx.h"
-#include "networkd-lldp-tx.h"
 #include "networkd-manager.h"
 #include "networkd-network.h"
 #include "string-table.h"
-#include "string-util.h"
 #include "strv.h"
-#include "tmpfile-util.h"
 
-DEFINE_CONFIG_PARSE_ENUM(config_parse_lldp_mode, lldp_mode, LLDPMode, "Failed to parse LLDP= setting.");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_lldp_mode, lldp_mode, LLDPMode);
 
 static const char* const lldp_mode_table[_LLDP_MODE_MAX] = {
         [LLDP_MODE_NO] = "no",

@@ -1,11 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-
 #include "sd-bus.h"
 
 #include "alloc-util.h"
@@ -13,7 +7,7 @@
 #include "errno-list.h"
 #include "errno-util.h"
 #include "string-util.h"
-#include "strv.h"
+#include "utf8.h"
 
 BUS_ERROR_MAP_ELF_REGISTER const sd_bus_error_map bus_standard_errors[] = {
         SD_BUS_ERROR_MAP(SD_BUS_ERROR_FAILED,                             EACCES),
@@ -62,12 +56,10 @@ extern const sd_bus_error_map __stop_SYSTEMD_BUS_ERROR_MAP[];
 static const sd_bus_error_map **additional_error_maps = NULL;
 
 static int bus_error_name_to_errno(const char *name) {
-        const sd_bus_error_map **map, *m;
         const char *p;
         int r;
 
-        if (!name)
-                return EINVAL;
+        assert_return(name, EINVAL);
 
         p = startswith(name, "System.Error.");
         if (p) {
@@ -79,8 +71,8 @@ static int bus_error_name_to_errno(const char *name) {
         }
 
         if (additional_error_maps)
-                for (map = additional_error_maps; *map; map++)
-                        for (m = *map;; m++) {
+                for (const sd_bus_error_map **map = additional_error_maps; *map; map++)
+                        for (const sd_bus_error_map *m = *map;; m++) {
                                 /* For additional error maps the end marker is actually the end marker */
                                 if (m->code == BUS_ERROR_MAP_END_MARKER)
                                         break;
@@ -91,25 +83,22 @@ static int bus_error_name_to_errno(const char *name) {
                                 }
                         }
 
-        m = ALIGN_PTR(__start_SYSTEMD_BUS_ERROR_MAP);
-        while (m < __stop_SYSTEMD_BUS_ERROR_MAP) {
-                /* For magic ELF error maps, the end marker might
-                 * appear in the middle of things, since multiple maps
-                 * might appear in the same section. Hence, let's skip
-                 * over it, but realign the pointer to the next 8 byte
-                 * boundary, which is the selected alignment for the
-                 * arrays. */
-                if (m->code == BUS_ERROR_MAP_END_MARKER) {
-                        m = ALIGN_PTR(m + 1);
+        const sd_bus_error_map *elf_map = ALIGN_PTR(__start_SYSTEMD_BUS_ERROR_MAP);
+        while (elf_map < __stop_SYSTEMD_BUS_ERROR_MAP) {
+                /* For magic ELF error maps, the end marker might appear in the middle of things, since
+                 * multiple maps might appear in the same section. Hence, let's skip over it, but realign
+                 * the pointer to the next 8 byte boundary, which is the selected alignment for the arrays. */
+                if (elf_map->code == BUS_ERROR_MAP_END_MARKER) {
+                        elf_map = ALIGN_PTR(elf_map + 1);
                         continue;
                 }
 
-                if (streq(m->name, name)) {
-                        assert(m->code > 0);
-                        return m->code;
+                if (streq(elf_map->name, name)) {
+                        assert(elf_map->code > 0);
+                        return elf_map->code;
                 }
 
-                m++;
+                elf_map++;
         }
 
         return EIO;
@@ -176,10 +165,11 @@ static int errno_to_bus_error_name_new(int error, char **ret) {
         const char *name;
         char *n;
 
-        if (error < 0)
-                error = -error;
-
-        name = errno_to_name(error);
+        /* D-Bus names must not start with a digit. Thus, an name like System.Error.500 would not be legal.
+         * Let's just return 0 if an unknown errno is encountered, which will cause the caller to fall back
+         * to BUS_ERROR_FAILED.
+         */
+        name = errno_name_no_fallback(error);
         if (!name)
                 return 0;
 
@@ -258,7 +248,7 @@ _public_ int sd_bus_error_setfv(sd_bus_error *e, const char *name, const char *f
                          * this, since we at least managed to write the error name */
 
                         if (vasprintf(&mesg, format, ap) >= 0)
-                                e->message = TAKE_PTR(mesg);
+                                e->message = utf8_escape_non_printable(mesg);
                 }
 
                 e->_need_free = 1;
@@ -389,7 +379,7 @@ _public_ int sd_bus_error_has_names_sentinel(const sd_bus_error *e, ...) {
         return !!p;
 }
 
-_public_ int sd_bus_error_get_errno(const sd_bus_error* e) {
+_public_ int sd_bus_error_get_errno(const sd_bus_error *e) {
         if (!e || !e->name)
                 return 0;
 
@@ -596,7 +586,7 @@ const char* _bus_error_message(const sd_bus_error *e, int error, char buf[static
         if (e && e->message)
                 return e->message;
 
-        return strerror_r(abs(error), buf, ERRNO_BUF_LEN);
+        return strerror_r(ABS(error), buf, ERRNO_BUF_LEN);
 }
 
 static bool map_ok(const sd_bus_error_map *map) {
@@ -607,7 +597,6 @@ static bool map_ok(const sd_bus_error_map *map) {
 }
 
 _public_ int sd_bus_error_add_map(const sd_bus_error_map *map) {
-        const sd_bus_error_map **maps = NULL;
         unsigned n = 0;
 
         assert_return(map, -EINVAL);
@@ -618,13 +607,11 @@ _public_ int sd_bus_error_add_map(const sd_bus_error_map *map) {
                         if (additional_error_maps[n] == map)
                                 return 0;
 
-        maps = reallocarray(additional_error_maps, n + 2, sizeof(struct sd_bus_error_map*));
-        if (!maps)
+        if (!GREEDY_REALLOC(additional_error_maps, n + 2))
                 return -ENOMEM;
 
-        maps[n] = map;
-        maps[n+1] = NULL;
+        additional_error_maps[n] = map;
+        additional_error_maps[n+1] = NULL;
 
-        additional_error_maps = maps;
         return 1;
 }

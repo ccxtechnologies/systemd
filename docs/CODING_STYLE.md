@@ -54,6 +54,18 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   }
   ```
 
+- Function return types should be seen/written as whole, i.e. write this:
+
+  ```c
+  const char* foo(const char *input);
+  ```
+
+  instead of this:
+
+  ```c
+  const char *foo(const char *input);
+  ```
+
 - Single-line `if` blocks should not be enclosed in `{}`. Write this:
 
   ```c
@@ -139,16 +151,16 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 ## Code Organization and Semantics
 
-- For our codebase we intend to use ISO C11 *with* GNU extensions (aka
-  "gnu11"). Public APIs (i.e. those we expose via `libsystemd.so`
+- For our codebase we intend to use ISO C17 *with* GNU extensions (aka
+  "gnu17"). Public APIs (i.e. those we expose via `libsystemd.so`
   i.e. `systemd/sd-*.h`) should only use ISO C89 however (with a very limited
   set of conservative and common extensions, such as fixed size integer types
-  from `<inttypes.h>`), so that we don't force consuming programs into C11
+  from `<inttypes.h>`), so that we don't force consuming programs into C17
   mode. (This discrepancy in particular means one thing: internally we use C99
   `bool` booleans, externally C89-compatible `int` booleans which generally
   have different size in memory and slightly different semantics, also see
   below.)  Both for internal and external code it's OK to use even newer
-  features and GCC extension than "gnu11", as long as there's reasonable
+  features and GCC extension than "gnu17", as long as there's reasonable
   fallback #ifdeffery in place to ensure compatibility is retained with older
   compilers.
 
@@ -164,27 +176,192 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   thread. Use `is_main_thread()` to detect whether the calling thread is the
   main thread.
 
-- Do not write functions that clobber call-by-reference variables on
-  failure. Use temporary variables for these cases and change the passed in
-  variables only on success. The rule is: never clobber return parameters on
-  failure, always initialize return parameters on success.
+- Typically, function parameters fit into four categories: input parameters,
+  mutable objects, call-by-reference return parameters that are initialized on
+  success, and call-by-reference return parameters that are initialized on
+  failure. Input parameters should always carry suitable `const` declarators if
+  they are pointers, to indicate they are input-only and not changed by the
+  function. The name of return parameters that are initialized on success
+  should be prefixed with `ret_`, to clarify they are return parameters. The
+  name of return parameters that are initialized on failure should be prefixed
+  with `reterr_`. (Examples of such parameters: those which carry additional
+  error information, such as the row/column of parse errors or so). –
+  Conversely, please do not prefix parameters that aren't output-only with
+  `ret_` or `reterr_`, in particular not mutable parameters that are both input
+  as well as output.
 
-- Typically, function parameters fit into three categories: input parameters,
-  mutable objects, and call-by-reference return parameters. Input parameters
-  should always carry suitable "const" declarators if they are pointers, to
-  indicate they are input-only and not changed by the function. Return
-  parameters are best prefixed with "ret_", to clarify they are return
-  parameters. (Conversely, please do not prefix parameters that aren't
-  output-only with "ret_", in particular not mutable parameters that are both
-  input as well as output). Example:
+  Example:
 
   ```c
   static int foobar_frobnicate(
-                  Foobar* object,            /* the associated mutable object */
+                  Foobar *object,            /* the associated mutable object */
                   const char *input,         /* immutable input parameter */
-                  char **ret_frobnicated) {  /* return parameter */
+                  char **ret_frobnicated,    /* return parameter on success */
+                  unsigned *reterr_line,     /* return parameter on failure */
+                  unsigned *reterr_column) { /* ditto */
           …
           return 0;
+  }
+  ```
+
+- Do not write functions that clobber call-by-reference success return
+  parameters on failure (i.e. `ret_xyz`, see above), or that clobber
+  call-by-reference failure return parameters on success
+  (i.e. `reterr_xyz`). Use temporary variables for these cases and change the
+  passed in variables only in the right condition. The rule is: never clobber
+  success return parameters on failure, always initialize success return
+  parameters on success (and the reverse for failure return parameters, of
+  course).
+
+- Please put `reterr_` return parameters in the function parameter list last,
+  and `ret_` return parameters immediately before that.
+
+  Good:
+
+  ```c
+  static int do_something(
+                  const char *input,
+                  const char *ret_on_success,
+                  const char *reterr_on_failure);
+  ```
+
+  Not good:
+
+  ```c
+  static int do_something(
+                  const char *reterr_on_failure,
+                  const char *ret_on_success,
+                  const char *input);
+  ```
+
+- Please do not introduce new circular dependencies between header files.
+  Effectively this means that if a.h includes b.h, then b.h cannot include a.h,
+  directly or transitively via another header. Circular header dependencies can
+  make for extremely confusing errors when modifying the headers, which can be
+  easily avoided by getting rid of the circular dependency. To get rid of a
+  circular header dependency, there are a few possible techniques:
+  - Introduce a new common header with the declarations that need to be shared
+    by both headers and include only this header in the other headers.
+  - Move declarations around between the two headers so one header doesn't need
+    to include the other header anymore.
+  - Use forward declarations if possible to remove the need for one header to
+    include the other. To make this possible, you can move the body of static
+    inline functions that require the full definition of a struct into the
+    implementation file so that only a forward declaration of the struct is
+    required and not the full definition.
+  - `src/basic/forward.h` contains forward declarations for common types. If
+    possible, only include `forward.h` in header files which makes circular
+    header dependencies a non-issue.
+
+  Bad:
+
+  ```c
+  // manager.h
+
+  typedef struct Manager Manager;
+
+  #include "unit.h"
+
+  struct Manager {
+          Unit *unit;
+  };
+
+  // unit.h
+
+  typedef struct Unit Unit;
+
+  #include "manager.h"
+
+  struct Unit {
+          Manager *manager;
+  };
+  ```
+
+  Good:
+
+  ```c
+  // manager.h
+
+  typedef struct Unit Unit;
+
+  typedef struct Manager {
+          Unit *unit;
+  } Manager;
+
+  // manager.c
+
+  #include "unit.h"
+
+  // unit.h
+
+  typedef struct Manager Manager;
+
+  typedef struct Unit {
+          Manager *manager;
+  } Unit;
+
+  // unit.c
+
+  #include "manager.h"
+  ```
+
+- Please keep header files as lean as possible. Prefer implementing functions in
+  the implementation (.c) file over implementing them in the corresponding
+  header file. Inline functions in the header are allowed if they are just a few
+  lines and don't require including any extra header files that would otherwise
+  not have to be included. Keeping header files as lean as possible speeds up
+  incremental builds when header files are changed (either by yourself when
+  working on a pull request or as part of rebasing onto the main branch) as each
+  file that (transitively) includes a header that was changed needs to be
+  recompiled. By keeping the number of header files included by other header
+  files low, we reduce the impact of modifying header files on
+  incremental builds as much as possible.
+
+  To avoid having to include other headers in header files, always include
+  `forward.h` in each header file and then add other required includes as
+  needed. `forward.h` already includes generic headers and contains forward
+  declarations for common types which should be sufficient for most header
+  files. For each extra include you add on top of `forward.h`, check if it can
+  be replaced by adding another forward declaration to `forward.h`. Depending on
+  the daemon, there might be a specific forward header to include (e.g.
+  `resolved-forward.h` for systemd-resolved header files).
+
+  Header files that extend other header files can include the original header
+  file. For example, `iovec-util.h` includes `iovec-fundamental.h` and
+  `sys/uio.h`. To identify headers that are exported from other headers, add a
+  `IWYU pragma: export` comment to the includes so that these exports are
+  recognized by clang static analysis tooling.
+
+  Bad:
+
+  ```c
+  // source.h
+
+  #include <stddef.h>
+
+  #include "log.h"
+
+  static inline void my_function_that_logs(size_t sz) {
+          log_error("oops: %zu", sz);
+  }
+  ```
+
+  Good:
+
+  ```c
+  // source.h
+
+  #include "forward.h"
+
+  void my_function_that_logs(size_t sz);
+
+  // source.c
+
+  #include "source.h"
+  #include "log.h"
+
+  void my_function_that_logs(size_t sz) {
+          log_error("oops: %zu", sz);
   }
   ```
 
@@ -544,6 +721,14 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   (at least initially), but it needs to be there. This is particularly
   important for objects that unprivileged users may allocate, but also matters
   for everything else any user may allocate.
+
+- Please use `secure_getenv()` for all environment variable accesses, unless
+  it's clear that `getenv()` would be the better choice. This matters in
+  particular in `src/basic/` and `src/shared/` (i.e. library code that might
+  end up in unexpected processes), but should be followed everywhere else too
+  (in order to make it unproblematic to move code around). To say this clearly:
+  the default should be `secure_getenv()`, the exception should be regular
+  `getenv()`.
 
 ## Types
 

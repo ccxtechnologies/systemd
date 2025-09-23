@@ -1,29 +1,40 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
+#include <sys/eventfd.h>
+
+#include "sd-bus.h"
+#include "sd-device.h"
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-get-properties.h"
 #include "bus-label.h"
+#include "bus-object.h"
 #include "bus-polkit.h"
-#include "bus-util.h"
+#include "device-util.h"
 #include "devnum-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
+#include "format-util.h"
+#include "hashmap.h"
+#include "log.h"
+#include "logind.h"
 #include "logind-brightness.h"
 #include "logind-dbus.h"
 #include "logind-polkit.h"
+#include "logind-seat.h"
 #include "logind-seat-dbus.h"
+#include "logind-session.h"
 #include "logind-session-dbus.h"
 #include "logind-session-device.h"
-#include "logind-session.h"
+#include "logind-user.h"
 #include "logind-user-dbus.h"
-#include "logind.h"
-#include "missing_capability.h"
 #include "path-util.h"
 #include "signal-util.h"
+#include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
+#include "user-record.h"
 #include "user-util.h"
 
 static int property_get_user(
@@ -107,6 +118,40 @@ static int property_get_idle_hint(
         assert(reply);
 
         return sd_bus_message_append(reply, "b", session_get_idle_hint(s, NULL) > 0);
+}
+
+static int property_get_can_idle(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        Session *s = ASSERT_PTR(userdata);
+
+        assert(bus);
+        assert(reply);
+
+        return sd_bus_message_append(reply, "b", SESSION_CLASS_CAN_IDLE(s->class));
+}
+
+static int property_get_can_lock(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        Session *s = ASSERT_PTR(userdata);
+
+        assert(bus);
+        assert(reply);
+
+        return sd_bus_message_append(reply, "b", SESSION_CLASS_CAN_LOCK(s->class));
 }
 
 static int property_get_idle_since_hint(
@@ -291,23 +336,23 @@ static int method_set_locked_hint(sd_bus_message *message, void *userdata, sd_bu
 
 int bus_session_method_kill(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Session *s = ASSERT_PTR(userdata);
-        const char *swho;
+        const char *swhom;
         int32_t signo;
-        KillWho who;
+        KillWhom whom;
         int r;
 
         assert(message);
 
-        r = sd_bus_message_read(message, "si", &swho, &signo);
+        r = sd_bus_message_read(message, "si", &swhom, &signo);
         if (r < 0)
                 return r;
 
-        if (isempty(swho))
-                who = KILL_ALL;
+        if (isempty(swhom))
+                whom = KILL_ALL;
         else {
-                who = kill_who_from_string(swho);
-                if (who < 0)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid kill parameter '%s'", swho);
+                whom = kill_whom_from_string(swhom);
+                if (whom < 0)
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid kill parameter '%s'", swhom);
         }
 
         if (!SIGNAL_VALID(signo))
@@ -326,7 +371,7 @@ int bus_session_method_kill(sd_bus_message *message, void *userdata, sd_bus_erro
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = session_kill(s, who, signo);
+        r = session_kill(s, whom, signo, error);
         if (r < 0)
                 return r;
 
@@ -425,18 +470,18 @@ static int method_set_class(sd_bus_message *message, void *userdata, sd_bus_erro
 
         /* For now, we'll allow only upgrades user-incomplete → user */
         if (class != SESSION_USER)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
-                                         "Class may only be set to 'user'");
+                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS,
+                                        "Class may only be set to 'user'");
 
         if (s->class == SESSION_USER) /* No change, shortcut */
                 return sd_bus_reply_method_return(message, NULL);
         if (s->class != SESSION_USER_INCOMPLETE)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
-                                         "Only sessions with class 'user-incomplete' may change class");
+                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS,
+                                        "Only sessions with class 'user-incomplete' may change class");
 
         if (s->upgrade_message)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
-                                         "Set session class operation already in progress");
+                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS,
+                                        "Set session class operation already in progress");
 
         r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_EUID, &creds);
         if (r < 0)
@@ -503,7 +548,7 @@ static int method_set_tty(sd_bus_message *message, void *userdata, sd_bus_error 
         flags = fcntl(fd, F_GETFL, 0);
         if (flags < 0)
                 return -errno;
-        if ((flags & O_ACCMODE) != O_RDWR)
+        if ((flags & O_ACCMODE_STRICT) != O_RDWR)
                 return -EACCES;
         if (FLAGS_SET(flags, O_PATH))
                 return -ENOTTY;
@@ -668,7 +713,10 @@ static int method_set_brightness(sd_bus_message *message, void *userdata, sd_bus
         if (r < 0)
                 return sd_bus_error_set_errnof(error, r, "Failed to open device %s:%s: %m", subsystem, name);
 
-        if (sd_device_get_property_value(d, "ID_SEAT", &seat) >= 0 && !streq_ptr(seat, s->seat->id))
+        r = device_get_seat(d, &seat);
+        if (r < 0)
+                return sd_bus_error_set_errnof(error, r, "Failed to get seat of %s:%s: %m", subsystem, name);
+        if (!streq(seat, s->seat->id))
                 return sd_bus_error_setf(error, BUS_ERROR_NOT_YOUR_DEVICE, "Device %s:%s does not belong to your seat %s, refusing.", subsystem, name, s->seat->id);
 
         r = manager_write_brightness(s->manager, d, brightness, message);
@@ -713,7 +761,7 @@ static int session_object_find(sd_bus *bus, const char *path, const char *interf
         return 1;
 }
 
-char *session_bus_path(Session *s) {
+char* session_bus_path(Session *s) {
         _cleanup_free_ char *t = NULL;
 
         assert(s);
@@ -810,9 +858,8 @@ int session_send_signal(Session *s, bool new_session) {
                         "so", s->id, p);
 }
 
-int session_send_changed(Session *s, const char *properties, ...) {
+int session_send_changed_strv(Session *s, char **properties) {
         _cleanup_free_ char *p = NULL;
-        char **l;
 
         assert(s);
 
@@ -823,9 +870,7 @@ int session_send_changed(Session *s, const char *properties, ...) {
         if (!p)
                 return -ENOMEM;
 
-        l = strv_from_stdarg_alloca(properties);
-
-        return sd_bus_emit_properties_changed_strv(s->manager->bus, p, "org.freedesktop.login1.Session", l);
+        return sd_bus_emit_properties_changed_strv(s->manager->bus, p, "org.freedesktop.login1.Session", properties);
 }
 
 int session_send_lock(Session *s, bool lock) {
@@ -855,89 +900,62 @@ int session_send_lock_all(Manager *m, bool lock) {
         assert(m);
 
         HASHMAP_FOREACH(session, m->sessions) {
-                int k;
 
                 if (!SESSION_CLASS_CAN_LOCK(session->class))
                         continue;
 
-                k = session_send_lock(session, lock);
-                if (k < 0)
-                        r = k;
+                RET_GATHER(r, session_send_lock(session, lock));
         }
 
         return r;
 }
 
-static bool session_job_pending(Session *s) {
-        assert(s);
-        assert(s->user);
-
-        /* Check if we have some jobs enqueued and not finished yet. Each time we get JobRemoved signal about
-         * relevant units, session_send_create_reply and hence us is called (see match_job_removed).
-         * Note that we don't care about job result here. */
-
-        return s->scope_job ||
-               s->user->runtime_dir_job ||
-               (SESSION_CLASS_WANTS_SERVICE_MANAGER(s->class) && s->user->service_manager_job);
-}
-
-int session_send_create_reply(Session *s, sd_bus_error *error) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *c = NULL;
-        _cleanup_close_ int fifo_fd = -EBADF;
-        _cleanup_free_ char *p = NULL;
-
+int session_send_create_reply_bus(Session *s, const sd_bus_error *error) {
         assert(s);
 
-        /* This is called after the session scope and the user service were successfully created, and finishes where
-         * bus_manager_create_session() left off. */
+        /* This is called after the session scope and the user service were successfully created, and
+         * finishes where manager_create_session() left off. */
 
-        if (!s->create_message)
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *c = TAKE_PTR(s->create_message);
+        if (!c)
                 return 0;
 
-        /* If error occurred, return it immediately. Otherwise let's wait for all jobs to finish before
-         * continuing. */
-        if (!sd_bus_error_is_set(error) && session_job_pending(s))
-                return 0;
-
-        c = TAKE_PTR(s->create_message);
-        if (error)
+        if (sd_bus_error_is_set(error))
                 return sd_bus_reply_method_error(c, error);
 
-        fifo_fd = session_create_fifo(s);
-        if (fifo_fd < 0)
-                return fifo_fd;
+        /* Prior to v258, logind tracked sessions by installing a fifo in client and subscribe to its EOF.
+         * Now we can fully rely on pidfd for this, but still need to return *something* to the client.
+         * Allocate something lightweight and isolated as placeholder. */
+        _cleanup_close_ int fd = eventfd(0, EFD_CLOEXEC);
+        if (fd < 0)
+                return -errno;
 
-        /* Update the session state file before we notify the client about the result. */
-        session_save(s);
-
-        p = session_bus_path(s);
+        _cleanup_free_ char *p = session_bus_path(s);
         if (!p)
                 return -ENOMEM;
 
-        log_debug("Sending reply about created session: "
-                  "id=%s object_path=%s uid=%u runtime_path=%s "
-                  "session_fd=%d seat=%s vtnr=%u",
+        log_debug("Sending D-Bus reply about created session: "
+                  "id=%s object_path=%s uid=" UID_FMT " runtime_path=%s seat=%s vtnr=%u",
                   s->id,
                   p,
-                  (uint32_t) s->user->user_record->uid,
+                  s->user->user_record->uid,
                   s->user->runtime_path,
-                  fifo_fd,
                   s->seat ? s->seat->id : "",
-                  (uint32_t) s->vtnr);
+                  s->vtnr);
 
         return sd_bus_reply_method_return(
                         c, "soshusub",
                         s->id,
                         p,
                         s->user->runtime_path,
-                        fifo_fd,
+                        fd, /* not really used - see comments above */
                         (uint32_t) s->user->user_record->uid,
                         s->seat ? s->seat->id : "",
                         (uint32_t) s->vtnr,
                         false);
 }
 
-int session_send_upgrade_reply(Session *s, sd_bus_error *error) {
+int session_send_upgrade_reply(Session *s, const sd_bus_error *error) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *c = NULL;
         assert(s);
 
@@ -975,6 +993,7 @@ static const sd_bus_vtable session_vtable[] = {
         SD_BUS_PROPERTY("Desktop", "s", NULL, offsetof(Session, desktop), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Scope", "s", NULL, offsetof(Session, scope), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Leader", "u", bus_property_get_pid, offsetof(Session, leader.pid), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("LeaderPIDFDId", "t", bus_property_get_pidfdid, offsetof(Session, leader), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Audit", "u", NULL, offsetof(Session, audit_id), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Type", "s", property_get_type, offsetof(Session, type), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("Class", "s", property_get_class, offsetof(Session, class), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
@@ -983,6 +1002,8 @@ static const sd_bus_vtable session_vtable[] = {
         SD_BUS_PROPERTY("IdleHint", "b", property_get_idle_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("IdleSinceHint", "t", property_get_idle_since_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("IdleSinceHintMonotonic", "t", property_get_idle_since_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("CanIdle", "b", property_get_can_idle, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("CanLock", "b", property_get_can_lock, 0, SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("LockedHint", "b", property_get_locked_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 
         SD_BUS_METHOD("Terminate",
@@ -1016,7 +1037,7 @@ static const sd_bus_vtable session_vtable[] = {
                                 method_set_locked_hint,
                                 SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD_WITH_ARGS("Kill",
-                                SD_BUS_ARGS("s", who, "i", signal_number),
+                                SD_BUS_ARGS("s", whom, "i", signal_number),
                                 SD_BUS_NO_RESULT,
                                 bus_session_method_kill,
                                 SD_BUS_VTABLE_UNPRIVILEGED),

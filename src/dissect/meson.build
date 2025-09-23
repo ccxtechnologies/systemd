@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+if conf.get('HAVE_BLKID') != 1
+        subdir_done()
+endif
+
 executables += [
         executable_template + {
                 'name' : 'systemd-dissect',
                 'public' : true,
-                'conditions' : ['HAVE_BLKID'],
                 'sources' : files('dissect.c'),
         },
 ]
 
-if conf.get('HAVE_BLKID') == 1
-        install_emptydir(sbindir)
-        meson.add_install_script(sh, '-c',
-                                 ln_s.format(bindir / 'systemd-dissect',
-                                             sbindir / 'mount.ddi'))
-endif
+install_symlink('mount.ddi',
+                pointing_to : sbin_to_bin + 'systemd-dissect',
+                install_dir : sbindir)

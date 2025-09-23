@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-
-#include "errno-list.h"
-#include "macro.h"
+#include "forward.h"
 
 typedef enum Virtualization {
         VIRTUALIZATION_NONE = 0,
@@ -65,6 +62,6 @@ Virtualization detect_virtualization(void);
 int running_in_userns(void);
 int running_in_chroot(void);
 
-const char *virtualization_to_string(Virtualization v) _const_;
+const char* virtualization_to_string(Virtualization v) _const_;
 Virtualization virtualization_from_string(const char *s) _pure_;
 bool has_cpu_with_flag(const char *flag);

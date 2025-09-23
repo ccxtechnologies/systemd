@@ -1,10 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "alloc-util.h"
+#include "bus-util.h"
 #include "format-table.h"
+#include "hostname-util.h"
+#include "log.h"
 #include "parse-argument.h"
+#include "parse-util.h"
 #include "path-util.h"
 #include "signal-util.h"
-#include "stdio-util.h"
 #include "string-table.h"
 #include "string-util.h"
 
@@ -31,16 +35,36 @@ int parse_boolean_argument(const char *optname, const char *s, bool *ret) {
         }
 }
 
-int parse_json_argument(const char *s, JsonFormatFlags *ret) {
+int parse_tristate_argument(const char *optname, const char *s, int *ret) {
+        int r;
+
+        if (s) {
+                r = parse_boolean(s);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse boolean argument to %s: %s.", optname, s);
+
+                if (ret)
+                        *ret = r;
+
+                return r;
+        } else {
+                if (ret)
+                        *ret = -1;
+
+                return 0;
+        }
+}
+
+int parse_json_argument(const char *s, sd_json_format_flags_t *ret) {
         assert(s);
         assert(ret);
 
         if (streq(s, "pretty"))
-                *ret = JSON_FORMAT_PRETTY|JSON_FORMAT_COLOR_AUTO;
+                *ret = SD_JSON_FORMAT_PRETTY|SD_JSON_FORMAT_COLOR_AUTO;
         else if (streq(s, "short"))
-                *ret = JSON_FORMAT_NEWLINE;
+                *ret = SD_JSON_FORMAT_NEWLINE;
         else if (streq(s, "off"))
-                *ret = JSON_FORMAT_OFF;
+                *ret = SD_JSON_FORMAT_OFF;
         else if (streq(s, "help")) {
                 puts("pretty\n"
                      "short\n"
@@ -120,4 +144,24 @@ int parse_signal_argument(const char *s, int *ret) {
 
         *ret = r;
         return 1; /* work to do */
+}
+
+int parse_machine_argument(const char *s, const char **ret_host, BusTransport *ret_transport) {
+        int r;
+
+        assert(s);
+        assert(ret_host);
+
+        r = machine_spec_valid(s);
+        if (r < 0)
+                return log_error_errno(r, "Failed to validate --machine= argument '%s': %m", s);
+        if (r == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid --machine= specified: %s", s);
+
+        *ret_host = s;
+
+        if (ret_transport)
+                *ret_transport = BUS_TRANSPORT_MACHINE;
+
+        return 0;
 }

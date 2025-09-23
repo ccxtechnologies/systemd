@@ -1,18 +1,25 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
+#include "alloc-util.h"
+#include "analyze.h"
 #include "analyze-plot.h"
 #include "analyze-time-data.h"
-#include "analyze.h"
 #include "bus-error.h"
 #include "bus-map-properties.h"
+#include "bus-util.h"
 #include "format-table.h"
 #include "os-util.h"
+#include "runtime-scope.h"
 #include "sort-util.h"
+#include "string-util.h"
 #include "strv.h"
+#include "time-util.h"
 #include "unit-def.h"
 #include "version.h"
 
-#define SCALE_X (0.1 / 1000.0) /* pixels per us */
+#define SCALE_X (0.1 * arg_svg_timescale / 1000.0) /* pixels per us */
 #define SCALE_Y (20.0)
 
 #define svg(...) printf(__VA_ARGS__)
@@ -30,6 +37,8 @@
                 svg("</text>\n");                                       \
         } while (false)
 
+#define svg_timestamp(b, t, y) \
+        svg_text(b, t, y, "%u.%03us", (unsigned)((t) / USEC_PER_SEC), (unsigned)(((t) % USEC_PER_SEC) / USEC_PER_MSEC))
 
 typedef struct HostInfo {
         char *hostname;
@@ -166,6 +175,8 @@ static void plot_tooltip(const UnitTimes *ut) {
         assert(ut->name);
 
         svg("%s:\n", ut->name);
+        svg("Activating: %"PRI_USEC".%.3"PRI_USEC"\n", ut->activating / USEC_PER_SEC, ut->activating % USEC_PER_SEC);
+        svg("Activated: %"PRI_USEC".%.3"PRI_USEC"\n", ut->activated / USEC_PER_SEC, ut->activated % USEC_PER_SEC);
 
         UnitDependency i;
         FOREACH_ARGUMENT(i, UNIT_AFTER, UNIT_BEFORE, UNIT_REQUIRES, UNIT_REQUISITE, UNIT_WANTS, UNIT_CONFLICTS, UNIT_UPHOLDS)
@@ -366,6 +377,8 @@ static int produce_plot_as_svg(
         svg_bar("generators", boot->generators_start_time, boot->generators_finish_time, y);
         svg_bar("unitsload", boot->unitsload_start_time, boot->unitsload_finish_time, y);
         svg_text(true, boot->userspace_time, y, "systemd");
+        if (arg_detailed_svg)
+                svg_timestamp(false, boot->userspace_time, y);
         y++;
 
         for (; u->has_data; u++)
@@ -413,8 +426,8 @@ static int show_table(Table *table, const char *word) {
         if (!table_isempty(table)) {
                 table_set_header(table, arg_legend);
 
-                if (!FLAGS_SET(arg_json_format_flags, JSON_FORMAT_OFF))
-                        r = table_print_json(table, NULL, arg_json_format_flags | JSON_FORMAT_COLOR_AUTO);
+                if (sd_json_format_enabled(arg_json_format_flags))
+                        r = table_print_json(table, NULL, arg_json_format_flags | SD_JSON_FORMAT_COLOR_AUTO);
                 else
                         r = table_print(table, NULL);
                 if (r < 0)
@@ -468,7 +481,7 @@ int verb_plot(int argc, char *argv[], void *userdata) {
 
         r = acquire_bus(&bus, &use_full_bus);
         if (r < 0)
-                return bus_log_connect_error(r, arg_transport);
+                return bus_log_connect_error(r, arg_transport, arg_runtime_scope);
 
         n = acquire_boot_times(bus, /* require_finished = */ true, &boot);
         if (n < 0)
@@ -490,7 +503,7 @@ int verb_plot(int argc, char *argv[], void *userdata) {
 
         typesafe_qsort(times, n, compare_unit_start);
 
-        if (!FLAGS_SET(arg_json_format_flags, JSON_FORMAT_OFF) || arg_table)
+        if (sd_json_format_enabled(arg_json_format_flags) || arg_table)
                 r = produce_plot_as_text(times, boot);
         else
                 r = produce_plot_as_svg(times, host, boot, pretty_times);

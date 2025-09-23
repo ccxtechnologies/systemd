@@ -31,6 +31,8 @@ systemd-analyze plot --json=short --no-legend >/dev/null || :
 systemd-analyze plot --json=off --no-legend >/dev/null || :
 systemd-analyze plot --table >/dev/null || :
 systemd-analyze plot --table --no-legend >/dev/null || :
+systemd-analyze plot --scale-svg=1.0 >/dev/null || :
+systemd-analyze plot --scale-svg=1.0 --detailed >/dev/null || :
 (! systemd-analyze plot --global)
 # legacy/deprecated options (moved to systemctl, but still usable from analyze)
 systemd-analyze log-level
@@ -105,6 +107,15 @@ systemd-analyze capability cap_chown CAP_KILL
 systemd-analyze capability 0 1 {30..32}
 (! systemd-analyze capability cap_chown CAP_KILL "hello*")
 (! systemd-analyze capability --global)
+systemd-analyze capability -m 0000000000003c00
+(! systemd-analyze capability -m 8000000000000000)
+cap="$(systemd-analyze capability -m 0000000000003c00)"
+[[ $cap != *cap_linux_immutable* ]]
+[[ $cap == *cap_net_bind_service* ]]
+[[ $cap == *cap_net_broadcast* ]]
+[[ $cap == *cap_net_admin* ]]
+[[ $cap == *cap_net_raw* ]]
+[[ $cap != *cap_ipc_lock* ]]
 # condition
 mkdir -p /run/systemd/system
 UNIT_NAME="analyze-condition-$RANDOM.service"
@@ -161,6 +172,12 @@ systemd-analyze calendar --base-time=yesterday --iterations=5 '*-* *:*:*'
 systemd-analyze timestamp now
 systemd-analyze timestamp -- -1
 systemd-analyze timestamp yesterday now tomorrow
+systemd-analyze timestamp 'Fri 2012-11-23 23:02:15'
+systemd-analyze timestamp 'Fri 2012-11-23 23:02:15 UTC'
+for i in $(timedatectl list-timezones); do
+    [[ -e "/usr/share/zoneinfo/$i" ]] || continue
+    systemd-analyze timestamp "Fri 2012-11-23 23:02:15 $i"
+done
 (! systemd-analyze timestamp yesterday never tomorrow)
 (! systemd-analyze timestamp 1)
 (! systemd-analyze timestamp '*-2-29 0:0:0')
@@ -185,6 +202,105 @@ systemd-analyze cat-config --tldr /etc/systemd/system.conf >/dev/null
 systemd-analyze cat-config --tldr systemd/system.conf systemd/journald.conf >/dev/null
 systemd-analyze cat-config --tldr systemd/system.conf foo/bar systemd/journald.conf >/dev/null
 systemd-analyze cat-config --tldr foo/bar
+mkdir -p /run/test-analyze-cat-config/main.conf.d
+cat >/run/test-analyze-cat-config/main.conf <<EOF
+#  This file is part of systemd.
+#
+#  systemd is free software; you can redistribute it and/or modify it under the
+#  terms of the GNU Lesser General Public License as published by the Free
+#  Software Foundation; either version 2.1 of the License, or (at your option)
+#  any later version.
+#
+# Entries in this file show the compile time defaults. Local configuration
+# should be created by either modifying this file (or a copy of it placed in
+# /etc/ if the original file is shipped in /usr/), or by creating "drop-ins" in
+# the /etc/systemd/networkd.conf.d/ directory. The latter is generally
+# recommended. Defaults can be restored by simply deleting the main
+# configuration file and all drop-ins located in /etc/.
+#
+# Use 'systemd-analyze cat-config systemd/networkd.conf' to display the full config.
+#
+# See networkd.conf(5) for details.
+
+[Network]
+#SpeedMeter=no
+#SpeedMeterIntervalSec=10sec
+#ManageForeignRoutingPolicyRules=yes
+#ManageForeignRoutes=yes
+#ManageForeignNextHops=yes
+#RouteTable=
+#IPv4Forwarding=
+#IPv6Forwarding=
+#IPv6PrivacyExtensions=no
+#UseDomains=no
+
+#[IPv6AddressLabel]
+#Prefix=
+#Label=
+
+[IPv6AcceptRA]
+#UseDomains=
+
+[DHCPv4]
+ClientIdentifier=duid
+#DUIDType=vendor
+#DUIDRawData=
+#UseDomains=
+
+[DHCPv6]
+#DUIDType=vendor
+#DUIDRawData=
+#UseDomains=
+
+[DHCPServer]
+PersistLeases=yes
+EOF
+cat >/run/test-analyze-cat-config/main.conf.d/override.conf <<EOF
+[DHCPServer]
+PersistLeases=no
+
+[Network]
+[Network]
+[Network]
+SpeedMeter=yes
+
+Continuation=foo \\
+             bar \\
+# comment
+             hogehoge \\
+             \\
+             aaa \\
+
+
+             bbb
+AAAA=bbbb
+EOF
+diff -u <(echo '# /run/test-analyze-cat-config/main.conf'
+          cat /run/test-analyze-cat-config/main.conf
+          echo
+          echo '# /run/test-analyze-cat-config/main.conf.d/override.conf'
+          cat /run/test-analyze-cat-config/main.conf.d/override.conf) \
+         <(systemd-analyze cat-config test-analyze-cat-config/main.conf)
+diff -u - <<EOF <(systemd-analyze --tldr cat-config test-analyze-cat-config/main.conf)
+# /run/test-analyze-cat-config/main.conf
+[DHCPv4]
+ClientIdentifier=duid
+[DHCPServer]
+PersistLeases=yes
+
+# /run/test-analyze-cat-config/main.conf.d/override.conf
+[DHCPServer]
+PersistLeases=no
+[Network]
+SpeedMeter=yes
+Continuation=foo \\
+             bar \\
+             hogehoge \\
+             aaa \\
+             bbb
+AAAA=bbbb
+EOF
+rm -rf /run/test-analyze-cat-config
 (! systemd-analyze cat-config --global systemd/system.conf)
 # security
 systemd-analyze security
@@ -197,6 +313,7 @@ if [[ ! -v ASAN_OPTIONS ]]; then
     # check that systemd-analyze cat-config paths work in a chroot
     mkdir -p /tmp/root
     mount --bind / /tmp/root
+    mount -t proc proc /tmp/root/proc
     if mountpoint -q /usr; then
         mount --bind /usr /tmp/root/usr
     fi
@@ -369,6 +486,35 @@ EOF
 systemd-analyze verify /tmp/multi-exec-start.service
 echo 'ExecStart=command-should-not-exist' >>/tmp/multi-exec-start.service
 (! systemd-analyze verify /tmp/multi-exec-start.service)
+
+# Prevent regression from #20233 where systemd-analyze will return nonzero exit codes on warnings
+
+# Unit file with warning "Unknown key name 'foo' in section 'Unit', ignoring"
+cat <<EOF >/tmp/testwarnings.service
+[Unit]
+Foo=Bar
+
+[Service]
+ExecStart=echo hello
+EOF
+
+# yes/no/one should all return nonzero exit status for warnings in unit file
+(! systemd-analyze verify --recursive-errors=yes /tmp/testwarnings.service)
+
+(! systemd-analyze verify --recursive-errors=no /tmp/testwarnings.service)
+
+(! systemd-analyze verify --recursive-errors=one /tmp/testwarnings.service)
+
+# zero exit status since no errors and only warnings
+systemd-analyze verify /tmp/testwarnings.service
+
+rm /tmp/testwarnings.service
+
+TESTDATA=/usr/lib/systemd/tests/testdata/TEST-65-ANALYZE.units
+systemd-analyze verify "${TESTDATA}/loopy.service"
+systemd-analyze verify "${TESTDATA}/loopy2.service"
+systemd-analyze verify "${TESTDATA}/loopy3.service"
+systemd-analyze verify "${TESTDATA}/loopy4.service"
 
 # Added an additional "INVALID_ID" id to the .json to verify that nothing breaks when input is malformed
 # The PrivateNetwork id description and weight was changed to verify that 'security' is actually reading in
@@ -842,13 +988,13 @@ systemd-analyze security --threshold=90 --offline=true \
                            --security-policy=/tmp/testfile.json \
                            --root=/tmp/img/ testfile.service
 
-# The strict profile adds a lot of sanboxing options
+# The strict profile adds a lot of sandboxing options
 systemd-analyze security --threshold=25 --offline=true \
                            --security-policy=/tmp/testfile.json \
                            --profile=strict \
                            --root=/tmp/img/ testfile.service
 
-# The trusted profile doesn't add any sanboxing options
+# The trusted profile doesn't add any sandboxing options
 (! systemd-analyze security --threshold=25 --offline=true \
                            --security-policy=/tmp/testfile.json \
                            --profile=/usr/lib/systemd/portable/profile/trusted/service.conf \
@@ -946,6 +1092,60 @@ systemd-analyze architectures x86
 systemd-analyze architectures x86-64
 systemd-analyze architectures native
 systemd-analyze architectures uname
+
+systemd-analyze smbios11
+systemd-analyze smbios11 -q
+
+if test -f /sys/class/dmi/id/board_vendor && ! systemd-detect-virt --container ; then
+    systemd-analyze chid
+    systemd-analyze chid --json=pretty
+fi
+
+systemd-analyze condition --instance=tmp --unit=systemd-growfs@.service
+systemd-analyze verify --instance=tmp --man=no systemd-growfs@.service
+systemd-analyze security --instance=tmp systemd-growfs@.service
+
+systemd-analyze has-tpm2 ||:
+if systemd-analyze has-tpm2 -q ; then
+    echo "have tpm2"
+else
+    echo "have no tpm2"
+fi
+
+# Test "transient-settings" verb
+
+# shellcheck disable=SC2046
+systemd-analyze --no-pager transient-settings $(systemctl --no-legend --no-pager -t help)
+systemd-analyze transient-settings service | grep NoNewPrivileges
+systemd-analyze transient-settings mount | grep CPUQuotaPeriodSec
+# make sure deprecated names are not printed
+(! systemd-analyze transient-settings service | grep CPUAccounting )
+(! systemd-analyze transient-settings service | grep ConditionKernelVersion )
+(! systemd-analyze transient-settings service | grep AssertKernelVersion )
+(! systemd-analyze transient-settings service socket timer path slice scope mount automount | grep -E 'Ex$' )
+
+# check systemd-analyze unit-shell with a namespaced unit
+UNIT_NAME="test-unit-shell.service"
+UNIT_FILE="/run/systemd/system/$UNIT_NAME"
+cat >"$UNIT_FILE" <<EOF
+[Unit]
+Description=Test unit for systemd-analyze unit-shell
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/bin/sh -c "echo 'Hello from test unit' >/tmp/testfile; systemd-notify --ready; sleep infinity"
+PrivateTmp=disconnected
+EOF
+# Start the service
+systemctl start "$UNIT_NAME"
+# Wait for the service to be active
+systemctl is-active --quiet "$UNIT_NAME"
+# Verify the service is active and has a MainPID
+MAIN_PID=$(systemctl show -p MainPID --value "$UNIT_NAME")
+[ "$MAIN_PID" -gt 0 ]
+# Test systemd-analyze unit-shell with a command (cat /tmp/testfile)
+OUTPUT=$(systemd-analyze unit-shell "$UNIT_NAME" cat /tmp/testfile)
+assert_in "Hello from test unit" "$OUTPUT"
 
 systemd-analyze log-level info
 

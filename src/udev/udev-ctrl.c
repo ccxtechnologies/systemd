@@ -1,10 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <poll.h>
-#include <stddef.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -15,6 +11,7 @@
 #include "fd-util.h"
 #include "format-util.h"
 #include "iovec-util.h"
+#include "log.h"
 #include "socket-util.h"
 #include "strxcpyx.h"
 #include "udev-ctrl.h"
@@ -47,6 +44,7 @@ struct UdevCtrl {
 int udev_ctrl_new_from_fd(UdevCtrl **ret, int fd) {
         _cleanup_close_ int sock = -EBADF;
         UdevCtrl *uctrl;
+        int r;
 
         assert(ret);
 
@@ -55,6 +53,15 @@ int udev_ctrl_new_from_fd(UdevCtrl **ret, int fd) {
                 if (sock < 0)
                         return log_error_errno(errno, "Failed to create socket: %m");
         }
+
+        /* enable receiving of the sender credentials in the messages */
+        r = setsockopt_int(fd >= 0 ? fd : sock, SOL_SOCKET, SO_PASSCRED, true);
+        if (r < 0)
+                log_warning_errno(r, "Failed to set SO_PASSCRED, ignoring: %m");
+
+        r = setsockopt_int(fd >= 0 ? fd : sock, SOL_SOCKET, SO_PASSRIGHTS, false);
+        if (r < 0)
+                log_debug_errno(r, "Failed to turn off SO_PASSRIGHTS, ignoring: %m");
 
         uctrl = new(UdevCtrl, 1);
         if (!uctrl)
@@ -72,7 +79,7 @@ int udev_ctrl_new_from_fd(UdevCtrl **ret, int fd) {
                 .sun_path = "/run/udev/control",
         };
 
-        uctrl->addrlen = SOCKADDR_UN_LEN(uctrl->saddr.un);
+        uctrl->addrlen = sockaddr_un_len(&uctrl->saddr.un);
 
         *ret = TAKE_PTR(uctrl);
         return 0;
@@ -169,33 +176,40 @@ static int udev_ctrl_connection_event_handler(sd_event_source *s, int fd, uint32
          * To avoid the object freed, let's increment the refcount. */
         uctrl = udev_ctrl_ref(userdata);
 
-        size = next_datagram_size_fd(fd);
-        if (size < 0)
-                return log_error_errno(size, "Failed to get size of message: %m");
-        if (size == 0)
-                return 0; /* Client disconnects? */
-
         size = recvmsg_safe(fd, &smsg, 0);
-        if (size == -EINTR)
+        if (ERRNO_IS_NEG_TRANSIENT(size))
                 return 0;
+        if (size == -ECHRNG) {
+                log_warning_errno(size, "Got message with truncated control data (unexpected fds sent?), ignoring.");
+                return 0;
+        }
+        if (size == -EXFULL) {
+                log_warning_errno(size, "Got message with truncated payload data, ignoring.");
+                return 0;
+        }
         if (size < 0)
                 return log_error_errno(size, "Failed to receive ctrl message: %m");
 
         cmsg_close_all(&smsg);
 
+        if (size != sizeof(msg_wire)) {
+                log_warning("Received message with invalid length, ignoring");
+                return 0;
+        }
+
         cred = CMSG_FIND_DATA(&smsg, SOL_SOCKET, SCM_CREDENTIALS, struct ucred);
         if (!cred) {
-                log_error("No sender credentials received, ignoring message");
+                log_warning("No sender credentials received, ignoring message");
                 return 0;
         }
 
         if (cred->uid != 0) {
-                log_error("Invalid sender uid "UID_FMT", ignoring message", cred->uid);
+                log_warning("Invalid sender uid "UID_FMT", ignoring message", cred->uid);
                 return 0;
         }
 
         if (msg_wire.magic != UDEV_CTRL_MAGIC) {
-                log_error("Message magic 0x%08x doesn't match, ignoring message", msg_wire.magic);
+                log_warning("Message magic 0x%08x doesn't match, ignoring message", msg_wire.magic);
                 return 0;
         }
 
@@ -235,11 +249,6 @@ static int udev_ctrl_event_handler(sd_event_source *s, int fd, uint32_t revents,
                 log_error("Invalid sender uid "UID_FMT", closing connection", ucred.uid);
                 return 0;
         }
-
-        /* enable receiving of the sender credentials in the messages */
-        r = setsockopt_int(sock, SOL_SOCKET, SO_PASSCRED, true);
-        if (r < 0)
-                log_warning_errno(r, "Failed to set SO_PASSCRED, ignoring: %m");
 
         r = sd_event_add_io(uctrl->event, &uctrl->event_source_connect, sock, EPOLLIN, udev_ctrl_connection_event_handler, uctrl);
         if (r < 0) {
@@ -285,7 +294,7 @@ int udev_ctrl_start(UdevCtrl *uctrl, udev_ctrl_handler_t callback, void *userdat
 
 int udev_ctrl_send(UdevCtrl *uctrl, UdevCtrlMessageType type, const void *data) {
         UdevCtrlMessageWire ctrl_msg_wire = {
-                .version = "udev-" STRINGIFY(PROJECT_VERSION),
+                .version = "udev-" PROJECT_VERSION_STR,
                 .magic = UDEV_CTRL_MAGIC,
                 .type = type,
         };

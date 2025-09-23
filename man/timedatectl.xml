@@ -78,10 +78,10 @@
       <varlistentry>
         <term><command>set-time [TIME]</command></term>
 
-        <listitem><para>Set the system clock to the specified time.
-        This will also update the RTC time accordingly. The time may
-        be specified in the format "2012-10-30
-        18:17:16".</para>
+        <listitem><para>Set the system clock to the specified timestamp. This will also update the RTC time
+        accordingly. The timestamp may be specified in the format <literal>2012-10-30 18:17:16</literal>. See
+        <citerefentry><refentrytitle>systemd.time</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+        for more details about acceptable timestamp format.</para>
 
         <xi:include href="version-info.xml" xpointer="v195"/></listitem>
       </varlistentry>
@@ -207,15 +207,6 @@
 
     <variablelist>
       <varlistentry>
-        <term><option>--no-ask-password</option></term>
-
-        <listitem><para>Do not query the user for authentication for
-        privileged operations.</para>
-
-        <xi:include href="version-info.xml" xpointer="v195"/></listitem>
-      </varlistentry>
-
-      <varlistentry>
         <term><option>--adjust-system-clock</option></term>
 
         <listitem><para>If <command>set-local-rtc</command> is invoked
@@ -285,6 +276,7 @@
       <xi:include href="user-system-options.xml" xpointer="host" />
       <xi:include href="user-system-options.xml" xpointer="machine" />
 
+      <xi:include href="standard-options.xml" xpointer="no-ask-password" />
       <xi:include href="standard-options.xml" xpointer="help" />
       <xi:include href="standard-options.xml" xpointer="version" />
       <xi:include href="standard-options.xml" xpointer="no-pager" />

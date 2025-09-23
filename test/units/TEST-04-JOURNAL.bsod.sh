@@ -4,12 +4,12 @@ set -eux
 set -o pipefail
 
 if systemd-detect-virt -cq; then
-    echo "This test requires a VM, skipping the test" | tee --append /skipped
+    echo "This test requires a VM, skipping the test"
     exit 0
 fi
 
 if [[ ! -x /usr/lib/systemd/systemd-bsod ]]; then
-    echo "systemd-bsod is not installed, skipping the test" | tee --append /skipped
+    echo "systemd-bsod is not installed, skipping the test"
     exit 0
 fi
 
@@ -89,7 +89,7 @@ journalctl --sync
 SYSTEMD_COLORS=256 /usr/lib/systemd/systemd-bsod &
 PID=$!
 vcs_dump_and_check "Root emergency message"
-grep -aq "Scan the QR code" /tmp/console.dump
+grep -aq "Scan the error message" /tmp/console.dump
 # TODO: check if systemd-bsod exits on a key press (didn't figure this one out yet)
 kill $PID
 timeout 10 bash -c "while kill -0 $PID; do sleep .5; done"

@@ -4,10 +4,13 @@
 #include <getopt.h>
 #include <locale.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
 #include "sd-journal.h"
+#include "sd-json.h"
 #include "sd-messages.h"
 
 #include "alloc-util.h"
@@ -17,17 +20,22 @@
 #include "bus-util.h"
 #include "chase.h"
 #include "compress.h"
-#include "constants.h"
 #include "dissect-image.h"
+#include "errno-util.h"
 #include "escape.h"
+#include "extract-word.h"
 #include "fd-util.h"
 #include "format-table.h"
+#include "format-util.h"
 #include "fs-util.h"
 #include "glob-util.h"
+#include "image-policy.h"
 #include "journal-internal.h"
 #include "journal-util.h"
+#include "json-util.h"
 #include "log.h"
-#include "macro.h"
+#include "logs-show.h"
+#include "loop-util.h"
 #include "main-func.h"
 #include "mount-util.h"
 #include "pager.h"
@@ -36,12 +44,11 @@
 #include "path-util.h"
 #include "pretty-print.h"
 #include "process-util.h"
-#include "rlimit-util.h"
-#include "sigbus.h"
 #include "signal-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
 #include "user-util.h"
 #include "verbs.h"
@@ -56,7 +63,7 @@ static const char *arg_directory = NULL;
 static char *arg_root = NULL;
 static char *arg_image = NULL;
 static char **arg_file = NULL;
-static JsonFormatFlags arg_json_format_flags = JSON_FORMAT_OFF;
+static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 static PagerFlags arg_pager_flags = 0;
 static int arg_legend = true;
 static size_t arg_rows_max = SIZE_MAX;
@@ -804,26 +811,26 @@ static int print_info(FILE *file, sd_journal *j, bool need_space) {
         /* Print out the build-id of the 'main' ELF module, by matching the JSON key
          * with the 'exe' field. */
         if (exe && pkgmeta_json) {
-                _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
 
-                r = json_parse(pkgmeta_json, 0, &v, NULL, NULL);
+                r = sd_json_parse(pkgmeta_json, 0, &v, NULL, NULL);
                 if (r < 0) {
                         _cleanup_free_ char *esc = cescape(pkgmeta_json);
                         log_warning_errno(r, "json_parse on \"%s\" failed, ignoring: %m", strnull(esc));
                 } else {
                         const char *module_name;
-                        JsonVariant *module_json;
+                        sd_json_variant *module_json;
 
                         JSON_VARIANT_OBJECT_FOREACH(module_name, module_json, v) {
-                                JsonVariant *build_id;
+                                sd_json_variant *build_id;
 
                                 /* We only print the build-id for the 'main' ELF module */
                                 if (!path_equal_filename(module_name, exe))
                                         continue;
 
-                                build_id = json_variant_by_key(module_json, "buildId");
+                                build_id = sd_json_variant_by_key(module_json, "buildId");
                                 if (build_id)
-                                        fprintf(file, "      build-id: %s\n", json_variant_string(build_id));
+                                        fprintf(file, "      build-id: %s\n", sd_json_variant_string(build_id));
 
                                 break;
                         }
@@ -1157,24 +1164,15 @@ static int dump_core(int argc, char **argv, void *userdata) {
         return 0;
 }
 
-static void sigterm_handler(int signal, siginfo_t *info, void *ucontext) {
-        assert(signal == SIGTERM);
-        assert(info);
-
-        /* If the sender is not us, propagate the signal to all processes in
-         * the same process group */
-        if (pid_is_valid(info->si_pid) && info->si_pid != getpid_cached())
-                (void) kill(0, signal);
-}
-
 static int run_debug(int argc, char **argv, void *userdata) {
+        static const struct sigaction sa = {
+                .sa_sigaction = sigterm_process_group_handler,
+                .sa_flags = SA_SIGINFO,
+        };
+
         _cleanup_(sd_journal_closep) sd_journal *j = NULL;
         _cleanup_free_ char *exe = NULL, *path = NULL;
         _cleanup_strv_free_ char **debugger_call = NULL;
-        struct sigaction sa = {
-                .sa_sigaction = sigterm_handler,
-                .sa_flags = SA_SIGINFO,
-        };
         bool unlink_path = false;
         const char *data, *fork_name;
         size_t len;
@@ -1376,14 +1374,11 @@ static int run(int argc, char *argv[]) {
         setlocale(LC_ALL, "");
         log_setup();
 
-        /* The journal merging logic potentially needs a lot of fds. */
-        (void) rlimit_nofile_bump(HIGH_RLIMIT_NOFILE);
-
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
 
-        sigbus_install();
+        journal_browse_prepare();
 
         units_active = check_units_active(); /* error is treated the same as 0 */
 

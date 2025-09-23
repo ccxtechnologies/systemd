@@ -1,10 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-typedef struct Timer Timer;
-typedef struct ActivationDetailsTimer ActivationDetailsTimer;
-
-#include "calendarspec.h"
+#include "core-forward.h"
 #include "unit.h"
 
 typedef enum TimerBase {
@@ -37,11 +34,12 @@ typedef enum TimerResult {
         _TIMER_RESULT_INVALID = -EINVAL,
 } TimerResult;
 
-struct Timer {
+typedef struct Timer {
         Unit meta;
 
         usec_t accuracy_usec;
-        usec_t random_usec;
+        usec_t random_delay_usec;
+        usec_t random_offset_usec;
 
         LIST_HEAD(TimerValue, values);
         usec_t next_elapse_realtime;
@@ -61,14 +59,15 @@ struct Timer {
         bool on_clock_change;
         bool on_timezone_change;
         bool fixed_random_delay;
+        bool defer_reactivation;
 
         char *stamp_path;
-};
+} Timer;
 
-struct ActivationDetailsTimer {
+typedef struct ActivationDetailsTimer {
         ActivationDetails meta;
         dual_timestamp last_trigger;
-};
+} ActivationDetailsTimer;
 
 #define TIMER_MONOTONIC_CLOCK(t) ((t)->wake_system ? CLOCK_BOOTTIME_ALARM : CLOCK_MONOTONIC)
 
@@ -79,7 +78,7 @@ void timer_free_values(Timer *t);
 extern const UnitVTable timer_vtable;
 extern const ActivationDetailsVTable activation_details_timer_vtable;
 
-const char *timer_base_to_string(TimerBase i) _const_;
+const char* timer_base_to_string(TimerBase i) _const_;
 TimerBase timer_base_from_string(const char *s) _pure_;
 
 char* timer_base_to_usec_string(TimerBase i);

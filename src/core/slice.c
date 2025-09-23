@@ -1,19 +1,19 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
+#include <stdio.h>
 
 #include "alloc-util.h"
 #include "dbus-slice.h"
 #include "dbus-unit.h"
-#include "fd-util.h"
 #include "log.h"
+#include "manager.h"
 #include "serialize.h"
 #include "slice.h"
 #include "special.h"
 #include "string-util.h"
 #include "strv.h"
-#include "unit-name.h"
 #include "unit.h"
+#include "unit-name.h"
 
 static const UnitActiveState state_translation_table[_SLICE_STATE_MAX] = {
         [SLICE_DEAD]   = UNIT_INACTIVE,
@@ -21,10 +21,13 @@ static const UnitActiveState state_translation_table[_SLICE_STATE_MAX] = {
 };
 
 static void slice_init(Unit *u) {
-        assert(u);
+        Slice *s = ASSERT_PTR(SLICE(u));
+
         assert(u->load_state == UNIT_STUB);
 
         u->ignore_on_isolate = true;
+        s->concurrency_hard_max = UINT_MAX;
+        s->concurrency_soft_max = UINT_MAX;
 }
 
 static void slice_set_state(Slice *s, SliceState state) {
@@ -330,7 +333,6 @@ static void slice_enumerate_perpetual(Manager *m) {
                  * means the kernel will track CPU/tasks/memory for us anyway, and it is all available in /proc. Let's
                  * hence turn accounting on here, so that our APIs to query this data are available. */
 
-                s->cgroup_context.cpu_accounting = true;
                 s->cgroup_context.tasks_accounting = true;
                 s->cgroup_context.memory_accounting = true;
         }
@@ -339,32 +341,31 @@ static void slice_enumerate_perpetual(Manager *m) {
                 (void) slice_make_perpetual(m, SPECIAL_SYSTEM_SLICE, NULL);
 }
 
-static bool slice_can_freeze(Unit *s) {
+static bool slice_can_freeze(const Unit *u) {
+        assert(u);
+
         Unit *member;
-
-        assert(s);
-
-        UNIT_FOREACH_DEPENDENCY(member, s, UNIT_ATOM_SLICE_OF)
+        UNIT_FOREACH_DEPENDENCY(member, u, UNIT_ATOM_SLICE_OF)
                 if (!unit_can_freeze(member))
                         return false;
+
         return true;
 }
 
 static int slice_freezer_action(Unit *s, FreezerAction action) {
         FreezerAction child_action;
-        Unit *member;
         int r;
 
         assert(s);
-        assert(IN_SET(action, FREEZER_FREEZE, FREEZER_PARENT_FREEZE,
-                      FREEZER_THAW, FREEZER_PARENT_THAW));
+        assert(action >= 0);
+        assert(action < _FREEZER_ACTION_MAX);
 
         if (action == FREEZER_FREEZE && !slice_can_freeze(s)) {
                 /* We're intentionally only checking for FREEZER_FREEZE here and ignoring the
                  * _BY_PARENT variant. If we're being frozen by parent, that means someone has
                  * already checked if we can be frozen further up the call stack. No point to
                  * redo that work */
-                log_unit_warning(s, "Requested freezer operation is not supported by all children of the slice");
+                log_unit_warning(s, "Requested freezer operation is not supported by all children of the slice.");
                 return 0;
         }
 
@@ -375,17 +376,66 @@ static int slice_freezer_action(Unit *s, FreezerAction action) {
         else
                 child_action = action;
 
-        UNIT_FOREACH_DEPENDENCY(member, s, UNIT_ATOM_SLICE_OF) {
-                if (UNIT_VTABLE(member)->freezer_action)
+        Unit *member;
+        UNIT_FOREACH_DEPENDENCY(member, s, UNIT_ATOM_SLICE_OF)
+                if (UNIT_VTABLE(member)->freezer_action) {
                         r = UNIT_VTABLE(member)->freezer_action(member, child_action);
-                else
-                        /* Only thawing will reach here, since freezing checks for a method in can_freeze */
-                        r = 0;
-                if (r < 0)
-                        return r;
-        }
+                        if (r < 0)
+                                return r;
+                }
 
         return unit_cgroup_freezer_action(s, action);
+}
+
+unsigned slice_get_currently_active(Slice *slice, Unit *ignore, bool with_pending) {
+        Unit *u = ASSERT_PTR(UNIT(slice));
+
+        /* If 'ignore' is non-NULL and a unit contained in this slice (or any below) we'll ignore it when
+         * counting. */
+
+        unsigned n = 0;
+        Unit *member;
+        UNIT_FOREACH_DEPENDENCY(member, u, UNIT_ATOM_SLICE_OF) {
+                if (member == ignore)
+                        continue;
+
+                if (!UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(member)) ||
+                    (with_pending && member->job && IN_SET(member->job->type, JOB_START, JOB_RESTART, JOB_RELOAD)))
+                        n++;
+
+                if (member->type == UNIT_SLICE)
+                        n += slice_get_currently_active(SLICE(member), ignore, with_pending);
+        }
+
+        return n;
+}
+
+bool slice_concurrency_soft_max_reached(Slice *slice, Unit *ignore) {
+        assert(slice);
+
+        if (slice->concurrency_soft_max != UINT_MAX &&
+            slice_get_currently_active(slice, ignore, /* with_pending= */ false) >= slice->concurrency_soft_max)
+                return true;
+
+        Unit *parent = UNIT_GET_SLICE(UNIT(slice));
+        if (parent)
+                return slice_concurrency_soft_max_reached(SLICE(parent), ignore);
+
+        return false;
+}
+
+bool slice_concurrency_hard_max_reached(Slice *slice, Unit *ignore) {
+        assert(slice);
+
+        if (slice->concurrency_hard_max != UINT_MAX &&
+            slice_get_currently_active(slice, ignore, /* with_pending= */ true) >= slice->concurrency_hard_max)
+                return true;
+
+        Unit *parent = UNIT_GET_SLICE(UNIT(slice));
+        if (parent)
+                return slice_concurrency_hard_max_reached(SLICE(parent), ignore);
+
+        return false;
 }
 
 const UnitVTable slice_vtable = {

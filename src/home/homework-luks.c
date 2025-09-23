@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <linux/loop.h>
+#include <linux/magic.h>
 #include <poll.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/xattr.h>
-
+#include <unistd.h>
 #if HAVE_VALGRIND_MEMCHECK_H
 #include <valgrind/memcheck.h>
 #endif
@@ -13,46 +14,54 @@
 #include "sd-daemon.h"
 #include "sd-device.h"
 #include "sd-event.h"
+#include "sd-gpt.h"
 #include "sd-id128.h"
 
 #include "blkid-util.h"
 #include "blockdev-util.h"
 #include "btrfs-util.h"
 #include "chattr-util.h"
+#include "cryptsetup-util.h"
 #include "device-util.h"
 #include "devnum-util.h"
-#include "dm-util.h"
+#include "dissect-image.h"
 #include "env-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fdisk-util.h"
 #include "fileio.h"
 #include "filesystems.h"
+#include "format-util.h"
 #include "fs-util.h"
 #include "fsck-util.h"
 #include "glyph-util.h"
-#include "gpt.h"
 #include "home-util.h"
+#include "homework.h"
 #include "homework-blob.h"
 #include "homework-luks.h"
 #include "homework-mount.h"
+#include "homework-password-cache.h"
 #include "io-util.h"
+#include "json-util.h"
 #include "keyring-util.h"
+#include "loop-util.h"
 #include "memory-util.h"
-#include "missing_magic.h"
 #include "mkdir.h"
 #include "mkfs-util.h"
-#include "mount-util.h"
 #include "openssl-util.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "random-util.h"
 #include "resize-fs.h"
+#include "string-util.h"
 #include "strv.h"
 #include "sync-util.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
 #include "udev-util.h"
+#include "user-record-util.h"
+#include "user-record.h"
 #include "user-util.h"
 
 /* Round down to the nearest 4K size. Given that newer hardware generally prefers 4K sectors, let's align our
@@ -727,7 +736,6 @@ static int luks_validate(
                 if (!streq_ptr(blkid_partition_get_name(pp), label))
                         continue;
 
-
                 r = blkid_partition_get_uuid_id128(pp, &id);
                 if (r < 0)
                         log_debug_errno(r, "Failed to read partition UUID, ignoring: %m");
@@ -825,7 +833,7 @@ static int luks_validate_home_record(
         assert(h);
 
         for (int token = 0; token < sym_crypt_token_max(CRYPT_LUKS2); token++) {
-                _cleanup_(json_variant_unrefp) JsonVariant *v = NULL, *rr = NULL;
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL, *rr = NULL;
                 _cleanup_(EVP_CIPHER_CTX_freep) EVP_CIPHER_CTX *context = NULL;
                 _cleanup_(user_record_unrefp) UserRecord *lhr = NULL;
                 _cleanup_free_ void *encrypted = NULL, *iv = NULL;
@@ -834,8 +842,7 @@ static int luks_validate_home_record(
                 _cleanup_free_ char *decrypted = NULL;
                 const char *text, *type;
                 crypt_token_info state;
-                JsonVariant *jr, *jiv;
-                unsigned line, column;
+                sd_json_variant *jr, *jiv;
                 const EVP_CIPHER *cc;
 
                 state = sym_crypt_token_status(cd, token, &type);
@@ -853,22 +860,23 @@ static int luks_validate_home_record(
                 if (r < 0)
                         return log_error_errno(r, "Failed to read LUKS token %i: %m", token);
 
-                r = json_parse(text, JSON_PARSE_SENSITIVE, &v, &line, &column);
+                unsigned line = 0, column = 0;
+                r = sd_json_parse(text, SD_JSON_PARSE_SENSITIVE, &v, &line, &column);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse LUKS token JSON data %u:%u: %m", line, column);
 
-                jr = json_variant_by_key(v, "record");
+                jr = sd_json_variant_by_key(v, "record");
                 if (!jr)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "LUKS token lacks 'record' field.");
-                jiv = json_variant_by_key(v, "iv");
+                jiv = sd_json_variant_by_key(v, "iv");
                 if (!jiv)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "LUKS token lacks 'iv' field.");
 
-                r = json_variant_unbase64(jr, &encrypted, &encrypted_size);
+                r = sd_json_variant_unbase64(jr, &encrypted, &encrypted_size);
                 if (r < 0)
                         return log_error_errno(r, "Failed to base64 decode record: %m");
 
-                r = json_variant_unbase64(jiv, &iv, &iv_size);
+                r = sd_json_variant_unbase64(jiv, &iv, &iv_size);
                 if (r < 0)
                         return log_error_errno(r, "Failed to base64 decode IV: %m");
 
@@ -906,7 +914,7 @@ static int luks_validate_home_record(
 
                 decrypted[decrypted_size] = 0;
 
-                r = json_parse(decrypted, JSON_PARSE_SENSITIVE, &rr, NULL, NULL);
+                r = sd_json_parse(decrypted, SD_JSON_PARSE_SENSITIVE, &rr, NULL, NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse decrypted JSON record, refusing.");
 
@@ -941,7 +949,7 @@ static int format_luks_token_text(
 
         int r, encrypted_size_out1 = 0, encrypted_size_out2 = 0, iv_size, key_size;
         _cleanup_(EVP_CIPHER_CTX_freep) EVP_CIPHER_CTX *context = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         _cleanup_free_ void *iv = NULL, *encrypted = NULL;
         size_t text_length, encrypted_size;
         _cleanup_free_ char *text = NULL;
@@ -976,7 +984,7 @@ static int format_luks_token_text(
         if (EVP_EncryptInit_ex(context, cc, NULL, volume_key, iv) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to initialize encryption context.");
 
-        r = json_variant_format(hr->json, 0, &text);
+        r = sd_json_variant_format(hr->json, 0, &text);
         if (r < 0)
                 return log_error_errno(r, "Failed to format user record for LUKS: %m");
 
@@ -997,16 +1005,16 @@ static int format_luks_token_text(
 
         assert((size_t) encrypted_size_out1 + (size_t) encrypted_size_out2 <= encrypted_size);
 
-        r = json_build(&v,
-                       JSON_BUILD_OBJECT(
-                                       JSON_BUILD_PAIR("type", JSON_BUILD_CONST_STRING("systemd-homed")),
-                                       JSON_BUILD_PAIR("keyslots", JSON_BUILD_EMPTY_ARRAY),
-                                       JSON_BUILD_PAIR("record", JSON_BUILD_BASE64(encrypted, encrypted_size_out1 + encrypted_size_out2)),
-                                       JSON_BUILD_PAIR("iv", JSON_BUILD_BASE64(iv, iv_size))));
+        r = sd_json_buildo(
+                        &v,
+                        SD_JSON_BUILD_PAIR("type", JSON_BUILD_CONST_STRING("systemd-homed")),
+                        SD_JSON_BUILD_PAIR("keyslots", SD_JSON_BUILD_EMPTY_ARRAY),
+                        SD_JSON_BUILD_PAIR("record", SD_JSON_BUILD_BASE64(encrypted, encrypted_size_out1 + encrypted_size_out2)),
+                        SD_JSON_BUILD_PAIR("iv", SD_JSON_BUILD_BASE64(iv, iv_size)));
         if (r < 0)
                 return log_error_errno(r, "Failed to prepare LUKS JSON token object: %m");
 
-        r = json_variant_format(v, 0, ret);
+        r = sd_json_variant_format(v, 0, ret);
         if (r < 0)
                 return log_error_errno(r, "Failed to format encrypted user record for LUKS: %m");
 
@@ -1219,7 +1227,7 @@ static int open_image_file(
         if (!S_ISREG(st.st_mode) && !S_ISBLK(st.st_mode))
                 return log_error_errno(
                                 S_ISDIR(st.st_mode) ? SYNTHETIC_ERRNO(EISDIR) : SYNTHETIC_ERRNO(EBADFD),
-                                "Image file %s is not a regular file or block device: %m", ip);
+                                "Image file %s is not a regular file or block device.", ip);
 
         /* Locking block devices doesn't really make sense, as this might interfere with
          * udev's workings, and these locks aren't network propagated anyway, hence not what
@@ -1996,11 +2004,11 @@ static int wait_for_devlink(const char *path) {
                 _cleanup_free_ char *dn = NULL;
                 usec_t w;
 
-                if (laccess(path, F_OK) < 0) {
-                        if (errno != ENOENT)
-                                return log_error_errno(errno, "Failed to determine whether %s exists: %m", path);
-                } else
+                r = access_nofollow(path, F_OK);
+                if (r >= 0)
                         return 0; /* Found it */
+                if (r != -ENOENT)
+                        return log_error_errno(r, "Failed to determine whether %s exists: %m", path);
 
                 if (inotify_fd < 0) {
                         /* We need to wait for the device symlink to show up, let's create an inotify watch for it */
@@ -2296,7 +2304,7 @@ int home_create_luks(
 
                 r = chattr_full(setup->image_fd, NULL, FS_NOCOW_FL|FS_NOCOMP_FL, FS_NOCOW_FL|FS_NOCOMP_FL, NULL, NULL, CHATTR_FALLBACK_BITWISE);
                 if (r < 0 && r != -ENOANO) /* ENOANO → some bits didn't work; which we skip logging about because chattr_full() already debug logs about those flags */
-                        log_full_errno(ERRNO_IS_NOT_SUPPORTED(r) ? LOG_DEBUG : LOG_WARNING, r,
+                        log_full_errno(ERRNO_IS_IOCTL_NOT_SUPPORTED(r) ? LOG_DEBUG : LOG_WARNING, r,
                                        "Failed to set file attributes on %s, ignoring: %m", setup->temporary_image_path);
 
                 r = calculate_initial_image_size(h, setup->image_fd, fstype, &host_size);
@@ -2374,9 +2382,10 @@ int home_create_luks(
                             user_record_user_name_and_realm(h),
                             /* root = */ NULL,
                             fs_uuid,
-                            user_record_luks_discard(h),
-                            /* quiet = */ true,
+                            (user_record_luks_discard(h) ? MKFS_DISCARD : 0) | MKFS_QUIET,
                             /* sector_size = */ 0,
+                            /* compression = */ NULL,
+                            /* compression_level= */ NULL,
                             extra_mkfs_options);
         if (r < 0)
                 return r;
@@ -2722,7 +2731,7 @@ static int prepare_resize_partition(
 
         r = sd_id128_from_string(disk_uuid_as_string, &disk_uuid);
         if (r < 0)
-                return log_error_errno(r, "Failed parse disk UUID: %m");
+                return log_error_errno(r, "Failed to parse disk UUID: %m");
 
         r = fdisk_get_partitions(c, &t);
         if (r < 0)
@@ -3385,13 +3394,13 @@ int home_resize_luks(
 
         log_info("Ready to resize image size %s %s %s, partition size %s %s %s, file system size %s %s %s.",
                  FORMAT_BYTES(old_image_size),
-                 special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
+                 glyph(GLYPH_ARROW_RIGHT),
                  FORMAT_BYTES(new_image_size),
                  FORMAT_BYTES(setup->partition_size),
-                 special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
+                 glyph(GLYPH_ARROW_RIGHT),
                  FORMAT_BYTES(new_partition_size),
                  FORMAT_BYTES(old_fs_size),
-                 special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
+                 glyph(GLYPH_ARROW_RIGHT),
                  FORMAT_BYTES(new_fs_size));
 
         if (new_fs_size > old_fs_size) { /* → Grow */
@@ -3910,4 +3919,18 @@ int home_auto_shrink_luks(UserRecord *h, HomeSetup *setup, PasswordCache *cache)
                 return r;
 
         return 1;
+}
+
+uint64_t luks_volume_key_size_convert(struct crypt_device *cd) {
+        int k;
+
+        assert(cd);
+
+        /* Convert the "int" to uint64_t, which we usually use for byte sizes stored on disk. */
+
+        k = sym_crypt_get_volume_key_size(cd);
+        if (k <= 0)
+                return UINT64_MAX;
+
+        return (uint64_t) k;
 }

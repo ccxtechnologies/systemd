@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <uchar.h>
-
+#include "forward.h"
 #include "tpm2-util.h"
 
 /* Definitions as per "TCG PC Client Specific Platform Firmware Profile Specification"
@@ -55,7 +54,7 @@
 #define LOAD_OPTIONS_EVENT_TAG_ID UINT32_C(0x8F3B22ED)
 #endif
 
-const char *tpm2_log_event_type_to_string(uint32_t type) _const_;
+const char* tpm2_log_event_type_to_string(uint32_t type) _const_;
 
 #if HAVE_TPM2
 

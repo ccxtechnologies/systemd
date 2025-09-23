@@ -1,47 +1,48 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <fcntl.h>
 #include <linux/btrfs.h>
+#include <linux/fsverity.h>
 #include <stddef.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/sendfile.h>
-#include <sys/xattr.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "btrfs-util.h"
 #include "chattr-util.h"
 #include "copy.h"
 #include "dirent-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "io-util.h"
-#include "macro.h"
-#include "missing_fs.h"
-#include "missing_syscall.h"
-#include "mkdir-label.h"
+#include "hashmap.h"
+#include "log.h"
 #include "mountpoint-util.h"
 #include "nulstr-util.h"
+#include "path-util.h"
 #include "rm-rf.h"
 #include "selinux-util.h"
 #include "signal-util.h"
 #include "stat-util.h"
+#include "set.h"
 #include "stdio-util.h"
 #include "string-util.h"
-#include "strv.h"
 #include "sync-util.h"
-#include "time-util.h"
 #include "tmpfile-util.h"
 #include "umask-util.h"
 #include "user-util.h"
 #include "xattr-util.h"
 
-#define COPY_BUFFER_SIZE (16U*1024U)
+/* If we copy via a userspace buffer, size it to 64K */
+#define COPY_BUFFER_SIZE (64U*U64_KB)
+
+/* If a byte progress function is specified during copying, never try to copy more than 1M, so that we can
+ * reasonably call the progress function still */
+#define PROGRESS_STEP_SIZE (1U*U64_MB)
 
 /* A safety net for descending recursively into file system trees to copy. On Linux PATH_MAX is 4096, which means the
  * deepest valid path one can build is around 2048, which we hence use as a safety net here, to not spin endlessly in
@@ -162,9 +163,9 @@ int copy_bytes_full(
                 void *userdata) {
 
         _cleanup_close_ int fdf_opened = -EBADF, fdt_opened = -EBADF;
-        bool try_cfr = true, try_sendfile = true, try_splice = true, copied_something = false;
+        bool try_cfr = true, try_sendfile = true, try_splice = true;
+        uint64_t copied_total = 0;
         int r, nonblock_pipe = -1;
-        size_t m = SSIZE_MAX; /* that is the maximum that sendfile and c_f_r accept */
 
         assert(fdf >= 0);
         assert(fdt >= 0);
@@ -264,6 +265,7 @@ int copy_bytes_full(
 
         for (;;) {
                 ssize_t n;
+                size_t m;
 
                 if (max_bytes <= 0)
                         break;
@@ -272,8 +274,19 @@ int copy_bytes_full(
                 if (r < 0)
                         return r;
 
+                /* sendfile() accepts at most SSIZE_MAX-offset bytes to copy, hence let's subtract how much
+                 * copied so far from SSIZE_MAX as maximum of what we want to copy. */
+                if (try_sendfile) {
+                        assert(copied_total < SSIZE_MAX);
+                        m = (uint64_t) SSIZE_MAX - copied_total;
+                } else
+                        m = SSIZE_MAX;
+
                 if (max_bytes != UINT64_MAX && m > max_bytes)
                         m = max_bytes;
+
+                if (progress && m > PROGRESS_STEP_SIZE)
+                        m = PROGRESS_STEP_SIZE;
 
                 if (copy_flags & COPY_HOLES) {
                         off_t c, e;
@@ -322,13 +335,21 @@ int copy_bytes_full(
                                         break;
                                 return -errno;
                         }
+                        if (e == c)
+                                /* Empty data segment? Maybe concurrent hole punching taking place? Or EOF?
+                                 * Let's figure this out by copying the smallest amount possible */
+                                m = 1;
+                        else {
+                                assert(e > c);
 
-                        /* SEEK_HOLE modifies the file offset so we need to move back to the initial offset. */
-                        if (lseek(fdf, c, SEEK_SET) < 0)
-                                return -errno;
+                                /* SEEK_HOLE modifies the file offset so we need to move back to the initial offset. */
+                                if (lseek(fdf, c, SEEK_SET) < 0)
+                                        return -errno;
 
-                        /* Make sure we're not copying more than the current data segment. */
-                        m = MIN(m, (size_t) e - c);
+                                /* Make sure we're not copying more than the current data segment. */
+                                m = MIN(m, (size_t) e - c);
+                                assert(m > 0);
+                        }
                 }
 
                 /* First try copy_file_range(), unless we already tried */
@@ -342,7 +363,7 @@ int copy_bytes_full(
                                 /* use fallback below */
                         } else if (n == 0) { /* likely EOF */
 
-                                if (copied_something)
+                                if (copied_total > 0)
                                         break;
 
                                 /* So, we hit EOF immediately, without having copied a single byte. This
@@ -369,7 +390,7 @@ int copy_bytes_full(
                                 /* use fallback below */
                         } else if (n == 0) { /* likely EOF */
 
-                                if (copied_something)
+                                if (copied_total > 0)
                                         break;
 
                                 try_sendfile = try_splice = false; /* same logic as above for copy_file_range() */
@@ -432,7 +453,7 @@ int copy_bytes_full(
                                 /* use fallback below */
                         } else if (n == 0) { /* likely EOF */
 
-                                if (copied_something)
+                                if (copied_total > 0)
                                         break;
 
                                 try_splice = false; /* same logic as above for copy_file_range() + sendfile() */
@@ -483,6 +504,12 @@ int copy_bytes_full(
                 }
 
         next:
+                copied_total += n;
+
+                /* Disable sendfile() in case we are getting too close to it's SSIZE_MAX-offset limit */
+                if (copied_total > SSIZE_MAX - COPY_BUFFER_SIZE)
+                        try_sendfile = false;
+
                 if (progress) {
                         r = progress(n, userdata);
                         if (r < 0)
@@ -493,13 +520,6 @@ int copy_bytes_full(
                         assert(max_bytes >= (uint64_t) n);
                         max_bytes -= n;
                 }
-
-                /* sendfile accepts at most SSIZE_MAX-offset bytes to copy, so reduce our maximum by the
-                 * amount we already copied, but don't go below our copy buffer size, unless we are close the
-                 * limit of bytes we are allowed to copy. */
-                m = MAX(MIN(COPY_BUFFER_SIZE, max_bytes), m - n);
-
-                copied_something = true;
         }
 
         if (FLAGS_SET(copy_flags, COPY_VERIFY_LINKED)) {
@@ -749,6 +769,102 @@ static int memorize_hardlink(
         return 1;
 }
 
+static int prepare_nocow(int fdf, const char *from, int fdt, unsigned *chattr_mask, unsigned *chattr_flags) {
+        unsigned attrs = 0;
+        int r;
+
+        assert(fdf >= 0 || fdf == AT_FDCWD);
+        assert(fdt >= 0);
+        assert(!!chattr_mask == !!chattr_flags);
+
+        /* If caller explicitly requested NOCOW to be set or unset, let's not interfere. */
+        if (chattr_mask && FLAGS_SET(*chattr_mask, FS_NOCOW_FL))
+                return 0;
+
+        r = read_attr_at(fdf, from, &attrs);
+        if (r < 0 && !ERRNO_IS_IOCTL_NOT_SUPPORTED(r) && r != -ELOOP) /* If the source is a symlink we get ELOOP */
+                return r;
+
+        if (FLAGS_SET(attrs, FS_NOCOW_FL)) {
+                if (chattr_mask && chattr_flags) {
+                        *chattr_mask |= FS_NOCOW_FL;
+                        *chattr_flags |= FS_NOCOW_FL;
+                } else
+                        /* If the NOCOW flag is set on the source, make the copy NOCOW as well. If the source
+                         * is not NOCOW, don't do anything in particular with the copy. */
+                        (void) chattr_fd(fdt, FS_NOCOW_FL, FS_NOCOW_FL);
+        }
+
+        return 0;
+}
+
+/* Copies fs-verity status.  May re-open fdt to do its job. */
+static int copy_fs_verity(int fdf, int *fdt) {
+        int r;
+
+        assert(fdf >= 0);
+        assert(fdt);
+        assert(*fdt >= 0);
+
+        r = fd_verify_regular(fdf);
+        if (r < 0)
+                return r;
+
+        struct fsverity_descriptor desc = {};
+        struct fsverity_read_metadata_arg read_arg = {
+                .metadata_type = FS_VERITY_METADATA_TYPE_DESCRIPTOR,
+                .buf_ptr = (uintptr_t) &desc,
+                .length = sizeof(desc),
+        };
+
+        r = ioctl(fdf, FS_IOC_READ_VERITY_METADATA, &read_arg);
+        if (r < 0) {
+                /* ENODATA means that the file doesn't have fs-verity,
+                 * so the correct thing to do is to do nothing at all. */
+                if (errno == ENODATA)
+                        return 0;
+                log_error_errno(errno, "Failed to read fs-verity metadata from source file: %m");
+                /* For cases where fs-verity is unsupported we return a special error code */
+                if (ERRNO_IS_NOT_SUPPORTED(errno))
+                        return -ESOCKTNOSUPPORT;
+                return -errno;
+        }
+
+        /* Make sure that the descriptor is completely initialized */
+        assert(r == (int) sizeof desc);
+
+        r = fd_verify_regular(*fdt);
+        if (r < 0)
+                return r;
+
+        /* Okay. We're doing this now. We need to re-open fdt as read-only because
+         * we can't enable fs-verity while writable file descriptors are outstanding. */
+        _cleanup_close_ int reopened_fd = -EBADF;
+        r = fd_reopen_condition(*fdt, O_RDONLY|O_CLOEXEC|O_NOCTTY, O_ACCMODE_STRICT|O_PATH, &reopened_fd);
+        if (r < 0)
+                return r;
+        if (reopened_fd >= 0)
+                close_and_replace(*fdt, reopened_fd);
+
+        struct fsverity_enable_arg enable_arg = {
+                .version = desc.version,
+                .hash_algorithm = desc.hash_algorithm,
+                .block_size = UINT32_C(1) << desc.log_blocksize,
+                .salt_size = desc.salt_size,
+                .salt_ptr = (uintptr_t) &desc.salt,
+        };
+
+        if (ioctl(*fdt, FS_IOC_ENABLE_VERITY, &enable_arg) < 0) {
+                log_error_errno(errno, "Failed to set fs-verity metadata: %m");
+                /* For cases where fs-verity is unsupported we return a special error code */
+                if (ERRNO_IS_NOT_SUPPORTED(errno))
+                        return -ESOCKTNOSUPPORT;
+                return -errno;
+        }
+
+        return 0;
+}
+
 static int fd_copy_tree_generic(
                 int df,
                 const char *from,
@@ -793,7 +909,7 @@ static int fd_copy_regular(
         if (r > 0) /* worked! */
                 return 0;
 
-        fdf = xopenat(df, from, O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW);
+        fdf = xopenat_full(df, from, O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW, XO_REGULAR, 0);
         if (fdf < 0)
                 return fdf;
 
@@ -807,6 +923,10 @@ static int fd_copy_regular(
                 mac_selinux_create_file_clear();
         if (fdt < 0)
                 return -errno;
+
+        r = prepare_nocow(fdf, /*from=*/ NULL, fdt, /*chattr_mask=*/ NULL, /*chattr_flags=*/ NULL);
+        if (r < 0)
+                return r;
 
         r = copy_bytes_full(fdf, fdt, UINT64_MAX, copy_flags, NULL, NULL, progress, userdata);
         if (r < 0)
@@ -827,6 +947,15 @@ static int fd_copy_regular(
                 r = fd_verify_linked(fdf);
                 if (r < 0)
                         return r;
+        }
+
+        /* NB: fs-verity cannot be enabled when a writable file descriptor is outstanding.
+         * copy_fs_verity() may well re-open 'fdt' as O_RDONLY. All code below this point
+         * needs to be able to work with a read-only file descriptor. */
+        if (FLAGS_SET(copy_flags, COPY_PRESERVE_FS_VERITY)) {
+                r = copy_fs_verity(fdf, &fdt);
+                if (r < 0)
+                        goto fail;
         }
 
         if (copy_flags & COPY_FSYNC) {
@@ -982,6 +1111,7 @@ static int fd_copy_directory(
 
         _cleanup_close_ int fdf = -EBADF, fdt = -EBADF;
         _cleanup_closedir_ DIR *d = NULL;
+        struct stat dt_st;
         bool exists;
         int r;
 
@@ -1026,7 +1156,10 @@ static int fd_copy_directory(
         if (fdt < 0)
                 return fdt;
 
-        r = 0;
+        if (exists && FLAGS_SET(copy_flags, COPY_RESTORE_DIRECTORY_TIMESTAMPS) && fstat(fdt, &dt_st) < 0)
+                return -errno;
+
+        int ret = 0;
 
         if (PTR_TO_INT(hashmap_get(denylist, st)) == DENY_CONTENTS) {
                 log_debug("%s is in the denylist, not recursing", from ?: "file to copy");
@@ -1037,7 +1170,6 @@ static int fd_copy_directory(
                 const char *child_display_path = NULL;
                 _cleanup_free_ char *dp = NULL;
                 struct stat buf;
-                int q;
 
                 if (dot_or_dot_dot(de->d_name))
                         continue;
@@ -1047,7 +1179,7 @@ static int fd_copy_directory(
                         return r;
 
                 if (fstatat(dirfd(d), de->d_name, &buf, AT_SYMLINK_NOFOLLOW) < 0) {
-                        r = -errno;
+                        RET_GATHER(ret, -errno);
                         continue;
                 }
 
@@ -1092,7 +1224,7 @@ static int fd_copy_directory(
                                 if (buf.st_dev != original_device)
                                         continue;
 
-                                r = fd_is_mount_point(dirfd(d), de->d_name, 0);
+                                r = is_mount_point_at(dirfd(d), de->d_name, 0);
                                 if (r < 0)
                                         return r;
                                 if (r > 0)
@@ -1100,17 +1232,17 @@ static int fd_copy_directory(
                         }
                 }
 
-                q = fd_copy_tree_generic(dirfd(d), de->d_name, &buf, fdt, de->d_name, original_device,
+                r = fd_copy_tree_generic(dirfd(d), de->d_name, &buf, fdt, de->d_name, original_device,
                                          depth_left-1, override_uid, override_gid, copy_flags & ~COPY_LOCK_BSD,
                                          denylist, subvolumes, hardlink_context, child_display_path, progress_path,
                                          progress_bytes, userdata);
 
-                if (q == -EINTR) /* Propagate SIGINT/SIGTERM up instantly */
-                        return q;
-                if (q == -EEXIST && (copy_flags & COPY_MERGE))
-                        q = 0;
-                if (q < 0)
-                        r = q;
+                /* Propagate SIGINT/SIGTERM, ENOSPC, and fs-verity fails up instantly */
+                if (IN_SET(r, -EINTR, -ENOSPC, -ESOCKTNOSUPPORT))
+                        return r;
+                if (r == -EEXIST && (copy_flags & COPY_MERGE))
+                        r = 0;
+                RET_GATHER(ret, r);
         }
 
 finish:
@@ -1118,13 +1250,20 @@ finish:
                 if (fchown(fdt,
                            uid_is_valid(override_uid) ? override_uid : st->st_uid,
                            gid_is_valid(override_gid) ? override_gid : st->st_gid) < 0)
-                        r = -errno;
+                        RET_GATHER(ret, -errno);
 
                 if (fchmod(fdt, st->st_mode & 07777) < 0)
-                        r = -errno;
+                        RET_GATHER(ret, -errno);
 
+                /* Run hardlink context cleanup now because it potentially changes timestamps */
+                hardlink_context_destroy(&our_hardlink_context);
                 (void) copy_xattr(dirfd(d), NULL, fdt, NULL, copy_flags);
                 (void) futimens(fdt, (struct timespec[]) { st->st_atim, st->st_mtim });
+        } else if (FLAGS_SET(copy_flags, COPY_RESTORE_DIRECTORY_TIMESTAMPS)) {
+                /* Run hardlink context cleanup now because it potentially changes timestamps */
+                hardlink_context_destroy(&our_hardlink_context);
+                /* If the directory already exists, make sure the timestamps stay the same as before. */
+                (void) futimens(fdt, (struct timespec[]) { dt_st.st_atim, dt_st.st_mtim });
         }
 
         if (copy_flags & COPY_FSYNC_FULL) {
@@ -1132,8 +1271,8 @@ finish:
                         return -errno;
         }
 
-        if (r < 0)
-                return r;
+        if (ret < 0)
+                return ret;
 
         return copy_flags & COPY_LOCK_BSD ? TAKE_FD(fdt) : 0;
 }
@@ -1341,13 +1480,9 @@ int copy_file_fd_at_full(
         assert(fdt >= 0);
         assert(!FLAGS_SET(copy_flags, COPY_LOCK_BSD));
 
-        fdf = xopenat(dir_fdf, from, O_RDONLY|O_CLOEXEC|O_NOCTTY);
+        fdf = xopenat_full(dir_fdf, from, O_RDONLY|O_CLOEXEC|O_NOCTTY, XO_REGULAR, 0);
         if (fdf < 0)
                 return fdf;
-
-        r = fd_verify_regular(fdf);
-        if (r < 0)
-                return r;
 
         if (fstat(fdt, &st) < 0)
                 return -errno;
@@ -1396,42 +1531,41 @@ int copy_file_at_full(
                 void *userdata) {
 
         _cleanup_close_ int fdf = -EBADF, fdt = -EBADF;
-        struct stat st;
         int r;
 
         assert(dir_fdf >= 0 || dir_fdf == AT_FDCWD);
         assert(dir_fdt >= 0 || dir_fdt == AT_FDCWD);
         assert(to);
 
-        fdf = xopenat(dir_fdf, from, O_RDONLY|O_CLOEXEC|O_NOCTTY);
+        fdf = xopenat_full(dir_fdf, from, O_RDONLY|O_CLOEXEC|O_NOCTTY, XO_REGULAR, 0);
         if (fdf < 0)
                 return fdf;
 
-        if (fstat(fdf, &st) < 0)
-                return -errno;
+        if (mode == MODE_INVALID) {
+                struct stat st;
 
-        r = stat_verify_regular(&st);
-        if (r < 0)
-                return r;
+                if (fstat(fdf, &st) < 0)
+                        return -errno;
+
+                mode = st.st_mode;
+        }
 
         WITH_UMASK(0000) {
                 fdt = xopenat_lock_full(dir_fdt, to,
                                         flags|O_WRONLY|O_CREAT|O_CLOEXEC|O_NOCTTY,
-                                        (copy_flags & COPY_MAC_CREATE ? XO_LABEL : 0),
-                                        mode != MODE_INVALID ? mode : st.st_mode,
+                                        XO_REGULAR | (copy_flags & COPY_MAC_CREATE ? XO_LABEL : 0),
+                                        mode,
                                         copy_flags & COPY_LOCK_BSD ? LOCK_BSD : LOCK_NONE, LOCK_EX);
                 if (fdt < 0)
                         return fdt;
         }
 
-        if (!FLAGS_SET(flags, O_EXCL)) { /* if O_EXCL was used we created the thing as regular file, no need to check again */
-                r = fd_verify_regular(fdt);
-                if (r < 0)
-                        goto fail;
-        }
+        r = prepare_nocow(fdf, /*from=*/ NULL, fdt, &chattr_mask, &chattr_flags);
+        if (r < 0)
+                return r;
 
-        if (chattr_mask != 0)
-                (void) chattr_fd(fdt, chattr_flags, chattr_mask & CHATTR_EARLY_FL, NULL);
+        if ((chattr_mask & CHATTR_EARLY_FL) != 0)
+                (void) chattr_fd(fdt, chattr_flags, chattr_mask & CHATTR_EARLY_FL);
 
         r = copy_bytes_full(fdf, fdt, UINT64_MAX, copy_flags & ~COPY_LOCK_BSD, NULL, NULL, progress_bytes, userdata);
         if (r < 0)
@@ -1446,8 +1580,9 @@ int copy_file_at_full(
                         goto fail;
         }
 
-        if (chattr_mask != 0)
-                (void) chattr_fd(fdt, chattr_flags, chattr_mask & ~CHATTR_EARLY_FL, NULL);
+        unsigned nocow = FLAGS_SET(copy_flags, COPY_NOCOW_AFTER) ? FS_NOCOW_FL : 0;
+        if (((chattr_mask & ~CHATTR_EARLY_FL) | nocow) != 0)
+                (void) chattr_fd(fdt, chattr_flags | nocow, (chattr_mask & ~CHATTR_EARLY_FL) | nocow);
 
         if (copy_flags & (COPY_FSYNC|COPY_FSYNC_FULL)) {
                 if (fsync(fdt) < 0) {
@@ -1508,8 +1643,12 @@ int copy_file_atomic_at_full(
         if (fdt < 0)
                 return fdt;
 
-        if (chattr_mask != 0)
-                (void) chattr_fd(fdt, chattr_flags, chattr_mask & CHATTR_EARLY_FL, NULL);
+        r = prepare_nocow(dir_fdf, from, fdt, &chattr_mask, &chattr_flags);
+        if (r < 0)
+                return r;
+
+        if ((chattr_mask & CHATTR_EARLY_FL) != 0)
+                (void) chattr_fd(fdt, chattr_flags, chattr_mask & CHATTR_EARLY_FL);
 
         r = copy_file_fd_at_full(dir_fdf, from, fdt, copy_flags, progress_bytes, userdata);
         if (r < 0)
@@ -1530,8 +1669,9 @@ int copy_file_atomic_at_full(
 
         t = mfree(t);
 
-        if (chattr_mask != 0)
-                (void) chattr_fd(fdt, chattr_flags, chattr_mask & ~CHATTR_EARLY_FL, NULL);
+        unsigned nocow = FLAGS_SET(copy_flags, COPY_NOCOW_AFTER) ? FS_NOCOW_FL : 0;
+        if (((chattr_mask & ~CHATTR_EARLY_FL) | nocow) != 0)
+                (void) chattr_fd(fdt, chattr_flags | nocow, (chattr_mask & ~CHATTR_EARLY_FL) | nocow);
 
         r = close_nointr(TAKE_FD(fdt)); /* even if this fails, the fd is now invalidated */
         if (r < 0)
@@ -1610,19 +1750,18 @@ int copy_xattr(int df, const char *from, int dt, const char *to, CopyFlags copy_
                 return r;
 
         NULSTR_FOREACH(p, names) {
-                _cleanup_free_ char *value = NULL;
-
                 if (!FLAGS_SET(copy_flags, COPY_ALL_XATTRS) && !startswith(p, "user."))
                         continue;
 
-                r = getxattr_at_malloc(df, from, p, 0, &value);
+                _cleanup_free_ char *value = NULL;
+                size_t value_size;
+                r = getxattr_at_malloc(df, from, p, 0, &value, &value_size);
                 if (r == -ENODATA)
                         continue; /* gone by now */
                 if (r < 0)
                         return r;
 
-                if (xsetxattr(dt, to, p, value, r, 0) < 0)
-                        ret = -errno;
+                RET_GATHER(ret, xsetxattr_full(dt, to, /* at_flags = */ 0, p, value, value_size, /* xattr_flags = */ 0));
         }
 
         return ret;

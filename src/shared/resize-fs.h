@@ -1,15 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <inttypes.h>
-
+#include "forward.h"
 #include "stat-util.h"
 
 int resize_fs(int fd, uint64_t sz, uint64_t *ret_size);
 
-#define BTRFS_MINIMAL_SIZE (256U*1024U*1024U)
-#define XFS_MINIMAL_SIZE (300U*1024U*1024U)
-#define EXT4_MINIMAL_SIZE (1024U*1024U)
+#define BTRFS_MINIMAL_SIZE (256U*U64_MB)
+#define XFS_MINIMAL_SIZE (300U*U64_MB)
+#define EXT4_MINIMAL_SIZE (32U*U64_MB)
 
 uint64_t minimal_size_by_fs_magic(statfs_f_type_t magic);
 uint64_t minimal_size_by_fs_name(const char *str);

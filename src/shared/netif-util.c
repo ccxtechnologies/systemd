@@ -3,8 +3,13 @@
 #include <linux/if.h>
 #include <linux/if_arp.h>
 
+#include "sd-device.h"
+#include "sd-id128.h"
+
+#include "alloc-util.h"
 #include "arphrd-util.h"
 #include "device-util.h"
+#include "ether-addr-util.h"
 #include "hexdecoct.h"
 #include "log-link.h"
 #include "memory-util.h"
@@ -12,6 +17,7 @@
 #include "netif-util.h"
 #include "siphash24.h"
 #include "sparse-endian.h"
+#include "string-util.h"
 #include "strv.h"
 
 #define SHORTEN_IFNAME_HASH_KEY SD_ID128_MAKE(e1,90,a4,04,a8,ef,4b,51,8c,cc,c3,3a,9f,11,fc,a2)
@@ -51,7 +57,7 @@ int net_get_type_string(sd_device *device, uint16_t iftype, char **ret) {
         return 0;
 }
 
-const char *net_get_persistent_name(sd_device *device) {
+const char* net_get_persistent_name(sd_device *device) {
         assert(device);
 
         /* fetch some persistent data unique (on this machine) to this device */

@@ -1,25 +1,28 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <grp.h>
 #include <sys/file.h>
 #include <sys/stat.h>
-#include <sys/types.h>
+#include <unistd.h>
 
 #include "clean-ipc.h"
 #include "dynamic-user.h"
+#include "errno-list.h"
+#include "extract-word.h"
 #include "fd-util.h"
+#include "fdset.h"
 #include "fileio.h"
 #include "format-util.h"
-#include "fs-util.h"
+#include "hashmap.h"
 #include "iovec-util.h"
 #include "lock-util.h"
-#include "nscd-flush.h"
-#include "parse-util.h"
+#include "manager.h"
 #include "random-util.h"
 #include "serialize.h"
+#include "siphash24.h"
 #include "socket-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
-#include "strv.h"
 #include "uid-classification.h"
 #include "user-util.h"
 
@@ -378,7 +381,6 @@ static int dynamic_user_realize(
         _cleanup_close_ int etc_passwd_lock_fd = -EBADF;
         uid_t num = UID_INVALID; /* a uid if is_user, and a gid otherwise */
         gid_t gid = GID_INVALID; /* a gid if is_user, ignored otherwise */
-        bool flush_cache = false;
         int r;
 
         assert(d);
@@ -411,9 +413,9 @@ static int dynamic_user_realize(
                 /* Let's see if a proper, static user or group by this name exists. Try to take the lock on
                  * /etc/passwd, if that fails with EROFS then /etc is read-only. In that case it's fine if we don't
                  * take the lock, given that users can't be added there anyway in this case. */
-                etc_passwd_lock_fd = take_etc_passwd_lock(NULL);
-                if (etc_passwd_lock_fd < 0 && etc_passwd_lock_fd != -EROFS)
-                        return etc_passwd_lock_fd;
+                r = etc_passwd_lock_fd = take_etc_passwd_lock(NULL);
+                if (r < 0 && r != -EROFS)
+                        return r;
 
                 /* First, let's parse this as numeric UID */
                 r = parse_uid(d->name, &num);
@@ -465,12 +467,9 @@ static int dynamic_user_realize(
                                 unlink_uid_lock(uid_lock_fd, num, d->name);
                                 return r;
                         }
-
-                        /* Great! Nothing is stored here, still. Store our newly acquired data. */
-                        flush_cache = true;
                 } else {
-                        /* Hmm, so as it appears there's now something stored in the storage socket. Throw away what we
-                         * acquired, and use what's stored now. */
+                        /* Hmm, so as it appears there's now something stored in the storage socket.
+                         * Throw away what we acquired, and use what's stored now. */
 
                         unlink_uid_lock(uid_lock_fd, num, d->name);
                         safe_close(uid_lock_fd);
@@ -495,14 +494,6 @@ static int dynamic_user_realize(
         r = dynamic_user_push(d, num, uid_lock_fd);
         if (r < 0)
                 return r;
-
-        if (flush_cache) {
-                /* If we allocated a new dynamic UID, refresh nscd, so that it forgets about potentially cached
-                 * negative entries. But let's do so after we release the /etc/passwd lock, so that there's no
-                 * potential for nscd wanting to lock that for completing the invalidation. */
-                etc_passwd_lock_fd = safe_close(etc_passwd_lock_fd);
-                (void) nscd_flush_cache(STRV_MAKE("passwd", "group"));
-        }
 
         if (is_user) {
                 *ret_uid = num;
@@ -581,7 +572,6 @@ static int dynamic_user_close(DynamicUser *d) {
         /* This dynamic user was realized and dynamically allocated. In this case, let's remove the lock file. */
         unlink_uid_lock(lock_fd, uid, d->name);
 
-        (void) nscd_flush_cache(STRV_MAKE("passwd", "group"));
         return 1;
 }
 

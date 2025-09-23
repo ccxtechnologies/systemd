@@ -2,42 +2,25 @@
 
 #include <getopt.h>
 
+#include "sd-event.h"
+
+#include "alloc-util.h"
 #include "build.h"
 #include "bus-log-control-api.h"
 #include "bus-object.h"
 #include "cgroup-util.h"
-#include "conf-parser.h"
 #include "daemon-util.h"
 #include "fileio.h"
 #include "log.h"
 #include "main-func.h"
-#include "oomd-manager-bus.h"
+#include "oomd-conf.h"
 #include "oomd-manager.h"
+#include "oomd-manager-bus.h"
 #include "parse-util.h"
 #include "pretty-print.h"
 #include "psi-util.h"
-#include "signal-util.h"
 
 static bool arg_dry_run = false;
-static int arg_swap_used_limit_permyriad = -1;
-static int arg_mem_pressure_limit_permyriad = -1;
-static usec_t arg_mem_pressure_usec = 0;
-
-static int parse_config(void) {
-        static const ConfigTableItem items[] = {
-                { "OOM", "SwapUsedLimit",                    config_parse_permyriad, 0, &arg_swap_used_limit_permyriad    },
-                { "OOM", "DefaultMemoryPressureLimit",       config_parse_permyriad, 0, &arg_mem_pressure_limit_permyriad },
-                { "OOM", "DefaultMemoryPressureDurationSec", config_parse_sec,       0, &arg_mem_pressure_usec            },
-                {}
-        };
-
-        return config_parse_standard_file_with_dropins(
-                        "systemd/oomd.conf",
-                        "OOM\0",
-                        config_item_table_lookup, items,
-                        CONFIG_PARSE_WARN,
-                        /* userdata= */ NULL);
-}
 
 static int help(void) {
         _cleanup_free_ char *link = NULL;
@@ -129,21 +112,19 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        r = parse_config();
-        if (r < 0)
-                return r;
-
         /* Do some basic requirement checks for running systemd-oomd. It's not exhaustive as some of the other
          * requirements do not have a reliable means to check for in code. */
 
         int n = sd_listen_fds(0);
+        if (n < 0)
+                return log_error_errno(n, "Failed to determine number of listening fds: %m");
         if (n > 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Received too many file descriptors");
 
-        int fd = n == 1 ? SD_LISTEN_FDS_START : -1;
+        int fd = n == 1 ? SD_LISTEN_FDS_START : -EBADF;
 
         /* SwapTotal is always available in /proc/meminfo and defaults to 0, even on swap-disabled kernels. */
-        r = get_proc_field("/proc/meminfo", "SwapTotal", WHITESPACE, &swap);
+        r = get_proc_field("/proc/meminfo", "SwapTotal", &swap);
         if (r < 0)
                 return log_error_errno(r, "Failed to get SwapTotal from /proc/meminfo: %m");
 
@@ -154,23 +135,12 @@ static int run(int argc, char *argv[]) {
         if (!is_pressure_supported())
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Pressure Stall Information (PSI) is not supported");
 
-        r = cg_all_unified();
-        if (r < 0)
-                return log_error_errno(r, "Failed to determine whether the unified cgroups hierarchy is used: %m");
-        if (r == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Requires the unified cgroups hierarchy");
-
         r = cg_mask_supported(&mask);
         if (r < 0)
                 return log_error_errno(r, "Failed to get supported cgroup controllers: %m");
 
         if (!FLAGS_SET(mask, CGROUP_MASK_MEMORY))
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Requires the cgroup memory controller.");
-
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT) >= 0);
-
-        if (arg_mem_pressure_usec > 0 && arg_mem_pressure_usec < 1 * USEC_PER_SEC)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "DefaultMemoryPressureDurationSec= must be 0 or at least 1s");
 
         r = manager_new(&m);
         if (r < 0)
@@ -179,14 +149,11 @@ static int run(int argc, char *argv[]) {
         r = manager_start(
                         m,
                         arg_dry_run,
-                        arg_swap_used_limit_permyriad,
-                        arg_mem_pressure_limit_permyriad,
-                        arg_mem_pressure_usec,
                         fd);
         if (r < 0)
                 return log_error_errno(r, "Failed to start up daemon: %m");
 
-        notify_msg = notify_start(NOTIFY_READY, NOTIFY_STOPPING);
+        notify_msg = notify_start(NOTIFY_READY_MESSAGE, NOTIFY_STOPPING_MESSAGE);
 
         log_debug("systemd-oomd started%s.", arg_dry_run ? " in dry run mode" : "");
 

@@ -8,7 +8,6 @@
 #include "id128-print.h"
 #include "log.h"
 #include "pretty-print.h"
-#include "terminal-util.h"
 
 int id128_pretty_print_sample(const char *name, sd_id128_t id) {
         _cleanup_free_ char *man_link = NULL, *mod_link = NULL;
@@ -44,7 +43,6 @@ int id128_pretty_print_sample(const char *name, sd_id128_t id) {
 
         return 0;
 }
-
 
 int id128_pretty_print(sd_id128_t id, Id128PrettyPrintMode mode) {
         assert(mode >= 0);

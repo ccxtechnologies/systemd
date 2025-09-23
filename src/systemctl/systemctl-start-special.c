@@ -2,20 +2,25 @@
 
 #include <unistd.h>
 
+#include "sd-bus.h"
+
 #include "bootspec.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "efivars.h"
+#include "log.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "reboot-util.h"
+#include "runtime-scope.h"
+#include "strv.h"
+#include "systemctl.h"
 #include "systemctl-logind.h"
 #include "systemctl-start-special.h"
 #include "systemctl-start-unit.h"
 #include "systemctl-trivial-method.h"
 #include "systemctl-util.h"
-#include "systemctl.h"
 
 static int load_kexec_kernel(void) {
         _cleanup_(boot_config_free) BootConfig config = BOOT_CONFIG_NULL;
@@ -201,16 +206,17 @@ int verb_start_special(int argc, char *argv[], void *userdata) {
                 case ACTION_KEXEC:
                 case ACTION_HALT:
                 case ACTION_SOFT_REBOOT:
-                        if (arg_when == 0)
+                        if (arg_when == 0) {
                                 r = logind_reboot(a);
-                        else if (arg_when != USEC_INFINITY)
+                                if (r >= 0 || IN_SET(r, -EACCES, -EOPNOTSUPP, -EINPROGRESS))
+                                        /* The latter indicates that the requested operation requires auth,
+                                         * is not supported or already in progress, in which cases we ignore the error. */
+                                        return r;
+                        } else {
                                 r = logind_schedule_shutdown(a);
-                        else /* arg_when == USEC_INFINITY */
-                                r = logind_cancel_shutdown();
-                        if (r >= 0 || IN_SET(r, -EACCES, -EOPNOTSUPP, -EINPROGRESS))
-                                /* The latter indicates that the requested operation requires auth,
-                                 * is not supported or already in progress, in which cases we ignore the error. */
-                                return r;
+                                if (r != -ENOSYS)
+                                        return r;
+                        }
 
                         /* On all other errors, try low-level operation. In order to minimize the difference
                          * between operation with and without logind, we explicitly enable non-blocking mode

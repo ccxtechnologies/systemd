@@ -1,22 +1,18 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* systemd service to wait until kernel realtime clock is synchronized */
 
-#include <errno.h>
-#include <stdbool.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/inotify.h>
-#include <sys/timerfd.h>
 #include <sys/timex.h>
 #include <unistd.h>
 
 #include "sd-event.h"
 
+#include "errno-util.h"
 #include "fd-util.h"
 #include "inotify-util.h"
+#include "log.h"
 #include "main-func.h"
-#include "signal-util.h"
 #include "time-util.h"
 
 typedef struct ClockState {
@@ -184,19 +180,13 @@ static int run(int argc, char * argv[]) {
         };
         int r;
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT) >= 0);
-
         r = sd_event_default(&event);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate event loop: %m");
 
-        r = sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL);
+        r = sd_event_set_signal_exit(event, true);
         if (r < 0)
-                return log_error_errno(r, "Failed to create sigterm event source: %m");
-
-        r = sd_event_add_signal(event, NULL, SIGINT, NULL, NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to create sigint event source: %m");
+                return log_error_errno(r, "Failed to enable SIGTERM/SIGINT handling: %m");
 
         r = sd_event_set_watchdog(event, true);
         if (r < 0)

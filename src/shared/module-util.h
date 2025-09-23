@@ -1,27 +1,27 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "dlfcn-util.h"
+#include "forward.h"
 
 #if HAVE_KMOD
 
-#include <libkmod.h>
+#include <libkmod.h> /* IWYU pragma: export */
 
-#include "macro.h"
+#include "dlfcn-util.h"
 
-DLSYM_PROTOTYPE(kmod_list_next);
-DLSYM_PROTOTYPE(kmod_load_resources);
-DLSYM_PROTOTYPE(kmod_module_get_initstate);
-DLSYM_PROTOTYPE(kmod_module_get_module);
-DLSYM_PROTOTYPE(kmod_module_get_name);
-DLSYM_PROTOTYPE(kmod_module_new_from_lookup);
-DLSYM_PROTOTYPE(kmod_module_probe_insert_module);
-DLSYM_PROTOTYPE(kmod_module_unref);
-DLSYM_PROTOTYPE(kmod_module_unref_list);
-DLSYM_PROTOTYPE(kmod_new);
-DLSYM_PROTOTYPE(kmod_set_log_fn);
-DLSYM_PROTOTYPE(kmod_unref);
-DLSYM_PROTOTYPE(kmod_validate_resources);
+extern DLSYM_PROTOTYPE(kmod_list_next);
+extern DLSYM_PROTOTYPE(kmod_load_resources);
+extern DLSYM_PROTOTYPE(kmod_module_get_initstate);
+extern DLSYM_PROTOTYPE(kmod_module_get_module);
+extern DLSYM_PROTOTYPE(kmod_module_get_name);
+extern DLSYM_PROTOTYPE(kmod_module_new_from_lookup);
+extern DLSYM_PROTOTYPE(kmod_module_probe_insert_module);
+extern DLSYM_PROTOTYPE(kmod_module_unref);
+extern DLSYM_PROTOTYPE(kmod_module_unref_list);
+extern DLSYM_PROTOTYPE(kmod_new);
+extern DLSYM_PROTOTYPE(kmod_set_log_fn);
+extern DLSYM_PROTOTYPE(kmod_unref);
+extern DLSYM_PROTOTYPE(kmod_validate_resources);
 
 int dlopen_libkmod(void);
 

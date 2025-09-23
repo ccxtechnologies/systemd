@@ -1,40 +1,41 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <math.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <resolv.h>
-#include <stdlib.h>
-#include <sys/timerfd.h>
 #include <sys/timex.h>
-#include <sys/types.h>
+#include <unistd.h>
 
+#include "sd-bus.h"
 #include "sd-daemon.h"
 #include "sd-messages.h"
+#include "sd-network.h"
 
 #include "alloc-util.h"
-#include "bus-polkit.h"
+#include "clock-util.h"
 #include "common-signal.h"
 #include "dns-domain.h"
+#include "errno-util.h"
 #include "event-util.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
+#include "hashmap.h"
 #include "list.h"
 #include "log.h"
 #include "logarithm.h"
 #include "network-util.h"
+#include "random-util.h"
 #include "ratelimit.h"
 #include "resolve-private.h"
-#include "random-util.h"
 #include "socket-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
-#include "timesyncd-conf.h"
 #include "timesyncd-manager.h"
-#include "user-util.h"
+#include "timesyncd-server.h"
 
 #ifndef ADJ_SETOFFSET
 #define ADJ_SETOFFSET                   0x0100  /* add 'time' to current time */
@@ -334,8 +335,8 @@ static bool manager_sample_spike_detection(Manager *m, double offset, double del
                         idx_min = i;
 
         j = 0;
-        for (i = 0; i < ELEMENTSOF(m->samples); i++)
-                j += pow(m->samples[i].offset - m->samples[idx_min].offset, 2);
+        FOREACH_ELEMENT(sample, m->samples)
+                j += pow(sample->offset - m->samples[idx_min].offset, 2);
         m->samples_jitter = sqrt(j / (ELEMENTSOF(m->samples) - 1));
 
         /* ignore samples when resyncing */
@@ -396,7 +397,8 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                 .iov_base = &ntpmsg,
                 .iov_len = sizeof(ntpmsg),
         };
-        /* This needs to be initialized with zero. See #20741. */
+        /* This needs to be initialized with zero. See #20741.
+         * The issue is fixed on glibc-2.35 (8fba672472ae0055387e9315fc2eddfa6775ca79). */
         CMSG_BUFFER_TYPE(CMSG_SPACE_TIMESPEC) control = {};
         union sockaddr_union server_addr;
         struct msghdr msghdr = {
@@ -422,15 +424,18 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
         }
 
         len = recvmsg_safe(fd, &msghdr, MSG_DONTWAIT);
-        if (len == -EAGAIN)
+        if (ERRNO_IS_NEG_TRANSIENT(len))
                 return 0;
         if (len < 0) {
-                log_warning_errno(len, "Error receiving message, disconnecting: %m");
+                log_warning_errno(len, "Error receiving message, disconnecting: %s",
+                                  len == -ECHRNG ? "got truncated control data" :
+                                  len == -EXFULL ? "got truncated payload data" :
+                                  STRERROR((int) len));
                 return manager_connect(m);
         }
 
-        /* Too short or too long packet? */
-        if (iov.iov_len < sizeof(struct ntp_msg) || (msghdr.msg_flags & MSG_TRUNC)) {
+        /* Too short packet? */
+        if (iov.iov_len < sizeof(struct ntp_msg)) {
                 log_warning("Invalid response from server. Disconnecting.");
                 return manager_connect(m);
         }
@@ -614,10 +619,10 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                 log_struct(LOG_INFO,
                            LOG_MESSAGE("Initial clock synchronization to %s.",
                                        FORMAT_TIMESTAMP_STYLE(dts.realtime, TIMESTAMP_US)),
-                           "MESSAGE_ID=" SD_MESSAGE_TIME_SYNC_STR,
-                           "MONOTONIC_USEC=" USEC_FMT, dts.monotonic,
-                           "REALTIME_USEC=" USEC_FMT, dts.realtime,
-                           "BOOTTIME_USEC=" USEC_FMT, dts.boottime);
+                           LOG_MESSAGE_ID(SD_MESSAGE_TIME_SYNC_STR),
+                           LOG_ITEM("MONOTONIC_USEC=" USEC_FMT, dts.monotonic),
+                           LOG_ITEM("REALTIME_USEC=" USEC_FMT, dts.realtime),
+                           LOG_ITEM("BOOTTIME_USEC=" USEC_FMT, dts.boottime));
         }
 
         r = manager_arm_timer(m, m->poll_interval_usec);
@@ -1023,7 +1028,7 @@ clear:
         return r;
 }
 
-bool manager_is_connected(Manager *m) {
+static bool manager_is_connected(Manager *m) {
         assert(m);
 
         /* Return true when the manager is sending a request, resolving a server name, or
@@ -1048,11 +1053,15 @@ static int manager_network_event_handler(sd_event_source *s, int fd, uint32_t re
         connected = manager_is_connected(m);
 
         if (connected && !online) {
-                log_info("No network connectivity, watching for changes.");
+                /* When m->talking is false, we have not received any responses from the server,
+                 * and it is not necessary to log about disconnection. */
+                log_full(m->talking ? LOG_INFO : LOG_DEBUG,
+                         "No network connectivity, watching for changes.");
                 manager_disconnect(m);
 
         } else if ((!connected || changed) && online) {
-                log_info("Network configuration changed, trying to establish connection.");
+                log_full(connected ? LOG_DEBUG : LOG_INFO,
+                         "Network configuration changed, trying to establish connection.");
 
                 if (m->current_server_address)
                         r = manager_begin(m);
@@ -1124,15 +1133,21 @@ int manager_new(Manager **ret) {
         if (r < 0)
                 return r;
 
-        (void) sd_event_add_signal(m->event, NULL, SIGTERM, NULL,  NULL);
-        (void) sd_event_add_signal(m->event, NULL, SIGINT, NULL, NULL);
-        (void) sd_event_add_signal(m->event, NULL, SIGRTMIN+18, sigrtmin18_handler, NULL);
+        r = sd_event_set_signal_exit(m->event, true);
+        if (r < 0)
+                return r;
+
+        r = sd_event_add_signal(m->event, /* ret= */ NULL, (SIGRTMIN+18)|SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, /* userdata= */ NULL);
+        if (r < 0)
+                log_debug_errno(r, "Failed to install SIGRTMIN+18 signal handler, ignoring: %m");
 
         r = sd_event_add_memory_pressure(m->event, NULL, NULL, NULL);
         if (r < 0)
-                log_debug_errno(r, "Failed allocate memory pressure event source, ignoring: %m");
+                log_debug_errno(r, "Failed to allocate memory pressure event source, ignoring: %m");
 
-        (void) sd_event_set_watchdog(m->event, true);
+        r = sd_event_set_watchdog(m->event, true);
+        if (r < 0)
+                log_debug_errno(r, "Failed to enable watchdog handling, ignoring: %m");
 
         /* Load previous synchronization state */
         r = access("/run/systemd/timesync/synchronized", F_OK);
@@ -1170,22 +1185,24 @@ int manager_setup_save_time_event(Manager *m) {
         int r;
 
         assert(m);
-        assert(!m->event_save_time);
 
         if (m->save_time_interval_usec == USEC_INFINITY)
                 return 0;
 
         /* NB: we'll accumulate scheduling latencies here, but this doesn't matter */
-        r = sd_event_add_time_relative(
-                        m->event, &m->event_save_time,
+        r = event_reset_time_relative(
+                        m->event,
+                        &m->event_save_time,
                         CLOCK_BOOTTIME,
                         m->save_time_interval_usec,
                         10 * USEC_PER_SEC,
-                        manager_save_time_handler, m);
+                        manager_save_time_handler,
+                        m,
+                        SD_EVENT_PRIORITY_NORMAL,
+                        "save-time",
+                        /* force_reset = */ false);
         if (r < 0)
-                return log_error_errno(r, "Failed to add save time event: %m");
-
-        (void) sd_event_source_set_description(m->event_save_time, "save-time");
+                return log_error_errno(r, "Failed to reset event source for saving time: %m");
 
         return 0;
 }
@@ -1199,23 +1216,11 @@ static int manager_save_time_and_rearm(Manager *m, usec_t t) {
          * clock, but otherwise uses the specified timestamp. Note that whenever we acquire an NTP sync the
          * specified timestamp value might be more accurate than the system clock, since the latter is
          * subject to slow adjustments. */
-        r = touch_file(CLOCK_FILE, false, t, UID_INVALID, GID_INVALID, MODE_INVALID);
+        r = touch_file(TIMESYNCD_CLOCK_FILE, /* parents = */ false, t, UID_INVALID, GID_INVALID, MODE_INVALID);
         if (r < 0)
-                log_debug_errno(r, "Failed to update " CLOCK_FILE ", ignoring: %m");
+                log_debug_errno(r, "Failed to update "TIMESYNCD_CLOCK_FILE", ignoring: %m");
 
-        m->save_on_exit = true;
-
-        if (m->save_time_interval_usec != USEC_INFINITY) {
-                r = sd_event_source_set_time_relative(m->event_save_time, m->save_time_interval_usec);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to rearm save time event: %m");
-
-                r = sd_event_source_set_enabled(m->event_save_time, SD_EVENT_ONESHOT);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to enable save time event: %m");
-        }
-
-        return 0;
+        return manager_setup_save_time_event(m);
 }
 
 static const char* ntp_server_property_name[_SERVER_TYPE_MAX] = {

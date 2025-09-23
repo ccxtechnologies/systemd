@@ -3,7 +3,7 @@
 
 #include "sd-id128.h"
 
-#include "macro.h"
+#include "forward.h"
 #include "sparse-endian.h"
 
 /*
@@ -44,9 +44,9 @@ typedef enum ObjectType {
 
 /* Object flags (note that src/basic/compress.h uses the same values for the compression types) */
 enum {
-        OBJECT_COMPRESSED_XZ   = 1 << 0,
-        OBJECT_COMPRESSED_LZ4  = 1 << 1,
-        OBJECT_COMPRESSED_ZSTD = 1 << 2,
+        OBJECT_COMPRESSED_XZ    = 1 << 0,
+        OBJECT_COMPRESSED_LZ4   = 1 << 1,
+        OBJECT_COMPRESSED_ZSTD  = 1 << 2,
         _OBJECT_COMPRESSED_MASK = OBJECT_COMPRESSED_XZ | OBJECT_COMPRESSED_LZ4 | OBJECT_COMPRESSED_ZSTD,
 };
 
@@ -55,7 +55,8 @@ struct ObjectHeader {
         uint8_t flags;
         uint8_t reserved[6];
         le64_t size;
-        uint8_t payload[];
+        uint8_t payload[0]; /* The struct is embedded in other objects, hence flex array (i.e. payload[])
+                             * cannot be used. */
 } _packed_;
 
 #define DataObject__contents {                                          \
@@ -103,18 +104,13 @@ assert_cc(sizeof(struct FieldObject) == sizeof(struct FieldObject__packed));
         le64_t xor_hash;                               \
         union {                                        \
                 struct {                               \
-                        dummy_t __empty__regular;      \
-                        struct {                       \
-                                le64_t object_offset;  \
-                                le64_t hash;           \
-                        } regular[];                   \
-                };                                     \
+                        le64_t object_offset;          \
+                        le64_t hash;                   \
+                } regular[0]; /* this is an array; since we are not allowed to place a variable sized array
+                               * in a union, we just zero-size it, even if it is generally longer. */ \
                 struct {                               \
-                        dummy_t __empty_compact;       \
-                        struct {                       \
-                                le32_t object_offset;  \
-                        } compact[];                   \
-                };                                     \
+                        le32_t object_offset;          \
+                } compact[0];                          \
         } items;                                       \
 }
 
@@ -164,7 +160,7 @@ enum {
         STATE_OFFLINE = 0,
         STATE_ONLINE = 1,
         STATE_ARCHIVED = 2,
-        _STATE_MAX
+        _STATE_MAX,
 };
 
 /* Header flags */
@@ -188,7 +184,6 @@ enum {
                                               HEADER_INCOMPATIBLE_COMPACT,
 };
 
-
 enum {
         HEADER_COMPATIBLE_SEALED             = 1 << 0,
         HEADER_COMPATIBLE_TAIL_ENTRY_BOOT_ID = 1 << 1, /* if set, the last_entry_boot_id field in the header is exclusively refreshed when an entry is appended */
@@ -200,7 +195,6 @@ enum {
         HEADER_COMPATIBLE_SUPPORTED          = (HAVE_GCRYPT ? HEADER_COMPATIBLE_SEALED | HEADER_COMPATIBLE_SEALED_CONTINUOUS : 0) |
                                                HEADER_COMPATIBLE_TAIL_ENTRY_BOOT_ID,
 };
-
 
 #define HEADER_SIGNATURE                                                \
         ((const uint8_t[]) { 'L', 'P', 'K', 'S', 'H', 'H', 'R', 'H' })

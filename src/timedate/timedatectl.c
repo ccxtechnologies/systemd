@@ -3,34 +3,42 @@
 #include <getopt.h>
 #include <locale.h>
 #include <math.h>
-#include <stdbool.h>
 #include <stdlib.h>
 
 #include "sd-bus.h"
+#include "sd-event.h"
 
+#include "alloc-util.h"
 #include "build.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-map-properties.h"
 #include "bus-print-properties.h"
+#include "bus-util.h"
+#include "constants.h"
 #include "env-util.h"
 #include "format-table.h"
 #include "in-addr-util.h"
+#include "log.h"
 #include "main-func.h"
 #include "pager.h"
+#include "parse-argument.h"
 #include "parse-util.h"
+#include "polkit-agent.h"
 #include "pretty-print.h"
+#include "runtime-scope.h"
 #include "sparse-endian.h"
-#include "spawn-polkit-agent.h"
 #include "string-table.h"
+#include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
+#include "time-util.h"
 #include "verbs.h"
 
 static PagerFlags arg_pager_flags = 0;
 static bool arg_ask_password = true;
 static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
-static char *arg_host = NULL;
+static const char *arg_host = NULL;
 static bool arg_adjust_system_clock = false;
 static bool arg_monitor = false;
 static char **arg_property = NULL;
@@ -51,11 +59,10 @@ typedef struct StatusInfo {
 static int print_status_info(const StatusInfo *i) {
         _cleanup_(table_unrefp) Table *table = NULL;
         const char *old_tz = NULL, *tz, *tz_colon;
-        bool have_time = false;
         char a[LINE_MAX];
         TableCell *cell;
         struct tm tm;
-        time_t sec;
+        usec_t t = USEC_INFINITY;
         size_t n;
         int r;
 
@@ -83,34 +90,50 @@ static int print_status_info(const StatusInfo *i) {
         else
                 tzset();
 
-        if (i->time != 0) {
-                sec = (time_t) (i->time / USEC_PER_SEC);
-                have_time = true;
-        } else if (IN_SET(arg_transport, BUS_TRANSPORT_LOCAL, BUS_TRANSPORT_MACHINE)) {
-                sec = time(NULL);
-                have_time = true;
-        } else
+        if (timestamp_is_set(i->time))
+                t = i->time;
+        else if (IN_SET(arg_transport, BUS_TRANSPORT_LOCAL, BUS_TRANSPORT_MACHINE))
+                t = now(CLOCK_REALTIME);
+        else
                 log_warning("Could not get time from timedated and not operating locally, ignoring.");
 
-        n = have_time ? strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S %Z", localtime_r(&sec, &tm)) : 0;
+        if (timestamp_is_set(t)) {
+                r = localtime_or_gmtime_usec(t, /* utc= */ false, &tm);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to convert system time to local time, ignoring: %m");
+                        n = 0;
+                } else
+                        n = strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S %Z", &tm);
+        } else
+                n = 0;
         r = table_add_many(table,
                            TABLE_FIELD, "Local time",
                            TABLE_STRING, n > 0 ? a : "n/a");
         if (r < 0)
                 return table_log_add_error(r);
 
-        n = have_time ? strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S UTC", gmtime_r(&sec, &tm)) : 0;
+        if (timestamp_is_set(t)) {
+                r = localtime_or_gmtime_usec(t, /* utc= */ true, &tm);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to convert system time to universal time, ignoring: %m");
+                        n = 0;
+                } else
+                        n = strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S UTC", &tm);
+        } else
+                n = 0;
         r = table_add_many(table,
                            TABLE_FIELD, "Universal time",
                            TABLE_STRING, n > 0 ? a : "n/a");
         if (r < 0)
                 return table_log_add_error(r);
 
-        if (i->rtc_time > 0) {
-                time_t rtc_sec;
-
-                rtc_sec = (time_t) (i->rtc_time / USEC_PER_SEC);
-                n = strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S", gmtime_r(&rtc_sec, &tm));
+        if (timestamp_is_set(i->rtc_time)) {
+                r = localtime_or_gmtime_usec(i->rtc_time, /* utc= */ true, &tm);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to convert RTC time to universal time, ignoring: %m");
+                        n = 0;
+                } else
+                        n = strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S", &tm);
         } else
                 n = 0;
         r = table_add_many(table,
@@ -122,8 +145,15 @@ static int print_status_info(const StatusInfo *i) {
         r = table_add_cell(table, NULL, TABLE_FIELD, "Time zone");
         if (r < 0)
                 return table_log_add_error(r);
-
-        n = have_time ? strftime(a, sizeof a, "%Z, %z", localtime_r(&sec, &tm)) : 0;
+        if (timestamp_is_set(t)) {
+                r = localtime_or_gmtime_usec(t, /* utc= */ false, &tm);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to determine timezone from system time, ignoring: %m");
+                        n = 0;
+                } else
+                        n = strftime(a, sizeof a, "%Z, %z", &tm);
+        } else
+                n = 0;
         r = table_add_cell_stringf(table, NULL, "%s (%s)", strna(i->timezone), n > 0 ? a : "n/a");
         if (r < 0)
                 return table_log_add_error(r);
@@ -149,14 +179,15 @@ static int print_status_info(const StatusInfo *i) {
         if (r < 0)
                 return table_log_print_error(r);
 
-        if (i->rtc_local)
-                printf("\n%s"
-                       "Warning: The system is configured to read the RTC time in the local time zone.\n"
-                       "         This mode cannot be fully supported. It will create various problems\n"
-                       "         with time zone changes and daylight saving time adjustments. The RTC\n"
-                       "         time is never updated, it relies on external facilities to maintain it.\n"
-                       "         If at all possible, use RTC in UTC by calling\n"
-                       "         'timedatectl set-local-rtc 0'.%s\n", ansi_highlight(), ansi_normal());
+        if (i->rtc_local) {
+                fflush(stdout);
+                log_warning(" \nWarning: The system is configured to read the RTC time in the local time zone.\n"
+                            "         This mode cannot be fully supported. It will create various problems\n"
+                            "         with time zone changes and daylight saving time adjustments. The RTC\n"
+                            "         time is never updated, it relies on external facilities to maintain it.\n"
+                            "         If at all possible, use RTC in UTC by calling\n"
+                            "         'timedatectl set-local-rtc 0'.\n");
+        }
 
         return 0;
 }
@@ -212,12 +243,11 @@ static int show_properties(int argc, char **argv, void *userdata) {
 
 static int set_time(int argc, char **argv, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        bool relative = false, interactive = arg_ask_password;
         sd_bus *bus = userdata;
         usec_t t;
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = parse_timestamp(argv[1], &t);
         if (r < 0)
@@ -229,7 +259,7 @@ static int set_time(int argc, char **argv, void *userdata) {
                         "SetTime",
                         &error,
                         NULL,
-                        "xbb", (int64_t) t, relative, interactive);
+                        "xbb", (int64_t) t, false, arg_ask_password);
         if (r < 0)
                 return log_error_errno(r, "Failed to set time: %s", bus_error_message(&error, r));
 
@@ -241,7 +271,7 @@ static int set_timezone(int argc, char **argv, void *userdata) {
         sd_bus *bus = userdata;
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = bus_call_method(bus, bus_timedate, "SetTimezone", &error, NULL, "sb", argv[1], arg_ask_password);
         if (r < 0)
@@ -255,11 +285,18 @@ static int set_local_rtc(int argc, char **argv, void *userdata) {
         sd_bus *bus = userdata;
         int r, b;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         b = parse_boolean(argv[1]);
         if (b < 0)
                 return log_error_errno(b, "Failed to parse local RTC setting '%s': %m", argv[1]);
+
+        if (b == 1)
+                log_warning("Warning: The system is now being configured to read the RTC time in the local time zone\n"
+                            "         This mode cannot be fully supported. It will create various problems\n"
+                            "         with time zone changes and daylight saving time adjustments. The RTC\n"
+                            "         time is never updated, it relies on external facilities to maintain it.\n"
+                            "         If at all possible, use RTC in UTC");
 
         r = bus_call_method(
                         bus,
@@ -280,7 +317,7 @@ static int set_ntp(int argc, char **argv, void *userdata) {
         sd_bus *bus = userdata;
         int b, r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         b = parse_boolean(argv[1]);
         if (b < 0)
@@ -289,7 +326,7 @@ static int set_ntp(int argc, char **argv, void *userdata) {
         r = bus_message_new_method_call(bus, &m, bus_timedate, "SetNTP");
         if (r < 0)
                 return bus_log_create_error(r);
-                
+
         r = sd_bus_message_append(m, "bb", b, arg_ask_password);
         if (r < 0)
                 return bus_log_create_error(r);
@@ -630,8 +667,14 @@ static int show_timesync_status_once(sd_bus *bus) {
                                    &error,
                                    &m,
                                    &info);
-        if (r < 0)
+        if (r < 0) {
+                if (bus_error_is_unknown_service(&error))
+                        return log_error_errno(r,
+                                               "Command requires systemd-timesyncd.service, but it is not available: %s",
+                                               bus_error_message(&error, r));
+
                 return log_error_errno(r, "Failed to query server: %s", bus_error_message(&error, r));
+        }
 
         if (arg_monitor && !terminal_is_dumb())
                 fputs(ANSI_HOME_CLEAR, stdout);
@@ -762,6 +805,7 @@ static int print_timesync_property(const char *name, const char *expected_value,
 }
 
 static int show_timesync(int argc, char **argv, void *userdata) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
@@ -771,9 +815,15 @@ static int show_timesync(int argc, char **argv, void *userdata) {
                                      print_timesync_property,
                                      arg_property,
                                      arg_print_flags,
-                                     NULL);
-        if (r < 0)
+                                     &error);
+        if (r < 0) {
+                if (bus_error_is_unknown_service(&error))
+                        return log_error_errno(r,
+                                               "Command requires systemd-timesyncd.service, but it is not available: %s",
+                                               bus_error_message(&error, r));
+
                 return bus_log_parse_error(r);
+        }
 
         return 0;
 }
@@ -813,7 +863,7 @@ static int verb_ntp_servers(int argc, char **argv, void *userdata) {
         if (ifindex < 0)
                 return ifindex;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = bus_message_new_method_call(bus, &req, bus_network_mgr, "SetLinkNTP");
         if (r < 0)
@@ -843,7 +893,7 @@ static int verb_revert(int argc, char **argv, void *userdata) {
         if (ifindex < 0)
                 return ifindex;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = bus_call_method(bus, bus_network_mgr, "RevertLinkNTP", &error, NULL, "i", ifindex);
         if (r < 0)
@@ -947,8 +997,9 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case 'M':
-                        arg_transport = BUS_TRANSPORT_MACHINE;
-                        arg_host = optarg;
+                        r = parse_machine_argument(optarg, &arg_host, &arg_transport);
+                        if (r < 0)
+                                return r;
                         break;
 
                 case ARG_NO_ASK_PASSWORD:
@@ -1031,7 +1082,9 @@ static int run(int argc, char *argv[]) {
 
         r = bus_connect_transport(arg_transport, arg_host, RUNTIME_SCOPE_SYSTEM, &bus);
         if (r < 0)
-                return bus_log_connect_error(r, arg_transport);
+                return bus_log_connect_error(r, arg_transport, RUNTIME_SCOPE_SYSTEM);
+
+        (void) sd_bus_set_allow_interactive_authorization(bus, arg_ask_password);
 
         return timedatectl_main(bus, argc, argv);
 }

@@ -17,17 +17,15 @@
   along with systemd; If not, see <https://www.gnu.org/licenses/>.
 ***/
 
-#include <inttypes.h>
-#include <net/ethernet.h>
-#include <netinet/in.h>
-#include <sys/types.h>
-#include <time.h>
-
 #include "_sd-common.h"
 
 _SD_BEGIN_DECLARATIONS;
 
+struct ether_addr;
+struct in6_addr;
+
 typedef struct sd_ndisc_router sd_ndisc_router;
+typedef struct sd_dns_resolver sd_dns_resolver;
 
 sd_ndisc_router *sd_ndisc_router_ref(sd_ndisc_router *rt);
 sd_ndisc_router *sd_ndisc_router_unref(sd_ndisc_router *rt);
@@ -86,6 +84,11 @@ int sd_ndisc_router_prefix64_get_prefix(sd_ndisc_router *rt, struct in6_addr *re
 int sd_ndisc_router_prefix64_get_prefixlen(sd_ndisc_router *rt, uint8_t *ret);
 int sd_ndisc_router_prefix64_get_lifetime(sd_ndisc_router *rt, uint64_t *ret);
 int sd_ndisc_router_prefix64_get_lifetime_timestamp(sd_ndisc_router *rt, clockid_t clock, uint64_t *ret);
+
+/* Specific option access: SD_NDISC_OPTION_ENCRYPTED_DNS */
+int sd_ndisc_router_encrypted_dns_get_resolver(sd_ndisc_router *rt, sd_dns_resolver **ret);
+int sd_ndisc_router_encrypted_dns_get_lifetime(sd_ndisc_router *rt, uint64_t *ret);
+int sd_ndisc_router_encrypted_dns_get_lifetime_timestamp(sd_ndisc_router *rt, clockid_t clock, uint64_t *ret);
 
 _SD_END_DECLARATIONS;
 

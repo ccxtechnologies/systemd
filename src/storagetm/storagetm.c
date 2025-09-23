@@ -1,32 +1,41 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
+#include <stdlib.h>
 #include <sys/file.h>
+#include <unistd.h>
+
+#include "sd-event.h"
+#include "sd-netlink.h"
 
 #include "af-list.h"
 #include "alloc-util.h"
+#include "blockdev-list.h"
 #include "blockdev-util.h"
 #include "build.h"
 #include "daemon-util.h"
 #include "device-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "format-util.h"
 #include "fs-util.h"
+#include "hashmap.h"
 #include "id128-util.h"
 #include "local-addresses.h"
-#include "loop-util.h"
 #include "main-func.h"
+#include "mountpoint-util.h"
 #include "os-util.h"
-#include "parse-argument.h"
 #include "path-util.h"
 #include "plymouth-util.h"
 #include "pretty-print.h"
-#include "process-util.h"
 #include "random-util.h"
 #include "recurse-dir.h"
+#include "siphash24.h"
 #include "socket-util.h"
+#include "stat-util.h"
+#include "string-util.h"
+#include "strv.h"
 #include "terminal-util.h"
+#include "time-util.h"
 #include "udev-util.h"
 
 static char **arg_devices = NULL;
@@ -50,6 +59,7 @@ static int help(void) {
                "     --version         Show package version\n"
                "     --nqn=STRING      Select NQN (NVMe Qualified Name)\n"
                "  -a --all             Expose all devices\n"
+               "     --list-devices    List candidate block devices to operate on\n"
                "\nSee the %s for details.\n",
                program_invocation_short_name,
                ansi_highlight(),
@@ -64,13 +74,15 @@ static int parse_argv(int argc, char *argv[]) {
         enum {
                 ARG_NQN = 0x100,
                 ARG_VERSION,
+                ARG_LIST_DEVICES,
         };
 
         static const struct option options[] = {
-                { "help",      no_argument,       NULL, 'h'           },
-                { "version",   no_argument,       NULL, ARG_VERSION   },
-                { "nqn",       required_argument, NULL, ARG_NQN       },
-                { "all",       no_argument,       NULL, 'a'           },
+                { "help",         no_argument,       NULL, 'h'              },
+                { "version",      no_argument,       NULL, ARG_VERSION      },
+                { "nqn",          required_argument, NULL, ARG_NQN          },
+                { "all",          no_argument,       NULL, 'a'              },
+                { "list-devices", no_argument,       NULL, ARG_LIST_DEVICES },
                 {}
         };
 
@@ -101,6 +113,13 @@ static int parse_argv(int argc, char *argv[]) {
                 case 'a':
                         arg_all++;
                         break;
+
+                case ARG_LIST_DEVICES:
+                        r = blockdev_list(BLOCKDEV_LIST_SHOW_SYMLINKS|BLOCKDEV_LIST_IGNORE_ZRAM);
+                        if (r < 0)
+                                return r;
+
+                        return 0;
 
                 case '?':
                         return -EINVAL;
@@ -401,7 +420,7 @@ static int nvme_subsystem_add(const char *node, int consumed_fd, sd_device *devi
         _cleanup_close_ int subsystems_fd = -EBADF;
         subsystems_fd = RET_NERRNO(open("/sys/kernel/config/nvmet/subsystems", O_DIRECTORY|O_CLOEXEC|O_RDONLY));
         if (subsystems_fd < 0)
-                return log_error_errno(subsystems_fd, "Failed to open /sys/kernel/config/nvmet/subsystems: %m");
+                return log_error_errno(subsystems_fd, "Failed to open %s: %m", "/sys/kernel/config/nvmet/subsystems");
 
         _cleanup_close_ int subsystem_fd = -EBADF;
         subsystem_fd = open_mkdir_at(subsystems_fd, j, O_EXCL|O_RDONLY|O_CLOEXEC, 0777);
@@ -454,7 +473,7 @@ static int nvme_subsystem_add(const char *node, int consumed_fd, sd_device *devi
 }
 
 typedef struct NvmePort {
-        uint16_t portnr; /* used for both the IP and the NVME port numer */
+        uint16_t portnr; /* used for both the IP and the NVME port number */
 
         int nvme_port_fd;
         int nvme_ports_fd;
@@ -616,7 +635,7 @@ static int nvme_port_add(const char *name, int ip_family, NvmePort **ret) {
         _cleanup_close_ int ports_fd = -EBADF;
         ports_fd = RET_NERRNO(open("/sys/kernel/config/nvmet/ports", O_DIRECTORY|O_RDONLY|O_CLOEXEC));
         if (ports_fd < 0)
-                return log_error_errno(ports_fd, "Failed to open /sys/kernel/config/nvmet/ports: %m");
+                return log_error_errno(ports_fd, "Failed to open %s: %m", "/sys/kernel/config/nvmet/ports");
 
         _cleanup_close_ int port_fd = -EBADF;
         uint16_t portnr = calculate_start_port(name, ip_family);
@@ -694,8 +713,8 @@ static int nvme_subsystem_report(NvmeSubsystem *subsystem, NvmePort *ipv4, NvmeP
                 return log_error_errno(n_addresses, "Failed to determine local IP addresses: %m");
 
         log_notice("NVMe-TCP: %s %s%s%s (%s)",
-                   special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
-                   emoji_enabled() ? special_glyph(SPECIAL_GLYPH_COMPUTER_DISK) : "", emoji_enabled() ? " " : "",
+                   glyph(GLYPH_ARROW_RIGHT),
+                   emoji_enabled() ? glyph(GLYPH_COMPUTER_DISK) : "", emoji_enabled() ? " " : "",
                    subsystem->name, subsystem->device);
 
         FOREACH_ARRAY(a, addresses, n_addresses) {
@@ -705,33 +724,11 @@ static int nvme_subsystem_report(NvmeSubsystem *subsystem, NvmePort *ipv4, NvmeP
                         continue;
 
                 log_info("          %s Try for specific device: nvme connect -t tcp -n '%s' -a %s -s %" PRIu16,
-                         special_glyph(a >= addresses + (n_addresses - 1) ? SPECIAL_GLYPH_TREE_RIGHT : SPECIAL_GLYPH_TREE_BRANCH),
+                         glyph(a >= addresses + (n_addresses - 1) ? GLYPH_TREE_RIGHT : GLYPH_TREE_BRANCH),
                          subsystem->name,
                          IN_ADDR_TO_STRING(a->family, &a->address),
                          port->portnr);
         }
-
-        return 0;
-}
-
-static int plymouth_send_text(const char *text) {
-        _cleanup_free_ char *plymouth_message = NULL;
-        int c, r;
-
-        assert(text);
-
-        c = asprintf(&plymouth_message,
-                     "M\x02%c%s%c"
-                     "A%c", /* pause spinner */
-                     (int) strlen(text) + 1, text, '\x00',
-                     '\x00');
-        if (c < 0)
-                return log_oom();
-
-        r = plymouth_send_raw(plymouth_message, c, SOCK_NONBLOCK);
-        if (r < 0)
-                return log_full_errno(ERRNO_IS_NO_PLYMOUTH(r) ? LOG_DEBUG : LOG_WARNING, r,
-                                      "Failed to communicate with plymouth, ignoring: %m");
 
         return 0;
 }
@@ -745,7 +742,7 @@ static int plymouth_notify_port(NvmePort *port, struct local_address *a) {
         if (asprintf(&m, "nvme connect-all -t tcp -a %s -s %" PRIu16, IN_ADDR_TO_STRING(a->family, &a->address), port->portnr) < 0)
                 return log_oom();
 
-        return plymouth_send_text(m);
+        return plymouth_send_msg(m, /* pause_spinner= */ true);
 }
 
 static int nvme_port_report(NvmePort *port, bool *plymouth_done) {
@@ -759,14 +756,14 @@ static int nvme_port_report(NvmePort *port, bool *plymouth_done) {
                 return log_error_errno(n_addresses, "Failed to determine local IP addresses: %m");
 
         log_notice("NVMe-TCP: %s %s%sListening on %s (port %" PRIu16 ")",
-                   special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
-                   emoji_enabled() ? special_glyph(SPECIAL_GLYPH_WORLD) : "", emoji_enabled() ? " " : "",
+                   glyph(GLYPH_ARROW_RIGHT),
+                   emoji_enabled() ? glyph(GLYPH_WORLD) : "", emoji_enabled() ? " " : "",
                    af_to_ipv4_ipv6(port->ip_family),
                    port->portnr);
 
         FOREACH_ARRAY(a, addresses, n_addresses)
                 log_info("          %s Try for all devices: nvme connect-all -t tcp -a %s -s %" PRIu16,
-                         special_glyph(a >= addresses + (n_addresses - 1) ? SPECIAL_GLYPH_TREE_RIGHT : SPECIAL_GLYPH_TREE_BRANCH),
+                         glyph(a >= addresses + (n_addresses - 1) ? GLYPH_TREE_RIGHT : GLYPH_TREE_BRANCH),
                          IN_ADDR_TO_STRING(a->family, &a->address),
                          port->portnr);
 
@@ -852,7 +849,7 @@ static void device_track_back(sd_device *d, sd_device **ret) {
 
         _cleanup_(sd_device_unrefp) sd_device *d_originating = NULL;
         r = block_device_get_originating(d, &d_originating);
-        if (r < 0)
+        if (r < 0 && r != -ENOENT)
                 log_device_debug_errno(d, r, "Failed to get originating device for '%s', ignoring: %m", strna(devname));
 
         sd_device *d_whole = NULL;
@@ -1054,7 +1051,7 @@ static int on_display_refresh(sd_event_source *s, uint64_t usec, void *userdata)
 
         c->display_refresh_scheduled = false;
 
-        if (isatty(STDERR_FILENO))
+        if (isatty_safe(STDERR_FILENO))
                 fputs(ANSI_HOME_CLEAR, stderr);
 
         /* If we have both IPv4 and IPv6, we display IPv4 info via Plymouth, since it doesn't have much
@@ -1065,7 +1062,7 @@ static int on_display_refresh(sd_event_source *s, uint64_t usec, void *userdata)
         (void) nvme_port_report(c->ipv6_port, &plymouth_done);
 
         if (!plymouth_done)
-                (void) plymouth_send_text("Network disconnected.");
+                (void) plymouth_send_msg("Network disconnected.", /* pause_spinner= */ true);
 
         NvmeSubsystem *i;
         HASHMAP_FOREACH(i, c->subsystems)
@@ -1090,7 +1087,7 @@ static int on_address_change(sd_netlink *rtnl, sd_netlink_message *mm, void *use
         if (!c->display_refresh_scheduled) {
                 r = sd_event_add_time_relative(
                                 sd_netlink_get_event(rtnl),
-                                /* ret_slot= */ NULL,
+                                /* ret= */ NULL,
                                 CLOCK_MONOTONIC,
                                 750 * USEC_PER_MSEC,
                                 0,
@@ -1116,6 +1113,14 @@ static int run(int argc, char* argv[]) {
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
+
+        /* If systemd-storagetm is invoked outside of it's unit /sys/kernel/config/ might not be mounted yet,
+         * so let's check explicitly whether it is mounted or not. */
+        r = path_is_mount_point("/sys/kernel/config");
+        if (r < 0)
+                return log_error_errno(r, "Failed to check if the configfs filesystem is mounted at /sys/kernel/config/: %m");
+        if (r == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(ENOENT), "The configfs filesystem must be mounted at /sys/kernel/config/ to be able to use systemd-storagetm");
 
         r = sd_event_new(&event);
         if (r < 0)
@@ -1159,7 +1164,7 @@ static int run(int argc, char* argv[]) {
         }
 
         if (!plymouth_done)
-                (void) plymouth_send_text("Network disconnected.");
+                (void) plymouth_send_msg("Network disconnected.", /* pause_spinner= */ true);
 
         NvmeSubsystem *i;
         HASHMAP_FOREACH(i, context.subsystems) {
@@ -1236,13 +1241,13 @@ static int run(int argc, char* argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to subscribe to RTM_DELADDR events: %m");
 
-        if (isatty(STDIN_FILENO))
+        if (isatty_safe(STDIN_FILENO))
                 log_info("Hit Ctrl-C to exit target mode.");
 
         _unused_ _cleanup_(notify_on_cleanup) const char *notify_message =
                 notify_start("READY=1\n"
                              "STATUS=Exposing disks in target mode...",
-                             NOTIFY_STOPPING);
+                             NOTIFY_STOPPING_MESSAGE);
 
         r = sd_event_loop(event);
         if (r < 0)

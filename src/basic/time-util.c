@@ -1,28 +1,24 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <ctype.h>
-#include <errno.h>
-#include <limits.h>
 #include <stdlib.h>
 #include <sys/mman.h>
-#include <sys/time.h>
 #include <sys/timerfd.h>
-#include <sys/types.h>
+#include <threads.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "errno-util.h"
+#include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
 #include "io-util.h"
 #include "log.h"
-#include "macro.h"
-#include "missing_threads.h"
-#include "missing_timerfd.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "stat-util.h"
+#include "stdio-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
@@ -312,7 +308,7 @@ struct timeval *timeval_store(struct timeval *tv, usec_t u) {
         return tv;
 }
 
-char *format_timestamp_style(
+char* format_timestamp_style(
                 char *buf,
                 size_t l,
                 usec_t t,
@@ -332,7 +328,6 @@ char *format_timestamp_style(
 
         struct tm tm;
         bool utc, us;
-        time_t sec;
         size_t n;
 
         assert(buf);
@@ -375,9 +370,7 @@ char *format_timestamp_style(
                 return strcpy(buf, xxx[style]);
         }
 
-        sec = (time_t) (t / USEC_PER_SEC); /* Round down */
-
-        if (!localtime_or_gmtime_r(&sec, &tm, utc))
+        if (localtime_or_gmtime_usec(t, utc, &tm) < 0)
                 return NULL;
 
         /* Start with the week day */
@@ -559,7 +552,7 @@ char* format_timespan(char *buf, size_t l, usec_t t, usec_t accuracy) {
 
         /* The result of this function can be parsed with parse_sec */
 
-        for (size_t i = 0; i < ELEMENTSOF(table); i++) {
+        FOREACH_ELEMENT(i, table) {
                 int k = 0;
                 size_t n;
                 bool done = false;
@@ -571,20 +564,20 @@ char* format_timespan(char *buf, size_t l, usec_t t, usec_t accuracy) {
                 if (t < accuracy && something)
                         break;
 
-                if (t < table[i].usec)
+                if (t < i->usec)
                         continue;
 
                 if (l <= 1)
                         break;
 
-                a = t / table[i].usec;
-                b = t % table[i].usec;
+                a = t / i->usec;
+                b = t % i->usec;
 
                 /* Let's see if we should shows this in dot notation */
                 if (t < USEC_PER_MINUTE && b > 0) {
                         signed char j = 0;
 
-                        for (usec_t cc = table[i].usec; cc > 1; cc /= 10)
+                        for (usec_t cc = i->usec; cc > 1; cc /= 10)
                                 j++;
 
                         for (usec_t cc = accuracy; cc > 1; cc /= 10) {
@@ -599,7 +592,7 @@ char* format_timespan(char *buf, size_t l, usec_t t, usec_t accuracy) {
                                              a,
                                              j,
                                              b,
-                                             table[i].suffix);
+                                             i->suffix);
 
                                 t = 0;
                                 done = true;
@@ -612,7 +605,7 @@ char* format_timespan(char *buf, size_t l, usec_t t, usec_t accuracy) {
                                      "%s"USEC_FMT"%s",
                                      p > buf ? " " : "",
                                      a,
-                                     table[i].suffix);
+                                     i->suffix);
 
                         t = b;
                 }
@@ -665,7 +658,6 @@ static int parse_timestamp_impl(
         unsigned fractional = 0;
         const char *k;
         struct tm tm, copy;
-        time_t sec;
 
         /* Allowed syntaxes:
          *
@@ -778,10 +770,9 @@ static int parse_timestamp_impl(
                 }
         }
 
-        sec = (time_t) (usec / USEC_PER_SEC);
-
-        if (!localtime_or_gmtime_r(&sec, &tm, utc))
-                return -EINVAL;
+        r = localtime_or_gmtime_usec(usec, utc, &tm);
+        if (r < 0)
+                return r;
 
         tm.tm_isdst = isdst;
 
@@ -800,12 +791,12 @@ static int parse_timestamp_impl(
                 goto from_tm;
         }
 
-        for (size_t i = 0; i < ELEMENTSOF(day_nr); i++) {
-                k = startswith_no_case(t, day_nr[i].name);
+        FOREACH_ELEMENT(day, day_nr) {
+                k = startswith_no_case(t, day->name);
                 if (!k || *k != ' ')
                         continue;
 
-                weekday = day_nr[i].nr;
+                weekday = day->nr;
                 t = k + 1;
                 break;
         }
@@ -939,11 +930,11 @@ from_tm:
         } else
                 minus = gmtoff * USEC_PER_SEC;
 
-        sec = mktime_or_timegm(&tm, utc);
-        if (sec < 0)
-                return -EINVAL;
+        r = mktime_or_timegm_usec(&tm, utc, &usec);
+        if (r < 0)
+                return r;
 
-        usec = usec_add(sec * USEC_PER_SEC, fractional);
+        usec = usec_add(usec, fractional);
 
 finish:
         usec = usec_add(usec, plus);
@@ -999,8 +990,12 @@ int parse_timestamp(const char *t, usec_t *ret) {
         assert(t);
 
         t_len = strlen(t);
-        if (t_len > 2 && t[t_len - 1] == 'Z' && t[t_len - 2] != ' ')  /* RFC3339-style welded UTC: "1985-04-12T23:20:50.52Z" */
-                return parse_timestamp_impl(t, t_len - 1, /* utc = */ true, /* isdst = */ -1, /* gmtoff = */ 0, ret);
+        if (t_len > 2 && t[t_len - 1] == 'Z') {
+                /* Try to parse as RFC3339-style welded UTC: "1985-04-12T23:20:50.52Z" */
+                r = parse_timestamp_impl(t, t_len - 1, /* utc = */ true, /* isdst = */ -1, /* gmtoff = */ 0, ret);
+                if (r >= 0)
+                        return r;
+        }
 
         if (t_len > 7 && IN_SET(t[t_len - 6], '+', '-') && t[t_len - 7] != ' ') {  /* RFC3339-style welded offset: "1990-12-31T15:59:60-08:00" */
                 k = strptime(&t[t_len - 6], "%z", &tm);
@@ -1043,6 +1038,14 @@ int parse_timestamp(const char *t, usec_t *ret) {
         shared = mmap(NULL, sizeof *shared, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
         if (shared == MAP_FAILED)
                 return negative_errno();
+
+        /* The input string may be in argv. Let's copy it. */
+        _cleanup_free_ char *t_copy = strdup(t);
+        if (!t_copy)
+                return -ENOMEM;
+
+        t = t_copy;
+        assert_se(tz = endswith(t_copy, tz));
 
         r = safe_fork("(sd-timestamp)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGKILL|FORK_WAIT, NULL);
         if (r < 0) {
@@ -1115,12 +1118,12 @@ static const char* extract_multiplier(const char *p, usec_t *ret) {
         assert(p);
         assert(ret);
 
-        for (size_t i = 0; i < ELEMENTSOF(table); i++) {
+        FOREACH_ELEMENT(i, table) {
                 char *e;
 
-                e = startswith(p, table[i].suffix);
+                e = startswith(p, i->suffix);
                 if (e) {
-                        *ret = table[i].usec;
+                        *ret = i->usec;
                         return e;
                 }
         }
@@ -1130,19 +1133,14 @@ static const char* extract_multiplier(const char *p, usec_t *ret) {
 
 int parse_time(const char *t, usec_t *ret, usec_t default_unit) {
         const char *p, *s;
-        usec_t usec = 0;
-        bool something = false;
 
         assert(t);
         assert(default_unit > 0);
 
-        p = t;
-
-        p += strspn(p, WHITESPACE);
+        p = skip_leading_chars(t, /* bad = */ NULL);
         s = startswith(p, "infinity");
         if (s) {
-                s += strspn(s, WHITESPACE);
-                if (*s != 0)
+                if (!in_charset(s, WHITESPACE))
                         return -EINVAL;
 
                 if (ret)
@@ -1150,13 +1148,14 @@ int parse_time(const char *t, usec_t *ret, usec_t default_unit) {
                 return 0;
         }
 
-        for (;;) {
+        usec_t usec = 0;
+
+        for (bool something = false;;) {
                 usec_t multiplier = default_unit, k;
                 long long l;
                 char *e;
 
-                p += strspn(p, WHITESPACE);
-
+                p = skip_leading_chars(p, /* bad = */ NULL);
                 if (*p == 0) {
                         if (!something)
                                 return -EINVAL;
@@ -1293,17 +1292,16 @@ static const char* extract_nsec_multiplier(const char *p, nsec_t *ret) {
                 { "ns",      1ULL            },
                 { "",        1ULL            }, /* default is nsec */
         };
-        size_t i;
 
         assert(p);
         assert(ret);
 
-        for (i = 0; i < ELEMENTSOF(table); i++) {
+        FOREACH_ELEMENT(i, table) {
                 char *e;
 
-                e = startswith(p, table[i].suffix);
+                e = startswith(p, i->suffix);
                 if (e) {
-                        *ret = table[i].nsec;
+                        *ret = i->nsec;
                         return e;
                 }
         }
@@ -1519,8 +1517,7 @@ int get_timezones(char ***ret) {
         if (r < 0)
                 return r;
 
-        strv_sort(zones);
-        strv_uniq(zones);
+        strv_sort_uniq(zones);
 
         *ret = TAKE_PTR(zones);
         return 0;
@@ -1610,7 +1607,7 @@ int get_timezone(char **ret) {
 
         assert(ret);
 
-        r = readlink_malloc("/etc/localtime", &t);
+        r = readlink_malloc(etc_localtime(), &t);
         if (r == -ENOENT)
                 /* If the symlink does not exist, assume "UTC", like glibc does */
                 return strdup_to(ret, "UTC");
@@ -1626,17 +1623,63 @@ int get_timezone(char **ret) {
         return strdup_to(ret, e);
 }
 
-time_t mktime_or_timegm(struct tm *tm, bool utc) {
-        assert(tm);
+const char* etc_localtime(void) {
+        static const char *cached = NULL;
 
-        return utc ? timegm(tm) : mktime(tm);
+        if (!cached)
+                cached = secure_getenv("SYSTEMD_ETC_LOCALTIME") ?: "/etc/localtime";
+
+        return cached;
 }
 
-struct tm *localtime_or_gmtime_r(const time_t *t, struct tm *tm, bool utc) {
-        assert(t);
+int mktime_or_timegm_usec(
+                struct tm *tm, /* input + normalized output */
+                bool utc,
+                usec_t *ret) {
+
+        time_t t;
+
         assert(tm);
 
-        return utc ? gmtime_r(t, tm) : localtime_r(t, tm);
+        if (tm->tm_year < 69) /* early check for negative (i.e. before 1970) time_t (Note that in some timezones the epoch is in the year 1969!) */
+                return -ERANGE;
+        if ((usec_t) tm->tm_year > CONST_MIN(USEC_INFINITY / USEC_PER_YEAR, (usec_t) TIME_T_MAX / (365U * 24U * 60U * 60U)) - 1900) /* early check for possible overrun of usec_t or time_t */
+                return -ERANGE;
+
+        /* timegm()/mktime() is a bit weird to use, since it returns -1 in two cases: on error as well as a
+         * valid time indicating one second before the UNIX epoch. Let's treat both cases the same here, and
+         * return -ERANGE for anything negative, since usec_t is unsigned, and we can thus not express
+         * negative times anyway. */
+
+        t = utc ? timegm(tm) : mktime(tm);
+        if (t < 0) /* Refuse negative times and errors */
+                return -ERANGE;
+        if ((usec_t) t >= USEC_INFINITY / USEC_PER_SEC) /* Never return USEC_INFINITY by accident (or overflow) */
+                return -ERANGE;
+
+        if (ret)
+                *ret = (usec_t) t * USEC_PER_SEC;
+        return 0;
+}
+
+int localtime_or_gmtime_usec(
+                usec_t t,
+                bool utc,
+                struct tm *ret) {
+
+        t /= USEC_PER_SEC; /* Round down */
+        if (t > (usec_t) TIME_T_MAX)
+                return -ERANGE;
+        time_t sec = (time_t) t;
+
+        struct tm buf = {};
+        if (!(utc ? gmtime_r(&sec, &buf) : localtime_r(&sec, &buf)))
+                return -EINVAL;
+
+        if (ret)
+                *ret = buf;
+
+        return 0;
 }
 
 static uint32_t sysconf_clock_ticks_cached(void) {
@@ -1748,7 +1791,7 @@ DEFINE_STRING_TABLE_LOOKUP_TO_STRING(timestamp_style, TimestampStyle);
 TimestampStyle timestamp_style_from_string(const char *s) {
         TimestampStyle t;
 
-        t = (TimestampStyle) string_table_lookup(timestamp_style_table, ELEMENTSOF(timestamp_style_table), s);
+        t = (TimestampStyle) string_table_lookup_from_string(timestamp_style_table, ELEMENTSOF(timestamp_style_table), s);
         if (t >= 0)
                 return t;
         if (STRPTR_IN_SET(s, "µs", "μs")) /* accept both µ symbols in unicode, i.e. micro symbol + Greek small letter mu. */

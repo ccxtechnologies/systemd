@@ -1,9 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <errno.h>
-
-#include "macro.h"
+#include "forward.h"
 
 typedef enum RuntimeScope {
         RUNTIME_SCOPE_SYSTEM,           /* for the system */
@@ -13,7 +11,7 @@ typedef enum RuntimeScope {
         _RUNTIME_SCOPE_INVALID = -EINVAL,
 } RuntimeScope;
 
-const char *runtime_scope_to_string(RuntimeScope scope) _const_;
+const char* runtime_scope_to_string(RuntimeScope scope) _const_;
 RuntimeScope runtime_scope_from_string(const char *s) _const_;
 
-const char *runtime_scope_cmdline_option_to_string(RuntimeScope scope) _const_;
+const char* runtime_scope_cmdline_option_to_string(RuntimeScope scope) _const_;

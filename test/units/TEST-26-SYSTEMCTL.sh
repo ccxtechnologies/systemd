@@ -21,6 +21,7 @@ at_exit() {
 #       the 'revert' verb as well
 export UNIT_NAME="systemctl-test-$RANDOM.service"
 export UNIT_NAME2="systemctl-test-$RANDOM.service"
+export UNIT_NAME_TEMPLATE="systemctl-test-${RANDOM}@.service"
 
 cat >"/usr/lib/systemd/system/$UNIT_NAME" <<\EOF
 [Unit]
@@ -64,6 +65,16 @@ Description=spectacular
 EOF
 printf '%s\n' '[Unit]'   'Description=spectacular' '# this comment should remain' | \
     cmp - "/etc/systemd/system/$UNIT_NAME.d/override2.conf"
+
+# Edit nonexistent template unit, see issue #35632.
+systemctl edit "$UNIT_NAME_TEMPLATE" --stdin --runtime --force --full <<EOF
+[Unit]
+Description=template unit test
+# this comment should remain
+
+EOF
+printf '%s\n' '[Unit]' 'Description=template unit test' '# this comment should remain' | \
+    cmp - "/run/systemd/system/$UNIT_NAME_TEMPLATE"
 
 # Test simultaneous editing of two units and creation of drop-in for a nonexistent unit
 systemctl edit "$UNIT_NAME" "$UNIT_NAME2" --stdin --force --drop-in=override2.conf <<<'[X-Section]'
@@ -238,12 +249,12 @@ systemctl revert "$UNIT_NAME"
 (! grep -r "IPAccounting=" "/etc/systemd/system.control/${UNIT_NAME}.d/")
 (! grep -r "MemoryMax=" "/etc/systemd/system.control/${UNIT_NAME}.d/")
 # Same stuff, but with --runtime, which should use /run
-systemctl set-property --runtime "$UNIT_NAME" CPUAccounting=no CPUQuota=10%
+systemctl set-property --runtime "$UNIT_NAME" IOAccounting=no CPUQuota=10%
 systemctl cat "$UNIT_NAME"
-grep -r "CPUAccounting=no" "/run/systemd/system.control/${UNIT_NAME}.d/"
+grep -r "IOAccounting=no" "/run/systemd/system.control/${UNIT_NAME}.d/"
 grep -r "CPUQuota=10.00%" "/run/systemd/system.control/${UNIT_NAME}.d/"
 systemctl revert "$UNIT_NAME"
-(! grep -r "CPUAccounting=" "/run/systemd/system.control/${UNIT_NAME}.d/")
+(! grep -r "IOAccounting=" "/run/systemd/system.control/${UNIT_NAME}.d/")
 (! grep -r "CPUQuota=" "/run/systemd/system.control/${UNIT_NAME}.d/")
 
 # Failed-unit related tests
@@ -340,9 +351,17 @@ done
 systemctl is-active "*-journald.service"
 systemctl cat "*udevd*"
 systemctl cat "$UNIT_NAME"
+(! systemctl cat hopefully-nonexistent-unit.service)
+systemctl cat --force hopefully-nonexistent-unit.service
 systemctl help "$UNIT_NAME"
 systemctl service-watchdogs
 systemctl service-watchdogs "$(systemctl service-watchdogs)"
+# Ensure that the enablement symlinks can still be removed after the user is gone, to avoid having leftovers
+systemctl enable "$UNIT_NAME"
+systemctl stop "$UNIT_NAME"
+rm -f "/usr/lib/systemd/system/$UNIT_NAME"
+systemctl daemon-reload
+systemctl disable "$UNIT_NAME"
 
 # show/set-environment
 # Make sure PATH is set

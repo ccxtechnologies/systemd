@@ -1,21 +1,21 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/stat.h>
-#include <sys/types.h>
 
 #include "sd-bus.h"
+#include "sd-event.h"
 
 #include "alloc-util.h"
 #include "bus-log-control-api.h"
-#include "bus-polkit.h"
+#include "bus-object.h"
+#include "bus-util.h"
 #include "common-signal.h"
 #include "constants.h"
 #include "daemon-util.h"
+#include "hashmap.h"
+#include "log.h"
 #include "main-func.h"
-#include "portabled-bus.h"
-#include "portabled-image-bus.h"
 #include "portabled.h"
-#include "process-util.h"
 #include "service-util.h"
 #include "signal-util.h"
 
@@ -28,29 +28,29 @@ static int manager_new(Manager **ret) {
 
         assert(ret);
 
-        m = new0(Manager, 1);
+        m = new(Manager, 1);
         if (!m)
                 return -ENOMEM;
+
+        *m = (Manager) {
+                .runtime_scope = RUNTIME_SCOPE_SYSTEM,
+        };
 
         r = sd_event_default(&m->event);
         if (r < 0)
                 return r;
 
-        r = sd_event_add_signal(m->event, NULL, SIGINT, NULL, NULL);
+        r = sd_event_set_signal_exit(m->event, true);
         if (r < 0)
                 return r;
 
-        r = sd_event_add_signal(m->event, NULL, SIGTERM, NULL, NULL);
-        if (r < 0)
-                return r;
-
-        r = sd_event_add_signal(m->event, NULL, SIGRTMIN+18, sigrtmin18_handler, NULL);
+        r = sd_event_add_signal(m->event, /* ret= */ NULL, (SIGRTMIN+18)|SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, /* userdata= */ NULL);
         if (r < 0)
                 return r;
 
         r = sd_event_add_memory_pressure(m->event, NULL, NULL, NULL);
         if (r < 0)
-                log_debug_errno(r, "Failed allocate memory pressure event source, ignoring: %m");
+                log_debug_errno(r, "Failed to allocate memory pressure event source, ignoring: %m");
 
         (void) sd_event_set_watchdog(m->event, true);
 
@@ -117,9 +117,10 @@ static int manager_startup(Manager *m) {
 }
 
 static bool check_idle(void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
 
-        return !m->operations;
+        return !m->operations &&
+                hashmap_isempty(m->polkit_registry);
 }
 
 static int run(int argc, char *argv[]) {
@@ -141,7 +142,7 @@ static int run(int argc, char *argv[]) {
         if (argc != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes no arguments.");
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD, SIGTERM, SIGINT, SIGRTMIN+18) >= 0);
+        assert_se(sigprocmask_many(SIG_BLOCK, /* ret_old_mask= */ NULL, SIGCHLD) >= 0);
 
         r = manager_new(&m);
         if (r < 0)
@@ -151,7 +152,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to fully start up daemon: %m");
 
-        r = sd_notify(false, NOTIFY_READY);
+        r = sd_notify(false, NOTIFY_READY_MESSAGE);
         if (r < 0)
                 log_warning_errno(r, "Failed to send readiness notification, ignoring: %m");
 

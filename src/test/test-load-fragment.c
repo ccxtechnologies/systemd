@@ -1,35 +1,31 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <fcntl.h>
-#include <stddef.h>
 #include <stdio.h>
 #include <unistd.h>
 
+#include "sd-daemon.h"
 #include "sd-id128.h"
 
 #include "all-units.h"
 #include "alloc-util.h"
 #include "capability-util.h"
 #include "conf-parser.h"
-#include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
-#include "fs-util.h"
 #include "hashmap.h"
-#include "hostname-util.h"
-#include "install-printf.h"
+#include "hostname-setup.h"
 #include "install.h"
+#include "install-printf.h"
 #include "load-fragment.h"
-#include "macro.h"
-#include "memory-util.h"
+#include "manager.h"
 #include "open-file.h"
 #include "pcre2-util.h"
 #include "rm-rf.h"
+#include "set.h"
 #include "specifier.h"
 #include "string-util.h"
 #include "strv.h"
 #include "tests.h"
-#include "tmpfile-util.h"
 #include "user-util.h"
 
 /* Nontrivial value serves as a placeholder to check that parsing function (didn't) change it */
@@ -42,15 +38,12 @@ STATIC_DESTRUCTOR_REGISTER(runtime_dir, rm_rf_physical_and_freep);
 /* For testing type compatibility. */
 _unused_ ConfigPerfItemLookup unused_lookup = load_fragment_gperf_lookup;
 
-TEST_RET(unit_file_get_set) {
+TEST_RET(unit_file_get_list) {
         int r;
         _cleanup_hashmap_free_ Hashmap *h = NULL;
         UnitFileList *p;
 
-        h = hashmap_new(&unit_file_list_hash_ops_free);
-        assert_se(h);
-
-        r = unit_file_get_list(RUNTIME_SCOPE_SYSTEM, NULL, h, NULL, NULL);
+        r = unit_file_get_list(RUNTIME_SCOPE_SYSTEM, NULL, NULL, NULL, &h);
         if (IN_SET(r, -EPERM, -EACCES))
                 return log_tests_skipped_errno(r, "unit_file_get_list");
 
@@ -915,24 +908,22 @@ TEST(config_parse_memory_limit) {
                 { "MemoryMax",  "10",           &c.memory_max,  10 },
                 { "MemoryMax",  "infinity",     &c.memory_max,  CGROUP_LIMIT_MAX },
         };
-        size_t i;
         int r;
 
-        for (i = 0; i < ELEMENTSOF(limit_tests); i++) {
+        FOREACH_ELEMENT(test, limit_tests) {
                 c.memory_min = CGROUP_LIMIT_DUMMY;
                 c.memory_low = CGROUP_LIMIT_DUMMY;
                 c.memory_high = CGROUP_LIMIT_DUMMY;
                 c.memory_max = CGROUP_LIMIT_DUMMY;
                 r = config_parse_memory_limit(NULL, "fake", 1, "section", 1,
-                                              limit_tests[i].limit, 1,
-                                              limit_tests[i].value, &c, NULL);
+                                              test->limit, 1,
+                                              test->value, &c, NULL);
                 log_info("%s=%s\t%"PRIu64"==%"PRIu64,
-                         limit_tests[i].limit, limit_tests[i].value,
-                         *limit_tests[i].result, limit_tests[i].expected);
+                         test->limit, test->value,
+                         *test->result, test->expected);
                 assert_se(r >= 0);
-                assert_se(*limit_tests[i].result == limit_tests[i].expected);
+                assert_se(*test->result == test->expected);
         }
-
 }
 
 TEST(contains_instance_specifier_superset) {
@@ -1032,12 +1023,12 @@ TEST(config_parse_log_filter_patterns) {
         if (ERRNO_IS_NOT_SUPPORTED(dlopen_pcre2()))
                 return (void) log_tests_skipped("PCRE2 support is not available");
 
-        for (size_t i = 0; i < ELEMENTSOF(regex_tests); i++) {
+        FOREACH_ELEMENT(test, regex_tests) {
                 assert_se(config_parse_log_filter_patterns(NULL, "fake", 1, "section", 1, "LogFilterPatterns", 1,
-                                                           regex_tests[i].regex, &c, NULL) >= 0);
+                                                           test->regex, &c, NULL) >= 0);
 
-                assert_se(set_size(c.log_filter_allowed_patterns) == regex_tests[i].allowed_patterns_count);
-                assert_se(set_size(c.log_filter_denied_patterns) == regex_tests[i].denied_patterns_count);
+                assert_se(set_size(c.log_filter_allowed_patterns) == test->allowed_patterns_count);
+                assert_se(set_size(c.log_filter_denied_patterns) == test->denied_patterns_count);
 
                 /* Ensure `~` is properly removed */
                 const char *p;

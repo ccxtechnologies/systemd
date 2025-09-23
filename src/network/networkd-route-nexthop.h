@@ -1,19 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <inttypes.h>
-#include <stdbool.h>
-
-#include "sd-netlink.h"
-
-#include "conf-parser.h"
 #include "in-addr-util.h"
-#include "macro.h"
-#include "siphash24.h"
-
-typedef struct Link Link;
-typedef struct Manager Manager;
-typedef struct Route Route;
+#include "networkd-forward.h"
 
 typedef struct RouteNextHop {
         int family; /* used in RTA_VIA (IPv4 only) */
@@ -52,6 +41,5 @@ int route_nexthops_read_netlink_message(Route *route, sd_netlink_message *messag
 int route_section_verify_nexthops(Route *route);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_gateway);
-CONFIG_PARSER_PROTOTYPE(config_parse_route_gateway_onlink);
 CONFIG_PARSER_PROTOTYPE(config_parse_route_nexthop);
 CONFIG_PARSER_PROTOTYPE(config_parse_multipath_route);

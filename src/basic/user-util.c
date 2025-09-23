@@ -1,32 +1,30 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <fcntl.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <utmp.h>
+#include <utmpx.h>
 
 #include "sd-messages.h"
 
 #include "alloc-util.h"
 #include "chase.h"
 #include "errno-util.h"
+#include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
 #include "lock-util.h"
-#include "macro.h"
+#include "log.h"
 #include "mkdir.h"
 #include "parse-util.h"
 #include "path-util.h"
-#include "random-util.h"
 #include "string-util.h"
 #include "strv.h"
+#include "terminal-util.h"
 #include "user-util.h"
 #include "utf8.h"
 
@@ -120,7 +118,7 @@ char* getlogname_malloc(void) {
         uid_t uid;
         struct stat st;
 
-        if (isatty(STDIN_FILENO) && fstat(STDIN_FILENO, &st) >= 0)
+        if (isatty_safe(STDIN_FILENO) && fstat(STDIN_FILENO, &st) >= 0)
                 uid = st.st_uid;
         else
                 uid = getuid();
@@ -154,6 +152,10 @@ bool is_nologin_shell(const char *shell) {
                            "/usr/bin/false",
                            "/bin/true",
                            "/usr/bin/true");
+}
+
+bool shell_is_placeholder(const char *shell) {
+        return isempty(shell) || is_nologin_shell(shell);
 }
 
 const char* default_root_shell_at(int rfd) {
@@ -219,9 +221,9 @@ static int synthesize_user_creds(
                 if (ret_gid)
                         *ret_gid = GID_NOBODY;
                 if (ret_home)
-                        *ret_home = FLAGS_SET(flags, USER_CREDS_CLEAN) ? NULL : "/";
+                        *ret_home = FLAGS_SET(flags, USER_CREDS_SUPPRESS_PLACEHOLDER) ? NULL : "/";
                 if (ret_shell)
-                        *ret_shell = FLAGS_SET(flags, USER_CREDS_CLEAN) ? NULL : NOLOGIN;
+                        *ret_shell = FLAGS_SET(flags, USER_CREDS_SUPPRESS_PLACEHOLDER) ? NULL : NOLOGIN;
 
                 return 0;
         }
@@ -243,6 +245,7 @@ int get_user_creds(
 
         assert(username);
         assert(*username);
+        assert((ret_home || ret_shell) || !(flags & (USER_CREDS_SUPPRESS_PLACEHOLDER|USER_CREDS_CLEAN)));
 
         if (!FLAGS_SET(flags, USER_CREDS_PREFER_NSS) ||
             (!ret_home && !ret_shell)) {
@@ -314,17 +317,14 @@ int get_user_creds(
 
         if (ret_home)
                 /* Note: we don't insist on normalized paths, since there are setups that have /./ in the path */
-                *ret_home = (FLAGS_SET(flags, USER_CREDS_CLEAN) &&
-                             (empty_or_root(p->pw_dir) ||
-                              !path_is_valid(p->pw_dir) ||
-                              !path_is_absolute(p->pw_dir))) ? NULL : p->pw_dir;
+                *ret_home = (FLAGS_SET(flags, USER_CREDS_SUPPRESS_PLACEHOLDER) && empty_or_root(p->pw_dir)) ||
+                            (FLAGS_SET(flags, USER_CREDS_CLEAN) && (!path_is_valid(p->pw_dir) || !path_is_absolute(p->pw_dir)))
+                            ? NULL : p->pw_dir;
 
         if (ret_shell)
-                *ret_shell = (FLAGS_SET(flags, USER_CREDS_CLEAN) &&
-                              (isempty(p->pw_shell) ||
-                               !path_is_valid(p->pw_shell) ||
-                               !path_is_absolute(p->pw_shell) ||
-                               is_nologin_shell(p->pw_shell))) ? NULL : p->pw_shell;
+                *ret_shell = (FLAGS_SET(flags, USER_CREDS_SUPPRESS_PLACEHOLDER) && shell_is_placeholder(p->pw_shell)) ||
+                             (FLAGS_SET(flags, USER_CREDS_CLEAN) && (!path_is_valid(p->pw_shell) || !path_is_absolute(p->pw_shell)))
+                             ? NULL : p->pw_shell;
 
         if (patch_username)
                 *username = p->pw_name;
@@ -468,9 +468,12 @@ char* gid_to_name(gid_t gid) {
 }
 
 static bool gid_list_has(const gid_t *list, size_t size, gid_t val) {
-        for (size_t i = 0; i < size; i++)
-                if (list[i] == val)
+        assert(list || size == 0);
+
+        FOREACH_ARRAY(i, list, size)
+                if (*i == val)
                         return true;
+
         return false;
 }
 
@@ -527,20 +530,24 @@ int merge_gid_lists(const gid_t *list1, size_t size1, const gid_t *list2, size_t
         return (int)nresult;
 }
 
-int getgroups_alloc(gid_t** gids) {
-        gid_t *allocated;
-        _cleanup_free_  gid_t *p = NULL;
+int getgroups_alloc(gid_t **ret) {
         int ngroups = 8;
-        unsigned attempt = 0;
 
-        allocated = new(gid_t, ngroups);
-        if (!allocated)
-                return -ENOMEM;
-        p = allocated;
+        assert(ret);
 
-        for (;;) {
+        for (unsigned attempt = 0;;) {
+                _cleanup_free_ gid_t *p = NULL;
+
+                p = new(gid_t, ngroups);
+                if (!p)
+                        return -ENOMEM;
+
                 ngroups = getgroups(ngroups, p);
-                if (ngroups >= 0)
+                if (ngroups > 0) {
+                        *ret = TAKE_PTR(p);
+                        return ngroups;
+                }
+                if (ngroups == 0)
                         break;
                 if (errno != EINVAL)
                         return -errno;
@@ -555,17 +562,11 @@ int getgroups_alloc(gid_t** gids) {
                 if (ngroups < 0)
                         return -errno;
                 if (ngroups == 0)
-                        return false;
-
-                free(allocated);
-
-                p = allocated = new(gid_t, ngroups);
-                if (!allocated)
-                        return -ENOMEM;
+                        break;
         }
 
-        *gids = TAKE_PTR(p);
-        return ngroups;
+        *ret = NULL;
+        return 0;
 }
 
 int get_home_dir(char **ret) {
@@ -763,8 +764,8 @@ bool valid_user_group_name(const char *u, ValidUserFlags flags) {
                 if (FLAGS_SET(flags, VALID_USER_WARN) && !valid_user_group_name(u, 0))
                         log_struct(LOG_NOTICE,
                                    LOG_MESSAGE("Accepting user/group name '%s', which does not match strict user/group name rules.", u),
-                                   "USER_GROUP_NAME=%s", u,
-                                   "MESSAGE_ID=" SD_MESSAGE_UNSAFE_USER_NAME_STR);
+                                   LOG_ITEM("USER_GROUP_NAME=%s", u),
+                                   LOG_MESSAGE_ID(SD_MESSAGE_UNSAFE_USER_NAME_STR));
 
                 /* Note that we make no restrictions on the length in relaxed mode! */
         } else {
@@ -801,7 +802,7 @@ bool valid_user_group_name(const char *u, ValidUserFlags flags) {
                         return false;
                 if (l > NAME_MAX) /* must fit in a filename: 255 */
                         return false;
-                if (l > UT_NAMESIZE - 1) /* must fit in utmp: 31 */
+                if (l > sizeof_field(struct utmpx, ut_user) - 1) /* must fit in utmp: 31 */
                         return false;
         }
 
@@ -881,6 +882,17 @@ bool valid_home(const char *p) {
                 return false;
 
         return true;
+}
+
+bool valid_shell(const char *p) {
+        /* We have the same requirements, so just piggy-back on the home check.
+         *
+         * Let's ignore /etc/shells because this is only applicable to real and not system users. It is also
+         * incompatible with the idea of empty /etc/. */
+        if (!valid_home(p))
+                return false;
+
+        return !endswith(p, "/"); /* one additional restriction: shells may not be dirs */
 }
 
 int maybe_setgroups(size_t size, const gid_t *list) {
@@ -1073,7 +1085,7 @@ int getpwnam_malloc(const char *name, struct passwd **ret) {
         for (;;) {
                 _cleanup_free_ void *buf = NULL;
 
-                buf = malloc(ALIGN(sizeof(struct passwd)) + bufsize);
+                buf = malloc0(ALIGN(sizeof(struct passwd)) + bufsize);
                 if (!buf)
                         return -ENOMEM;
 
@@ -1114,7 +1126,7 @@ int getpwuid_malloc(uid_t uid, struct passwd **ret) {
         for (;;) {
                 _cleanup_free_ void *buf = NULL;
 
-                buf = malloc(ALIGN(sizeof(struct passwd)) + bufsize);
+                buf = malloc0(ALIGN(sizeof(struct passwd)) + bufsize);
                 if (!buf)
                         return -ENOMEM;
 
@@ -1158,7 +1170,7 @@ int getgrnam_malloc(const char *name, struct group **ret) {
         for (;;) {
                 _cleanup_free_ void *buf = NULL;
 
-                buf = malloc(ALIGN(sizeof(struct group)) + bufsize);
+                buf = malloc0(ALIGN(sizeof(struct group)) + bufsize);
                 if (!buf)
                         return -ENOMEM;
 
@@ -1197,7 +1209,7 @@ int getgrgid_malloc(gid_t gid, struct group **ret) {
         for (;;) {
                 _cleanup_free_ void *buf = NULL;
 
-                buf = malloc(ALIGN(sizeof(struct group)) + bufsize);
+                buf = malloc0(ALIGN(sizeof(struct group)) + bufsize);
                 if (!buf)
                         return -ENOMEM;
 

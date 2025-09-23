@@ -1,27 +1,28 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdio.h>
 #include <unistd.h>
 
+#include "alloc-util.h"
 #include "dlfcn-util.h"
 #include "errno-util.h"
 #include "log.h"
-#include "macro.h"
-#include "memory-util.h"
 #include "password-quality-util.h"
+#include "string-util.h"
 #include "strv.h"
 
 #if HAVE_PWQUALITY
 
 static void *pwquality_dl = NULL;
 
-DLSYM_FUNCTION(pwquality_check);
-DLSYM_FUNCTION(pwquality_default_settings);
-DLSYM_FUNCTION(pwquality_free_settings);
-DLSYM_FUNCTION(pwquality_generate);
-DLSYM_FUNCTION(pwquality_get_str_value);
-DLSYM_FUNCTION(pwquality_read_config);
-DLSYM_FUNCTION(pwquality_set_int_value);
-DLSYM_FUNCTION(pwquality_strerror);
+DLSYM_PROTOTYPE(pwquality_check) = NULL;
+DLSYM_PROTOTYPE(pwquality_default_settings) = NULL;
+DLSYM_PROTOTYPE(pwquality_free_settings) = NULL;
+DLSYM_PROTOTYPE(pwquality_generate) = NULL;
+DLSYM_PROTOTYPE(pwquality_get_str_value) = NULL;
+DLSYM_PROTOTYPE(pwquality_read_config) = NULL;
+DLSYM_PROTOTYPE(pwquality_set_int_value) = NULL;
+DLSYM_PROTOTYPE(pwquality_strerror) = NULL;
 
 int dlopen_pwquality(void) {
         ELF_NOTE_DLOPEN("pwquality",

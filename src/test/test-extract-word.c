@@ -1,11 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stdlib.h>
-
 #include "extract-word.h"
-#include "log.h"
-#include "string-util.h"
 #include "tests.h"
 
 TEST(extract_first_word) {
@@ -547,6 +542,49 @@ TEST(extract_first_word) {
         ASSERT_STREQ(t, "가너도루");
         free(t);
         assert_se(isempty(p));
+
+        /* For issue #16735. */
+        p = "test1@foo\\x2dbar\\x2dbaz.service test2@aaa\\x2dbbb\\x2dccc.service test3@escaped-path-like-data.service test4@/pure/path/like/data.service";
+        ASSERT_OK_POSITIVE(extract_first_word(&p, &t, NULL, EXTRACT_UNQUOTE));
+        ASSERT_STREQ(t, "test1@foox2dbarx2dbaz.service");
+        free(t);
+        ASSERT_OK_POSITIVE(extract_first_word(&p, &t, NULL, EXTRACT_UNQUOTE));
+        ASSERT_STREQ(t, "test2@aaax2dbbbx2dccc.service");
+        free(t);
+        ASSERT_OK_POSITIVE(extract_first_word(&p, &t, NULL, EXTRACT_UNQUOTE));
+        ASSERT_STREQ(t, "test3@escaped-path-like-data.service");
+        free(t);
+        ASSERT_OK_POSITIVE(extract_first_word(&p, &t, NULL, EXTRACT_UNQUOTE));
+        ASSERT_STREQ(t, "test4@/pure/path/like/data.service");
+        free(t);
+
+        p = "test1@foo\\x2dbar\\x2dbaz.service test2@aaa\\x2dbbb\\x2dccc.service test3@escaped-path-like-data.service test4@/pure/path/like/data.service";
+        ASSERT_OK_POSITIVE(extract_first_word(&p, &t, NULL, EXTRACT_UNQUOTE | EXTRACT_RETAIN_ESCAPE));
+        ASSERT_STREQ(t, "test1@foo\\x2dbar\\x2dbaz.service");
+        free(t);
+        ASSERT_OK_POSITIVE(extract_first_word(&p, &t, NULL, EXTRACT_UNQUOTE | EXTRACT_RETAIN_ESCAPE));
+        ASSERT_STREQ(t, "test2@aaa\\x2dbbb\\x2dccc.service");
+        free(t);
+        ASSERT_OK_POSITIVE(extract_first_word(&p, &t, NULL, EXTRACT_UNQUOTE | EXTRACT_RETAIN_ESCAPE));
+        ASSERT_STREQ(t, "test3@escaped-path-like-data.service");
+        free(t);
+        ASSERT_OK_POSITIVE(extract_first_word(&p, &t, NULL, EXTRACT_UNQUOTE | EXTRACT_RETAIN_ESCAPE));
+        ASSERT_STREQ(t, "test4@/pure/path/like/data.service");
+        free(t);
+
+        p = "test1@foo\\x2dbar\\x2dbaz.service test2@aaa\\x2dbbb\\x2dccc.service test3@escaped-path-like-data.service test4@/pure/path/like/data.service";
+        ASSERT_OK_POSITIVE(extract_first_word(&p, &t, NULL, EXTRACT_UNQUOTE | EXTRACT_CUNESCAPE));
+        ASSERT_STREQ(t, "test1@foo-bar-baz.service");
+        free(t);
+        ASSERT_OK_POSITIVE(extract_first_word(&p, &t, NULL, EXTRACT_UNQUOTE | EXTRACT_CUNESCAPE));
+        ASSERT_STREQ(t, "test2@aaa-bbb-ccc.service");
+        free(t);
+        ASSERT_OK_POSITIVE(extract_first_word(&p, &t, NULL, EXTRACT_UNQUOTE | EXTRACT_CUNESCAPE));
+        ASSERT_STREQ(t, "test3@escaped-path-like-data.service");
+        free(t);
+        ASSERT_OK_POSITIVE(extract_first_word(&p, &t, NULL, EXTRACT_UNQUOTE | EXTRACT_CUNESCAPE));
+        ASSERT_STREQ(t, "test4@/pure/path/like/data.service");
+        free(t);
 }
 
 TEST(extract_first_word_and_warn) {

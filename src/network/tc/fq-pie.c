@@ -3,10 +3,10 @@
 
 #include <linux/pkt_sched.h>
 
-#include "alloc-util.h"
-#include "conf-parser.h"
+#include "sd-netlink.h"
+
 #include "fq-pie.h"
-#include "netlink-util.h"
+#include "log.h"
 #include "parse-util.h"
 #include "string-util.h"
 
@@ -49,7 +49,7 @@ int config_parse_fq_pie_packet_limit(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         FlowQueuePIE *fq_pie;
         Network *network = ASSERT_PTR(data);
         uint32_t val;

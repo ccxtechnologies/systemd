@@ -1,22 +1,23 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-/* Make sure the net/if.h header is included before any linux/ one */
-#include <net/if.h>
 #include <linux/if_bridge.h>
 
-#include "netlink-util.h"
+#include "sd-netlink.h"
+
+#include "conf-parser.h"
+#include "hashmap.h"
 #include "networkd-bridge-mdb.h"
 #include "networkd-link.h"
 #include "networkd-manager.h"
 #include "networkd-network.h"
 #include "networkd-queue.h"
+#include "networkd-util.h"
 #include "string-util.h"
 #include "vlan-util.h"
 
 #define STATIC_BRIDGE_MDB_ENTRIES_PER_NETWORK_MAX 1024U
 
-/* remove MDB entry. */
-BridgeMDB *bridge_mdb_free(BridgeMDB *mdb) {
+static BridgeMDB* bridge_mdb_free(BridgeMDB *mdb) {
         if (!mdb)
                 return NULL;
 
@@ -32,7 +33,11 @@ BridgeMDB *bridge_mdb_free(BridgeMDB *mdb) {
 
 DEFINE_SECTION_CLEANUP_FUNCTIONS(BridgeMDB, bridge_mdb_free);
 
-/* create a new MDB entry or get an existing one. */
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                bridge_mdb_hash_ops_by_section,
+                ConfigSection, config_section_hash_func, config_section_compare_func,
+                BridgeMDB, bridge_mdb_free);
+
 static int bridge_mdb_new_static(
                 Network *network,
                 const char *filename,
@@ -71,9 +76,10 @@ static int bridge_mdb_new_static(
         *mdb = (BridgeMDB) {
                 .network = network,
                 .section = TAKE_PTR(n),
+                .type = _BRIDGE_MDB_ENTRY_TYPE_INVALID,
         };
 
-        r = hashmap_ensure_put(&network->bridge_mdb_entries_by_section, &config_section_hash_ops, mdb->section, mdb);
+        r = hashmap_ensure_put(&network->bridge_mdb_entries_by_section, &bridge_mdb_hash_ops_by_section, mdb->section, mdb);
         if (r < 0)
                 return r;
 
@@ -89,13 +95,7 @@ static int bridge_mdb_configure_handler(sd_netlink *rtnl, sd_netlink_message *m,
         assert(link);
 
         r = sd_netlink_message_get_errno(m);
-        if (r == -EINVAL && streq_ptr(link->kind, "bridge") && link->master_ifindex <= 0) {
-                /* To configure bridge MDB entries on bridge master, 1bc844ee0faa1b92e3ede00bdd948021c78d7088 (v5.4) is required. */
-                if (!link->manager->bridge_mdb_on_master_not_supported) {
-                        log_link_warning_errno(link, r, "Kernel seems not to support bridge MDB entries on bridge master, ignoring: %m");
-                        link->manager->bridge_mdb_on_master_not_supported = true;
-                }
-        } else if (r < 0 && r != -EEXIST) {
+        if (r < 0 && r != -EEXIST) {
                 log_link_message_warning_errno(link, m, r, "Could not add MDB entry");
                 link_enter_failed(link);
                 return 1;
@@ -125,24 +125,35 @@ static int bridge_mdb_configure(BridgeMDB *mdb, Link *link, Request *req) {
                                IN_ADDR_TO_STRING(mdb->family, &mdb->group_addr), mdb->vlan_id);
 
         entry = (struct br_mdb_entry) {
-                /* If MDB entry is added on bridge master, then the state must be MDB_TEMPORARY.
+                /* If MDB entry is added on bridge master, then the state must be MDB_TEMPORARY,
+                 * except on L2 routes, where they must always be permanent.
                  * See br_mdb_add_group() in net/bridge/br_mdb.c of kernel. */
-                .state = link->master_ifindex <= 0 ? MDB_TEMPORARY : MDB_PERMANENT,
+                .state = link->master_ifindex <= 0 && mdb->type == BRIDGE_MDB_ENTRY_TYPE_L3 ? MDB_TEMPORARY : MDB_PERMANENT,
                 .ifindex = link->ifindex,
                 .vid = mdb->vlan_id,
         };
 
-        switch (mdb->family) {
-        case AF_INET:
-                entry.addr.u.ip4 = mdb->group_addr.in.s_addr;
-                entry.addr.proto = htobe16(ETH_P_IP);
+        switch (mdb->type) {
+        case BRIDGE_MDB_ENTRY_TYPE_L2:
+                memcpy(entry.addr.u.mac_addr, &mdb->l2_addr.ether_addr_octet, ETH_ALEN);
+                entry.addr.proto = 0;
                 break;
+        case BRIDGE_MDB_ENTRY_TYPE_L3:
+                switch (mdb->family) {
+                case AF_INET:
+                        entry.addr.u.ip4 = mdb->group_addr.in.s_addr;
+                        entry.addr.proto = htobe16(ETH_P_IP);
+                        break;
 
-        case AF_INET6:
-                entry.addr.u.ip6 = mdb->group_addr.in6;
-                entry.addr.proto = htobe16(ETH_P_IPV6);
+                case AF_INET6:
+                        entry.addr.u.ip6 = mdb->group_addr.in6;
+                        entry.addr.proto = htobe16(ETH_P_IPV6);
+                        break;
+
+                default:
+                        assert_not_reached();
+                }
                 break;
-
         default:
                 assert_not_reached();
         }
@@ -252,30 +263,48 @@ static int bridge_mdb_verify(BridgeMDB *mdb) {
         if (section_is_invalid(mdb->section))
                 return -EINVAL;
 
-        if (mdb->family == AF_UNSPEC)
+        switch (mdb->type) {
+        case BRIDGE_MDB_ENTRY_TYPE_L2:
+                if (!ether_addr_is_multicast(&mdb->l2_addr))
+                        return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                 "%s: MulticastGroupAddress= is not an L2 multicast address. "
+                                                 "Ignoring [BridgeMDB] section from line %u.",
+                                                 mdb->section->filename, mdb->section->line);
+                break;
+        case BRIDGE_MDB_ENTRY_TYPE_L3:
+                if (mdb->family == AF_UNSPEC)
+                        return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                 "%s: [BridgeMDB] section without MulticastGroupAddress= field configured. "
+                                                 "Ignoring [BridgeMDB] section from line %u.",
+                                                 mdb->section->filename, mdb->section->line);
+
+                if (!in_addr_is_multicast(mdb->family, &mdb->group_addr))
+                        return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                 "%s: MulticastGroupAddress= is not a multicast address. "
+                                                 "Ignoring [BridgeMDB] section from line %u.",
+                                                 mdb->section->filename, mdb->section->line);
+
+                switch (mdb->family) {
+                case AF_INET:
+                        if (in4_addr_is_local_multicast(&mdb->group_addr.in))
+                                return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                         "%s: MulticastGroupAddress= is a local multicast address. "
+                                                         "Ignoring [BridgeMDB] section from line %u.",
+                                                         mdb->section->filename, mdb->section->line);
+                        break;
+                default:
+                        if (in6_addr_is_link_local_all_nodes(&mdb->group_addr.in6))
+                                return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                         "%s: MulticastGroupAddress= is the multicast all nodes address. "
+                                                         "Ignoring [BridgeMDB] section from line %u.",
+                                                         mdb->section->filename, mdb->section->line);
+                }
+                break;
+        default:
                 return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
                                          "%s: [BridgeMDB] section without MulticastGroupAddress= field configured. "
                                          "Ignoring [BridgeMDB] section from line %u.",
                                          mdb->section->filename, mdb->section->line);
-
-        if (!in_addr_is_multicast(mdb->family, &mdb->group_addr))
-                return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
-                                         "%s: MulticastGroupAddress= is not a multicast address. "
-                                         "Ignoring [BridgeMDB] section from line %u.",
-                                         mdb->section->filename, mdb->section->line);
-
-        if (mdb->family == AF_INET) {
-                if (in4_addr_is_local_multicast(&mdb->group_addr.in))
-                        return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                 "%s: MulticastGroupAddress= is a local multicast address. "
-                                                 "Ignoring [BridgeMDB] section from line %u.",
-                                                 mdb->section->filename, mdb->section->line);
-        } else {
-                if (in6_addr_is_link_local_all_nodes(&mdb->group_addr.in6))
-                        return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                 "%s: MulticastGroupAddress= is the multicast all nodes address. "
-                                                 "Ignoring [BridgeMDB] section from line %u.",
-                                                 mdb->section->filename, mdb->section->line);
         }
 
         return 0;
@@ -355,10 +384,17 @@ int config_parse_mdb_group_address(
         if (r < 0)
                 return log_oom();
 
-        r = in_addr_from_string_auto(rvalue, &mdb->family, &mdb->group_addr);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r, "Cannot parse multicast group address: %m");
-                return 0;
+        r = parse_ether_addr(rvalue, &mdb->l2_addr);
+        if (r >= 0)
+                mdb->type = BRIDGE_MDB_ENTRY_TYPE_L2;
+        else {
+                r = in_addr_from_string_auto(rvalue, &mdb->family, &mdb->group_addr);
+                if (r < 0) {
+                        log_syntax(unit, LOG_WARNING, filename, line, r,
+                        "Cannot parse multicast group address as either L2 MAC, IPv4 or IPv6, ignoring: %m");
+                        return 0;
+                }
+                mdb->type = BRIDGE_MDB_ENTRY_TYPE_L3;
         }
 
         TAKE_PTR(mdb);

@@ -1,20 +1,20 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <sys/epoll.h>
 #include <sys/inotify.h>
 #include <unistd.h>
 
+#include "sd-bus.h"
+
+#include "async.h"
 #include "bus-error.h"
-#include "bus-util.h"
 #include "dbus-path.h"
 #include "dbus-unit.h"
+#include "errno-util.h"
 #include "escape.h"
 #include "event-util.h"
-#include "fd-util.h"
 #include "glob-util.h"
 #include "inotify-util.h"
-#include "macro.h"
+#include "manager.h"
 #include "mkdir-label.h"
 #include "path.h"
 #include "path-util.h"
@@ -23,7 +23,7 @@
 #include "stat-util.h"
 #include "string-table.h"
 #include "string-util.h"
-#include "unit-name.h"
+#include "strv.h"
 #include "unit.h"
 
 static const UnitActiveState state_translation_table[_PATH_STATE_MAX] = {
@@ -81,7 +81,7 @@ int path_spec_watch(PathSpec *s, sd_event_io_handler_t handler) {
                         tmp = *cut;
                         *cut = '\0';
 
-                        flags = IN_MOVE_SELF | IN_DELETE_SELF | IN_ATTRIB | IN_CREATE | IN_MOVED_TO;
+                        flags = IN_MOVE_SELF | IN_DELETE_SELF | IN_CREATE | IN_MOVED_TO;
                 } else {
                         cut = NULL;
                         flags = flags_table[s->type];
@@ -169,7 +169,7 @@ void path_spec_unwatch(PathSpec *s) {
         assert(s);
 
         s->event_source = sd_event_source_disable_unref(s->event_source);
-        s->inotify_fd = safe_close(s->inotify_fd);
+        s->inotify_fd = asynchronous_close(s->inotify_fd);
 }
 
 int path_spec_fd_event(PathSpec *s, uint32_t revents) {
@@ -546,7 +546,7 @@ static void path_enter_running(Path *p, char *trigger_path) {
                 goto fail;
         }
 
-        r = manager_add_job(UNIT(p)->manager, JOB_START, trigger, JOB_REPLACE, NULL, &error, &job);
+        r = manager_add_job(UNIT(p)->manager, JOB_START, trigger, JOB_REPLACE, &error, &job);
         if (r < 0) {
                 log_unit_warning(UNIT(p), "Failed to queue unit startup job: %s", bus_error_message(&error, r));
                 goto fail;
@@ -591,7 +591,7 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify) 
         }
 
         if (path_check_good(p, initial, from_trigger_notify, &trigger_path)) {
-                log_unit_debug(UNIT(p), "Got triggered.");
+                log_unit_debug(UNIT(p), "Got triggered by '%s'.", trigger_path);
                 path_enter_running(p, trigger_path);
                 return;
         }
@@ -608,7 +608,7 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify) 
          * recheck */
 
         if (path_check_good(p, false, from_trigger_notify, &trigger_path)) {
-                log_unit_debug(UNIT(p), "Got triggered.");
+                log_unit_debug(UNIT(p), "Got triggered by '%s'.", trigger_path);
                 path_enter_running(p, trigger_path);
                 return;
         }
@@ -917,8 +917,8 @@ static void activation_details_path_done(ActivationDetails *details) {
         p->trigger_path_filename = mfree(p->trigger_path_filename);
 }
 
-static void activation_details_path_serialize(ActivationDetails *details, FILE *f) {
-        ActivationDetailsPath *p = ASSERT_PTR(ACTIVATION_DETAILS_PATH(details));
+static void activation_details_path_serialize(const ActivationDetails *details, FILE *f) {
+        const ActivationDetailsPath *p = ASSERT_PTR(ACTIVATION_DETAILS_PATH(details));
 
         assert(f);
 
@@ -949,8 +949,8 @@ static int activation_details_path_deserialize(const char *key, const char *valu
         return 0;
 }
 
-static int activation_details_path_append_env(ActivationDetails *details, char ***strv) {
-        ActivationDetailsPath *p = ASSERT_PTR(ACTIVATION_DETAILS_PATH(details));
+static int activation_details_path_append_env(const ActivationDetails *details, char ***strv) {
+        const ActivationDetailsPath *p = ASSERT_PTR(ACTIVATION_DETAILS_PATH(details));
         char *s;
         int r;
 
@@ -970,8 +970,8 @@ static int activation_details_path_append_env(ActivationDetails *details, char *
         return 1; /* Return the number of variables added to the env block */
 }
 
-static int activation_details_path_append_pair(ActivationDetails *details, char ***strv) {
-        ActivationDetailsPath *p = ASSERT_PTR(ACTIVATION_DETAILS_PATH(details));
+static int activation_details_path_append_pair(const ActivationDetails *details, char ***strv) {
+        const ActivationDetailsPath *p = ASSERT_PTR(ACTIVATION_DETAILS_PATH(details));
         int r;
 
         assert(strv);

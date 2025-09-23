@@ -1,10 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdlib.h>
 #include <sys/mount.h>
+#include <unistd.h>
 
 #include "confidential-virt.h"
 #include "copy.h"
 #include "creds-util.h"
+#include "errno-util.h"
 #include "escape.h"
 #include "fileio.h"
 #include "format-util.h"
@@ -13,6 +16,7 @@
 #include "import-creds.h"
 #include "initrd-util.h"
 #include "io-util.h"
+#include "log.h"
 #include "mkdir-label.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
@@ -20,6 +24,9 @@
 #include "path-util.h"
 #include "proc-cmdline.h"
 #include "recurse-dir.h"
+#include "smbios11.h"
+#include "stat-util.h"
+#include "string-util.h"
 #include "strv.h"
 #include "virt.h"
 
@@ -201,8 +208,8 @@ static int import_credentials_boot(void) {
                         continue;
                 }
 
-                for (size_t i = 0; i < de->n_entries; i++) {
-                        const struct dirent *d = de->entries[i];
+                FOREACH_ARRAY(i, de->entries, de->n_entries) {
+                        const struct dirent *d = *i;
                         _cleanup_close_ int cfd = -EBADF, nfd = -EBADF;
                         _cleanup_free_ char *n = NULL;
                         const char *e;
@@ -578,38 +585,18 @@ static int import_credentials_smbios(ImportCredentialContext *c) {
                 return 0;
 
         for (unsigned i = 0;; i++) {
-                struct dmi_field_header {
-                        uint8_t type;
-                        uint8_t length;
-                        uint16_t handle;
-                        uint8_t count;
-                        char contents[];
-                } _packed_ *dmi_field_header;
-                _cleanup_free_ char *p = NULL;
-                _cleanup_free_ void *data = NULL;
+                _cleanup_free_ char *data = NULL;
                 size_t size;
 
-                assert_cc(offsetof(struct dmi_field_header, contents) == 5);
-
-                if (asprintf(&p, "/sys/firmware/dmi/entries/11-%u/raw", i) < 0)
-                        return log_oom();
-
-                r = read_virtual_file(p, sizeof(dmi_field_header) + CREDENTIALS_TOTAL_SIZE_MAX, (char**) &data, &size);
+                r = read_smbios11_field(i, CREDENTIALS_TOTAL_SIZE_MAX, &data, &size);
+                if (r == -ENOENT) /* Once we reach ENOENT there are no more DMI Type 11 fields around. */
+                        break;
                 if (r < 0) {
-                        /* Once we reach ENOENT there are no more DMI Type 11 fields around. */
-                        log_full_errno(r == -ENOENT ? LOG_DEBUG : LOG_WARNING, r, "Failed to open '%s', ignoring: %m", p);
+                        log_warning_errno(r, "Failed to read SMBIOS type #11 object %u, ignoring: %m", i);
                         break;
                 }
 
-                if (size < offsetof(struct dmi_field_header, contents))
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "DMI field header of '%s' too short.", p);
-
-                dmi_field_header = data;
-                if (dmi_field_header->type != 11 ||
-                    dmi_field_header->length != offsetof(struct dmi_field_header, contents))
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Invalid DMI field header.");
-
-                r = parse_smbios_strings(c, dmi_field_header->contents, size - offsetof(struct dmi_field_header, contents));
+                r = parse_smbios_strings(c, data, size);
                 if (r < 0)
                         return r;
 
@@ -640,7 +627,7 @@ static int import_credentials_initrd(ImportCredentialContext *c) {
                 if (errno == ENOENT)
                         log_debug_errno(errno, "No credentials passed from initrd.");
                 else
-                        log_warning_errno(errno, "Failed to open '/run/credentials/@initrd', ignoring: %m");
+                        log_warning_errno(errno, "Failed to open '%s', ignoring: %m", "/run/credentials/@initrd");
                 return 0;
         }
 
@@ -867,7 +854,7 @@ static void report_credentials(void) {
 int import_credentials(void) {
         const char *received_creds_dir = NULL, *received_encrypted_creds_dir = NULL;
         bool envvar_set = false;
-        int r, q;
+        int r;
 
         r = get_credentials_dir(&received_creds_dir);
         if (r < 0 && r != -ENXIO) /* ENXIO → env var not set yet */
@@ -891,37 +878,26 @@ int import_credentials(void) {
                 else
                         r = 0;
 
-                if (received_encrypted_creds_dir) {
-                        q = symlink_credential_dir("ENCRYPTED_CREDENTIALS_DIRECTORY", received_encrypted_creds_dir, ENCRYPTED_SYSTEM_CREDENTIALS_DIRECTORY);
-                        if (r >= 0)
-                                r = q;
-                }
+                if (received_encrypted_creds_dir)
+                        RET_GATHER(r, symlink_credential_dir("ENCRYPTED_CREDENTIALS_DIRECTORY",
+                                                             received_encrypted_creds_dir,
+                                                             ENCRYPTED_SYSTEM_CREDENTIALS_DIRECTORY));
 
-                q = merge_credentials_trusted(received_creds_dir);
-                if (r >= 0)
-                        r = q;
+                RET_GATHER(r, merge_credentials_trusted(received_creds_dir));
 
         } else {
-                _cleanup_free_ char *v = NULL;
+                bool import;
 
-                r = proc_cmdline_get_key("systemd.import_credentials", PROC_CMDLINE_STRIP_RD_PREFIX, &v);
+                r = proc_cmdline_get_bool("systemd.import_credentials", PROC_CMDLINE_STRIP_RD_PREFIX|PROC_CMDLINE_TRUE_WHEN_MISSING, &import);
                 if (r < 0)
-                        log_debug_errno(r, "Failed to check if 'systemd.import_credentials=' kernel command line option is set, ignoring: %m");
-                else if (r > 0) {
-                        r = parse_boolean(v);
-                        if (r < 0)
-                                log_debug_errno(r, "Failed to parse 'systemd.import_credentials=' parameter, ignoring: %m");
-                        else if (r == 0) {
-                                log_notice("systemd.import_credentials=no is set, skipping importing of credentials.");
-                                return 0;
-                        }
+                        log_debug_errno(r, "Failed to check systemd.import_credentials= kernel command line option, proceeding: %m");
+                else if (!import) {
+                        log_notice("systemd.import_credentials=no is set, skipping importing of credentials.");
+                        return 0;
                 }
 
                 r = import_credentials_boot();
-
-                q = import_credentials_trusted();
-                if (r >= 0)
-                        r = q;
+                RET_GATHER(r, import_credentials_trusted());
         }
 
         report_credentials();

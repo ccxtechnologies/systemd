@@ -1,32 +1,32 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <linux/fs.h>
+#include <sys/stat.h>
 
 #include "sd-daemon.h"
 #include "sd-event.h"
 
 #include "alloc-util.h"
-#include "btrfs-util.h"
 #include "copy.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
-#include "hostname-util.h"
 #include "import-common.h"
 #include "import-compress.h"
 #include "import-raw.h"
+#include "import-util.h"
 #include "install-file.h"
 #include "io-util.h"
-#include "machine-pool.h"
+#include "log.h"
 #include "mkdir-label.h"
-#include "path-util.h"
+#include "pretty-print.h"
 #include "qcow2-util.h"
 #include "ratelimit.h"
-#include "rm-rf.h"
 #include "string-util.h"
+#include "terminal-util.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
 
-struct RawImport {
+typedef struct RawImport {
         sd_event *event;
 
         char *image_root;
@@ -61,7 +61,7 @@ struct RawImport {
 
         uint64_t offset;
         uint64_t size_max;
-};
+} RawImport;
 
 RawImport* raw_import_unref(RawImport *i) {
         if (!i)
@@ -149,7 +149,16 @@ static void raw_import_report_progress(RawImport *i) {
                 return;
 
         sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
-        log_info("Imported %u%%.", percent);
+
+        if (isatty_safe(STDERR_FILENO))
+                (void) draw_progress_barf(
+                                percent,
+                                "%s %s/%s",
+                                glyph(GLYPH_ARROW_RIGHT),
+                                FORMAT_BYTES(i->written_compressed),
+                                FORMAT_BYTES(i->input_stat.st_size));
+        else
+                log_info("Imported %u%%.", percent);
 
         i->last_percent = percent;
 }
@@ -409,6 +418,11 @@ static int raw_import_process(RawImport *i) {
                 goto finish;
         }
 
+        if ((size_t) l > sizeof(i->buffer) - i->buffer_size) {
+                r = log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Read input file exceeded maximum size.");
+                goto finish;
+        }
+
         i->buffer_size += l;
 
         if (i->compress.type == IMPORT_COMPRESS_UNKNOWN) {
@@ -454,6 +468,9 @@ static int raw_import_process(RawImport *i) {
         return 0;
 
 complete:
+        if (isatty_safe(STDERR_FILENO))
+                clear_progress_bar(/* prefix= */ NULL);
+
         r = raw_import_finish(i);
 
 finish:
