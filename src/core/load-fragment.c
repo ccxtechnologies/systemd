@@ -1778,7 +1778,6 @@ int config_parse_exec_root_hash_sig(
                 void *userdata) {
 
         _cleanup_free_ void *roothash_sig_decoded = NULL;
-        char *value;
         ExecContext *c = ASSERT_PTR(data);
         size_t roothash_sig_decoded_size = 0;
         int r;
@@ -1809,7 +1808,8 @@ int config_parse_exec_root_hash_sig(
                 return 0;
         }
 
-        if (!(value = startswith(rvalue, "base64:"))) {
+        const char *value = startswith(rvalue, "base64:");
+        if (!value) {
                 log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "Failed to decode RootHashSignature=, not a path but doesn't start with 'base64:', ignoring: %s", rvalue);
                 return 0;
