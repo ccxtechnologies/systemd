@@ -3,8 +3,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "sd-daemon.h"
 #include "sd-event.h"
 
+#include "capability-util.h"
 #include "device-internal.h"
 #include "device-private.h"
 #include "device-util.h"
@@ -12,6 +14,7 @@
 #include "fd-util.h"
 #include "fs-util.h"
 #include "hashmap.h"
+#include "libmount-util.h"
 #include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
@@ -25,16 +28,22 @@
 #include "tests.h"
 #include "tmpfile-util.h"
 #include "udev-util.h"
+#include "virt.h"
 
 TEST(mdio_bus) {
         int r;
 
         /* For issue #37711 */
 
-        if (getuid() != 0)
-                return (void) log_tests_skipped("not running as root");
+        if (getuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0)
+                return (void) log_tests_skipped("Not privileged");
+        if (running_in_chroot() > 0)
+                return (void) log_tests_skipped("Running in chroot");
 
-        ASSERT_OK(r = safe_fork("(mdio_bus)", FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REOPEN_LOG|FORK_LOG|FORK_WAIT|FORK_NEW_MOUNTNS|FORK_MOUNTNS_SLAVE, NULL));
+        r = ASSERT_OK(pidref_safe_fork(
+                        "(mdio_bus)",
+                        FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REOPEN_LOG|FORK_LOG|FORK_WAIT|FORK_NEW_MOUNTNS|FORK_MOUNTNS_SLAVE,
+                        NULL));
         if (r == 0) {
                 const char *syspath = "/sys/bus/mdio_bus/drivers/Qualcomm Atheros AR8031!AR8033";
                 const char *id = "+drivers:mdio_bus:Qualcomm Atheros AR8031!AR8033";
@@ -50,7 +59,7 @@ TEST(mdio_bus) {
                         { sd_device_get_sysname,          "Qualcomm Atheros AR8031/AR8033" },
                 };
 
-                ASSERT_OK_ERRNO(setenv("SYSTEMD_DEVICE_VERIFY_SYSFS", "0", /* overwrite = */ false));
+                ASSERT_OK_ERRNO(setenv("SYSTEMD_DEVICE_VERIFY_SYSFS", "0", /* overwrite= */ false));
                 ASSERT_OK(mount_nofollow_verbose(LOG_ERR, "tmpfs", "/sys/bus/", "tmpfs", 0, NULL));
                 r = mkdir_p(syspath, 0755);
                 if (ERRNO_IS_NEG_PRIVILEGE(r)) {
@@ -101,7 +110,15 @@ static void test_sd_device_one(sd_device *d) {
 
         log_info("%s(%s)", __func__, syspath);
 
-        ASSERT_OK(sd_device_new_from_syspath(&dev, syspath));
+        r = sd_device_new_from_syspath(&dev, syspath);
+        if (ERRNO_IS_DEVICE_ABSENT(r)) {
+                /* Devices may be hot-unplugged while we are running, e.g. on Azure the accelerated
+                 * networking PCI VF behind a Hyper-V vmbus PCI bridge may be removed and re-added
+                 * during host servicing. Don't fail the test if a device vanished since enumeration. */
+                log_device_notice_errno(d, r, "Device disappeared while running the test, skipping: %m");
+                return;
+        }
+        ASSERT_OK(r);
         ASSERT_OK(sd_device_get_syspath(dev, &val));
         ASSERT_STREQ(syspath, val);
         ASSERT_NULL(dev = sd_device_unref(dev));
@@ -296,6 +313,48 @@ static void test_sd_device_one(sd_device *d) {
                 ASSERT_OK(r = device_get_sysattr_unsigned(d, "nsid", &x));
                 ASSERT_EQ(x > 0, r > 0);
         }
+
+        const char *uevent;
+        if (sd_device_get_sysattr_value(d, "uevent", &uevent) >= 0) {
+                const char *uevent_safe;
+                ASSERT_OK(device_get_sysattr_safe_string(d, "uevent", &uevent_safe));
+                ASSERT_STREQ(uevent, uevent_safe);
+        }
+
+        if (sd_device_get_ifindex(d, &ifindex) >= 0) {
+                int i;
+                ASSERT_OK_POSITIVE(device_get_sysattr_int(d, "ifindex", &i));
+                ASSERT_EQ(i, ifindex);
+
+                unsigned u;
+                ASSERT_OK_POSITIVE(device_get_sysattr_unsigned(d, "ifindex", &u));
+                ASSERT_EQ(u, (unsigned) ifindex);
+
+                uint64_t u64;
+                ASSERT_OK_POSITIVE(device_get_sysattr_u64(d, "ifindex", &u64));
+                ASSERT_EQ(u64, (uint64_t) ifindex);
+
+                uint32_t u32;
+                ASSERT_OK_POSITIVE(device_get_sysattr_u32(d, "ifindex", &u32));
+                ASSERT_EQ(u32, (uint32_t) ifindex);
+
+                if (ifindex <= UINT16_MAX) {
+                        uint16_t u16;
+                        ASSERT_OK_POSITIVE(device_get_sysattr_u16(d, "ifindex", &u16));
+                        ASSERT_EQ(u16, (uint16_t) ifindex);
+                }
+
+                if (ifindex <= UINT8_MAX) {
+                        uint8_t u8;
+                        ASSERT_OK_POSITIVE(device_get_sysattr_u8(d, "ifindex", &u8));
+                        ASSERT_EQ(u8, (uint8_t) ifindex);
+                }
+
+                const char *s;
+                ASSERT_OK(sd_device_get_sysattr_value(d, "ifindex", &s));
+                ASSERT_OK_POSITIVE(device_get_sysattr_streq(d, "ifindex", s));
+                ASSERT_OK_ZERO(device_get_sysattr_streq(d, "ifindex", "hoge"));
+        }
 }
 
 static void exclude_problematic_devices(sd_device_enumerator *e) {
@@ -341,6 +400,9 @@ static void test_sd_device_enumerator_filter_subsystem_one(
         _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
         unsigned n_new_dev = 0, n_removed_dev = 0;
         sd_device *dev;
+
+        assert(ret_n_new_dev);
+        assert(ret_n_removed_dev);
 
         ASSERT_OK(sd_device_enumerator_new(&e));
         ASSERT_OK(sd_device_enumerator_add_match_subsystem(e, subsystem, true));
@@ -457,6 +519,10 @@ TEST(sd_device_enumerator_filter_subsystem) {
                 ASSERT_TRUE(test_sd_device_enumerator_filter_subsystem_trial_many());
                 return;
         }
+
+        /* The rest of this test depends on a full booted system with a working udev and so on */
+        if (!sd_booted())
+                return (void) log_tests_skipped("Test requires fully booted system with udev/etc, skipping to avoid hanging forever.");
 
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         ASSERT_OK(sd_event_default(&event));
@@ -749,6 +815,62 @@ TEST(sd_device_new_from_nulstr) {
         }
 }
 
+TEST(sd_device_new_from_nulstr_invalid_property) {
+        char nulstr[] =
+                "ACTION=add\0"
+                "DEVPATH=/devices/pci0000:00/80860F14:00/mmc_host/mmc0/mmc0:0001\0"
+                "SUBSYSTEM=mmc\0"
+                "MMC_NAME=H8G4a\x92\0"
+                "MODALIAS=mmc:block\0"
+                "SEQNUM=1\0";
+        _cleanup_(sd_device_unrefp) sd_device *device = NULL;
+        const char *value;
+
+        ASSERT_OK(device_new_from_nulstr(&device, nulstr, sizeof(nulstr) - 1));
+        ASSERT_ERROR(sd_device_get_property_value(device, "MMC_NAME", &value), ENOENT);
+        ASSERT_OK(sd_device_get_property_value(device, "MODALIAS", &value));
+        ASSERT_STREQ(value, "mmc:block");
+}
+
+TEST(sd_device_new_from_nulstr_invalid_property_key) {
+        char nulstr[] =
+                "ACTION=add\0"
+                "DEVPATH=/devices/pci0000:00/80860F14:00/mmc_host/mmc0/mmc0:0001\0"
+                "SUBSYSTEM=mmc\0"
+                "INVALID-KEY=value\0"
+                "SEQNUM=1\0";
+        _cleanup_(sd_device_unrefp) sd_device *device = NULL;
+        const char *value;
+
+        ASSERT_OK(device_new_from_nulstr(&device, nulstr, sizeof(nulstr) - 1));
+        ASSERT_ERROR(sd_device_get_property_value(device, "INVALID-KEY", &value), ENOENT);
+}
+
+TEST(sd_device_new_from_nulstr_invalid_required_property) {
+        char nulstr[] =
+                "ACTION=invalid\0"
+                "DEVPATH=/devices/pci0000:00/80860F14:00/mmc_host/mmc0/mmc0:0001\0"
+                "SUBSYSTEM=mmc\0"
+                "MODALIAS=mmc:block\0"
+                "SEQNUM=1\0";
+        _cleanup_(sd_device_unrefp) sd_device *device = NULL;
+
+        ASSERT_ERROR(device_new_from_nulstr(&device, nulstr, sizeof(nulstr) - 1), EINVAL);
+}
+
+TEST(sd_device_new_from_nulstr_invalid_typed_property) {
+        char nulstr[] =
+                "ACTION=add\0"
+                "DEVPATH=/devices/pci0000:00/80860F14:00/mmc_host/mmc0/mmc0:0001\0"
+                "SUBSYSTEM=mmc\0"
+                "IFINDEX=invalid\0"
+                "MODALIAS=mmc:block\0"
+                "SEQNUM=1\0";
+        _cleanup_(sd_device_unrefp) sd_device *device = NULL;
+
+        ASSERT_ERROR(device_new_from_nulstr(&device, nulstr, sizeof(nulstr) - 1), EINVAL);
+}
+
 TEST(sd_device_new_from_path) {
         _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
         _cleanup_(rm_rf_physical_and_freep) char *tmpdir = NULL;
@@ -828,9 +950,63 @@ TEST(devname_from_devnum) {
         }
 }
 
+TEST(device_add_property) {
+        _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
+        const char *val;
+
+        ASSERT_OK(sd_device_new_from_syspath(&dev, "/sys/class/net/lo"));
+
+        /* add a property */
+        ASSERT_OK(device_add_property(dev, "hoge", "foo"));
+        ASSERT_OK(sd_device_get_property_value(dev, "hoge", &val));
+        ASSERT_STREQ(val, "foo");
+
+        /* update an existing property */
+        ASSERT_OK(device_add_property(dev, "hoge", "bar"));
+        ASSERT_OK(sd_device_get_property_value(dev, "hoge", &val));
+        ASSERT_STREQ(val, "bar");
+
+        /* remove an existing property */
+        ASSERT_OK(device_add_property(dev, "hoge", NULL));
+        ASSERT_ERROR(sd_device_get_property_value(dev, "hoge", &val), ENOENT);
+
+        /* add a property again */
+        ASSERT_OK(device_add_property(dev, "hoge", "foo"));
+        ASSERT_OK(sd_device_get_property_value(dev, "hoge", &val));
+        ASSERT_STREQ(val, "foo");
+
+        /* remove it with an empty string */
+        ASSERT_OK(device_add_property(dev, "hoge", ""));
+        ASSERT_ERROR(sd_device_get_property_value(dev, "hoge", &val), ENOENT);
+
+        /* check internal property (starting with dot) */
+        ASSERT_OK(device_add_property(dev, ".hoge", "baz"));
+        ASSERT_OK(sd_device_get_property_value(dev, ".hoge", &val));
+        ASSERT_STREQ(val, "baz");
+
+        /* refuse invalid property names */
+        ASSERT_ERROR(device_add_property(dev, "hoge-hoge", "aaa"), EINVAL);
+        ASSERT_ERROR(device_add_property(dev, "hoge=hoge", "aaa"), EINVAL);
+        ASSERT_ERROR(device_add_property(dev, "hoge hoge", "aaa"), EINVAL);
+        ASSERT_ERROR(device_add_property(dev, "hoge\nhoge", "aaa"), EINVAL);
+        ASSERT_ERROR(device_add_property(dev, "hoge\rhoge", "aaa"), EINVAL);
+        ASSERT_ERROR(device_add_property(dev, "hoge\thoge", "aaa"), EINVAL);
+
+        /* refuse invalid property values */
+        ASSERT_ERROR(device_add_property(dev, "hoge", "aaa\naaa"), EINVAL);
+        ASSERT_ERROR(device_add_property(dev, "hoge", "aaa\raaa"), EINVAL);
+        ASSERT_ERROR(device_add_property(dev, "hoge", "aaa\taaa"), EINVAL);
+}
+
 static int intro(void) {
+        int r;
+
         if (path_is_mount_point("/sys") <= 0)
-                return log_tests_skipped("/sys is not mounted");
+                return log_tests_skipped("/sys/ is not mounted");
+
+        r = dlopen_libmount(LOG_DEBUG);
+        if (r < 0)
+                return log_tests_skipped("libmount not available.");
 
         return EXIT_SUCCESS;
 }

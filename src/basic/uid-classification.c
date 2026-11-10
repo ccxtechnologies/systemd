@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#if ENABLE_COMPAT_MUTABLE_UID_BOUNDARIES
 #include <threads.h>
 
 #include "chase.h"
@@ -7,6 +8,8 @@
 #include "fileio.h"
 #include "log.h"
 #include "string-util.h"
+#endif
+
 #include "uid-classification.h"
 #include "user-util.h"
 
@@ -22,6 +25,8 @@ static int parse_alloc_uid(const char *path, const char *name, const char *t, ui
         uid_t uid;
         int r;
 
+        assert(ret_uid);
+
         r = parse_uid(t, &uid);
         if (r < 0)
                 return log_debug_errno(r, "%s: failed to parse %s %s, ignoring: %m", path, name, t);
@@ -34,6 +39,8 @@ static int parse_alloc_uid(const char *path, const char *name, const char *t, ui
 #endif
 
 int read_login_defs(UGIDAllocationRange *ret_defs, const char *path, const char *root) {
+        assert(ret_defs);
+
 #if ENABLE_COMPAT_MUTABLE_UID_BOUNDARIES
         _cleanup_fclose_ FILE *f = NULL;
         UGIDAllocationRange defs;

@@ -41,10 +41,10 @@
     system.</para>
 
     <para>Note that these APIs only allow purely passive access and
-    monitoring of seats, sessions and users. To actively make changes
+    monitoring of seats, sessions, and users. To actively make changes
     to the seat configuration, terminate login sessions, or switch
     session on a seat you need to utilize the D-Bus API of
-    systemd-logind, instead.</para>
+    systemd-logind instead.</para>
 
     <para>These functions synchronously access data in
     <filename>/proc/</filename>, <filename>/sys/fs/cgroup/</filename>
@@ -62,7 +62,7 @@
     other.</para>
 
     <para>If the functions return string arrays, these are generally
-    <constant>NULL</constant> terminated and need to be freed by the
+    <constant>NULL</constant>-terminated and need to be freed by the
     caller with the libc
     <citerefentry project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry>
     call after use, including the strings referenced therein.
@@ -180,6 +180,26 @@
         considered to be around.</para>
 
         <xi:include href="version-info.xml" xpointer="v235"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>Tag <literal>uaccess</literal></term>
+
+        <listitem><para>When set, access to this device is tied to an active seat.
+        As the session on the seat becomes active or inactive, access to the device
+        is updated accordingly.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>Tag <literal>xaccess-*</literal></term>
+
+        <listitem><para>When <literal>xaccess-<replaceable>ID</replaceable></literal>
+        is set, access to this device is granted to sessions created with
+        <literal><replaceable>ID</replaceable></literal> listed in <literal>ExtraDeviceAccess</literal>.
+        As the sessions with some <literal>ExtraDeviceAccess</literal> open and close,
+        access to the device is updated accordingly.</para>
+
+        <xi:include href="version-info.xml" xpointer="v260"/></listitem>
       </varlistentry>
 
       <varlistentry>

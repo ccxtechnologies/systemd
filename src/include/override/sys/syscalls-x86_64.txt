@@ -80,6 +80,7 @@ fchmodat2	452
 fchown	93
 fchown32
 fchownat	260
+fchroot	472
 fcntl	72
 fcntl64
 fdatasync	75
@@ -194,6 +195,7 @@ link	86
 linkat	265
 listen	50
 listmount	458
+listns	470
 listxattr	194
 listxattrat	465
 llistxattr	195
@@ -358,6 +360,7 @@ riscv_flush_icache
 riscv_hwprobe
 rmdir	84
 rseq	334
+rseq_slice_yield	471
 rt_sigaction	13
 rt_sigpending	127
 rt_sigprocmask	14
@@ -513,6 +516,7 @@ uname	63
 unlink	87
 unlinkat	263
 unshare	272
+uprobe	336
 uretprobe	335
 userfaultfd	323
 usr26

@@ -1,7 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
+#include "dns-answer.h"
 #include "dns-domain.h"
+#include "dns-packet.h"
+#include "dns-question.h"
+#include "dns-rr.h"
 #include "dns-type.h"
 #include "env-util.h"
 #include "hostname-util.h"
@@ -9,10 +13,6 @@
 #include "log.h"
 #include "missing-network.h"
 #include "resolved-def.h"
-#include "resolved-dns-answer.h"
-#include "resolved-dns-packet.h"
-#include "resolved-dns-question.h"
-#include "resolved-dns-rr.h"
 #include "resolved-dns-synthesize.h"
 #include "resolved-manager.h"
 #include "socket-util.h"
@@ -97,6 +97,8 @@ static int synthesize_localhost_rr(Manager *m, const DnsResourceKey *key, DnsAns
 
 static int answer_add_ptr(DnsAnswer **answer, const char *from, const char *to, int ifindex, DnsAnswerFlags flags) {
         _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+
+        assert(answer);
 
         rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_PTR, from);
         if (!rr)

@@ -14,6 +14,7 @@
 #include "bus-util.h"
 #include "chase.h"
 #include "creds-util.h"
+#include "dlopen-note.h"
 #include "efi-loader.h"
 #include "env-util.h"
 #include "errno-util.h"
@@ -24,10 +25,10 @@
 #include "generator.h"
 #include "in-addr-util.h"
 #include "initrd-util.h"
+#include "libmount-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "mount-setup.h"
-#include "mount-util.h"
 #include "mountpoint-util.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -221,6 +222,7 @@ static int add_swap(
 
         _cleanup_free_ char *name = NULL;
         _cleanup_fclose_ FILE *f = NULL;
+        bool is_network;
         int r;
 
         assert(what);
@@ -240,11 +242,14 @@ static int add_swap(
                 return true;
         }
 
-        log_debug("Found swap entry what=%s makefs=%s growfs=%s pcrfs=%s validatefs=%s noauto=%s nofail=%s",
+        is_network = fstab_test_option(options, "_netdev\0");
+
+        log_debug("Found swap entry what=%s makefs=%s growfs=%s pcrfs=%s validatefs=%s noauto=%s nofail=%s netdev=%s",
                   what,
                   yes_no(flags & MOUNT_MAKEFS), yes_no(flags & MOUNT_GROWFS),
                   yes_no(flags & MOUNT_PCRFS), yes_no(flags & MOUNT_VALIDATEFS),
-                  yes_no(flags & MOUNT_NOAUTO), yes_no(flags & MOUNT_NOFAIL));
+                  yes_no(flags & MOUNT_NOAUTO), yes_no(flags & MOUNT_NOFAIL),
+                  yes_no(is_network));
 
         r = unit_name_from_path(what, ".swap", &name);
         if (r < 0)
@@ -285,6 +290,12 @@ static int add_swap(
         if (r < 0)
                 return r;
 
+        if (is_network) {
+                r = generator_write_network_device_deps(arg_dest, what, /* where= */ NULL, options);
+                if (r < 0)
+                        return r;
+        }
+
         if (flags & MOUNT_MAKEFS) {
                 r = generator_hook_up_mkswap(arg_dest, what);
                 if (r < 0)
@@ -300,7 +311,8 @@ static int add_swap(
                 log_warning("%s: validating swap devices is currently unsupported.", what);
 
         if (!(flags & MOUNT_NOAUTO)) {
-                r = generator_add_symlink(arg_dest, SPECIAL_SWAP_TARGET,
+                const char *target = is_network ? SPECIAL_REMOTE_FS_TARGET : SPECIAL_SWAP_TARGET;
+                r = generator_add_symlink(arg_dest, target,
                                           (flags & MOUNT_NOFAIL) ? "wants" : "requires", name);
                 if (r < 0)
                         return r;
@@ -672,9 +684,9 @@ static int add_mount(
         }
 
         if (flags & MOUNT_PCRFS) {
-                r = efi_measured_uki(LOG_WARNING);
+                r = efi_measured_os(LOG_WARNING);
                 if (r == 0)
-                        log_debug("Kernel stub did not measure kernel image into PCR, skipping userspace measurement, too.");
+                        log_debug("OS measurements not explicitly requested and kernel stub did not measure kernel image into PCR, skipping userspace measurement, too.");
                 else if (r > 0) {
                         r = generator_hook_up_pcrfs(dest, where, target_unit);
                         if (r < 0)
@@ -693,7 +705,7 @@ static int add_mount(
                 if (r < 0) {
                         if (r != -EOPNOTSUPP)
                                 return r;
-                } else {
+                } else if (r > 0) {
                         r = generator_hook_up_quotaon(dest, where, target_unit);
                         if (r < 0)
                                 return r;
@@ -790,7 +802,7 @@ static int do_daemon_reload(void) {
 
                 k = bus_call_method(bus, bus_systemd_mgr, "StartUnit", &error, NULL, "ss", unit, "replace");
                 if (k < 0) {
-                        log_error_errno(k, "Failed to (re)start %s: %s", unit, bus_error_message(&error, r));
+                        log_error_errno(k, "Failed to (re)start %s: %s", unit, bus_error_message(&error, k));
                         RET_GATHER(r, k);
                 }
         }
@@ -877,7 +889,9 @@ static int canonicalize_mount_path(const char *path, const char *type, bool pref
 
         // FIXME: when chase() learns to chase non-existent paths, use this here and drop the prefixing with
         // /sysroot on error below.
-        r = chase(path, prefix_sysroot ? "/sysroot" : NULL, CHASE_PREFIX_ROOT | CHASE_NONEXISTENT, &p, NULL);
+        r = chase(path, prefix_sysroot ? "/sysroot" : NULL,
+                  CHASE_PREFIX_ROOT | CHASE_NONEXISTENT | CHASE_NO_SYNC,
+                  &p, NULL);
         if (r < 0) {
                 log_debug_errno(r, "Failed to chase '%s', using as-is: %m", path);
 
@@ -1025,9 +1039,9 @@ static int parse_fstab_one(
 }
 
 static int parse_fstab(bool prefix_sysroot) {
-        _cleanup_endmntent_ FILE *f = NULL;
+        _cleanup_(mnt_free_tablep) struct libmnt_table *table = NULL;
+        _cleanup_(mnt_free_iterp) struct libmnt_iter *iter = NULL;
         const char *fstab;
-        struct mntent *me;
         int r, ret = 0;
 
         if (prefix_sysroot)
@@ -1039,27 +1053,35 @@ static int parse_fstab(bool prefix_sysroot) {
 
         log_debug("Parsing %s...", fstab);
 
-        f = setmntent(fstab, "re");
-        if (!f) {
-                if (errno == ENOENT)
-                        return 0;
+        r = libmount_parse_full(fstab, /* source= */ NULL, MNT_ITER_FORWARD, &table, &iter);
+        if (r == -ENOENT)
+                return 0;
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse '%s': %m", fstab);
 
-                return log_error_errno(errno, "Failed to open %s: %m", fstab);
-        }
+        for (;;) {
+                struct libmnt_fs *fs;
 
-        while ((me = getmntent(f))) {
-                r = parse_fstab_one(fstab,
-                                    me->mnt_fsname, me->mnt_dir, me->mnt_type, me->mnt_opts, me->mnt_passno,
-                                    prefix_sysroot,
-                                    /* accept_root = */ false,
-                                    /* use_swap_enabled = */ true);
-                if (r < 0 && ret >= 0)
-                        ret = r;
+                r = sym_mnt_table_next_fs(table, iter, &fs);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get next entry from '%s': %m", fstab);
+                if (r > 0) /* EOF */
+                        return ret;
+
+                r = parse_fstab_one(
+                                fstab,
+                                sym_mnt_fs_get_source(fs),
+                                sym_mnt_fs_get_target(fs),
+                                sym_mnt_fs_get_fstype(fs),
+                                sym_mnt_fs_get_options(fs),
+                                sym_mnt_fs_get_passno(fs),
+                                prefix_sysroot,
+                                /* accept_root= */ false,
+                                /* use_swap_enabled= */ true);
                 if (arg_sysroot_check && r > 0)
                         return true;  /* We found a mount or swap that would be started… */
+                RET_GATHER(ret, r);
         }
-
-        return ret;
 }
 
 static int mount_source_is_nfsroot(const char *what) {
@@ -1221,11 +1243,31 @@ static int add_sysroot_mount(void) {
                 if (!strextend_with_separator(&combined_options, ",", extra_opts))
                         return log_oom();
 
+        /* A bind mount inherits the mount flags (nosuid, nodev, noexec, …) of the file system the source
+         * directory is located on. The source typically lives below /run/ (e.g. a freshly unpacked tar image
+         * in /run/machines/), which is mounted nosuid,nodev, and these flags would then propagate to our root
+         * file system, breaking suid binaries (e.g. sudo) and device nodes. Since this is supposed to become a
+         * regular OS root file system, default to dev,suid,exec instead, unless the user explicitly requested
+         * otherwise. */
+        if (bind) {
+                static const char* const defaults[] = {
+                        "suid", "suid\0" "nosuid\0",
+                        "dev",  "dev\0"  "nodev\0",
+                        "exec", "exec\0" "noexec\0",
+                        NULL,
+                };
+
+                STRV_FOREACH_PAIR(add, test, defaults)
+                        if (!fstab_test_option(combined_options, *test))
+                                if (!strextend_with_separator(&combined_options, ",", *add))
+                                        return log_oom();
+        }
+
         log_debug("Found entry what=%s where=/sysroot type=%s opts=%s", what, strna(fstype), strempty(combined_options));
 
         /* Only honor x-systemd.makefs and .validatefs here, others are not relevant in initrd/not used
          * at all (also see mandatory_mount_drop_unapplicable_options()) */
-        flags = fstab_options_to_flags(combined_options, /* is_swap = */ false) & (MOUNT_MAKEFS|MOUNT_VALIDATEFS);
+        flags = fstab_options_to_flags(combined_options, /* is_swap= */ false) & (MOUNT_MAKEFS|MOUNT_VALIDATEFS);
 
         return add_mount("/proc/cmdline",
                          arg_dest,
@@ -1403,10 +1445,10 @@ static int add_mounts_from_cmdline(void) {
                                               m->where,
                                               m->fstype,
                                               m->options,
-                                              /* passno = */ -1,
-                                              /* prefix_sysroot = */ !m->for_initrd && in_initrd(),
-                                              /* accept_root = */ true,
-                                              /* use_swap_enabled = */ false));
+                                              /* passno= */ -1,
+                                              /* prefix_sysroot= */ !m->for_initrd && in_initrd(),
+                                              /* accept_root= */ true,
+                                              /* use_swap_enabled= */ false));
         }
 
         return r;
@@ -1414,15 +1456,15 @@ static int add_mounts_from_cmdline(void) {
 
 static int add_mounts_from_creds(bool prefix_sysroot) {
         _cleanup_free_ void *b = NULL;
-        struct mntent *me;
         size_t bs;
-        int r;
+        const char *cred;
+        int r, ret = 0;
 
         assert(in_initrd() || !prefix_sysroot);
 
-        r = read_credential_with_decryption(
-                        in_initrd() && !prefix_sysroot ? "fstab.extra.initrd" : "fstab.extra",
-                        &b, &bs);
+        cred = in_initrd() && !prefix_sysroot ? "fstab.extra.initrd" : "fstab.extra";
+
+        r = read_credential_with_decryption(cred, &b, &bs);
         if (r <= 0)
                 return r;
 
@@ -1431,20 +1473,33 @@ static int add_mounts_from_creds(bool prefix_sysroot) {
         if (!f)
                 return log_oom();
 
-        r = 0;
+        _cleanup_(mnt_free_tablep) struct libmnt_table *table = NULL;
+        _cleanup_(mnt_free_iterp) struct libmnt_iter *iter = NULL;
 
-        while ((me = getmntent(f)))
-                RET_GATHER(r, parse_fstab_one("/run/credentials",
-                                              me->mnt_fsname,
-                                              me->mnt_dir,
-                                              me->mnt_type,
-                                              me->mnt_opts,
-                                              me->mnt_passno,
-                                              /* prefix_sysroot = */ prefix_sysroot,
-                                              /* accept_root = */ true,
-                                              /* use_swap_enabled = */ true));
+        r = libmount_parse_full(cred, f, MNT_ITER_FORWARD, &table, &iter);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse credential '%s' (as fstab): %m", cred);
 
-        return r;
+        for (;;) {
+                struct libmnt_fs *fs;
+
+                r = sym_mnt_table_next_fs(table, iter, &fs);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get next fstab entry from credential '%s': %m", cred);
+                if (r > 0) /* EOF */
+                        return ret;
+
+                RET_GATHER(ret, parse_fstab_one(
+                                           "/run/credentials",
+                                           sym_mnt_fs_get_source(fs),
+                                           sym_mnt_fs_get_target(fs),
+                                           sym_mnt_fs_get_fstype(fs),
+                                           sym_mnt_fs_get_options(fs),
+                                           sym_mnt_fs_get_passno(fs),
+                                           prefix_sysroot,
+                                           /* accept_root= */ true,
+                                           /* use_swap_enabled= */ true));
+        }
 }
 
 static int parse_proc_cmdline_item(const char *key, const char *value, void *data) {
@@ -1634,7 +1689,7 @@ static int run_generator(void) {
         (void) determine_usr();
 
         if (arg_sysroot_check) {
-                r = parse_fstab(/* prefix_sysroot = */ true);
+                r = parse_fstab(/* prefix_sysroot= */ true);
                 if (r == 0)
                         log_debug("Nothing interesting found, not doing daemon-reload.");
                 if (r > 0)
@@ -1657,26 +1712,31 @@ static int run_generator(void) {
         /* Honour /etc/fstab only when that's enabled */
         if (arg_fstab_enabled) {
                 /* Parse the local /etc/fstab, possibly from the initrd */
-                RET_GATHER(r, parse_fstab(/* prefix_sysroot = */ false));
+                RET_GATHER(r, parse_fstab(/* prefix_sysroot= */ false));
 
                 /* If running in the initrd also parse the /etc/fstab from the host */
                 if (in_initrd())
-                        RET_GATHER(r, parse_fstab(/* prefix_sysroot = */ true));
+                        RET_GATHER(r, parse_fstab(/* prefix_sysroot= */ true));
                 else
                         RET_GATHER(r, generator_enable_remount_fs_service(arg_dest));
         }
 
         RET_GATHER(r, add_mounts_from_cmdline());
 
-        RET_GATHER(r, add_mounts_from_creds(/* prefix_sysroot = */ false));
+        RET_GATHER(r, add_mounts_from_creds(/* prefix_sysroot= */ false));
 
         if (in_initrd())
-                RET_GATHER(r, add_mounts_from_creds(/* prefix_sysroot = */ true));
+                RET_GATHER(r, add_mounts_from_creds(/* prefix_sysroot= */ true));
 
         return r;
 }
 
 static int run(int argc, char **argv) {
+        LIBCRYPTO_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+        TPM2_NOTE(suggested);
+
         arg_sysroot_check = invoked_as(argv, "systemd-sysroot-fstab-check");
 
         if (arg_sysroot_check) {

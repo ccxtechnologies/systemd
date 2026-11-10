@@ -6,37 +6,25 @@
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "log.h"
 #include "parse-util.h"
 #include "process-util.h"
 #include "procfs-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
+#include "sysctl-util.h"
 #include "time-util.h"
 
 int procfs_get_pid_max(uint64_t *ret) {
-        _cleanup_free_ char *value = NULL;
-        int r;
-
         assert(ret);
 
-        r = read_one_line_file("/proc/sys/kernel/pid_max", &value);
-        if (r < 0)
-                return r;
-
-        return safe_atou64(value, ret);
+        return sysctl_read_uint64("kernel/pid_max", ret);
 }
 
 int procfs_get_threads_max(uint64_t *ret) {
-        _cleanup_free_ char *value = NULL;
-        int r;
-
         assert(ret);
 
-        r = read_one_line_file("/proc/sys/kernel/threads-max", &value);
-        if (r < 0)
-                return r;
-
-        return safe_atou64(value, ret);
+        return sysctl_read_uint64("kernel/threads-max", ret);
 }
 
 int procfs_tasks_set_limit(uint64_t limit) {
@@ -127,13 +115,36 @@ static uint64_t calc_gcd64(uint64_t a, uint64_t b) {
         return a;
 }
 
+nsec_t procfs_ticks_to_nsec(uint64_t ticks) {
+        uint64_t ticks_per_second = sysconf_clock_ticks_cached(),
+                gcd = calc_gcd64(NSEC_PER_SEC, ticks_per_second);
+
+        /* Reduce NSEC_PER_SEC/ticks_per_second first to avoid overflow of ticks * NSEC_PER_SEC, and split
+         * the multiplication into whole and remainder parts, so that the result stays exact.
+         *
+         * Note that in most cases b == 1 and the second term is trivial. */
+        uint64_t a = NSEC_PER_SEC / gcd,
+                 b = ticks_per_second / gcd;
+
+        return ticks / b * a + DIV_ROUND_UP(ticks % b * a, b);
+}
+
 int procfs_cpu_get_usage(nsec_t *ret) {
+        int r;
+
+        assert(ret);
+
+        ProcfsCpuTicks ticks;
+        r = procfs_cpu_get_ticks(&ticks);
+        if (r < 0)
+                return r;
+
+        *ret = procfs_ticks_to_nsec(ticks.user + ticks.nice + ticks.system + ticks.irq + ticks.softirq);
+        return 0;
+}
+
+int procfs_cpu_get_ticks(ProcfsCpuTicks *ret) {
         _cleanup_free_ char *first_line = NULL;
-        unsigned long user_ticks, nice_ticks, system_ticks, irq_ticks, softirq_ticks,
-                guest_ticks = 0, guest_nice_ticks = 0;
-        long ticks_per_second;
-        uint64_t sum, gcd, a, b;
-        const char *p;
         int r;
 
         assert(ret);
@@ -142,36 +153,30 @@ int procfs_cpu_get_usage(nsec_t *ret) {
         if (r < 0)
                 return r;
 
-        p = first_word(first_line, "cpu");
+        const char *p = first_word(first_line, "cpu");
         if (!p)
                 return -EINVAL;
 
-        if (sscanf(p, "%lu %lu %lu %*u %*u %lu %lu %*u %lu %lu",
-                   &user_ticks,
-                   &nice_ticks,
-                   &system_ticks,
-                   &irq_ticks,
-                   &softirq_ticks,
-                   &guest_ticks,
-                   &guest_nice_ticks) < 5) /* we only insist on the first five fields */
+        /* All eight fields exist on any kernel we support: iowait was added in 2.5.41, steal in 2.6.11.
+         * "guest" and "guest_nice" are not returned, the kernel already includes them in "user" and "nice".
+         * Nevertheless, this file might be synthesized slopilly, so let's not require the last three fields.
+         * We don't care about them in most cases anyway. */
+        ProcfsCpuTicks t = {};
+        r = sscanf(p, "%"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64,
+                   &t.user,
+                   &t.nice,
+                   &t.system,
+                   &t.idle,
+                   &t.iowait,
+                   &t.irq,
+                   &t.softirq,
+                   &t.steal);
+        if (r < 5)
                 return -EINVAL;
+        if (r < 8)
+                log_once(LOG_INFO, "Short read (%d fields) from /proc/stat, continuing.", r);
 
-        ticks_per_second = sysconf(_SC_CLK_TCK);
-        if (ticks_per_second  < 0)
-                return -errno;
-        assert(ticks_per_second > 0);
-
-        sum = (uint64_t) user_ticks + (uint64_t) nice_ticks + (uint64_t) system_ticks +
-                (uint64_t) irq_ticks + (uint64_t) softirq_ticks +
-                (uint64_t) guest_ticks + (uint64_t) guest_nice_ticks;
-
-        /* Let's reduce this fraction before we apply it to avoid overflows when converting this to μsec */
-        gcd = calc_gcd64(NSEC_PER_SEC, ticks_per_second);
-
-        a = (uint64_t) NSEC_PER_SEC / gcd;
-        b = (uint64_t) ticks_per_second / gcd;
-
-        *ret = DIV_ROUND_UP((nsec_t) sum * (nsec_t) a, (nsec_t) b);
+        *ret = t;
         return 0;
 }
 
@@ -183,7 +188,7 @@ int convert_meminfo_value_to_uint64_bytes(const char *s, uint64_t *ret) {
         assert(s);
         assert(ret);
 
-        r = extract_first_word(&s, &w, /* separators = */ NULL, /* flags = */ 0);
+        r = extract_first_word(&s, &w, /* separators= */ NULL, /* flags= */ 0);
         if (r < 0)
                 return r;
         if (r == 0)

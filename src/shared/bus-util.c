@@ -10,7 +10,6 @@
 #include "sd-bus.h"
 #include "sd-daemon.h"
 #include "sd-event.h"
-#include "sd-id128.h"
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
@@ -35,7 +34,6 @@
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
-#include "uid-classification.h"
 
 static int name_owner_change_callback(sd_bus_message *m, void *userdata, sd_bus_error *reterr_error) {
         sd_event *e = ASSERT_PTR(userdata);
@@ -316,17 +314,13 @@ static int pin_capsule_socket(const char *capsule, const char *suffix, uid_t *re
         if (!p)
                 return -ENOMEM;
 
-        /* We enter territory owned by the user, hence let's be paranoid about symlinks and ownership */
+        /* We enter territory owned by the user, hence let's be paranoid about symlinks */
         r = chase(p, /* root= */ NULL, CHASE_SAFE|CHASE_PROHIBIT_SYMLINKS, /* ret_path= */ NULL, &inode_fd);
         if (r < 0)
                 return r;
 
         if (fstat(inode_fd, &st) < 0)
                 return negative_errno();
-
-        /* Paranoid safety check */
-        if (uid_is_system(st.st_uid) || gid_is_system(st.st_gid))
-                return -EPERM;
 
         *ret_uid = st.st_uid;
         *ret_gid = st.st_gid;
@@ -919,28 +913,6 @@ int bus_query_sender_pidref(
                 return r;
 
         return bus_creds_get_pidref(creds, ret);
-}
-
-int bus_get_instance_id(sd_bus *bus, sd_id128_t *ret) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        int r;
-
-        assert(bus);
-        assert(ret);
-
-        r = sd_bus_call_method(bus,
-                               "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetId",
-                               /* reterr_error = */ NULL, &reply, NULL);
-        if (r < 0)
-                return r;
-
-        const char *id;
-
-        r = sd_bus_message_read_basic(reply, 's', &id);
-        if (r < 0)
-                return r;
-
-        return sd_id128_from_string(id, ret);
 }
 
 static const char* const bus_transport_table[] = {

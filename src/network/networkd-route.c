@@ -234,7 +234,7 @@ DEFINE_HASH_OPS_WITH_KEY_DESTRUCTOR(
                 route_compare_func,
                 route_unref);
 
-DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
                 route_section_hash_ops,
                 ConfigSection,
                 config_section_hash_func,
@@ -244,6 +244,8 @@ DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
 
 int route_new(Route **ret) {
         _cleanup_(route_unrefp) Route *route = NULL;
+
+        assert(ret);
 
         route = new(Route, 1);
         if (!route)
@@ -444,7 +446,7 @@ static int route_to_string(const Route *route, Manager *manager, char **ret) {
         if (in_addr_is_set(route->family, &route->prefsrc))
                 (void) in_addr_to_string(route->family, &route->prefsrc, &prefsrc);
         (void) route_scope_to_string_alloc(route->scope, &scope);
-        (void) manager_get_route_table_to_string(manager, route->table, /* append_num = */ true, &table);
+        (void) manager_get_route_table_to_string(manager, route->table, /* append_num= */ true, &table);
         (void) route_protocol_full_to_string_alloc(route->protocol, &proto);
         (void) route_flags_to_string_alloc(route->flags, &flags);
 
@@ -906,7 +908,7 @@ static int route_is_ready_to_configure(const Route *route, Link *link) {
         assert(route);
         assert(link);
 
-        if (!link_is_ready_to_configure(link, /* allow_unmanaged = */ false))
+        if (!link_is_ready_to_configure(link, /* allow_unmanaged= */ false))
                 return false;
 
         if (in_addr_is_set(route->family, &route->prefsrc) > 0) {
@@ -1201,7 +1203,7 @@ static int process_route_one(
                         route_forget(manager, route, "Forgetting removed");
                 else
                         log_route_debug(tmp,
-                                        manager->manage_foreign_routes ? "Kernel removed unknown" : "Ignoring received",
+                                        manager->manage_foreign_routes ? "Kernel removed unknown" : "Ignoring removed",
                                         manager);
                 break;
 
@@ -1641,7 +1643,7 @@ int link_drop_routes(Link *link, bool only_static) {
 void link_forget_routes(Link *link) {
         assert(link);
         assert(link->ifindex > 0);
-        assert(!FLAGS_SET(link->flags, IFF_UP));
+        assert(!link_is_up(link));
 
         /* When an interface went down, IPv4 non-local routes bound to the interface are silently removed by
          * the kernel, without any notifications. Let's forget them in that case. Otherwise, when the link
@@ -2007,6 +2009,12 @@ int config_parse_route_section(
 
         if (streq(section, "Network")) {
                 assert(streq_ptr(lvalue, "Gateway"));
+
+                /* Clear all previously defined routes when Gateway= (empty) is set in [Network] section */
+                if (isempty(rvalue)) {
+                        network->routes_by_section = hashmap_free(network->routes_by_section);
+                        return 0;
+                }
 
                 /* we are not in an Route section, so use line number instead */
                 r = route_new_static(network, filename, line, &route);

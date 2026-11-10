@@ -2,19 +2,16 @@
 
 #include <linux/if_tunnel.h>
 
-#include "sd-bus.h"
+#include "sd-json.h"
 #include "sd-netlink.h"
 
 #include "alloc-util.h"
-#include "bus-common-errors.h"
-#include "bus-error.h"
-#include "bus-util.h"
 #include "device-util.h"
 #include "fd-util.h"
 #include "glob-util.h"
 #include "netlink-util.h"
 #include "networkctl-link-info.h"
-#include "networkctl-util.h"
+#include "networkctl-link-info-json.h"
 #include "sort-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
@@ -28,6 +25,8 @@
 LinkInfo* link_info_array_free(LinkInfo *array) {
         for (unsigned i = 0; array && array[i].needs_freeing; i++) {
                 sd_device_unref(array[i].sd_device);
+                sd_json_variant_unref(array[i].description);
+                sd_dhcp_message_unref(array[i].dhcp_message);
                 free(array[i].netdev_kind);
                 free(array[i].ssid);
                 free(array[i].qdisc);
@@ -109,9 +108,9 @@ static int decode_netdev(sd_netlink_message *m, LinkInfo *info) {
                 (void) sd_netlink_message_read_u8(m, IFLA_VXLAN_L2MISS, &info->vxlan_info.l2miss);
                 (void) sd_netlink_message_read_u8(m, IFLA_VXLAN_TOS, &info->vxlan_info.tos);
                 (void) sd_netlink_message_read_u8(m, IFLA_VXLAN_TTL, &info->vxlan_info.ttl);
-        } else if (streq(info->netdev_kind, "vlan"))
+        } else if (streq(info->netdev_kind, "vlan")) {
                 (void) sd_netlink_message_read_u16(m, IFLA_VLAN_ID, &info->vlan_id);
-        else if (STR_IN_SET(info->netdev_kind, "ipip", "sit")) {
+        } else if (STR_IN_SET(info->netdev_kind, "ipip", "sit")) {
                 (void) sd_netlink_message_read_in_addr(m, IFLA_IPTUN_LOCAL, &info->local.in);
                 (void) sd_netlink_message_read_in_addr(m, IFLA_IPTUN_REMOTE, &info->remote.in);
         } else if (streq(info->netdev_kind, "geneve")) {
@@ -144,9 +143,9 @@ static int decode_netdev(sd_netlink_message *m, LinkInfo *info) {
         } else if (streq(info->netdev_kind, "vti6")) {
                 (void) sd_netlink_message_read_in6_addr(m, IFLA_VTI_LOCAL, &info->local.in6);
                 (void) sd_netlink_message_read_in6_addr(m, IFLA_VTI_REMOTE, &info->remote.in6);
-        } else if (STR_IN_SET(info->netdev_kind, "macvlan", "macvtap"))
+        } else if (STR_IN_SET(info->netdev_kind, "macvlan", "macvtap")) {
                 (void) sd_netlink_message_read_u32(m, IFLA_MACVLAN_MODE, &info->macvlan_mode);
-        else if (streq(info->netdev_kind, "ipvlan")) {
+        } else if (streq(info->netdev_kind, "ipvlan")) {
                 (void) sd_netlink_message_read_u16(m, IFLA_IPVLAN_MODE, &info->ipvlan_mode);
                 (void) sd_netlink_message_read_u16(m, IFLA_IPVLAN_FLAGS, &info->ipvlan_flags);
         }
@@ -280,36 +279,6 @@ static int decode_link(
         return 1;
 }
 
-static int acquire_link_bitrates(sd_bus *bus, LinkInfo *link) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        int r;
-
-        assert(bus);
-        assert(link);
-
-        r = link_get_property(bus, link->ifindex, &error, &reply, "org.freedesktop.network1.Link", "BitRates", "(tt)");
-        if (r < 0) {
-                bool quiet = sd_bus_error_has_names(&error, SD_BUS_ERROR_UNKNOWN_PROPERTY,
-                                                            BUS_ERROR_SPEED_METER_INACTIVE);
-
-                return log_full_errno(quiet ? LOG_DEBUG : LOG_WARNING,
-                                      r, "Failed to query link bit rates: %s", bus_error_message(&error, r));
-        }
-
-        r = sd_bus_message_read(reply, "(tt)", &link->tx_bitrate, &link->rx_bitrate);
-        if (r < 0)
-                return bus_log_parse_error(r);
-
-        r = sd_bus_message_exit_container(reply);
-        if (r < 0)
-                return bus_log_parse_error(r);
-
-        link->has_bitrates = link->tx_bitrate != UINT64_MAX && link->rx_bitrate != UINT64_MAX;
-
-        return 0;
-}
-
 static void acquire_ether_link_info(int *fd, LinkInfo *link) {
         assert(fd);
         assert(link);
@@ -356,7 +325,7 @@ static void acquire_wlan_link_info(LinkInfo *link) {
         link->has_wlan_link_info = r > 0 || k > 0;
 }
 
-int acquire_link_info(sd_bus *bus, sd_netlink *rtnl, char * const *patterns, LinkInfo **ret) {
+int acquire_link_info(sd_varlink *vl, sd_netlink *rtnl, char * const *patterns, LinkInfo **ret) {
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req = NULL, *reply = NULL;
         _cleanup_(link_info_array_freep) LinkInfo *links = NULL;
         _cleanup_free_ bool *matched_patterns = NULL;
@@ -402,6 +371,8 @@ int acquire_link_info(sd_bus *bus, sd_netlink *rtnl, char * const *patterns, Lin
                 acquire_ether_link_info(&fd, &links[c]);
                 acquire_wlan_link_info(&links[c]);
 
+                (void) link_info_parse_description(&links[c], vl);
+
                 c++;
         }
 
@@ -420,10 +391,6 @@ int acquire_link_info(sd_bus *bus, sd_netlink *rtnl, char * const *patterns, Lin
         }
 
         typesafe_qsort(links, c, link_info_compare);
-
-        if (bus)
-                FOREACH_ARRAY(link, links, c)
-                        (void) acquire_link_bitrates(bus, link);
 
         *ret = TAKE_PTR(links);
 

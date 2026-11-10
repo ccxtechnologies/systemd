@@ -1,13 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <resolv.h>
+#include <resolv.h>                     /* IWYU pragma: keep */
 #include <sys/stat.h>
 
 #include "alloc-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "label-util.h"
 #include "log.h"
 #include "ordered-set.h"
 #include "path-util.h"
@@ -22,7 +21,7 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
-#include "tmpfile-util-label.h"
+#include "tmpfile-util.h"
 
 int manager_check_resolv_conf(const Manager *m) {
         struct stat st, own;

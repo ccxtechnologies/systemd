@@ -2,7 +2,8 @@
 #pragma once
 
 #include "forward.h"
-#include "strv-fundamental.h"   /* IWYU pragma: export */
+
+#include "../fundamental/strv.h"   /* IWYU pragma: export */
 
 char* strv_find(char * const *l, const char *name) _pure_;
 char* strv_find_case(char * const *l, const char *name) _pure_;
@@ -56,7 +57,12 @@ static inline int strv_extend(char ***l, const char *value) {
 int strv_extend_many_internal(char ***l, const char *value, ...);
 #define strv_extend_many(l, ...) strv_extend_many_internal(l, __VA_ARGS__, POINTER_MAX)
 
-int strv_extendf(char ***l, const char *format, ...) _printf_(2,3);
+int strv_extendf_with_size(char ***l, size_t *n, const char *format, ...) _printf_(3,4);
+#define strv_extendf(l, ...) strv_extendf_with_size(l, NULL, __VA_ARGS__)
+
+int strv_extend_joined_with_size_sentinel(char ***l, size_t *n, ...) _sentinel_;
+#define strv_extend_joined_with_size(l, n, ...) strv_extend_joined_with_size_sentinel(l, n, __VA_ARGS__, NULL)
+#define strv_extend_joined(l, ...) strv_extend_joined_with_size(l, NULL, __VA_ARGS__)
 
 int strv_push_with_size(char ***l, size_t *n, char *value);
 static inline int strv_push(char ***l, char *value) {
@@ -79,6 +85,7 @@ int strv_consume_pair(char ***l, char *a, char *b);
 int strv_consume_prepend(char ***l, char *value);
 
 char** strv_remove(char **l, const char *s);
+char** strv_remove_strv(char **l, char *const*ll);
 char** strv_uniq(char **l);
 bool strv_is_uniq(char * const *l) _pure_;
 
@@ -99,10 +106,6 @@ static inline const char* STRV_IFNOTNULL(const char *x) {
         return x ?: STRV_IGNORE;
 }
 
-static inline bool strv_isempty(char * const *l) {
-        return !l || !*l;
-}
-
 int strv_split_full(char ***t, const char *s, const char *separators, ExtractFlags flags);
 char** strv_split(const char *s, const char *separators);
 
@@ -117,9 +120,9 @@ char** strv_split_newlines(const char *s);
  * string in the vector is an empty string. */
 int strv_split_colon_pairs(char ***t, const char *s);
 
-char* strv_join_full(char * const *l, const char *separator, const char *prefix, bool escape_separator);
+char* strv_join_full(char * const *l, const char *separator, const char *prefix);
 static inline char *strv_join(char * const *l, const char *separator) {
-        return strv_join_full(l, separator, NULL, false);
+        return strv_join_full(l, separator, NULL);
 }
 
 bool strv_overlap(char * const *a, char * const *b) _pure_;
@@ -216,3 +219,9 @@ int string_strv_ordered_hashmap_put(OrderedHashmap **h, const char *key, const c
 int strv_rebreak_lines(char **l, size_t width, char ***ret);
 
 char** strv_filter_prefix(char * const *l, const char *prefix);
+
+/* whenever we need to initialize something with a constant non-NULL, but empty strv, we can use this shared
+ * one */
+extern const char* const strv_empty[1];
+
+#define STRV_EMPTY ((char**) strv_empty)

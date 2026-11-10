@@ -23,7 +23,7 @@ int ipe_setup(void) {
         _cleanup_strv_free_ char **policies = NULL;
         int r;
 
-        /* Very quick smoke tests first: this is in the citical, sequential boot path, and in most cases it
+        /* Very quick smoke tests first: this is in the critical, sequential boot path, and in most cases it
          * is unlikely this will be configured, so do the fastest existence checks first and immediately
          * return if there's nothing to do. */
 
@@ -36,7 +36,7 @@ int ipe_setup(void) {
                         &policies,
                         ".p7b",
                         /* root= */ NULL,
-                        CONF_FILES_REGULAR|CONF_FILES_FILTER_MASKED,
+                        CONF_FILES_REGULAR|CONF_FILES_FILTER_MASKED|CONF_FILES_WARN,
                         CONF_PATHS_NULSTR("ipe"));
         if (r < 0)
                 return log_error_errno(r, "Failed to assemble list of IPE policies: %m");

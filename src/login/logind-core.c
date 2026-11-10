@@ -13,6 +13,7 @@
 #include "bus-locator.h"
 #include "cgroup-util.h"
 #include "conf-parser.h"
+#include "device-private.h"
 #include "device-util.h"
 #include "efi-loader.h"
 #include "errno-util.h"
@@ -244,11 +245,14 @@ int manager_add_inhibitor(Manager *m, const char* id, Inhibitor **ret) {
 
 int manager_add_button(Manager *m, const char *name, Button **ret_button) {
         Button *b;
+        bool is_new;
 
         assert(m);
         assert(name);
 
         b = hashmap_get(m->buttons, name);
+        is_new = !b;
+
         if (!b) {
                 b = button_new(m, name);
                 if (!b)
@@ -258,7 +262,7 @@ int manager_add_button(Manager *m, const char *name, Button **ret_button) {
         if (ret_button)
                 *ret_button = b;
 
-        return 0;
+        return is_new;
 }
 
 int manager_process_seat_device(Manager *m, sd_device *d) {
@@ -328,7 +332,7 @@ int manager_process_seat_device(Manager *m, sd_device *d) {
         return 0;
 }
 
-int manager_process_button_device(Manager *m, sd_device *d) {
+int manager_process_button_device(Manager *m, sd_device *d, Button **ret_button) {
         const char *sysname;
         Button *b;
         int r;
@@ -340,28 +344,39 @@ int manager_process_button_device(Manager *m, sd_device *d) {
                 return r;
 
         if (device_for_action(d, SD_DEVICE_REMOVE) ||
-            sd_device_has_current_tag(d, "power-switch") <= 0)
+            sd_device_has_current_tag(d, "power-switch") <= 0) {
 
-                button_free(hashmap_get(m->buttons, sysname));
-
-        else {
-                const char *sn;
-
-                r = manager_add_button(m, sysname, &b);
-                if (r < 0)
-                        return r;
-
-                r = device_get_seat(d, &sn);
-                if (r < 0)
-                        return r;
-
-                button_set_seat(b, sn);
-
-                r = button_open(b);
-                if (r < 0) /* event device doesn't have any keys or switches relevant to us? (or any other error
-                            * opening the device?) let's close the button again. */
-                        button_free(b);
+                b = hashmap_get(m->buttons, sysname);
+                goto unwatch;
         }
+
+        r = manager_add_button(m, sysname, &b);
+        if (r < 0)
+                return r;
+        bool is_new = r > 0;
+
+        const char *sn;
+        r = device_get_seat(d, &sn);
+        if (r < 0)
+                return r;
+
+        button_set_seat(b, sn);
+
+        r = button_open(b);
+        if (r < 0) /* event device doesn't have any keys or switches relevant to us? (or any other error
+                    * opening the device?) let's close the button again. */
+                goto unwatch;
+
+        if (ret_button)
+                *ret_button = b;
+
+        return is_new;
+
+unwatch:
+        button_free(b);
+
+        if (ret_button)
+                *ret_button = NULL;
 
         return 0;
 }
@@ -432,7 +447,7 @@ int manager_get_user_by_pid(Manager *m, pid_t pid, User **ret) {
         return !!u;
 }
 
-int manager_get_idle_hint(Manager *m, dual_timestamp *t) {
+bool manager_get_idle_hint(Manager *m, dual_timestamp *ret_timestamp) {
         Session *s;
         bool idle_hint;
         dual_timestamp ts;
@@ -443,19 +458,16 @@ int manager_get_idle_hint(Manager *m, dual_timestamp *t) {
          * unreasonable large idle periods starting with the Unix epoch. */
         ts = m->init_ts;
 
-        idle_hint = !manager_is_inhibited(m, INHIBIT_IDLE, t, /* flags= */ 0, UID_INVALID, NULL);
+        idle_hint = !manager_is_inhibited(m, INHIBIT_IDLE, /* since= */ NULL, /* flags= */ 0, UID_INVALID, NULL);
 
         HASHMAP_FOREACH(s, m->sessions) {
                 dual_timestamp k;
-                int ih;
+                bool ih;
 
                 if (!SESSION_CLASS_CAN_IDLE(s->class))
                         continue;
 
                 ih = session_get_idle_hint(s, &k);
-                if (ih < 0)
-                        return ih;
-
                 if (!ih) {
                         if (!idle_hint) {
                                 if (k.monotonic < ts.monotonic)
@@ -471,8 +483,8 @@ int manager_get_idle_hint(Manager *m, dual_timestamp *t) {
                 }
         }
 
-        if (t)
-                *t = ts;
+        if (ret_timestamp)
+                *ret_timestamp = ts;
 
         return idle_hint;
 }
@@ -662,21 +674,17 @@ static int manager_count_external_displays(Manager *m) {
                         continue;
 
                 /* Ignore ports that are not enabled */
-                const char *enabled;
-                r = sd_device_get_sysattr_value(d, "enabled", &enabled);
-                if (r == -ENOENT)
+                r = device_get_sysattr_streq(d, "enabled", "enabled");
+                if (IN_SET(r, 0, -ENOENT))
                         continue;
                 if (r < 0)
                         return r;
-                if (!streq(enabled, "enabled"))
-                        continue;
 
                 /* We count any connector which is not explicitly "disconnected" as connected. */
-                const char *status = NULL;
-                r = sd_device_get_sysattr_value(d, "status", &status);
+                r = device_get_sysattr_streq(d, "status", "disconnected");
                 if (r < 0 && r != -ENOENT)
                         return r;
-                if (!streq_ptr(status, "disconnected"))
+                if (r <= 0)
                         n++;
         }
 
@@ -758,18 +766,45 @@ int manager_read_efi_boot_loader_entries(Manager *m) {
                 return 0;
 
         r = efi_loader_get_entries(&m->efi_boot_loader_entries);
-        if (r < 0) {
-                if (r == -ENOENT || ERRNO_IS_NOT_SUPPORTED(r)) {
-                        log_debug_errno(r, "Boot loader reported no entries.");
-                        m->efi_boot_loader_entries_set = true;
-                        return 0;
-                }
-                return log_error_errno(r, "Failed to determine entries reported by boot loader: %m");
+        if (r == -ENOENT || ERRNO_IS_NEG_NOT_SUPPORTED(r)) {
+                log_debug_errno(r, "Boot loader reported no entries.");
+                m->efi_boot_loader_entries_set = true;
+                return 0;
         }
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine entries reported by boot loader: %m");
 
         m->efi_boot_loader_entries_set = true;
         return 1;
 #else
         return 0;
 #endif
+}
+
+int config_parse_kill_exclude_users(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        char ***users = ASSERT_PTR(data);
+
+        if (isempty(rvalue)) {
+                /* NULL represents the default, i.e. only root is excluded. An empty (non-NULL) strv means
+                 * that no user is excluded. Hence, allocate an empty strv instead of freeing it. */
+                char **v = strv_new(NULL);
+                if (!v)
+                        return log_oom();
+
+                return strv_free_and_replace(*users, v);
+        }
+
+        return config_parse_strv(unit, filename, line, section, section_line,
+                                 lvalue, ltype, rvalue, data, userdata);
 }

@@ -125,6 +125,7 @@ static int macsec_receive_channel_new(MACsec *s, uint64_t sci, ReceiveChannel **
         ReceiveChannel *c;
 
         assert(s);
+        assert(ret);
 
         c = new(ReceiveChannel, 1);
         if (!c)
@@ -238,6 +239,7 @@ static int netdev_macsec_create_message(NetDev *netdev, int command, sd_netlink_
         assert(netdev);
         assert(netdev->ifindex > 0);
         assert(netdev->manager);
+        assert(ret);
 
         r = sd_genl_message_new(netdev->manager->genl, MACSEC_GENL_NAME, command, &m);
         if (r < 0)
@@ -743,7 +745,7 @@ int config_parse_macsec_key(
 
         dest = a ? &a->sa : &b->sa;
 
-        r = unhexmem_full(rvalue, SIZE_MAX, /* secure = */ true, &p, &l);
+        r = unhexmem_full(rvalue, SIZE_MAX, /* secure= */ true, &p, &l);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse key. Ignoring assignment: %m");
                 return 0;

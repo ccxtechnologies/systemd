@@ -8,7 +8,6 @@
 #include "daemon-util.h"
 #include "log.h"
 #include "main-func.h"
-#include "signal-util.h"
 #include "userdbd-manager.h"
 
 /* This service offers two Varlink services, both implementing io.systemd.UserDatabase:
@@ -39,8 +38,6 @@ static int run(int argc, char *argv[]) {
         if (setenv("SYSTEMD_BYPASS_USERDB", "io.systemd.NameServiceSwitch:io.systemd.Multiplexer:io.systemd.DropIn", 1) < 0)
                 return log_error_errno(errno, "Failed to set $SYSTEMD_BYPASS_USERDB: %m");
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD) >= 0);
-
         r = manager_new(&m);
         if (r < 0)
                 return log_error_errno(r, "Could not create manager: %m");
@@ -55,7 +52,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Event loop failed: %m");
 
-        return 0;
+        return r;
 }
 
-DEFINE_MAIN_FUNCTION(run);
+DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);

@@ -33,7 +33,7 @@
     for each unit and for each queued job. The unit objects implement a generic
     <interfacename>Unit</interfacename> interface as well as a type-specific interface. For example, service units
     implement both <interfacename>org.freedesktop.systemd1.Unit</interfacename> and
-    <interfacename>org.freedesktop.system1.Service</interfacename>. The manager object can list
+    <interfacename>org.freedesktop.systemd1.Service</interfacename>. The manager object can list
     unit and job objects or directly convert a unit name or job identifier to a bus path of the corresponding
     D-Bus object.</para>
 
@@ -109,6 +109,11 @@ node /org/freedesktop/systemd1 {
                      out o unit_path,
                      out s job_type,
                      out a(uosos) affected_jobs);
+      EnqueueUnitJobMany(in  as units,
+                         in  s job_type,
+                         in  s job_mode,
+                         in  t flags,
+                         out a(uosos) jobs);
       KillUnit(in  s name,
                in  s whom,
                in  i signal);
@@ -346,6 +351,26 @@ node /org/freedesktop/systemd1 {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly t ShutdownStartTimestampMonotonic = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly t ShutdownFinishTimestamp = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly t ShutdownFinishTimestampMonotonic = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly t PreviousShutdownStartTimestamp = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly t PreviousShutdownStartTimestampMonotonic = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly t PreviousShutdownFinishTimestamp = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly t PreviousShutdownFinishTimestampMonotonic = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly t PreviousShutdownLateStartTimestamp = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly t PreviousShutdownLateStartTimestampMonotonic = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly t PreviousShutdownLateFinishTimestamp = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly t PreviousShutdownLateFinishTimestampMonotonic = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly t SecurityStartTimestamp = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly t SecurityStartTimestampMonotonic = ...;
@@ -413,6 +438,8 @@ node /org/freedesktop/systemd1 {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly u NFailedJobs = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly at TransactionsWithOrderingCycle = [...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly d Progress = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly as Environment = ['...', ...];
@@ -472,6 +499,10 @@ node /org/freedesktop/systemd1 {
       readonly t DefaultStartLimitIntervalUSec = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly u DefaultStartLimitBurst = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly t EventLoopRateLimitIntervalUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly u EventLoopRateLimitBurst = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly b DefaultIOAccounting = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
@@ -550,6 +581,14 @@ node /org/freedesktop/systemd1 {
       readonly t DefaultMemoryPressureThresholdUSec = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s DefaultMemoryPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t DefaultCPUPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s DefaultCPUPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t DefaultIOPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s DefaultIOPressureWatch = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly t TimerSlackNSec = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
@@ -562,6 +601,12 @@ node /org/freedesktop/systemd1 {
       readonly s CtrlAltDelBurstAction = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly u SoftRebootsCount = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly u KExecCount = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t ReloadCount = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly b DefaultMemoryZSwapWriteback = ...;
   };
   interface org.freedesktop.DBus.Peer { ... };
   interface org.freedesktop.DBus.Introspectable { ... };
@@ -572,8 +617,6 @@ node /org/freedesktop/systemd1 {
     <!--method GetUnitByInvocationID is not documented!-->
 
     <!--method GetUnitByControlGroup is not documented!-->
-
-    <!--method EnqueueUnitJob is not documented!-->
 
     <!--method FreezeUnit is not documented!-->
 
@@ -618,6 +661,14 @@ node /org/freedesktop/systemd1 {
     <!--method LookupDynamicUserByUID is not documented!-->
 
     <!--method GetDynamicUsers is not documented!-->
+
+    <!--property PreviousShutdownStartTimestampMonotonic is not documented!-->
+
+    <!--property PreviousShutdownFinishTimestampMonotonic is not documented!-->
+
+    <!--property PreviousShutdownLateStartTimestampMonotonic is not documented!-->
+
+    <!--property PreviousShutdownLateFinishTimestampMonotonic is not documented!-->
 
     <!--property SecurityStartTimestampMonotonic is not documented!-->
 
@@ -711,6 +762,10 @@ node /org/freedesktop/systemd1 {
 
     <!--property DefaultStartLimitBurst is not documented!-->
 
+    <!--property EventLoopRateLimitIntervalUSec is not documented!-->
+
+    <!--property EventLoopRateLimitBurst is not documented!-->
+
     <!--property DefaultIOAccounting is not documented!-->
 
     <!--property DefaultIPAccounting is not documented!-->
@@ -789,6 +844,14 @@ node /org/freedesktop/systemd1 {
 
     <!--property DefaultMemoryPressureWatch is not documented!-->
 
+    <!--property DefaultCPUPressureThresholdUSec is not documented!-->
+
+    <!--property DefaultCPUPressureWatch is not documented!-->
+
+    <!--property DefaultIOPressureThresholdUSec is not documented!-->
+
+    <!--property DefaultIOPressureWatch is not documented!-->
+
     <!--property TimerSlackNSec is not documented!-->
 
     <!--property DefaultOOMPolicy is not documented!-->
@@ -798,6 +861,8 @@ node /org/freedesktop/systemd1 {
     <!--property DefaultRestrictSUIDSGID is not documented!-->
 
     <!--property CtrlAltDelBurstAction is not documented!-->
+
+    <!--property DefaultMemoryZSwapWriteback is not documented!-->
 
     <!--Autogenerated cross-references for systemd.directives, do not edit-->
 
@@ -836,6 +901,8 @@ node /org/freedesktop/systemd1 {
     <variablelist class="dbus-method" generated="True" extra-ref="ReloadOrTryRestartUnit()"/>
 
     <variablelist class="dbus-method" generated="True" extra-ref="EnqueueUnitJob()"/>
+
+    <variablelist class="dbus-method" generated="True" extra-ref="EnqueueUnitJobMany()"/>
 
     <variablelist class="dbus-method" generated="True" extra-ref="KillUnit()"/>
 
@@ -1037,6 +1104,26 @@ node /org/freedesktop/systemd1 {
 
     <variablelist class="dbus-property" generated="True" extra-ref="ShutdownStartTimestampMonotonic"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="ShutdownFinishTimestamp"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ShutdownFinishTimestampMonotonic"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="PreviousShutdownStartTimestamp"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="PreviousShutdownStartTimestampMonotonic"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="PreviousShutdownFinishTimestamp"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="PreviousShutdownFinishTimestampMonotonic"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="PreviousShutdownLateStartTimestamp"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="PreviousShutdownLateStartTimestampMonotonic"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="PreviousShutdownLateFinishTimestamp"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="PreviousShutdownLateFinishTimestampMonotonic"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="SecurityStartTimestamp"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="SecurityStartTimestampMonotonic"/>
@@ -1103,6 +1190,8 @@ node /org/freedesktop/systemd1 {
 
     <variablelist class="dbus-property" generated="True" extra-ref="NFailedJobs"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="TransactionsWithOrderingCycle"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="Progress"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="Environment"/>
@@ -1156,6 +1245,10 @@ node /org/freedesktop/systemd1 {
     <variablelist class="dbus-property" generated="True" extra-ref="DefaultStartLimitIntervalUSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="DefaultStartLimitBurst"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="EventLoopRateLimitIntervalUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="EventLoopRateLimitBurst"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="DefaultIOAccounting"/>
 
@@ -1235,6 +1328,14 @@ node /org/freedesktop/systemd1 {
 
     <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryPressureWatch"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="DefaultCPUPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="DefaultCPUPressureWatch"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="DefaultIOPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="DefaultIOPressureWatch"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="TimerSlackNSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="DefaultOOMPolicy"/>
@@ -1246,6 +1347,12 @@ node /org/freedesktop/systemd1 {
     <variablelist class="dbus-property" generated="True" extra-ref="CtrlAltDelBurstAction"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="SoftRebootsCount"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="KExecCount"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ReloadCount"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryZSwapWriteback"/>
 
     <!--End of Autogenerated section-->
 
@@ -1307,6 +1414,37 @@ node /org/freedesktop/systemd1 {
       running and fails otherwise. If a service is restarted that is not running, it will be started unless
       the "Try" flavor is used in which case a service that is not running is not affected by the restart. The
       "ReloadOrRestart" flavors attempt a reload if the unit supports it and use a restart otherwise.</para>
+
+      <para><function>EnqueueUnitJob()</function> is similar to the various
+      <function>StartUnit()</function>/<function>StopUnit()</function>/<function>RestartUnit()</function>
+      methods above, but provides a unified interface that operates on a single unit. The
+      <varname>job_type</varname> argument selects the job type and is one of
+      <literal>start</literal>, <literal>stop</literal>, <literal>reload</literal>,
+      <literal>restart</literal>, <literal>try-restart</literal>,
+      <literal>reload-or-restart</literal> or <literal>reload-or-try-restart</literal>. The
+      <varname>job_mode</varname> argument matches the <varname>mode</varname> argument of
+      <function>StartUnit()</function>. On reply the method returns the enqueued anchor job's
+      numeric id and object path, the affected unit's id and object path, the job type
+      actually queued (after type collapsing, e.g. <literal>reload-or-restart</literal> turns
+      into <literal>restart</literal> or <literal>reload</literal>), and an array of
+      additional jobs that were enqueued as part of the same transaction in order to satisfy
+      dependencies.</para>
+
+      <para><function>EnqueueUnitJobMany()</function> is similar to
+      <function>EnqueueUnitJob()</function>, but operates on multiple units at once. All
+      requested units are enqueued in a single transaction, which is necessary in order to
+      properly honour <varname>After=</varname>/<varname>Before=</varname> ordering between
+      units passed in the same call regardless of their order in the array. The
+      <varname>job_type</varname> argument is applied to each of the listed units, including
+      the magic values <literal>reload-or-restart</literal> and
+      <literal>reload-or-try-restart</literal> which are resolved per unit (units that
+      support reloading get a reload job, others get a restart). The <varname>flags</varname>
+      argument does not support any flags for now and must be passed as <literal>0</literal>;
+      it is reserved for future extensions. On reply the method returns an array of tuples
+      describing the anchor job that was enqueued for each requested unit: the numeric job
+      id, the job object path, the unit id, the unit object path, and the job type that was
+      actually queued. Note that the order of tuples in the reply is unspecified and may not
+      correspond to the order of the input array.</para>
 
       <para><function>EnqueueMarkedJobs()</function> creates reload/restart jobs for units which have been
       appropriately marked, see <varname>Markers</varname> property above. This is equivalent to calling
@@ -1380,7 +1518,7 @@ node /org/freedesktop/systemd1 {
       <orderedlist>
         <listitem><para>Send a D-Bus message that will turn off status messages.</para></listitem>
         <listitem><para>Block until a reply to that message is received.</para></listitem>
-        <listitem><para>Print multiples lines without being interrupted by status messages.</para></listitem>
+        <listitem><para>Print multiple lines without being interrupted by status messages.</para></listitem>
         <listitem><para>Send a D-Bus message that will reset <varname>ShowStatus</varname> back to its
         original value.</para></listitem>
       </orderedlist>
@@ -1788,6 +1926,31 @@ node /org/freedesktop/systemd1 {
       are always available, depending on the used firmware, boot loader or initrd implementation. In these
       cases the respective pairs of timestamps are both 0, indicating that no data is available.</para>
 
+      <para><varname>ShutdownFinishTimestamp</varname> and
+      <varname>ShutdownFinishTimestampMonotonic</varname> encode <constant>CLOCK_REALTIME</constant> and
+      <constant>CLOCK_MONOTONIC</constant> microsecond timestamps taken when all units have finished stopping
+      during shutdown, i.e. when <filename>shutdown.target</filename> is reached. Together with
+      <varname>ShutdownStartTimestamp</varname> (which is taken when unit stopping begins) they bracket the
+      time spent stopping units.</para>
+
+      <para><varname>PreviousShutdownStartTimestamp</varname>,
+      <varname>PreviousShutdownFinishTimestamp</varname>,
+      <varname>PreviousShutdownLateStartTimestamp</varname>,
+      <varname>PreviousShutdownLateFinishTimestamp</varname> and their
+      <constant>Monotonic</constant> counterparts encode <constant>CLOCK_REALTIME</constant> and
+      <constant>CLOCK_MONOTONIC</constant> microsecond timestamps describing the shutdown of the
+      <emphasis>previous</emphasis> boot, restored from the Live Update Orchestrator (LUO) payload after a
+      kexec-based live update. <varname>PreviousShutdownStartTimestamp</varname> and
+      <varname>PreviousShutdownFinishTimestamp</varname> bracket the unit-stopping phase of that previous
+      boot, while <varname>PreviousShutdownLateStartTimestamp</varname> and
+      <varname>PreviousShutdownLateFinishTimestamp</varname> are taken by <command>systemd-shutdown</command>
+      itself when it began execution and when it was about to <function>kexec()</function> into the current
+      kernel, respectively. Unlike the current cycle's <varname>ShutdownStartTimestamp</varname> and
+      <varname>ShutdownFinishTimestamp</varname> (which describe an in-progress shutdown of the running
+      system), these always refer to a previous, already-completed boot, similar to the firmware, boot loader
+      and kernel timestamps. They are populated only after a kexec-based live update and are useful for
+      determining shutdown and live-update performance; otherwise they are all 0.</para>
+
       <para><varname>UnitsLoadTimestamp</varname> and <varname>UnitsLoadTimestampMonotonic</varname> encode
       <constant>CLOCK_REALTIME</constant> and <constant>CLOCK_MONOTONIC</constant> microseconds timestamps
       (as described above). The timestamps are taken every time when the manager starts loading unit files.
@@ -1809,6 +1972,9 @@ node /org/freedesktop/systemd1 {
 
       <para><varname>NFailedJobs</varname> encodes how many jobs have ever failed in total.</para>
 
+      <para><varname>TransactionsWithOrderingCycle</varname> encodes IDs of transactions that encountered
+      ordering cycle.</para>
+
       <para><varname>Progress</varname> encodes boot progress as a floating point value between 0.0 and
       1.0. This value begins at 0.0 at early-boot and ends at 1.0 when boot is finished and is based on the
       number of executed and queued jobs. After startup, this field is always 1.0 indicating a finished
@@ -1828,6 +1994,15 @@ node /org/freedesktop/systemd1 {
 
       <para><varname>SoftRebootsCount</varname> encodes how many soft-reboots were successfully completed
       since the last full boot. Starts at <literal>0</literal>.</para>
+
+      <para><varname>KExecCount</varname> encodes how many kexec-based live updates were successfully
+      completed since the last full boot. Starts at <literal>0</literal>. The counter is preserved across the
+      kexec through the Live Update Orchestrator (LUO), and is hence <literal>0</literal> when the kernel does
+      not provide LUO support.</para>
+
+      <para><varname>ReloadCount</varname> encodes the number of successfully completed configuration
+      reloads of the manager. The counter is reset to <literal>0</literal> on
+      <command>daemon-reexec</command> and on the initial boot.</para>
 
       <para><varname>Virtualization</varname> contains a short ID string describing the virtualization
       technology the system runs in. On bare-metal hardware this is the empty string. Otherwise, it contains
@@ -1911,7 +2086,7 @@ node /org/freedesktop/systemd1 {
       operations are allowed through the polkit privilege system. Operations which modify unit state
       (<function>StartUnit()</function>, <function>StopUnit()</function>, <function>KillUnit()</function>,
       <function>KillUnitSubgroup()</function>, <function>QueueSignalUnit()</function>,
-      <function>RestartUnit()</function> and similar, <function>SetProperty()</function>) require
+      <function>RestartUnit()</function> and similar, <function>SetUnitProperties()</function>) require
       <interfacename>org.freedesktop.systemd1.manage-units</interfacename>. Operations which modify unit file
       enablement state (<function>EnableUnitFiles()</function>, <function>DisableUnitFiles()</function>,
       <function>EnableUnitFilesWithFlags()</function>, <function>DisableUnitFilesWithFlags()</function>,
@@ -2637,12 +2812,33 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       </para>
 
       <para><varname>Markers</varname> is an array of string flags that can be set using
-      <function>SetUnitProperties()</function> to indicate that the service should be reloaded or
-      restarted. Currently known values are <literal>needs-restart</literal> and
-      <literal>needs-reload</literal>. Package scripts may use the first to mark units for later restart when
-      a new version of the package is installed. Configuration management scripts may use the second to mark
-      units for a later reload when the configuration is adjusted. Those flags are not set by the manager,
-      except to unset as appropriate when the unit is stopped, restarted, or reloaded.</para>
+      <function>SetUnitProperties()</function> to indicate that the service should be reloaded or restarted.
+      Currently known values are <literal>needs-restart</literal>, <literal>needs-stop</literal>,
+      <literal>needs-start</literal> and <literal>needs-reload</literal>. Package scripts may use the first
+      three to mark units for later restart or start or stop when a new version of the package is installed
+      or removed. Configuration management scripts may use the fourth to mark units for a later reload when
+      the configuration is adjusted. Those flags are not set by the manager, except to unset as appropriate
+      when the unit is stopped, restarted, or reloaded. When markers are set, they are normalized according
+      to the following precedence rules, modeled after the job type merging logic. When new markers are
+      applied incrementally (using the <literal>+</literal> prefix), conflicting existing markers are
+      cleared before the new markers are merged in:
+      <itemizedlist>
+        <listitem><para><literal>needs-reload</literal> loses against all other markers. If any of
+        <literal>needs-restart</literal>, <literal>needs-start</literal>, or <literal>needs-stop</literal>
+        is set, <literal>needs-reload</literal> is cleared.</para></listitem>
+        <listitem><para><literal>needs-stop</literal> wins against <literal>needs-restart</literal> and
+        <literal>needs-reload</literal>, clearing both.</para></listitem>
+        <listitem><para><literal>needs-start</literal> wins against <literal>needs-stop</literal>, clearing
+        it.</para></listitem>
+        <listitem><para><literal>needs-restart</literal> wins against <literal>needs-start</literal>. If
+        both are set, <literal>needs-start</literal> is cleared.</para></listitem>
+      </itemizedlist>
+      For example, if a unit currently has <literal>needs-stop</literal> set and a new
+      <literal>+needs-start</literal> marker is applied, the existing <literal>needs-stop</literal> is
+      cleared and only <literal>needs-start</literal> remains. Conversely, applying
+      <literal>+needs-stop</literal> to any existing marker will clear all other markers, as
+      <literal>needs-stop</literal> takes precedence over <literal>needs-restart</literal> and
+      <literal>needs-reload</literal>, and the new marker clears conflicting existing ones.</para>
 
       <para><varname>JobTimeoutUSec</varname> maps directly to the corresponding configuration setting in the
       unit file.</para>
@@ -2691,6 +2887,18 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       or the restart rate limit is reached. See the <literal>RestartMode=</literal> section in
       <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
       for more details.</para>
+
+      <para><varname>OOMKills</varname> contains a different value depending on whether
+      <varname>OOMPolicy=kill</varname> is enabled for the unit or not. If enabled, the property contains the
+      number of times the kernel OOM killer killed all the processes in the unit's cgroup and its
+      descendant cgroups. If disabled, the property contains the number of processes the kernel OOM killer
+      has killed in the unit's cgroup and its descendant cgroups. When the corresponding cgroups have not
+      been realized, it reports <constant>18446744073709551615</constant> (<constant>2^64 - 1</constant>).</para>
+
+      <para><varname>ManagedOOMKills</varname> contains the number of times <command>systemd-oomd</command>
+      killed all the processes in the unit's cgroup and its descendant cgroups. When the corresponding
+      cgroups have not been realized yet, it reports <constant>18446744073709551615</constant>
+      (<constant>2^64 - 1</constant>).</para>
     </refsect2>
 
     <refsect2>
@@ -2747,6 +2955,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       readonly u RestartSteps = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly t RestartMaxDelayUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly t RestartRandomizedDelayUSec = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t RestartUSecNext = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
@@ -2791,6 +3001,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       readonly u NFileDescriptorStore = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s FileDescriptorStorePreserve = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly as LUOSession = ['...', ...];
       readonly s StatusText = '...';
       readonly i StatusErrno = ...;
       readonly s StatusBusError = '...';
@@ -2814,6 +3026,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       readonly as ExtraFileDescriptorNames = ['...', ...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly i ReloadSignal = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly as RefreshOnReload = ['...', ...];
       readonly t ExecMainStartTimestamp = ...;
       readonly t ExecMainStartTimestampMonotonic = ...;
       readonly t ExecMainExitTimestamp = ...;
@@ -2843,6 +3057,10 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       readonly a(sasbttttuii) ExecReload = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("invalidates")
       readonly a(sasasttttuii) ExecReloadEx = [...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("invalidates")
+      readonly a(sasbttttuii) ExecReloadPost = [...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("invalidates")
+      readonly a(sasasttttuii) ExecReloadPostEx = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("invalidates")
       readonly a(sasbttttuii) ExecStop = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("invalidates")
@@ -2900,6 +3118,10 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t IOWriteOperations = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t OOMKills = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t ManagedOOMKills = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b Delegate = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly as DelegateControllers = ['...', ...];
@@ -2922,6 +3144,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly ay StartupAllowedMemoryNodes = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s CPUSetPartition = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b IOAccounting = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t IOWeight = ...;
@@ -2941,12 +3165,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       readonly a(st) IODeviceLatencyTargetUSec = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b MemoryAccounting = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultMemoryLow = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultStartupMemoryLow = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultMemoryMin = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t MemoryMin = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
@@ -3002,6 +3220,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s ManagedOOMPreference = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly as OOMRules = ['...', ...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(ss) BPFProgram = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(iiqq) SocketBindAllow = [...];
@@ -3010,9 +3230,19 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly (bas) RestrictNetworkInterfaces = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s BindNetworkInterface = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s MemoryPressureWatch = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t MemoryPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s CPUPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t CPUPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s IOPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t IOPressureThresholdUSec = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(iiss) NFTSet = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
@@ -3111,6 +3341,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       readonly s RootVerity = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly b RootEphemeral = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly s RootMStack = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly as ExtensionDirectories = ['...', ...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
@@ -3392,6 +3624,10 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly b MemoryKSM = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly s MemoryTHP = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly s UserNamespacePath = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly s NetworkNamespacePath = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly s IPCNamespacePath = '...';
@@ -3453,6 +3689,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <!--property RestartMaxDelayUSec is not documented!-->
 
+    <!--property RestartRandomizedDelayUSec is not documented!-->
+
     <!--property RestartUSecNext is not documented!-->
 
     <!--property TimeoutStartFailureMode is not documented!-->
@@ -3485,6 +3723,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <!--property FileDescriptorStorePreserve is not documented!-->
 
+    <!--property LUOSession is not documented!-->
+
     <!--property ReloadResult is not documented!-->
 
     <!--property CleanResult is not documented!-->
@@ -3507,6 +3747,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <!--property ReloadSignal is not documented!-->
 
+    <!--property RefreshOnReload is not documented!-->
+
     <!--property ExecCondition is not documented!-->
 
     <!--property ExecConditionEx is not documented!-->
@@ -3519,9 +3761,9 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <!--property ExecReloadEx is not documented!-->
 
-    <!--property ExecStopEx is not documented!-->
+    <!--property ExecReloadPostEx is not documented!-->
 
-    <!--property ExecStopPost is not documented!-->
+    <!--property ExecStopEx is not documented!-->
 
     <!--property ExecStopPostEx is not documented!-->
 
@@ -3589,6 +3831,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <!--property StartupAllowedMemoryNodes is not documented!-->
 
+    <!--property CPUSetPartition is not documented!-->
+
     <!--property IOAccounting is not documented!-->
 
     <!--property IOWeight is not documented!-->
@@ -3608,12 +3852,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
     <!--property IODeviceLatencyTargetUSec is not documented!-->
 
     <!--property MemoryAccounting is not documented!-->
-
-    <!--property DefaultMemoryLow is not documented!-->
-
-    <!--property DefaultStartupMemoryLow is not documented!-->
-
-    <!--property DefaultMemoryMin is not documented!-->
 
     <!--property MemoryMin is not documented!-->
 
@@ -3667,6 +3905,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <!--property ManagedOOMPreference is not documented!-->
 
+    <!--property OOMRules is not documented!-->
+
     <!--property BPFProgram is not documented!-->
 
     <!--property SocketBindAllow is not documented!-->
@@ -3675,9 +3915,19 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <!--property RestrictNetworkInterfaces is not documented!-->
 
+    <!--property BindNetworkInterface is not documented!-->
+
     <!--property MemoryPressureWatch is not documented!-->
 
     <!--property MemoryPressureThresholdUSec is not documented!-->
+
+    <!--property CPUPressureWatch is not documented!-->
+
+    <!--property CPUPressureThresholdUSec is not documented!-->
+
+    <!--property IOPressureWatch is not documented!-->
+
+    <!--property IOPressureThresholdUSec is not documented!-->
 
     <!--property NFTSet is not documented!-->
 
@@ -4003,6 +4253,10 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <!--property MemoryKSM is not documented!-->
 
+    <!--property MemoryTHP is not documented!-->
+
+    <!--property UserNamespacePath is not documented!-->
+
     <!--property NetworkNamespacePath is not documented!-->
 
     <!--property IPCNamespacePath is not documented!-->
@@ -4073,6 +4327,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <variablelist class="dbus-property" generated="True" extra-ref="RestartMaxDelayUSec"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="RestartRandomizedDelayUSec"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="RestartUSecNext"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="TimeoutStartUSec"/>
@@ -4119,6 +4375,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <variablelist class="dbus-property" generated="True" extra-ref="FileDescriptorStorePreserve"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="LUOSession"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="StatusText"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="StatusErrno"/>
@@ -4152,6 +4410,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
     <variablelist class="dbus-property" generated="True" extra-ref="ExtraFileDescriptorNames"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ReloadSignal"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="RefreshOnReload"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ExecMainStartTimestamp"/>
 
@@ -4190,6 +4450,10 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
     <variablelist class="dbus-property" generated="True" extra-ref="ExecReload"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ExecReloadEx"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ExecReloadPost"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ExecReloadPostEx"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ExecStop"/>
 
@@ -4247,6 +4511,10 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <variablelist class="dbus-property" generated="True" extra-ref="IOWriteOperations"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="OOMKills"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ManagedOOMKills"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="Delegate"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="DelegateControllers"/>
@@ -4269,6 +4537,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <variablelist class="dbus-property" generated="True" extra-ref="StartupAllowedMemoryNodes"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUSetPartition"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="IOAccounting"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="IOWeight"/>
@@ -4288,12 +4558,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
     <variablelist class="dbus-property" generated="True" extra-ref="IODeviceLatencyTargetUSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryAccounting"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryLow"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultStartupMemoryLow"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryMin"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryMin"/>
 
@@ -4349,6 +4613,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <variablelist class="dbus-property" generated="True" extra-ref="ManagedOOMPreference"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="OOMRules"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="BPFProgram"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="SocketBindAllow"/>
@@ -4357,9 +4623,19 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <variablelist class="dbus-property" generated="True" extra-ref="RestrictNetworkInterfaces"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="BindNetworkInterface"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryPressureWatch"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUPressureWatch"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="IOPressureWatch"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="IOPressureThresholdUSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="NFTSet"/>
 
@@ -4458,6 +4734,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
     <variablelist class="dbus-property" generated="True" extra-ref="RootVerity"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="RootEphemeral"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="RootMStack"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ExtensionDirectories"/>
 
@@ -4739,6 +5017,10 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryKSM"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="MemoryTHP"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="UserNamespacePath"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="NetworkNamespacePath"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="IPCNamespacePath"/>
@@ -4815,10 +5097,10 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       last watchdog ping received from the service, or 0 if none was ever received.</para>
 
       <para><varname>ExecStartPre</varname>, <varname>ExecStart</varname>, <varname>ExecStartPost</varname>,
-      <varname>ExecReload</varname>, <varname>ExecStop</varname>, and <varname>ExecStop</varname> are arrays
-      of structures where each struct contains: the binary path to execute; an array with all arguments to
-      pass to the executed command, starting with argument 0; a boolean whether it should be considered a
-      failure if the process exits uncleanly; two pairs of
+      <varname>ExecReload</varname>, <varname>ExecReloadPost</varname>, <varname>ExecStop</varname>, and
+      <varname>ExecStopPost</varname> are arrays of structures where each struct contains: the binary path
+      to execute; an array with all arguments to pass to the executed command, starting with argument 0;
+      a boolean whether it should be considered a failure if the process exits uncleanly; two pairs of
       <constant>CLOCK_REALTIME</constant>/<constant>CLOCK_MONOTONIC</constant> microsecond timestamps when
       the process began and finished running the last time, or 0 if it never ran or never finished running;
       the PID of the process, or 0 if it has not run yet; the exit code and status of the last run. This
@@ -4860,7 +5142,7 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       has no main PID. The control PID is the PID of the current start/stop/reload process running and is 0
       if no such process is currently running. That means that <varname>ExecMainPID</varname> and
       <varname>MainPID</varname> differ in the way that the latter immediately reflects whether a main
-      process is currently running while the latter possible contains information collected from the last run
+      process is currently running while the former possibly contains information collected from the last run
       even if the process is no longer around.</para>
 
       <para><varname>StatusText</varname>, <varname>StatusErrno</varname>, <varname>StatusBusError</varname>,
@@ -4897,6 +5179,7 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       <varname>MountImages</varname>
       <varname>ExtensionImages</varname>
       <varname>ExtensionDirectories</varname>
+      <varname>RootMStack</varname>
       see systemd.exec(5) for their meaning.</para>
 
       <para><varname>MemoryAvailable</varname> takes into account unit's and parents' <literal>MemoryMax</literal>
@@ -4926,12 +5209,12 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       for more details on how to retrieve these file descriptors. Unlike the <varname>ExtraFileDescriptors</varname>
       input property, <varname>ExtraFileDescriptorNames</varname> only contains names and not the file descriptors.</para>
 
-      <para><varname>ManagedOOMMemoryPressureDurationUSec</varname> implement the destination parameter of the
+      <para><varname>ManagedOOMMemoryPressureDurationUSec</varname> implements the destination parameter of the
       unit file setting <varname>ManagedOOMMemoryPressureDurationSec=</varname> listed in
       <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
       Note the time unit is expressed in <literal>μs</literal>.</para>
 
-      <para><varname>ProtectControlGroupsEx</varname> implement the destination parameter of the
+      <para><varname>ProtectControlGroupsEx</varname> implements the destination parameter of the
       unit file setting <varname>ProtectControlGroups=</varname> listed in
       <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
       Unlike boolean <varname>ProtectControlGroups</varname>, <varname>ProtectControlGroupsEx</varname>
@@ -4942,7 +5225,7 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
       Note <varname>PrivatePIDs</varname> is a string type to allow adding more values in the future.</para>
 
-      <para><varname>ProtectHostnameEx</varname> implement the destination parameter of the
+      <para><varname>ProtectHostnameEx</varname> implements the destination parameter of the
       unit file setting <varname>ProtectHostname=</varname> listed in
       <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
       Unlike boolean <varname>ProtectHostname</varname>, <varname>ProtectHostnameEx</varname> is a pair of
@@ -5034,6 +5317,12 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
       readonly a(ss) Listen = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly as Symlinks = ['...', ...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly a(ss) XAttrEntryPoint = [...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly a(ss) XAttrListen = [...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly a(ss) XAttrAccept = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly i Mark = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
@@ -5139,6 +5428,10 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t IOWriteOperations = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t OOMKills = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t ManagedOOMKills = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b Delegate = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly as DelegateControllers = ['...', ...];
@@ -5161,6 +5454,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly ay StartupAllowedMemoryNodes = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s CPUSetPartition = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b IOAccounting = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t IOWeight = ...;
@@ -5180,12 +5475,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
       readonly a(st) IODeviceLatencyTargetUSec = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b MemoryAccounting = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultMemoryLow = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultStartupMemoryLow = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultMemoryMin = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t MemoryMin = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
@@ -5241,6 +5530,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s ManagedOOMPreference = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly as OOMRules = ['...', ...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(ss) BPFProgram = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(iiqq) SocketBindAllow = [...];
@@ -5249,9 +5540,19 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly (bas) RestrictNetworkInterfaces = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s BindNetworkInterface = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s MemoryPressureWatch = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t MemoryPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s CPUPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t CPUPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s IOPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t IOPressureThresholdUSec = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(iiss) NFTSet = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
@@ -5350,6 +5651,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
       readonly s RootVerity = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly b RootEphemeral = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly s RootMStack = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly as ExtensionDirectories = ['...', ...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
@@ -5630,6 +5933,10 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
       readonly s BPFDelegateAttachments = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly b MemoryKSM = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly s MemoryTHP = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly s UserNamespacePath = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly s NetworkNamespacePath = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
@@ -5782,8 +6089,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
 
     <!--property ExecStopPre is not documented!-->
 
-    <!--property ExecStopPost is not documented!-->
-
     <!--property Slice is not documented!-->
 
     <!--property ControlGroupId is not documented!-->
@@ -5848,6 +6153,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
 
     <!--property StartupAllowedMemoryNodes is not documented!-->
 
+    <!--property CPUSetPartition is not documented!-->
+
     <!--property IOAccounting is not documented!-->
 
     <!--property IOWeight is not documented!-->
@@ -5867,12 +6174,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
     <!--property IODeviceLatencyTargetUSec is not documented!-->
 
     <!--property MemoryAccounting is not documented!-->
-
-    <!--property DefaultMemoryLow is not documented!-->
-
-    <!--property DefaultStartupMemoryLow is not documented!-->
-
-    <!--property DefaultMemoryMin is not documented!-->
 
     <!--property MemoryMin is not documented!-->
 
@@ -5926,6 +6227,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
 
     <!--property ManagedOOMPreference is not documented!-->
 
+    <!--property OOMRules is not documented!-->
+
     <!--property BPFProgram is not documented!-->
 
     <!--property SocketBindAllow is not documented!-->
@@ -5934,9 +6237,19 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
 
     <!--property RestrictNetworkInterfaces is not documented!-->
 
+    <!--property BindNetworkInterface is not documented!-->
+
     <!--property MemoryPressureWatch is not documented!-->
 
     <!--property MemoryPressureThresholdUSec is not documented!-->
+
+    <!--property CPUPressureWatch is not documented!-->
+
+    <!--property CPUPressureThresholdUSec is not documented!-->
+
+    <!--property IOPressureWatch is not documented!-->
+
+    <!--property IOPressureThresholdUSec is not documented!-->
 
     <!--property NFTSet is not documented!-->
 
@@ -6262,6 +6575,10 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
 
     <!--property MemoryKSM is not documented!-->
 
+    <!--property MemoryTHP is not documented!-->
+
+    <!--property UserNamespacePath is not documented!-->
+
     <!--property NetworkNamespacePath is not documented!-->
 
     <!--property IPCNamespacePath is not documented!-->
@@ -6378,6 +6695,12 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
 
     <variablelist class="dbus-property" generated="True" extra-ref="Symlinks"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="XAttrEntryPoint"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="XAttrListen"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="XAttrAccept"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="Mark"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MaxConnections"/>
@@ -6486,6 +6809,10 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
 
     <variablelist class="dbus-property" generated="True" extra-ref="IOWriteOperations"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="OOMKills"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ManagedOOMKills"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="Delegate"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="DelegateControllers"/>
@@ -6508,6 +6835,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
 
     <variablelist class="dbus-property" generated="True" extra-ref="StartupAllowedMemoryNodes"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUSetPartition"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="IOAccounting"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="IOWeight"/>
@@ -6527,12 +6856,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
     <variablelist class="dbus-property" generated="True" extra-ref="IODeviceLatencyTargetUSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryAccounting"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryLow"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultStartupMemoryLow"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryMin"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryMin"/>
 
@@ -6588,6 +6911,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
 
     <variablelist class="dbus-property" generated="True" extra-ref="ManagedOOMPreference"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="OOMRules"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="BPFProgram"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="SocketBindAllow"/>
@@ -6596,9 +6921,19 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
 
     <variablelist class="dbus-property" generated="True" extra-ref="RestrictNetworkInterfaces"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="BindNetworkInterface"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryPressureWatch"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUPressureWatch"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="IOPressureWatch"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="IOPressureThresholdUSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="NFTSet"/>
 
@@ -6697,6 +7032,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
     <variablelist class="dbus-property" generated="True" extra-ref="RootVerity"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="RootEphemeral"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="RootMStack"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ExtensionDirectories"/>
 
@@ -6978,6 +7315,10 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryKSM"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="MemoryTHP"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="UserNamespacePath"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="NetworkNamespacePath"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="IPCNamespacePath"/>
@@ -7043,6 +7384,17 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
       <para><varname>FlushPending</varname> specifies whether to flush the socket
       just before entering the listening state. This setting only applies to sockets with
       <varname>Accept=</varname> set to <literal>no</literal>.</para>
+
+      <para><varname>XAttrEntryPoint</varname>, <varname>XAttrListen</varname> and
+      <varname>XAttrAccept</varname> each contain a list of extended attributes (as
+      <literal><replaceable>NAME</replaceable></literal>/<literal><replaceable>VALUE</replaceable></literal>
+      pairs) to set on socket inodes. <varname>XAttrEntryPoint</varname> applies to the file-system inode an
+      <constant>AF_UNIX</constant> socket is bound to, <varname>XAttrListen</varname> applies to the listening
+      socket, and <varname>XAttrAccept</varname> applies to connection sockets accepted off the listening
+      socket. See the <varname>XAttrEntryPoint=</varname>, <varname>XAttrListen=</varname> and
+      <varname>XAttrAccept=</varname> settings in
+      <citerefentry><refentrytitle>systemd.socket</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
+      details.</para>
     </refsect2>
   </refsect1>
 
@@ -7202,6 +7554,10 @@ node /org/freedesktop/systemd1/unit/home_2emount {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t IOWriteOperations = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t OOMKills = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t ManagedOOMKills = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b Delegate = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly as DelegateControllers = ['...', ...];
@@ -7224,6 +7580,8 @@ node /org/freedesktop/systemd1/unit/home_2emount {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly ay StartupAllowedMemoryNodes = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s CPUSetPartition = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b IOAccounting = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t IOWeight = ...;
@@ -7243,12 +7601,6 @@ node /org/freedesktop/systemd1/unit/home_2emount {
       readonly a(st) IODeviceLatencyTargetUSec = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b MemoryAccounting = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultMemoryLow = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultStartupMemoryLow = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultMemoryMin = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t MemoryMin = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
@@ -7304,6 +7656,8 @@ node /org/freedesktop/systemd1/unit/home_2emount {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s ManagedOOMPreference = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly as OOMRules = ['...', ...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(ss) BPFProgram = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(iiqq) SocketBindAllow = [...];
@@ -7312,9 +7666,19 @@ node /org/freedesktop/systemd1/unit/home_2emount {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly (bas) RestrictNetworkInterfaces = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s BindNetworkInterface = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s MemoryPressureWatch = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t MemoryPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s CPUPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t CPUPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s IOPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t IOPressureThresholdUSec = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(iiss) NFTSet = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
@@ -7413,6 +7777,8 @@ node /org/freedesktop/systemd1/unit/home_2emount {
       readonly s RootVerity = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly b RootEphemeral = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly s RootMStack = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly as ExtensionDirectories = ['...', ...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
@@ -7694,6 +8060,10 @@ node /org/freedesktop/systemd1/unit/home_2emount {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly b MemoryKSM = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly s MemoryTHP = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly s UserNamespacePath = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly s NetworkNamespacePath = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly s IPCNamespacePath = '...';
@@ -7833,6 +8203,8 @@ node /org/freedesktop/systemd1/unit/home_2emount {
 
     <!--property StartupAllowedMemoryNodes is not documented!-->
 
+    <!--property CPUSetPartition is not documented!-->
+
     <!--property IOAccounting is not documented!-->
 
     <!--property IOWeight is not documented!-->
@@ -7852,12 +8224,6 @@ node /org/freedesktop/systemd1/unit/home_2emount {
     <!--property IODeviceLatencyTargetUSec is not documented!-->
 
     <!--property MemoryAccounting is not documented!-->
-
-    <!--property DefaultMemoryLow is not documented!-->
-
-    <!--property DefaultStartupMemoryLow is not documented!-->
-
-    <!--property DefaultMemoryMin is not documented!-->
 
     <!--property MemoryMin is not documented!-->
 
@@ -7911,6 +8277,8 @@ node /org/freedesktop/systemd1/unit/home_2emount {
 
     <!--property ManagedOOMPreference is not documented!-->
 
+    <!--property OOMRules is not documented!-->
+
     <!--property BPFProgram is not documented!-->
 
     <!--property SocketBindAllow is not documented!-->
@@ -7919,9 +8287,19 @@ node /org/freedesktop/systemd1/unit/home_2emount {
 
     <!--property RestrictNetworkInterfaces is not documented!-->
 
+    <!--property BindNetworkInterface is not documented!-->
+
     <!--property MemoryPressureWatch is not documented!-->
 
     <!--property MemoryPressureThresholdUSec is not documented!-->
+
+    <!--property CPUPressureWatch is not documented!-->
+
+    <!--property CPUPressureThresholdUSec is not documented!-->
+
+    <!--property IOPressureWatch is not documented!-->
+
+    <!--property IOPressureThresholdUSec is not documented!-->
 
     <!--property NFTSet is not documented!-->
 
@@ -8247,6 +8625,10 @@ node /org/freedesktop/systemd1/unit/home_2emount {
 
     <!--property MemoryKSM is not documented!-->
 
+    <!--property MemoryTHP is not documented!-->
+
+    <!--property UserNamespacePath is not documented!-->
+
     <!--property NetworkNamespacePath is not documented!-->
 
     <!--property IPCNamespacePath is not documented!-->
@@ -8379,6 +8761,10 @@ node /org/freedesktop/systemd1/unit/home_2emount {
 
     <variablelist class="dbus-property" generated="True" extra-ref="IOWriteOperations"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="OOMKills"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ManagedOOMKills"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="Delegate"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="DelegateControllers"/>
@@ -8401,6 +8787,8 @@ node /org/freedesktop/systemd1/unit/home_2emount {
 
     <variablelist class="dbus-property" generated="True" extra-ref="StartupAllowedMemoryNodes"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUSetPartition"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="IOAccounting"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="IOWeight"/>
@@ -8420,12 +8808,6 @@ node /org/freedesktop/systemd1/unit/home_2emount {
     <variablelist class="dbus-property" generated="True" extra-ref="IODeviceLatencyTargetUSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryAccounting"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryLow"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultStartupMemoryLow"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryMin"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryMin"/>
 
@@ -8481,6 +8863,8 @@ node /org/freedesktop/systemd1/unit/home_2emount {
 
     <variablelist class="dbus-property" generated="True" extra-ref="ManagedOOMPreference"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="OOMRules"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="BPFProgram"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="SocketBindAllow"/>
@@ -8489,9 +8873,19 @@ node /org/freedesktop/systemd1/unit/home_2emount {
 
     <variablelist class="dbus-property" generated="True" extra-ref="RestrictNetworkInterfaces"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="BindNetworkInterface"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryPressureWatch"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUPressureWatch"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="IOPressureWatch"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="IOPressureThresholdUSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="NFTSet"/>
 
@@ -8590,6 +8984,8 @@ node /org/freedesktop/systemd1/unit/home_2emount {
     <variablelist class="dbus-property" generated="True" extra-ref="RootVerity"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="RootEphemeral"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="RootMStack"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ExtensionDirectories"/>
 
@@ -8870,6 +9266,10 @@ node /org/freedesktop/systemd1/unit/home_2emount {
     <variablelist class="dbus-property" generated="True" extra-ref="BPFDelegateAttachments"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryKSM"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="MemoryTHP"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="UserNamespacePath"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="NetworkNamespacePath"/>
 
@@ -9228,6 +9628,10 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t IOWriteOperations = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t OOMKills = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t ManagedOOMKills = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b Delegate = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly as DelegateControllers = ['...', ...];
@@ -9250,6 +9654,8 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly ay StartupAllowedMemoryNodes = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s CPUSetPartition = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b IOAccounting = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t IOWeight = ...;
@@ -9269,12 +9675,6 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
       readonly a(st) IODeviceLatencyTargetUSec = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b MemoryAccounting = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultMemoryLow = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultStartupMemoryLow = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultMemoryMin = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t MemoryMin = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
@@ -9330,6 +9730,8 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s ManagedOOMPreference = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly as OOMRules = ['...', ...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(ss) BPFProgram = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(iiqq) SocketBindAllow = [...];
@@ -9338,9 +9740,19 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly (bas) RestrictNetworkInterfaces = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s BindNetworkInterface = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s MemoryPressureWatch = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t MemoryPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s CPUPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t CPUPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s IOPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t IOPressureThresholdUSec = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(iiss) NFTSet = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
@@ -9439,6 +9851,8 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
       readonly s RootVerity = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly b RootEphemeral = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly s RootMStack = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly as ExtensionDirectories = ['...', ...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
@@ -9720,6 +10134,10 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly b MemoryKSM = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly s MemoryTHP = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly s UserNamespacePath = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly s NetworkNamespacePath = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly s IPCNamespacePath = '...';
@@ -9841,6 +10259,8 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
 
     <!--property StartupAllowedMemoryNodes is not documented!-->
 
+    <!--property CPUSetPartition is not documented!-->
+
     <!--property IOAccounting is not documented!-->
 
     <!--property IOWeight is not documented!-->
@@ -9860,12 +10280,6 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
     <!--property IODeviceLatencyTargetUSec is not documented!-->
 
     <!--property MemoryAccounting is not documented!-->
-
-    <!--property DefaultMemoryLow is not documented!-->
-
-    <!--property DefaultStartupMemoryLow is not documented!-->
-
-    <!--property DefaultMemoryMin is not documented!-->
 
     <!--property MemoryMin is not documented!-->
 
@@ -9919,6 +10333,8 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
 
     <!--property ManagedOOMPreference is not documented!-->
 
+    <!--property OOMRules is not documented!-->
+
     <!--property BPFProgram is not documented!-->
 
     <!--property SocketBindAllow is not documented!-->
@@ -9927,9 +10343,19 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
 
     <!--property RestrictNetworkInterfaces is not documented!-->
 
+    <!--property BindNetworkInterface is not documented!-->
+
     <!--property MemoryPressureWatch is not documented!-->
 
     <!--property MemoryPressureThresholdUSec is not documented!-->
+
+    <!--property CPUPressureWatch is not documented!-->
+
+    <!--property CPUPressureThresholdUSec is not documented!-->
+
+    <!--property IOPressureWatch is not documented!-->
+
+    <!--property IOPressureThresholdUSec is not documented!-->
 
     <!--property NFTSet is not documented!-->
 
@@ -10255,6 +10681,10 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
 
     <!--property MemoryKSM is not documented!-->
 
+    <!--property MemoryTHP is not documented!-->
+
+    <!--property UserNamespacePath is not documented!-->
+
     <!--property NetworkNamespacePath is not documented!-->
 
     <!--property IPCNamespacePath is not documented!-->
@@ -10369,6 +10799,10 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
 
     <variablelist class="dbus-property" generated="True" extra-ref="IOWriteOperations"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="OOMKills"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ManagedOOMKills"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="Delegate"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="DelegateControllers"/>
@@ -10391,6 +10825,8 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
 
     <variablelist class="dbus-property" generated="True" extra-ref="StartupAllowedMemoryNodes"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUSetPartition"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="IOAccounting"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="IOWeight"/>
@@ -10410,12 +10846,6 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
     <variablelist class="dbus-property" generated="True" extra-ref="IODeviceLatencyTargetUSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryAccounting"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryLow"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultStartupMemoryLow"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryMin"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryMin"/>
 
@@ -10471,6 +10901,8 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
 
     <variablelist class="dbus-property" generated="True" extra-ref="ManagedOOMPreference"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="OOMRules"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="BPFProgram"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="SocketBindAllow"/>
@@ -10479,9 +10911,19 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
 
     <variablelist class="dbus-property" generated="True" extra-ref="RestrictNetworkInterfaces"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="BindNetworkInterface"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryPressureWatch"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUPressureWatch"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="IOPressureWatch"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="IOPressureThresholdUSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="NFTSet"/>
 
@@ -10580,6 +11022,8 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
     <variablelist class="dbus-property" generated="True" extra-ref="RootVerity"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="RootEphemeral"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="RootMStack"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ExtensionDirectories"/>
 
@@ -10861,6 +11305,10 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryKSM"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="MemoryTHP"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="UserNamespacePath"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="NetworkNamespacePath"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="IPCNamespacePath"/>
@@ -11021,6 +11469,8 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly u ConcurrencySoftMax = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly u ActivatingConcurrencyMax = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly u NCurrentlyActive = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s Slice = '...';
@@ -11071,6 +11521,10 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t IOWriteOperations = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t OOMKills = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t ManagedOOMKills = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b Delegate = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly as DelegateControllers = ['...', ...];
@@ -11093,6 +11547,8 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly ay StartupAllowedMemoryNodes = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s CPUSetPartition = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b IOAccounting = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t IOWeight = ...;
@@ -11112,12 +11568,6 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
       readonly a(st) IODeviceLatencyTargetUSec = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b MemoryAccounting = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultMemoryLow = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultStartupMemoryLow = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultMemoryMin = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t MemoryMin = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
@@ -11173,6 +11623,8 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s ManagedOOMPreference = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly as OOMRules = ['...', ...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(ss) BPFProgram = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(iiqq) SocketBindAllow = [...];
@@ -11181,9 +11633,19 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly (bas) RestrictNetworkInterfaces = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s BindNetworkInterface = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s MemoryPressureWatch = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t MemoryPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s CPUPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t CPUPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s IOPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t IOPressureThresholdUSec = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(iiss) NFTSet = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
@@ -11205,6 +11667,8 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
     <!--property ConcurrencyHardMax is not documented!-->
 
     <!--property ConcurrencySoftMax is not documented!-->
+
+    <!--property ActivatingConcurrencyMax is not documented!-->
 
     <!--property NCurrentlyActive is not documented!-->
 
@@ -11272,6 +11736,8 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
 
     <!--property StartupAllowedMemoryNodes is not documented!-->
 
+    <!--property CPUSetPartition is not documented!-->
+
     <!--property IOAccounting is not documented!-->
 
     <!--property IOWeight is not documented!-->
@@ -11291,12 +11757,6 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
     <!--property IODeviceLatencyTargetUSec is not documented!-->
 
     <!--property MemoryAccounting is not documented!-->
-
-    <!--property DefaultMemoryLow is not documented!-->
-
-    <!--property DefaultStartupMemoryLow is not documented!-->
-
-    <!--property DefaultMemoryMin is not documented!-->
 
     <!--property MemoryMin is not documented!-->
 
@@ -11350,6 +11810,8 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
 
     <!--property ManagedOOMPreference is not documented!-->
 
+    <!--property OOMRules is not documented!-->
+
     <!--property BPFProgram is not documented!-->
 
     <!--property SocketBindAllow is not documented!-->
@@ -11358,9 +11820,19 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
 
     <!--property RestrictNetworkInterfaces is not documented!-->
 
+    <!--property BindNetworkInterface is not documented!-->
+
     <!--property MemoryPressureWatch is not documented!-->
 
     <!--property MemoryPressureThresholdUSec is not documented!-->
+
+    <!--property CPUPressureWatch is not documented!-->
+
+    <!--property CPUPressureThresholdUSec is not documented!-->
+
+    <!--property IOPressureWatch is not documented!-->
+
+    <!--property IOPressureThresholdUSec is not documented!-->
 
     <!--property NFTSet is not documented!-->
 
@@ -11385,6 +11857,8 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
     <variablelist class="dbus-property" generated="True" extra-ref="ConcurrencyHardMax"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ConcurrencySoftMax"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ActivatingConcurrencyMax"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="NCurrentlyActive"/>
 
@@ -11436,6 +11910,10 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
 
     <variablelist class="dbus-property" generated="True" extra-ref="IOWriteOperations"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="OOMKills"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ManagedOOMKills"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="Delegate"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="DelegateControllers"/>
@@ -11458,6 +11936,8 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
 
     <variablelist class="dbus-property" generated="True" extra-ref="StartupAllowedMemoryNodes"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUSetPartition"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="IOAccounting"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="IOWeight"/>
@@ -11477,12 +11957,6 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
     <variablelist class="dbus-property" generated="True" extra-ref="IODeviceLatencyTargetUSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryAccounting"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryLow"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultStartupMemoryLow"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryMin"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryMin"/>
 
@@ -11538,6 +12012,8 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
 
     <variablelist class="dbus-property" generated="True" extra-ref="ManagedOOMPreference"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="OOMRules"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="BPFProgram"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="SocketBindAllow"/>
@@ -11546,9 +12022,19 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
 
     <variablelist class="dbus-property" generated="True" extra-ref="RestrictNetworkInterfaces"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="BindNetworkInterface"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryPressureWatch"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUPressureWatch"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="IOPressureWatch"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="IOPressureThresholdUSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="NFTSet"/>
 
@@ -11561,7 +12047,7 @@ node /org/freedesktop/systemd1/unit/system_2eslice {
 
       <para>Most properties correspond directly with the matching settings in slice unit files.</para>
 
-      <para><varname>ManagedOOMMemoryPressureDurationUSec</varname> implement the destination parameter of the
+      <para><varname>ManagedOOMMemoryPressureDurationUSec</varname> implements the destination parameter of the
       unit file setting <varname>ManagedOOMMemoryPressureDurationSec=</varname> listed in
       <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
       Note the time unit is expressed in <literal>μs</literal>.</para>
@@ -11647,6 +12133,10 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t IOWriteOperations = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t OOMKills = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t ManagedOOMKills = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b Delegate = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly as DelegateControllers = ['...', ...];
@@ -11669,6 +12159,8 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly ay StartupAllowedMemoryNodes = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s CPUSetPartition = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b IOAccounting = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t IOWeight = ...;
@@ -11688,12 +12180,6 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
       readonly a(st) IODeviceLatencyTargetUSec = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly b MemoryAccounting = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultMemoryLow = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultStartupMemoryLow = ...;
-      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
-      readonly t DefaultMemoryMin = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t MemoryMin = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
@@ -11749,6 +12235,8 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s ManagedOOMPreference = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly as OOMRules = ['...', ...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(ss) BPFProgram = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(iiqq) SocketBindAllow = [...];
@@ -11757,9 +12245,19 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly (bas) RestrictNetworkInterfaces = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s BindNetworkInterface = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly s MemoryPressureWatch = '...';
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly t MemoryPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s CPUPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t CPUPressureThresholdUSec = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly s IOPressureWatch = '...';
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
+      readonly t IOPressureThresholdUSec = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
       readonly a(iiss) NFTSet = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("false")
@@ -11862,6 +12360,8 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
 
     <!--property StartupAllowedMemoryNodes is not documented!-->
 
+    <!--property CPUSetPartition is not documented!-->
+
     <!--property IOAccounting is not documented!-->
 
     <!--property IOWeight is not documented!-->
@@ -11881,12 +12381,6 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
     <!--property IODeviceLatencyTargetUSec is not documented!-->
 
     <!--property MemoryAccounting is not documented!-->
-
-    <!--property DefaultMemoryLow is not documented!-->
-
-    <!--property DefaultStartupMemoryLow is not documented!-->
-
-    <!--property DefaultMemoryMin is not documented!-->
 
     <!--property MemoryMin is not documented!-->
 
@@ -11940,6 +12434,8 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
 
     <!--property ManagedOOMPreference is not documented!-->
 
+    <!--property OOMRules is not documented!-->
+
     <!--property BPFProgram is not documented!-->
 
     <!--property SocketBindAllow is not documented!-->
@@ -11948,9 +12444,19 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
 
     <!--property RestrictNetworkInterfaces is not documented!-->
 
+    <!--property BindNetworkInterface is not documented!-->
+
     <!--property MemoryPressureWatch is not documented!-->
 
     <!--property MemoryPressureThresholdUSec is not documented!-->
+
+    <!--property CPUPressureWatch is not documented!-->
+
+    <!--property CPUPressureThresholdUSec is not documented!-->
+
+    <!--property IOPressureWatch is not documented!-->
+
+    <!--property IOPressureThresholdUSec is not documented!-->
 
     <!--property NFTSet is not documented!-->
 
@@ -12050,6 +12556,10 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
 
     <variablelist class="dbus-property" generated="True" extra-ref="IOWriteOperations"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="OOMKills"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ManagedOOMKills"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="Delegate"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="DelegateControllers"/>
@@ -12072,6 +12582,8 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
 
     <variablelist class="dbus-property" generated="True" extra-ref="StartupAllowedMemoryNodes"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUSetPartition"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="IOAccounting"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="IOWeight"/>
@@ -12091,12 +12603,6 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
     <variablelist class="dbus-property" generated="True" extra-ref="IODeviceLatencyTargetUSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryAccounting"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryLow"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultStartupMemoryLow"/>
-
-    <variablelist class="dbus-property" generated="True" extra-ref="DefaultMemoryMin"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryMin"/>
 
@@ -12152,6 +12658,8 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
 
     <variablelist class="dbus-property" generated="True" extra-ref="ManagedOOMPreference"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="OOMRules"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="BPFProgram"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="SocketBindAllow"/>
@@ -12160,9 +12668,19 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
 
     <variablelist class="dbus-property" generated="True" extra-ref="RestrictNetworkInterfaces"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="BindNetworkInterface"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryPressureWatch"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="MemoryPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUPressureWatch"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="CPUPressureThresholdUSec"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="IOPressureWatch"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="IOPressureThresholdUSec"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="NFTSet"/>
 
@@ -12208,10 +12726,10 @@ node /org/freedesktop/systemd1/unit/session_2d1_2escope {
 
       <para><varname>Controller</varname> contains the bus name (unique or well-known) that is notified when
       the scope unit is to be shut down via a <function>RequestStop()</function> signal (see below). This is
-      set when the scope is created. If not set, the scope's processes will terminated with
+      set when the scope is created. If not set, the scope's processes will be terminated with
       <constant>SIGTERM</constant> directly.</para>
 
-      <para><varname>ManagedOOMMemoryPressureDurationUSec</varname> implement the destination parameter of the
+      <para><varname>ManagedOOMMemoryPressureDurationUSec</varname> implements the destination parameter of the
       unit file setting <varname>ManagedOOMMemoryPressureDurationSec=</varname> listed in
       <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
       Note the time unit is expressed in <literal>μs</literal>.</para>
@@ -12375,6 +12893,27 @@ $ gdbus introspect --system --dest org.freedesktop.systemd1 \
       <para><varname>DefaultRestrictSUIDSGID</varname>,
       <function>RemoveSubgroupFromUnit()</function>, and
       <function>KillUnitSubgroup()</function> were added in version 258.</para>
+      <para><varname>TransactionsWithOrderingCycle</varname> was added in version 259.</para>
+      <para><varname>DefaultMemoryZSwapWriteback</varname>,
+      <varname>DefaultCPUPressureThresholdUSec</varname>,
+      <varname>DefaultCPUPressureWatch</varname>,
+      <varname>DefaultIOPressureThresholdUSec</varname>,
+      <varname>DefaultIOPressureWatch</varname>,
+      <varname>ReloadCount</varname>,
+      <varname>EventLoopRateLimitIntervalUSec</varname>, and
+      <varname>EventLoopRateLimitBurst</varname> were added in version 261.</para>
+      <para><varname>KExecCount</varname>,
+      <function>EnqueueUnitJobMany()</function>,
+      <varname>ShutdownFinishTimestamp</varname>,
+      <varname>ShutdownFinishTimestampMonotonic</varname>,
+      <varname>PreviousShutdownStartTimestamp</varname>,
+      <varname>PreviousShutdownStartTimestampMonotonic</varname>,
+      <varname>PreviousShutdownFinishTimestamp</varname>,
+      <varname>PreviousShutdownFinishTimestampMonotonic</varname>,
+      <varname>PreviousShutdownLateStartTimestamp</varname>,
+      <varname>PreviousShutdownLateStartTimestampMonotonic</varname>,
+      <varname>PreviousShutdownLateFinishTimestamp</varname>, and
+      <varname>PreviousShutdownLateFinishTimestampMonotonic</varname> were added in version 262.</para>
     </refsect2>
     <refsect2>
       <title>Unit Objects</title>
@@ -12459,6 +12998,21 @@ $ gdbus introspect --system --dest org.freedesktop.systemd1 \
       <varname>LogsDirectoryQuotaUsage</varname>,
       <varname>LogsDirectoryAccounting</varname>, and
       <function>KillSubgroup()</function> were added in version 258.</para>
+      <para><varname>UserNamespacePath</varname>,
+      <varname>OOMKills</varname>,
+      <varname>ManagedOOMKills</varname>,
+      <varname>ExecReloadPost</varname>, and
+      <varname>ExecReloadPostEx</varname> were added in version 259.</para>
+      <para><varname>BindNetworkInterface</varname>, <varname>MemoryTHP</varname>,
+      <varname>RefreshOnReload</varname>, and <varname>RootMStack</varname> were added in version 260.</para>
+      <para><varname>CPUPressureThresholdUSec</varname>,
+      <varname>CPUPressureWatch</varname>,
+      <varname>IOPressureThresholdUSec</varname>,
+      <varname>IOPressureWatch</varname>,
+      <varname>CPUSetPartition</varname>, and
+      <varname>OOMRules</varname> were added in version 261.</para>
+      <para><varname>LUOSession</varname> was added in version 262.</para>
+      <para><varname>RestartRandomizedDelayUSec</varname> was added in version 262.</para>
     </refsect2>
     <refsect2>
       <title>Socket Unit Objects</title>
@@ -12524,6 +13078,20 @@ $ gdbus introspect --system --dest org.freedesktop.systemd1 \
       <varname>LogsDirectoryQuotaUsage</varname>,
       <varname>LogsDirectoryAccounting</varname>, and
       <function>KillSubgroup()</function> were added in version 258.</para>
+      <para><varname>UserNamespacePath</varname>,
+      <varname>OOMKills</varname>, and
+      <varname>ManagedOOMKills</varname> were added in 259.</para>
+      <para><varname>BindNetworkInterface</varname> <varname>MemoryTHP</varname>, and
+      <varname>RootMStack</varname> were added in version 260.</para>
+      <para><varname>CPUPressureThresholdUSec</varname>,
+      <varname>CPUPressureWatch</varname>,
+      <varname>IOPressureThresholdUSec</varname>,
+      <varname>IOPressureWatch</varname>,
+      <varname>CPUSetPartition</varname>, and
+      <varname>OOMRules</varname> were added in version 261.</para>
+      <para><varname>XAttrEntryPoint</varname>,
+      <varname>XAttrListen</varname>, and
+      <varname>XAttrAccept</varname> were added in version 262.</para>
     </refsect2>
     <refsect2>
       <title>Mount Unit Objects</title>
@@ -12584,6 +13152,17 @@ $ gdbus introspect --system --dest org.freedesktop.systemd1 \
       <varname>LogsDirectoryQuotaUsage</varname>,
       <varname>LogsDirectoryAccounting</varname>, and
       <function>KillSubgroup()</function> were added in version 258.</para>
+      <para><varname>UserNamespacePath</varname>,
+      <varname>OOMKills</varname>, and
+      <varname>ManagedOOMKills</varname> were added in 259.</para>
+      <para><varname>BindNetworkInterface</varname> <varname>MemoryTHP</varname>, and
+      <varname>RootMStack</varname> were added in version 260.</para>
+      <para><varname>CPUPressureThresholdUSec</varname>,
+      <varname>CPUPressureWatch</varname>,
+      <varname>IOPressureThresholdUSec</varname>,
+      <varname>IOPressureWatch</varname>,
+      <varname>CPUSetPartition</varname>, and
+      <varname>OOMRules</varname> were added in version 261.</para>
     </refsect2>
     <refsect2>
       <title>Swap Unit Objects</title>
@@ -12642,6 +13221,17 @@ $ gdbus introspect --system --dest org.freedesktop.systemd1 \
       <varname>LogsDirectoryQuotaUsage</varname>,
       <varname>LogsDirectoryAccounting</varname>, and
       <function>KillSubgroup()</function> were added in version 258.</para>
+      <para><varname>UserNamespacePath</varname>,
+      <varname>OOMKills</varname>, and
+      <varname>ManagedOOMKills</varname> were added in 259.</para>
+      <para><varname>BindNetworkInterface</varname>, <varname>MemoryTHP</varname>, and
+      <varname>RootMStack</varname> were added in version 260.</para>
+      <para><varname>CPUPressureThresholdUSec</varname>,
+      <varname>CPUPressureWatch</varname>,
+      <varname>IOPressureThresholdUSec</varname>,
+      <varname>IOPressureWatch</varname>,
+      <varname>CPUSetPartition</varname>, and
+      <varname>OOMRules</varname> were added in version 261.</para>
     </refsect2>
     <refsect2>
       <title>Slice Unit Objects</title>
@@ -12672,6 +13262,16 @@ $ gdbus introspect --system --dest org.freedesktop.systemd1 \
       <varname>NCurrentlyActive</varname>,
       <function>RemoveSubgroup()</function>, and
       <function>KillSubgroup()</function> were added in version 258.</para>
+      <para><varname>OOMKills</varname>, and
+      <varname>ManagedOOMKills</varname> were added in 259.</para>
+      <para><varname>BindNetworkInterface</varname> was added in version 260.</para>
+      <para><varname>CPUPressureThresholdUSec</varname>,
+      <varname>CPUPressureWatch</varname>,
+      <varname>IOPressureThresholdUSec</varname>,
+      <varname>IOPressureWatch</varname>,
+      <varname>CPUSetPartition</varname>, and
+      <varname>OOMRules</varname> were added in version 261.</para>
+      <para><varname>ActivatingConcurrencyMax</varname> was added in version 262.</para>
     </refsect2>
     <refsect2>
       <title>Scope Unit Objects</title>
@@ -12700,6 +13300,15 @@ $ gdbus introspect --system --dest org.freedesktop.systemd1 \
       <para><varname>ManagedOOMMemoryPressureDurationUSec</varname> was added in version 257.</para>
       <para><function>RemoveSubgroup()</function> and
       <function>KillSubgroup()</function> were added in version 258.</para>
+      <para><varname>OOMKills</varname>, and
+      <varname>ManagedOOMKills</varname> were added in 259.</para>
+      <para><varname>BindNetworkInterface</varname> was added in version 260.</para>
+      <para><varname>CPUPressureThresholdUSec</varname>,
+      <varname>CPUPressureWatch</varname>,
+      <varname>IOPressureThresholdUSec</varname>,
+      <varname>IOPressureWatch</varname>,
+      <varname>CPUSetPartition</varname>, and
+      <varname>OOMRules</varname> were added in version 261.</para>
     </refsect2>
     <refsect2>
       <title>Job Objects</title>

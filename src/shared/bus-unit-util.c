@@ -160,7 +160,7 @@ static int bus_append_string(sd_bus_message *m, const char *field, const char *e
         return 1;
 }
 
-static int bus_append_strv_full(sd_bus_message *m, const char *field, const char *eq, ExtractFlags flags) {
+static int bus_append_strv_full(sd_bus_message *m, const char *field, const char *eq, const char *separators, ExtractFlags flags) {
         int r;
 
         assert(m);
@@ -185,7 +185,7 @@ static int bus_append_strv_full(sd_bus_message *m, const char *field, const char
         for (const char *p = eq;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&p, &word, /* separators= */ NULL, flags);
+                r = extract_first_word(&p, &word, separators, flags);
                 if (r < 0)
                         return parse_log_error(r, field, eq);
                 if (r == 0)
@@ -212,11 +212,68 @@ static int bus_append_strv_full(sd_bus_message *m, const char *field, const char
 }
 
 static int bus_append_strv(sd_bus_message *m, const char *field, const char *eq) {
-        return bus_append_strv_full(m, field, eq, EXTRACT_UNQUOTE);
+        return bus_append_strv_full(m, field, eq, /* separators= */ NULL, EXTRACT_UNQUOTE);
 }
 
 static int bus_append_strv_cunescape(sd_bus_message *m, const char *field, const char *eq) {
-        return bus_append_strv_full(m, field, eq, EXTRACT_UNQUOTE | EXTRACT_CUNESCAPE);
+        return bus_append_strv_full(m, field, eq, /* separators= */ NULL, EXTRACT_UNQUOTE | EXTRACT_CUNESCAPE);
+}
+
+static int bus_append_strv_colon(sd_bus_message *m, const char *field, const char *eq) {
+        /* This also accepts colon as the separator. */
+        return bus_append_strv_full(m, field, eq, ":" WHITESPACE, EXTRACT_UNQUOTE);
+}
+
+static int bus_append_xattr(sd_bus_message *m, const char *field, const char *eq) {
+        int r;
+
+        assert(m);
+        assert(field);
+
+        /* Sends an extended attribute assignment of the form "name=value" as an a(ss) array of one
+         * name/value pair (or as an empty array if the value is empty, which resets the list). */
+
+        r = sd_bus_message_open_container(m, 'r', "sv");
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_append_basic(m, 's', field);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_open_container(m, 'v', "a(ss)");
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_open_container(m, 'a', "(ss)");
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        if (!isempty(eq)) {
+                _cleanup_free_ char *name = NULL, *value = NULL;
+
+                r = split_pair(eq, "=", &name, &value);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse extended attribute expression '%s': %m", eq);
+
+                r = sd_bus_message_append(m, "(ss)", name, value);
+                if (r < 0)
+                        return bus_log_create_error(r);
+        }
+
+        r = sd_bus_message_close_container(m);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_close_container(m);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_close_container(m);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        return 1;
 }
 
 static int bus_append_byte_array(sd_bus_message *m, const char *field, const void *buf, size_t n) {
@@ -290,6 +347,23 @@ static int bus_append_parse_size(sd_bus_message *m, const char *field, const cha
         return 1;
 }
 
+static int bus_append_parse_size_i64(sd_bus_message *m, const char *field, const char *eq) {
+        uint64_t v;
+        int r;
+
+        r = parse_size(eq, /* base= */ 1024, &v);
+        if (r < 0)
+                return parse_log_error(r, field, eq);
+        if (v > INT64_MAX)
+                return parse_log_error(SYNTHETIC_ERRNO(ERANGE), field, eq);
+
+        r = sd_bus_message_append(m, "(sv)", field, "x", (int64_t) v);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        return 1;
+}
+
 static int bus_append_parse_permyriad(sd_bus_message *m, const char *field, const char *eq) {
         int r;
 
@@ -342,8 +416,6 @@ static int bus_append_parse_resource_limit(sd_bus_message *m, const char *field,
         if (isempty(eq) || streq(eq, "infinity")) {
                 uint64_t x = streq(eq, "infinity") ? CGROUP_LIMIT_MAX :
                         STR_IN_SET(field,
-                                   "DefaultMemoryLow",
-                                   "DefaultMemoryMin",
                                    "MemoryLow",
                                    "MemoryMin") ? CGROUP_LIMIT_MIN : CGROUP_LIMIT_MAX;
 
@@ -564,6 +636,10 @@ static int bus_append_exec_command(sd_bus_message *m, const char *field, const c
         _cleanup_free_ char *_path = NULL;
         ExecCommandFlags flags = 0;
         int r;
+
+        assert(m);
+        assert(field);
+        assert(eq);
 
         do {
                 switch (*eq) {
@@ -1169,6 +1245,58 @@ static int bus_append_import_credential(sd_bus_message *m, const char *field, co
         return 1;
 }
 
+static int bus_append_refresh_on_reload(sd_bus_message *m, const char *field, const char *eq) {
+        int r;
+
+        assert(eq);
+
+        r = sd_bus_message_open_container(m, 'r', "sv");
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_append_basic(m, 's', field);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_open_container(m, 'v', "a(bs)");
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_open_container(m, 'a', "(bs)");
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        bool invert = *eq == '~';
+
+        for (const char *p = eq + invert;;) {
+                _cleanup_free_ char *word = NULL;
+
+                r = extract_first_word(&p, &word, NULL, 0);
+                if (r < 0)
+                        return parse_log_error(r, field, eq);
+                if (r == 0)
+                        break;
+
+                r = sd_bus_message_append(m, "(bs)", invert, word);
+                if (r < 0)
+                        return bus_log_create_error(r);
+        }
+
+        r = sd_bus_message_close_container(m);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_close_container(m);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_close_container(m);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        return 1;
+}
+
 static int bus_append_log_extra_fields(sd_bus_message *m, const char *field, const char *eq) {
         int r;
 
@@ -1252,7 +1380,8 @@ static int bus_append_standard_input_text(sd_bus_message *m, const char *field, 
         /* Note that we don't expand specifiers here, but that should be OK, as this is a
          * programmatic interface anyway */
 
-        return bus_append_byte_array(m, field, unescaped, l + 1);
+        /* The server side does not have StandardInputText, using StandardInputData instead. */
+        return bus_append_byte_array(m, "StandardInputData", unescaped, l + 1);
 }
 
 static int bus_append_standard_input_data(sd_bus_message *m, const char *field, const char *eq) {
@@ -1347,7 +1476,7 @@ static int bus_append_cpu_affinity(sd_bus_message *m, const char *field, const c
                 r = sd_bus_message_append(m, "(sv)", "CPUAffinityFromNUMA", "b", true);
                 if (r < 0)
                         return bus_log_create_error(r);
-                return r;
+                return 1;
         }
 
         return bus_append_parse_cpu_set(m, field, eq);
@@ -1954,7 +2083,7 @@ static int bus_append_directory(sd_bus_message *m, const char *field, const char
                 } else {
                         ExecDirectoryFlags exec_directory_flags = exec_directory_flags_from_string(flags);
                         if (exec_directory_flags < 0 || (exec_directory_flags & ~_EXEC_DIRECTORY_FLAGS_PUBLIC) != 0)
-                                return log_error_errno(r, "Failed to parse flags for %s=: '%s'", field, flags);
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse flags for %s=: '%s'", field, flags);
 
                         if (!isempty(dest)) {
                                 path_simplify(dest);
@@ -2070,7 +2199,7 @@ static int bus_append_quota_directory(sd_bus_message *m, const char *field, cons
                 if (r < 0) {
                         r = parse_size(eq, 1024, &quota_absolute);
                         if (r < 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse argument: %s=%s", field, eq);
+                                return log_error_errno(r, "Failed to parse argument: %s=%s", field, eq);
                 } else
                         quota_scale = UINT32_SCALE_FROM_PERMYRIAD(r);
 
@@ -2088,7 +2217,7 @@ static int bus_append_protect_hostname(sd_bus_message *m, const char *field, con
         int r;
 
         /* The command-line field is called "ProtectHostname". We also accept "ProtectHostnameEx" as the
-         * field name for backward compatibility. We set ProtectHostame or ProtectHostnameEx. */
+         * field name for backward compatibility. We set ProtectHostname or ProtectHostnameEx. */
 
         r = parse_boolean(eq);
         if (r >= 0)
@@ -2328,7 +2457,10 @@ static const BusProperty cgroup_properties[] = {
         { "ManagedOOMSwap",                        bus_append_string                             },
         { "ManagedOOMMemoryPressure",              bus_append_string                             },
         { "ManagedOOMPreference",                  bus_append_string                             },
+        { "OOMRules",                              bus_append_strv                               },
         { "MemoryPressureWatch",                   bus_append_string                             },
+        { "CPUPressureWatch",                      bus_append_string                             },
+        { "IOPressureWatch",                       bus_append_string                             },
         { "DelegateSubgroup",                      bus_append_string                             },
         { "ManagedOOMMemoryPressureLimit",         bus_append_parse_permyriad                    },
         { "MemoryAccounting",                      bus_append_parse_boolean                      },
@@ -2345,11 +2477,10 @@ static const BusProperty cgroup_properties[] = {
         { "StartupAllowedCPUs",                    bus_append_parse_cpu_set                      },
         { "AllowedMemoryNodes",                    bus_append_parse_cpu_set                      },
         { "StartupAllowedMemoryNodes",             bus_append_parse_cpu_set                      },
+        { "CPUSetPartition",                       bus_append_string                             },
         { "DisableControllers",                    bus_append_strv                               },
         { "Delegate",                              bus_append_parse_delegate                     },
         { "MemoryMin",                             bus_append_parse_resource_limit               },
-        { "DefaultMemoryLow",                      bus_append_parse_resource_limit               },
-        { "DefaultMemoryMin",                      bus_append_parse_resource_limit               },
         { "MemoryLow",                             bus_append_parse_resource_limit               },
         { "MemoryHigh",                            bus_append_parse_resource_limit               },
         { "MemoryMax",                             bus_append_parse_resource_limit               },
@@ -2369,7 +2500,10 @@ static const BusProperty cgroup_properties[] = {
         { "SocketBindAllow",                       bus_append_socket_filter                      },
         { "SocketBindDeny",                        bus_append_socket_filter                      },
         { "MemoryPressureThresholdSec",            bus_append_parse_sec_rename                   },
+        { "CPUPressureThresholdSec",               bus_append_parse_sec_rename                   },
+        { "IOPressureThresholdSec",                bus_append_parse_sec_rename                   },
         { "NFTSet",                                bus_append_nft_set                            },
+        { "BindNetworkInterface",                  bus_append_string                             },
 
         /* While infinity is disallowed in unit file, infinity is allowed in D-Bus API which
          * means use the default memory pressure duration from oomd.conf. */
@@ -2385,6 +2519,8 @@ static const BusProperty cgroup_properties[] = {
         { "BlockIOReadBandwidth",                  warn_deprecated                               },
         { "BlockIOWriteBandwidth",                 warn_deprecated                               },
         { "CPUAccounting",                         warn_deprecated                               },
+        { "DefaultMemoryMin",                      warn_deprecated                               },
+        { "DefaultMemoryLow",                      warn_deprecated                               },
 
         { NULL, bus_try_append_parse_cgroup_io_limit, cgroup_io_limits_list                      },
         {}
@@ -2413,12 +2549,14 @@ static const BusProperty execute_properties[] = {
         { "SELinuxContext",                        bus_append_string                             },
         { "RootImage",                             bus_append_string                             },
         { "RootVerity",                            bus_append_string                             },
+        { "RootMStack",                            bus_append_string                             },
         { "RuntimeDirectoryPreserve",              bus_append_string                             },
         { "Personality",                           bus_append_string                             },
         { "KeyringMode",                           bus_append_string                             },
         { "ProtectProc",                           bus_append_string                             },
         { "ProcSubset",                            bus_append_string                             },
         { "NetworkNamespacePath",                  bus_append_string                             },
+        { "UserNamespacePath",                     bus_append_string                             },
         { "IPCNamespacePath",                      bus_append_string                             },
         { "LogNamespace",                          bus_append_string                             },
         { "RootImagePolicy",                       bus_append_string                             },
@@ -2453,6 +2591,7 @@ static const BusProperty execute_properties[] = {
         { "CPUSchedulingResetOnFork",              bus_append_parse_boolean                      },
         { "LockPersonality",                       bus_append_parse_boolean                      },
         { "MemoryKSM",                             bus_append_parse_boolean                      },
+        { "MemoryTHP",                             bus_append_string                             },
         { "RestrictSUIDSGID",                      bus_append_parse_boolean                      },
         { "RootEphemeral",                         bus_append_parse_boolean                      },
         { "SetLoginEnvironment",                   bus_append_parse_boolean                      },
@@ -2464,7 +2603,7 @@ static const BusProperty execute_properties[] = {
         { "InaccessiblePaths",                     bus_append_strv                               },
         { "ExecPaths",                             bus_append_strv                               },
         { "NoExecPaths",                           bus_append_strv                               },
-        { "ExecSearchPath",                        bus_append_strv                               },
+        { "ExecSearchPath",                        bus_append_strv_colon                         },
         { "ExtensionDirectories",                  bus_append_strv                               },
         { "ConfigurationDirectory",                bus_append_strv                               },
         { "SupplementaryGroups",                   bus_append_strv                               },
@@ -2563,7 +2702,6 @@ static const BusProperty kill_properties[] = {
         { "RestartKillSignal",                     bus_append_signal_from_string                 },
         { "FinalKillSignal",                       bus_append_signal_from_string                 },
         { "WatchdogSignal",                        bus_append_signal_from_string                 },
-        { "ReloadSignal",                          bus_append_signal_from_string                 },
         {}
 };
 
@@ -2623,12 +2761,14 @@ static const BusProperty service_properties[] = {
         { "TimeoutStartFailureMode",               bus_append_string                             },
         { "TimeoutStopFailureMode",                bus_append_string                             },
         { "FileDescriptorStorePreserve",           bus_append_string                             },
+        { "LUOSession",                            bus_append_strv                               },
         { "PermissionsStartOnly",                  bus_append_parse_boolean                      },
         { "RootDirectoryStartOnly",                bus_append_parse_boolean                      },
         { "RemainAfterExit",                       bus_append_parse_boolean                      },
         { "GuessMainPID",                          bus_append_parse_boolean                      },
         { "RestartSec",                            bus_append_parse_sec_rename                   },
         { "RestartMaxDelaySec",                    bus_append_parse_sec_rename                   },
+        { "RestartRandomizedDelaySec",             bus_append_parse_sec_rename                   },
         { "TimeoutStartSec",                       bus_append_parse_sec_rename                   },
         { "TimeoutStopSec",                        bus_append_parse_sec_rename                   },
         { "TimeoutAbortSec",                       bus_append_parse_sec_rename                   },
@@ -2648,6 +2788,8 @@ static const BusProperty service_properties[] = {
         { "ExecStartPostEx",                       bus_append_exec_command                       }, /* compat */
         { "ExecReload",                            bus_append_exec_command                       },
         { "ExecReloadEx",                          bus_append_exec_command                       }, /* compat */
+        { "ExecReloadPost",                        bus_append_exec_command                       },
+        { "ExecReloadPostEx",                      bus_append_exec_command                       }, /* compat */
         { "ExecStop",                              bus_append_exec_command                       },
         { "ExecStopEx",                            bus_append_exec_command                       }, /* compat */
         { "ExecStopPost",                          bus_append_exec_command                       },
@@ -2656,6 +2798,8 @@ static const BusProperty service_properties[] = {
         { "RestartForceExitStatus",                bus_append_exit_status                        },
         { "SuccessExitStatus",                     bus_append_exit_status                        },
         { "OpenFile",                              bus_append_open_file                          },
+        { "ReloadSignal",                          bus_append_signal_from_string                 },
+        { "RefreshOnReload",                       bus_append_refresh_on_reload                  },
         {}
 };
 
@@ -2688,7 +2832,6 @@ static const BusProperty socket_properties[] = {
         { "SocketMode",                            bus_append_parse_mode                         },
         { "DirectoryMode",                         bus_append_parse_mode                         },
         { "MessageQueueMaxMessages",               bus_append_safe_atoi64                        },
-        { "MessageQueueMessageSize",               bus_append_safe_atoi64                        },
         { "TimeoutSec",                            bus_append_parse_sec_rename                   },
         { "KeepAliveTimeSec",                      bus_append_parse_sec_rename                   },
         { "KeepAliveIntervalSec",                  bus_append_parse_sec_rename                   },
@@ -2699,6 +2842,7 @@ static const BusProperty socket_properties[] = {
         { "ReceiveBuffer",                         bus_append_parse_size                         },
         { "SendBuffer",                            bus_append_parse_size                         },
         { "PipeSize",                              bus_append_parse_size                         },
+        { "MessageQueueMessageSize",               bus_append_parse_size_i64                     },
         { "ExecStartPre",                          bus_append_exec_command                       },
         { "ExecStartPost",                         bus_append_exec_command                       },
         { "ExecReload",                            bus_append_exec_command                       },
@@ -2715,6 +2859,9 @@ static const BusProperty socket_properties[] = {
         { "Timestamping",                          bus_append_string                             },
         { "DeferTrigger",                          bus_append_string                             },
         { "Symlinks",                              bus_append_strv                               },
+        { "XAttrEntryPoint",                       bus_append_xattr                              },
+        { "XAttrListen",                           bus_append_xattr                              },
+        { "XAttrAccept",                           bus_append_xattr                              },
         { "SocketProtocol",                        bus_append_parse_ip_protocol                  },
         { "ListenStream",                          bus_append_listen                             },
         { "ListenDatagram",                        bus_append_listen                             },
@@ -3103,7 +3250,7 @@ static int unit_freezer_action(UnitFreezer *f, bool freeze) {
         r = bus_call_method(f->bus, bus_systemd_mgr,
                             freeze ? "FreezeUnit" : "ThawUnit",
                             &error,
-                            /* ret_reply = */ NULL,
+                            /* ret_reply= */ NULL,
                             "s",
                             f->name);
         if (r < 0) {
@@ -3140,4 +3287,14 @@ ExecDirectoryFlags exec_directory_flags_from_string(const char *s) {
                 return EXEC_DIRECTORY_READ_ONLY;
 
         return _EXEC_DIRECTORY_FLAGS_INVALID;
+}
+
+const char* exec_directory_flags_to_string(uint64_t flags) {
+        if (flags == 0)
+                return "";
+
+        if (flags == EXEC_DIRECTORY_READ_ONLY)
+                return "ro";
+
+        return NULL;
 }

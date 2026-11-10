@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "forward.h"
 #include "netdev.h"
 
 #define LINK_BRIDGE_PORT_PRIORITY_INVALID 128U
@@ -41,8 +40,7 @@ typedef enum MulticastRouter {
 DEFINE_NETDEV_CAST(BRIDGE, Bridge);
 extern const NetDevVTable bridge_vtable;
 
-const char* multicast_router_to_string(MulticastRouter i) _const_;
-MulticastRouter multicast_router_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(multicast_router, MulticastRouter);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_multicast_router);
 CONFIG_PARSER_PROTOTYPE(config_parse_bridge_igmp_version);

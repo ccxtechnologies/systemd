@@ -29,12 +29,12 @@ unsigned routes_max(void) {
 
         /* The kernel internally stores these maximum size in int. */
 
-        if (sysctl_read_ip_property_int(AF_INET, /* ifname = */ NULL, "route/max_size", &val4) >= 0)
+        if (sysctl_read_ip_property_int(AF_INET, /* ifname= */ NULL, "route/max_size", &val4) >= 0)
                 if (val4 == INT_MAX)
                         /* This is the default "no limit" value in the kernel */
                         val4 = ROUTES_DEFAULT_MAX_PER_FAMILY;
 
-        if (sysctl_read_ip_property_int(AF_INET6, /* ifname = */ NULL, "route/max_size", &val6) >= 0)
+        if (sysctl_read_ip_property_int(AF_INET6, /* ifname= */ NULL, "route/max_size", &val6) >= 0)
                 if (val6 == INT_MAX)
                         /* This is the default "no limit" value in the kernel */
                         val6 = ROUTES_DEFAULT_MAX_PER_FAMILY;
@@ -138,6 +138,12 @@ bool gateway_is_ready(Link *link, bool onlink, int family, const union in_addr_u
 
         assert(link);
         assert(link->manager);
+
+        if (link->set_flags_messages > 0)
+                return false;
+
+        if (!link_is_up(link))
+                return false;
 
         if (onlink)
                 return true;
@@ -368,26 +374,29 @@ static const char * const route_protocol_table[] = {
 DEFINE_STRING_TABLE_LOOKUP_WITH_FALLBACK(route_protocol, int, UINT8_MAX);
 
 static const char * const route_protocol_full_table[] = {
-        [RTPROT_REDIRECT] = "redirect",
-        [RTPROT_KERNEL]   = "kernel",
-        [RTPROT_BOOT]     = "boot",
-        [RTPROT_STATIC]   = "static",
-        [RTPROT_GATED]    = "gated",
-        [RTPROT_RA]       = "ra",
-        [RTPROT_MRT]      = "mrt",
-        [RTPROT_ZEBRA]    = "zebra",
-        [RTPROT_BIRD]     = "bird",
-        [RTPROT_DNROUTED] = "dnrouted",
-        [RTPROT_XORP]     = "xorp",
-        [RTPROT_NTK]      = "ntk",
-        [RTPROT_DHCP]     = "dhcp",
-        [RTPROT_MROUTED]  = "mrouted",
-        [RTPROT_BABEL]    = "babel",
-        [RTPROT_BGP]      = "bgp",
-        [RTPROT_ISIS]     = "isis",
-        [RTPROT_OSPF]     = "ospf",
-        [RTPROT_RIP]      = "rip",
-        [RTPROT_EIGRP]    = "eigrp",
+        [RTPROT_REDIRECT]   = "redirect",
+        [RTPROT_KERNEL]     = "kernel",
+        [RTPROT_BOOT]       = "boot",
+        [RTPROT_STATIC]     = "static",
+        [RTPROT_GATED]      = "gated",
+        [RTPROT_RA]         = "ra",
+        [RTPROT_MRT]        = "mrt",
+        [RTPROT_ZEBRA]      = "zebra",
+        [RTPROT_BIRD]       = "bird",
+        [RTPROT_DNROUTED]   = "dnrouted",
+        [RTPROT_XORP]       = "xorp",
+        [RTPROT_NTK]        = "ntk",
+        [RTPROT_DHCP]       = "dhcp",
+        [RTPROT_MROUTED]    = "mrouted",
+        [RTPROT_KEEPALIVED] = "keepalived",
+        [RTPROT_BABEL]      = "babel",
+        [RTPROT_OVN]        = "ovn",
+        [RTPROT_OPENR]      = "openr",
+        [RTPROT_BGP]        = "bgp",
+        [RTPROT_ISIS]       = "isis",
+        [RTPROT_OSPF]       = "ospf",
+        [RTPROT_RIP]        = "rip",
+        [RTPROT_EIGRP]      = "eigrp",
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_FALLBACK(route_protocol_full, int, UINT8_MAX);

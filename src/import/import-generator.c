@@ -5,6 +5,7 @@
 #include "alloc-util.h"
 #include "creds-util.h"
 #include "discover-image.h"
+#include "dlopen-note.h"
 #include "efivars.h"
 #include "errno-util.h"
 #include "extract-word.h"
@@ -17,6 +18,7 @@
 #include "parse-util.h"
 #include "path-util.h"
 #include "proc-cmdline.h"
+#include "runtime-scope.h"
 #include "specifier.h"
 #include "string-util.h"
 #include "unit-name.h"
@@ -200,18 +202,21 @@ static int parse_pull_expression(const char *v) {
         if (!GREEDY_REALLOC(arg_transfers, arg_n_transfers + 1))
                 return log_oom();
 
-        const char *image_root = runtime ? image_root_runtime_to_string(class) : image_root_to_string(class);
+        _cleanup_free_ char *image_root = NULL;
+        r = image_root_pick(RUNTIME_SCOPE_SYSTEM, class, runtime, &image_root);
+        if (r < 0)
+                return log_error_errno(r, "Failed to pick image root: %m");
 
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
         r = sd_json_buildo(
                         &j,
-                        SD_JSON_BUILD_PAIR("remote", SD_JSON_BUILD_STRING(remote)),
-                        SD_JSON_BUILD_PAIR("local", SD_JSON_BUILD_STRING(local)),
-                        SD_JSON_BUILD_PAIR("class", JSON_BUILD_STRING_UNDERSCORIFY(image_class_to_string(class))),
-                        SD_JSON_BUILD_PAIR("type", JSON_BUILD_STRING_UNDERSCORIFY(import_type_to_string(type))),
-                        SD_JSON_BUILD_PAIR("readOnly", SD_JSON_BUILD_BOOLEAN(ro)),
-                        SD_JSON_BUILD_PAIR("verify", JSON_BUILD_STRING_UNDERSCORIFY(import_verify_to_string(verify))),
-                        SD_JSON_BUILD_PAIR("imageRoot", SD_JSON_BUILD_STRING(image_root)));
+                        SD_JSON_BUILD_PAIR_STRING("remote", remote),
+                        SD_JSON_BUILD_PAIR_STRING("local", local),
+                        JSON_BUILD_PAIR_ENUM("class", image_class_to_string(class)),
+                        JSON_BUILD_PAIR_ENUM("type", import_type_to_string(type)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("readOnly", ro),
+                        JSON_BUILD_PAIR_ENUM("verify", import_verify_to_string(verify)),
+                        SD_JSON_BUILD_PAIR_STRING("imageRoot", image_root));
         if (r < 0)
                 return log_error_errno(r, "Failed to build import JSON object: %m");
 
@@ -220,7 +225,7 @@ static int parse_pull_expression(const char *v) {
                 .type = type,
                 .local = TAKE_PTR(local),
                 .remote = TAKE_PTR(remote),
-                .image_root = image_root,
+                .image_root = TAKE_PTR(image_root),
                 .json = TAKE_PTR(j),
                 .blockdev = blockdev,
         };
@@ -328,7 +333,7 @@ static int transfer_generate(const Transfer *t) {
                 return log_error_errno(r, "Failed to build import unit name from '%s': %m", local_path);
 
         _cleanup_fclose_ FILE *f = NULL;
-        r = generator_open_unit_file(arg_dest, /* source = */ NULL, service, &f);
+        r = generator_open_unit_file(arg_dest, /* source= */ NULL, service, &f);
         if (r < 0)
                 return r;
 
@@ -353,9 +358,11 @@ static int transfer_generate(const Transfer *t) {
                         arg_failure_action);
 
         if (t->class == IMAGE_SYSEXT)
-                fputs("Before=systemd-sysext.service\n", f);
+                fprintf(f, "Before=systemd-sysext%s.service\n",
+                        in_initrd() ? "-initrd" : "");
         else if (t->class == IMAGE_CONFEXT)
-                fputs("Before=systemd-confext.service\n", f);
+                fprintf(f, "Before=systemd-confext%s.service\n",
+                        in_initrd() ? "-initrd" : "");
 
         /* Assume network resource unless URL is file:// */
         if (!file_url_is_valid(t->remote))
@@ -419,6 +426,9 @@ static int generate(void) {
 
 static int run(const char *dest, const char *dest_early, const char *dest_late) {
         int r;
+
+        LIBCRYPTO_NOTE(suggested);
+        TPM2_NOTE(suggested);
 
         assert_se(arg_dest = dest);
 

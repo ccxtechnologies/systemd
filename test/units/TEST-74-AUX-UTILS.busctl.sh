@@ -43,6 +43,12 @@ busctl call --json=short \
 busctl call -j \
             org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.DBus.Properties \
             GetAll s "org.freedesktop.systemd1.Manager" | jq -c
+# Do the same with D-Bus' org.freedesktop.DBus.Debug.Stats interface which also provides some
+# complex signatures that caused issues during the JSON conversion in the past
+# See: https://github.com/systemd/systemd/issues/32904
+busctl call --json=pretty \
+            org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.Debug.Stats \
+            GetStats | jq -c
 busctl call --verbose --timeout=60 --expect-reply=yes \
             org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager \
             ListUnitsByPatterns asas 1 "active" 2 "systemd-*.socket" "*.mount"
@@ -57,10 +63,27 @@ busctl emit --auto-start=no --destination=systemd-logind.service \
             /org/freedesktop/login1 org.freedesktop.login1.Manager \
             PrepareForShutdown b false
 
+signal_emit_command() {
+    echo "for i in \$(seq 1 ${1:?}); do busctl emit /test org.freedesktop.fake1 TestSignal s success; done"
+}
+
 systemd-run --quiet --service-type=notify --unit=test-busctl-wait --pty \
             -p Environment=SYSTEMD_LOG_LEVEL=debug \
-            -p ExecStartPost="busctl emit /test org.freedesktop.fake1 TestSignal s success" \
-            busctl --timeout=30 wait /test org.freedesktop.fake1 TestSignal | grep -qF 's "success"'
+            -p ExecStartPost="sh -c '$(signal_emit_command 1)'" \
+            busctl --timeout=30 wait /test org.freedesktop.fake1 TestSignal |
+            grep -Fc 's "success"' | xargs test 1 -eq
+
+systemd-run --quiet --service-type=notify --unit=test-busctl-wait-limited --pty \
+            -p Environment=SYSTEMD_LOG_LEVEL=debug \
+            -p ExecStartPost="sh -c '$(signal_emit_command 5)'" \
+            busctl --timeout=30 --limit-messages=3 wait /test org.freedesktop.fake1 TestSignal |
+            grep -Fc 's "success"' | xargs test 3 -eq
+
+systemd-run --quiet --service-type=notify --unit=test-busctl-wait-unlimited --pty \
+            -p Environment=SYSTEMD_LOG_LEVEL=debug \
+            -p ExecStartPost="sh -c '$(signal_emit_command 2)'" \
+            busctl --timeout=30 --limit-messages=infinity wait /test org.freedesktop.fake1 TestSignal |
+            grep -Fc 's "success"' | xargs test 2 -eq
 
 busctl get-property org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager \
                     Version
@@ -129,10 +152,10 @@ busctl get-property -j \
 
 busctl --quiet --timeout=1 --limit-messages=1 --match "interface=org.freedesktop.systemd1.Manager" monitor
 
-START_USEC=$(date +%s%6N)
+START_NSEC=$(date +%s%N)
 busctl --quiet --timeout=500ms --match "interface=io.dontexist.NeverGonnaHappen" monitor
-END_USEC=$(date +%s%6N)
-USEC=$((END_USEC-START_USEC))
+END_NSEC=$(date +%s%N)
+NSEC=$((END_NSEC-START_NSEC))
 # Validate that the above was delayed for at least 500ms, but at most 30s (some leeway for slow CIs)
-test "$USEC" -gt 500000
-test "$USEC" -lt 30000000
+test "$NSEC" -gt 500000000
+test "$NSEC" -lt 30000000000

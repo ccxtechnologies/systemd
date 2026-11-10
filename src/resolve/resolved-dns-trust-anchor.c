@@ -5,7 +5,9 @@
 #include "alloc-util.h"
 #include "conf-files.h"
 #include "constants.h"
+#include "dns-answer.h"
 #include "dns-domain.h"
+#include "dns-rr.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -13,9 +15,7 @@
 #include "log.h"
 #include "nulstr-util.h"
 #include "parse-util.h"
-#include "resolved-dns-answer.h"
 #include "resolved-dns-dnssec.h"
-#include "resolved-dns-rr.h"
 #include "resolved-dns-trust-anchor.h"
 #include "set.h"
 #include "string-util.h"
@@ -191,6 +191,11 @@ static int dns_trust_anchor_add_builtin_negative(DnsTrustAnchor *d) {
                 "ipv4only.arpa\0"
                 "170.0.0.192.in-addr.arpa\0"
                 "171.0.0.192.in-addr.arpa\0";
+
+        /* RFC 9476 reserves the .alt pseudo-TLD for names that are resolved by protocols other than DNS.
+         * dns_name_dont_resolve() returns true for .alt names. We hence never send a lookup of a .alt name
+         * to a DNS server, and synthesize an NXDOMAIN reply instead. Lookups of .alt names never go through
+         * DNSSEC validation. The list above doesn't need an entry for .alt for that reason. */
 
         int r;
 
@@ -437,7 +442,7 @@ static int dns_trust_anchor_load_files(
         assert(suffix);
         assert(loader);
 
-        r = conf_files_list_nulstr(&files, suffix, NULL, 0, trust_anchor_dirs);
+        r = conf_files_list_nulstr(&files, suffix, /* root= */ NULL, CONF_FILES_WARN, trust_anchor_dirs);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate %s trust anchor files: %m", suffix);
 
@@ -502,7 +507,7 @@ static int dns_trust_anchor_dump(DnsTrustAnchor *d) {
         else {
                 _cleanup_free_ char **l = NULL, *j = NULL;
 
-                if (set_dump_sorted(d->negative_by_name, (void***) &l, /* ret_n = */ NULL) < 0)
+                if (set_dump_sorted(d->negative_by_name, (void***) &l, /* ret_n= */ NULL) < 0)
                         return log_oom();
 
                 j = strv_join(l, " ");
@@ -581,7 +586,7 @@ int dns_trust_anchor_lookup_negative(DnsTrustAnchor *d, const char *name) {
                 if (hashmap_contains(d->positive_by_key, &DNS_RESOURCE_KEY_CONST(DNS_CLASS_IN, DNS_TYPE_DS, name)))
                         return false;
 
-                if (hashmap_contains(d->positive_by_key, &DNS_RESOURCE_KEY_CONST(DNS_CLASS_IN, DNS_TYPE_KEY, name)))
+                if (hashmap_contains(d->positive_by_key, &DNS_RESOURCE_KEY_CONST(DNS_CLASS_IN, DNS_TYPE_DNSKEY, name)))
                         return false;
 
                 /* And now, let's look at the parent, and check that too */

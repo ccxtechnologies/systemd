@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
 
-#include "forward.h"
+#include "udev-forward.h"
 #include "udev-event.h"
 
 typedef struct UdevBuiltin {
@@ -43,6 +43,9 @@ extern const UdevBuiltin udev_builtin_net_driver;
 extern const UdevBuiltin udev_builtin_net_id;
 extern const UdevBuiltin udev_builtin_net_setup_link;
 extern const UdevBuiltin udev_builtin_path_id;
+#if HAVE_TPM2
+extern const UdevBuiltin udev_builtin_tpm2_id;
+#endif
 #if HAVE_ACL
 extern const UdevBuiltin udev_builtin_uaccess;
 #endif

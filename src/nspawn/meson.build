@@ -13,7 +13,7 @@ nspawn_sources = files(
         'nspawn-setuid.c',
         'nspawn-stub-pid1.c',
 )
-nspawn_extract_sources = files(
+nspawn_export_sources = files(
         'nspawn-expose-ports.c',
         'nspawn-mount.c',
         'nspawn-network.c',
@@ -27,11 +27,11 @@ nspawn_gperf_c = custom_target(
         command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
 generated_sources += nspawn_gperf_c
-nspawn_extract_sources += nspawn_gperf_c
+nspawn_export_sources += nspawn_gperf_c
 
 nspawn_common_template = {
-        'dependencies' : libseccomp,
-        'objects' : ['systemd-nspawn'],
+        'dependencies' : libseccomp_cflags,
+        'import' : ['systemd-nspawn'],
 }
 nspawn_test_template = test_template + nspawn_common_template
 nspawn_fuzz_template = fuzz_template + nspawn_common_template
@@ -40,16 +40,20 @@ executables += [
         executable_template + {
                 'name' : 'systemd-nspawn',
                 'public' : true,
-                'sources' : nspawn_sources + nspawn_extract_sources,
+                'sources' : nspawn_sources,
+                'export' : nspawn_export_sources,
                 'include_directories' : [
+                        include_directories('.'),
                         executable_template['include_directories'],
-                        include_directories('.')
                 ],
-                'extract' : nspawn_extract_sources,
                 'dependencies' : [
-                        libblkid,
-                        libseccomp,
-                        libselinux,
+                        libacl_cflags,
+                        libblkid_cflags,
+                        libcryptsetup_cflags,
+                        libmount_cflags,
+                        libopenssl_cflags,
+                        libseccomp_cflags,
+                        libselinux_cflags,
                 ],
         },
         nspawn_test_template + {

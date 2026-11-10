@@ -28,10 +28,10 @@ int udev_parse_config_full(const ConfigTableItem config_table[]) {
 
         r = config_parse_standard_file_with_dropins(
                         "udev/udev.conf",
-                        /* sections = */ NULL,
+                        /* sections= */ NULL,
                         config_item_table_lookup, config_table,
                         CONFIG_PARSE_WARN,
-                        /* userdata = */ NULL);
+                        /* userdata= */ NULL);
         if (r == -ENOENT)
                 return 0;
         return r;
@@ -315,7 +315,9 @@ size_t udev_replace_whitespace(const char *str, char *to, size_t len) {
          *
          * Note that only 'len' characters are read from 'str'. */
 
-        i = strspn(str, WHITESPACE);
+        /* Skip leading whitespace, but read at most 'len' bytes: 'str' is not necessarily NUL
+         * terminated within 'len' (e.g. the space padded ATA IDENTIFY fields ata_id passes in). */
+        i = strnspn(str, WHITESPACE, len);
 
         for (j = 0; j < len && i < len && str[i] != '\0'; i++) {
                 if (isspace(str[i])) {

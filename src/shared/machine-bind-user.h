@@ -27,4 +27,6 @@ int machine_bind_user_prepare(
                 char **bind_user,
                 const char *bind_user_shell,
                 bool bind_user_shell_copy,
+                const char *bind_user_home_mount_directory,
+                char **bind_user_groups,
                 MachineBindUserContext **ret);

@@ -150,6 +150,11 @@ int sd_session_is_active(const char *session);
 /* Return 1 if the session is remote. */
 int sd_session_is_remote(const char *session);
 
+/* Return extra hardware devices that the session is granted access to.
+ * For every $ID in the list, this adds access for all devices tagged with
+ * "xaccess-$ID" in udev. */
+int sd_session_get_extra_device_access(const char *session, char ***ret_ids);
+
 /* Get state from session. Possible states: online, active, closing.
  * This function is a more generic version of sd_session_is_active(). */
 int sd_session_get_state(const char *session, char **ret_state);
@@ -188,7 +193,7 @@ int sd_session_get_leader(const char *session, pid_t *ret_leader);
 int sd_session_get_remote_host(const char *session, char **ret_remote_host);
 
 /* Determine the remote user of this session (if provided by PAM). */
-int sd_session_get_remote_user(const char *session, char **tre_remote_user);
+int sd_session_get_remote_user(const char *session, char **ret_remote_user);
 
 /* Determine the TTY of this session. */
 int sd_session_get_tty(const char *session, char **ret_tty);

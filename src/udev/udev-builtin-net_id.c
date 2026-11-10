@@ -107,7 +107,7 @@ static int get_first_syspath_component(sd_device *dev, const char *prefix, char 
         if (!p)
                 return -EINVAL;
 
-        r = path_find_first_component(&p, /* accept_dot_dot = */ false, &q);
+        r = path_find_first_component(&p, /* accept_dot_dot= */ false, &q);
         if (r < 0)
                 return r;
 
@@ -165,6 +165,46 @@ static int get_virtfn_info(sd_device *pcidev, sd_device **ret_physfn_pcidev, cha
         return -ENOENT;
 }
 
+static int get_subfunc_info(sd_device *aux_dev, sd_device **ret_parent_pcidev, char **ret_suffix) {
+        sd_device *parent;
+        unsigned sfnum;
+        char *suffix;
+        int r;
+
+        assert(aux_dev);
+        assert(ret_parent_pcidev);
+        assert(ret_suffix);
+
+        /* The auxiliary device must expose an 'sfnum' attribute. This is currently used by the
+         * mlx5_core driver for sub-function (SF) auxiliary devices. The sfnum is the user-defined
+         * stable identifier passed to "devlink port add ... sfnum N". */
+        r = device_get_sysattr_unsigned_filtered(aux_dev, "sfnum", &sfnum);
+        if (r < 0)
+                return r;
+
+        /* Walk one hop up: the auxiliary device's parent must be a PCI function. It can be either
+         * the PF directly, or an SR-IOV VF — mlx5 also supports SFs hosted on VFs (VF-SF), see
+         * Documentation/networking/representors.rst in the kernel tree. The VF case is handled by
+         * the existing virtfn logic in names_pci(), so here we just return the immediate PCI
+         * parent and a single "S<sfnum>" suffix piece. */
+        r = sd_device_get_parent(aux_dev, &parent);
+        if (r < 0)
+                return r;
+
+        r = device_in_subsystem(parent, "pci");
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -ENODEV;
+
+        if (asprintf(&suffix, "S%u", sfnum) < 0)
+                return log_oom_debug();
+
+        *ret_parent_pcidev = sd_device_ref(parent);
+        *ret_suffix = suffix;
+        return 0;
+}
+
 static int get_port_specifier(sd_device *dev, char **ret) {
         const char *phys_port_name;
         unsigned dev_port;
@@ -175,7 +215,7 @@ static int get_port_specifier(sd_device *dev, char **ret) {
         assert(ret);
 
         /* First, try to use the kernel provided front panel port name for multiple port PCI device. */
-        r = device_get_sysattr_value_filtered(dev, "phys_port_name", &phys_port_name);
+        r = device_get_sysattr_safe_string_filtered(dev, "phys_port_name", &phys_port_name);
         if (r >= 0 && !isempty(phys_port_name)) {
                 if (naming_scheme_has(NAMING_SR_IOV_R)) {
                         int vf_id = -1;
@@ -249,7 +289,7 @@ static int pci_get_onboard_index(sd_device *dev, unsigned *ret) {
                 return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EINVAL),
                                               "Naming scheme does not allow onboard index==0.");
         if (!is_valid_onboard_index(idx))
-                return log_device_debug_errno(dev, SYNTHETIC_ERRNO(ENOENT),
+                return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EINVAL),
                                               "Not a valid onboard index: %u", idx);
 
         *ret = idx;
@@ -293,7 +333,7 @@ static int names_pci_onboard_label(UdevEvent *event, sd_device *pci_dev, const c
         assert(prefix);
 
         /* retrieve on-board label from firmware */
-        r = device_get_sysattr_value_filtered(pci_dev, "label", &label);
+        r = device_get_sysattr_safe_string_filtered(pci_dev, "label", &label);
         if (r < 0)
                 return log_device_debug_errno(pci_dev, r, "Failed to get PCI onboard label: %m");
 
@@ -346,7 +386,7 @@ static bool is_pci_bridge(sd_device *dev) {
 
         assert(dev);
 
-        if (device_get_sysattr_value_filtered(dev, "modalias", &v) < 0)
+        if (device_get_sysattr_safe_string_filtered(dev, "modalias", &v) < 0)
                 return false;
 
         if (!startswith(v, "pci:"))
@@ -388,14 +428,14 @@ static int parse_hotplug_slot_from_function_id(sd_device *dev, int slots_dirfd, 
                 return 0;
         }
 
-        if (device_get_sysattr_value_filtered(dev, "function_id", &attr) < 0) {
+        if (device_get_sysattr_safe_string_filtered(dev, "function_id", &attr) < 0) {
                 *ret = 0;
                 return 0;
         }
 
         r = safe_atou64(attr, &function_id);
         if (r < 0)
-                return log_device_debug_errno(dev, r, "Failed to parse function_id, ignoring: %s", attr);
+                return log_device_debug_errno(dev, r, "Failed to parse function_id, ignoring: '%s'", attr);
 
         if (function_id <= 0 || function_id > UINT32_MAX)
                 return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EINVAL),
@@ -407,7 +447,7 @@ static int parse_hotplug_slot_from_function_id(sd_device *dev, int slots_dirfd, 
                                               "PCI slot path is too long, ignoring.");
 
         if (faccessat(slots_dirfd, filename, F_OK, 0) < 0)
-                return log_device_debug_errno(dev, errno, "Cannot access %s under pci slots, ignoring: %m", filename);
+                return log_device_debug_errno(dev, errno, "Cannot access '%s' under pci slots, ignoring: %m", filename);
 
         *ret = (uint32_t) function_id;
         return 1; /* Found. We should ignore domain part. */
@@ -451,7 +491,7 @@ static int pci_get_hotplug_slot_from_address(
                 if (!path)
                         return log_oom_debug();
 
-                if (device_get_sysattr_value_filtered(pci, path, &address) < 0)
+                if (device_get_sysattr_safe_string_filtered(pci, path, &address) < 0)
                         continue;
 
                 /* match slot address with device by stripping the function */
@@ -530,7 +570,7 @@ static int get_device_firmware_node_sun(sd_device *dev, uint32_t *ret) {
         assert(dev);
         assert(ret);
 
-        r = device_get_sysattr_value_filtered(dev, "firmware_node/sun", &attr);
+        r = device_get_sysattr_safe_string_filtered(dev, "firmware_node/sun", &attr);
         if (r < 0)
                 return log_device_debug_errno(dev, r, "Failed to read firmware_node/sun, ignoring: %m");
 
@@ -692,7 +732,7 @@ static int names_vio(UdevEvent *event, const char *prefix) {
         /* get ibmveth/ibmvnic slot-based names. */
 
         /* check if our direct parent is a VIO device with no other bus in-between */
-        if (get_matching_parent(dev, STRV_MAKE("vio"), /* skip_virtio = */ false, NULL) < 0)
+        if (get_matching_parent(dev, STRV_MAKE("vio"), /* skip_virtio= */ false, NULL) < 0)
                 return 0;
 
         log_device_debug(dev, "Parent device is in the vio subsystem.");
@@ -707,11 +747,11 @@ static int names_vio(UdevEvent *event, const char *prefix) {
 
         if (r != 8)
                 return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EINVAL),
-                                              "VIO bus ID and slot ID have invalid length: %s", s);
+                                              "VIO bus ID and slot ID have invalid length: '%s'", s);
 
         if (!in_charset(s, HEXDIGITS))
                 return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EINVAL),
-                                              "VIO bus ID and slot ID contain invalid characters: %s", s);
+                                              "VIO bus ID and slot ID contain invalid characters: '%s'", s);
 
         /* Parse only slot ID (the last 4 hexdigits). */
         r = safe_atou_full(s + 4, 16, &slotid);
@@ -739,7 +779,7 @@ static int names_platform(UdevEvent *event, const char *prefix) {
         /* get ACPI path names for ARM64 platform devices */
 
         /* check if our direct parent is a platform device with no other bus in-between */
-        if (get_matching_parent(dev, STRV_MAKE("platform"), /* skip_virtio = */ false, NULL) < 0)
+        if (get_matching_parent(dev, STRV_MAKE("platform"), /* skip_virtio= */ false, NULL) < 0)
                 return 0;
 
         log_device_debug(dev, "Parent device is in the platform subsystem.");
@@ -767,8 +807,8 @@ static int names_platform(UdevEvent *event, const char *prefix) {
                 return -EOPNOTSUPP;
 
         if (!in_charset(vendor, validchars))
-                return log_device_debug_errno(dev, SYNTHETIC_ERRNO(ENOENT),
-                                              "Platform vendor contains invalid characters: %s", vendor);
+                return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EINVAL),
+                                              "Platform vendor contains invalid characters: '%s'", vendor);
 
         ascii_strlower(vendor);
 
@@ -788,20 +828,20 @@ static int names_platform(UdevEvent *event, const char *prefix) {
         return 0;
 }
 
-static int names_devicetree(UdevEvent *event, const char *prefix) {
+static int names_devicetree_alias_prefix(UdevEvent *event, const char *prefix, const char *alias_prefix) {
         sd_device *dev = ASSERT_PTR(ASSERT_PTR(event)->dev);
         _cleanup_(sd_device_unrefp) sd_device *aliases_dev = NULL, *ofnode_dev = NULL, *devicetree_dev = NULL;
         const char *ofnode_path, *ofnode_syspath, *devicetree_syspath;
         int r;
 
         assert(prefix);
+        assert(alias_prefix);
 
-        if (!naming_scheme_has(NAMING_DEVICETREE_ALIASES))
-                return 0;
+        /* Returns 1 if found, 0 if not found, negative if error */
 
-        /* only ethernet supported for now */
-        if (!streq(prefix, "en"))
-                return -EOPNOTSUPP;
+        _cleanup_free_ char *alias_prefix_0 = strjoin(alias_prefix, "0");
+        if (!alias_prefix_0)
+                return log_oom_debug();
 
         /* check if the device itself has an of_node */
         if (naming_scheme_has(NAMING_DEVICETREE_PORT_ALIASES)) {
@@ -860,11 +900,11 @@ static int names_devicetree(UdevEvent *event, const char *prefix) {
                 const char *alias_path, *alias_index, *conflict;
                 unsigned i;
 
-                alias_index = startswith(alias, "ethernet");
+                alias_index = startswith(alias, alias_prefix);
                 if (!alias_index)
                         continue;
 
-                if (device_get_sysattr_value_filtered(aliases_dev, alias, &alias_path) < 0)
+                if (device_get_sysattr_safe_string_filtered(aliases_dev, alias, &alias_path) < 0)
                         continue;
 
                 if (!path_equal(ofnode_path, alias_path))
@@ -873,51 +913,111 @@ static int names_devicetree(UdevEvent *event, const char *prefix) {
                 /* If there's no index, we default to 0... */
                 if (isempty(alias_index)) {
                         i = 0;
-                        conflict = "ethernet0";
+                        conflict = alias_prefix_0;
                 } else {
                         r = safe_atou(alias_index, &i);
                         if (r < 0)
                                 return log_device_debug_errno(dev, r,
-                                                "Could not get index of alias %s: %m", alias);
-                        conflict = "ethernet";
+                                                "Could not get index of alias '%s': %m", alias);
+                        conflict = alias_prefix;
                 }
 
                 /* ...but make sure we don't have an alias conflict */
-                if (i == 0 && device_get_sysattr_value_filtered(aliases_dev, conflict, NULL) >= 0)
+                if (i == 0 && device_get_sysattr_safe_string_filtered(aliases_dev, conflict, NULL) >= 0)
                         return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EEXIST),
-                                        "Ethernet alias conflict: ethernet and ethernet0 both exist.");
+                                        "DeviceTree alias conflict: '%s' and '%s' both exist.",
+                                        alias_prefix, alias_prefix_0);
 
                 char str[ALTIFNAMSIZ];
                 if (snprintf_ok(str, sizeof str, "%sd%u", prefix, i))
                         udev_builtin_add_property(event, "ID_NET_NAME_ONBOARD", str);
                 log_device_debug(dev, "DeviceTree identifier: alias_index=%u %s \"%s\"",
                                  i, glyph(GLYPH_ARROW_RIGHT), str + strlen(prefix));
-                return 0;
+                return 1;
         }
 
-        return -ENOENT;
+        return 0;
 }
+
+static int names_devicetree(UdevEvent *event, const char *prefix) {
+        int r;
+
+        assert(event);
+        assert(prefix);
+
+        if (!naming_scheme_has(NAMING_DEVICETREE_ALIASES))
+                return 0;
+
+        if (streq(prefix, "en"))
+                r = names_devicetree_alias_prefix(event, prefix, "ethernet");
+        else if (naming_scheme_has(NAMING_DEVICETREE_ALIASES_WLAN) &&
+                 streq(prefix, "wl")) {
+                r = names_devicetree_alias_prefix(event, prefix, "wifi");
+                /* Sometimes DeviceTrees have WLAN devices with alias ethernetN, fall back to those */
+                if (r == 0)
+                        r = names_devicetree_alias_prefix(event, prefix, "ethernet");
+        } else
+                return -EOPNOTSUPP; /* Unsupported interface type */
+        if (r < 0)
+                return r;
+        if (r == 0) /* Not found */
+                return -ENOENT;
+
+        return 0; /* Found */
+};
 
 static int names_pci(UdevEvent *event, const char *prefix) {
         sd_device *parent, *dev = ASSERT_PTR(ASSERT_PTR(event)->dev);
-        _cleanup_(sd_device_unrefp) sd_device *physfn_pcidev = NULL;
-        _cleanup_free_ char *virtfn_suffix = NULL;
+        _cleanup_(sd_device_unrefp) sd_device *physfn_pcidev = NULL, *parent_pcidev = NULL;
+        _cleanup_free_ char *virtfn_suffix = NULL, *subfunc_suffix = NULL, *combined_suffix = NULL;
+        const char *suffix = NULL;
 
         assert(prefix);
 
-        /* check if our direct parent is a PCI device with no other bus in-between */
-        if (get_matching_parent(dev, STRV_MAKE("pci"), /* skip_virtio = */ true, &parent) < 0)
+        /* If the network device's direct parent is an auxiliary device that exposes a stable
+         * 'sfnum' attribute (currently mlx5_core sub-functions), peel off the SF identity into
+         * a 'S<sfnum>' suffix piece and pick up the aux device's underlying PCI function as
+         * 'parent'. The aux device is just a bump on the path; everything below — PF/VF
+         * resolution, slot/onboard lookup — proceeds the same way as for any PCI-rooted
+         * network device. */
+        if (naming_scheme_has(NAMING_SUBFUNC)) {
+                sd_device *aux;
+
+                if (get_matching_parent(dev, STRV_MAKE("auxiliary"),
+                                        /* skip_virtio= */ false, &aux) >= 0)
+                        (void) get_subfunc_info(aux, &parent_pcidev, &subfunc_suffix);
+        }
+
+        /* SF: parent is the aux device's PCI function. Otherwise the network device's direct
+         * parent must itself be a PCI device. */
+        if (subfunc_suffix)
+                parent = parent_pcidev;
+        else if (get_matching_parent(dev, STRV_MAKE("pci"), /* skip_virtio= */ true, &parent) < 0)
                 return 0;
 
-        /* If this is an SR-IOV virtual device, get base name using physical device and add virtfn suffix. */
+        /* If parent is an SR-IOV VF, walk to the parent PF and add a 'v<N>' suffix piece. The
+         * onboard BIOS label is intentionally not exposed for any "child function" (VF, SF, or
+         * VF-SF), since the label refers to the parent's physical port, not to a logical child. */
+        bool is_child_function = !!subfunc_suffix;
         if (naming_scheme_has(NAMING_SR_IOV_V) &&
-            get_virtfn_info(parent, &physfn_pcidev, &virtfn_suffix) >= 0)
+            get_virtfn_info(parent, &physfn_pcidev, &virtfn_suffix) >= 0) {
                 parent = physfn_pcidev;
-        else
+                is_child_function = true;
+        }
+        if (!is_child_function)
                 (void) names_pci_onboard_label(event, parent, prefix);
 
-        (void) names_pci_onboard(event, parent, prefix, virtfn_suffix);
-        (void) names_pci_slot(event, parent, prefix, virtfn_suffix);
+        /* Compose the final suffix in PF -> [VF ->] SF order, e.g. "v0", "S88", or "v0S88". */
+        if (virtfn_suffix && subfunc_suffix) {
+                combined_suffix = strjoin(virtfn_suffix, subfunc_suffix);
+                if (!combined_suffix)
+                        return log_oom_debug();
+                suffix = combined_suffix;
+        } else
+                suffix = virtfn_suffix ?: subfunc_suffix;
+
+        (void) names_pci_onboard(event, parent, prefix, suffix);
+        (void) names_pci_slot(event, parent, prefix, suffix);
         return 0;
 }
 
@@ -941,14 +1041,14 @@ static int get_usb_specifier(sd_device *dev, char **ret) {
 
         ports = strdupa_safe(s + 1);
         char *t = strchr(ports, ':');
-        if (!s)
+        if (!t)
                 return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EINVAL),
                                               "sysname \"%s\" does not have ':' in the expected place.", sysname);
 
         *t = '\0';
         config = t + 1;
-        s = strchr(config, '.');
-        if (!s)
+        t = strchr(config, '.');
+        if (!t)
                 return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EINVAL),
                                               "sysname \"%s\" does not have '.' in the expected place.", sysname);
 
@@ -1075,7 +1175,7 @@ static int names_ccw(UdevEvent *event, const char *prefix) {
 
         /* get path names for Linux on System z network devices */
 
-        if (get_matching_parent(dev, STRV_MAKE("ccwgroup", "ccw"), /* skip_virtio = */ true, &cdev) < 0)
+        if (get_matching_parent(dev, STRV_MAKE("ccwgroup", "ccw"), /* skip_virtio= */ true, &cdev) < 0)
                 return 0;
 
         log_device_debug(dev, "Device is CCW.");
@@ -1093,7 +1193,7 @@ static int names_ccw(UdevEvent *event, const char *prefix) {
          */
         bus_id_len = strlen(bus_id);
         if (!IN_SET(bus_id_len, 8, 9))
-                return log_device_debug_errno(cdev, SYNTHETIC_ERRNO(EINVAL), "Invalid bus_id: %s", bus_id);
+                return log_device_debug_errno(cdev, SYNTHETIC_ERRNO(EINVAL), "Invalid bus_id: '%s'", bus_id);
 
         /* Strip leading zeros from the bus id for aesthetic purposes. This
          * keeps the ccw names stable, yet much shorter in general case of
@@ -1168,7 +1268,7 @@ static int names_mac(UdevEvent *event, const char *prefix) {
                 return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EINVAL),
                                               "addr_assign_type=%u, MAC address is not permanent.", assign_type);
 
-        r = device_get_sysattr_value_filtered(dev, "address", &s);
+        r = device_get_sysattr_safe_string_filtered(dev, "address", &s);
         if (r < 0)
                 return log_device_debug_errno(dev, r, "Failed to read 'address' attribute: %m");
 
@@ -1213,7 +1313,7 @@ static int names_netdevsim(UdevEvent *event, const char *prefix) {
         if (r < 0)
                 return log_device_debug_errno(netdevsimdev, r, "Failed to get device sysnum: %m");
 
-        r = device_get_sysattr_value_filtered(dev, "phys_port_name", &phys_port_name);
+        r = device_get_sysattr_safe_string_filtered(dev, "phys_port_name", &phys_port_name);
         if (r < 0)
                 return log_device_debug_errno(dev, r, "Failed to get 'phys_port_name' attribute: %m");
         if (isempty(phys_port_name))
@@ -1243,7 +1343,7 @@ static int names_xen(UdevEvent *event, const char *prefix) {
                 return 0;
 
         /* check if our direct parent is a Xen VIF device with no other bus in-between */
-        if (get_matching_parent(dev, STRV_MAKE("xen"), /* skip_virtio = */ false, NULL) < 0)
+        if (get_matching_parent(dev, STRV_MAKE("xen"), /* skip_virtio= */ false, NULL) < 0)
                 return 0;
 
         /* Use the vif-n name to extract "n" */
@@ -1253,7 +1353,7 @@ static int names_xen(UdevEvent *event, const char *prefix) {
 
         p = startswith(vif, "vif-");
         if (!p)
-                return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EINVAL), "Invalid vif name: %s.", vif);
+                return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EINVAL), "Invalid vif name: '%s'.", vif);
 
         r = safe_atou_full(p, SAFE_ATO_REFUSE_PLUS_MINUS | SAFE_ATO_REFUSE_LEADING_ZERO |
                            SAFE_ATO_REFUSE_LEADING_WHITESPACE | 10, &id);
@@ -1279,7 +1379,7 @@ static int get_ifname_prefix(sd_device *dev, const char **ret) {
         if (r < 0)
                 return r;
 
-        /* handle only ARPHRD_ETHER, ARPHRD_SLIP and ARPHRD_INFINIBAND devices */
+        /* handle only ARPHRD_ETHER, ARPHRD_SLIP, ARPHRD_INFINIBAND, and ARPHDR_MCTP devices */
         switch (iftype) {
         case ARPHRD_ETHER: {
                 if (device_is_devtype(dev, "wlan") > 0)
@@ -1299,6 +1399,13 @@ static int get_ifname_prefix(sd_device *dev, const char **ret) {
 
         case ARPHRD_SLIP:
                 *ret = "sl";
+                return 0;
+
+        case ARPHRD_MCTP:
+                if (!naming_scheme_has(NAMING_MCTP))
+                        return -EOPNOTSUPP;
+
+                *ret = "mc";
                 return 0;
 
         default:

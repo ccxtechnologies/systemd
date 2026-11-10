@@ -4,9 +4,8 @@
 #include "sd-dhcp-duid.h"
 #include "sd-id128.h"
 
+#include "dhcp-forward.h"
 #include "ether-addr-util.h"
-#include "forward.h"
-#include "sparse-endian.h"
 
 #define SYSTEMD_PEN    43793
 
@@ -76,7 +75,7 @@ static inline bool duid_data_size_is_valid(size_t size) {
         return size >= MIN_DUID_DATA_LEN && size <= MAX_DUID_DATA_LEN;
 }
 
-const char* duid_type_to_string(DUIDType t) _const_;
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(duid_type, DUIDType);
 int dhcp_duid_to_string_internal(uint16_t type, const void *data, size_t data_size, char **ret);
 
 int dhcp_identifier_set_iaid(

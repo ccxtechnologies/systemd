@@ -1,12 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
+#include "dns-packet.h"
 #include "dns-resolver-internal.h"
 #include "errno-util.h"
 #include "siphash24.h"
 #include "socket-netlink.h"
-#include "stdio-util.h"
-#include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
 #include "unaligned.h"
@@ -27,14 +26,7 @@ sd_dns_resolver *sd_dns_resolver_unref(sd_dns_resolver *res) {
         return mfree(res);
 }
 
-void dns_resolver_done_many(sd_dns_resolver resolvers[], size_t n) {
-        assert(resolvers || n == 0);
-
-        FOREACH_ARRAY(res, resolvers, n)
-                sd_dns_resolver_done(res);
-
-        free(resolvers);
-}
+DEFINE_ARRAY_FREE_FUNC(dns_resolver_free_array, sd_dns_resolver, sd_dns_resolver_done);
 
 int dns_resolver_prio_compare(const sd_dns_resolver *a, const sd_dns_resolver *b) {
         return CMP(ASSERT_PTR(a)->priority, ASSERT_PTR(b)->priority);
@@ -154,29 +146,6 @@ void siphash24_compress_resolver(const sd_dns_resolver *res, struct siphash *sta
                 siphash24_compress_typesafe(*addr, state);
 }
 
-static const char* const dns_svc_param_key_table[_DNS_SVC_PARAM_KEY_MAX_DEFINED] = {
-        [DNS_SVC_PARAM_KEY_MANDATORY]       = "mandatory",
-        [DNS_SVC_PARAM_KEY_ALPN]            = "alpn",
-        [DNS_SVC_PARAM_KEY_NO_DEFAULT_ALPN] = "no-default-alpn",
-        [DNS_SVC_PARAM_KEY_PORT]            = "port",
-        [DNS_SVC_PARAM_KEY_IPV4HINT]        = "ipv4hint",
-        [DNS_SVC_PARAM_KEY_ECH]             = "ech",
-        [DNS_SVC_PARAM_KEY_IPV6HINT]        = "ipv6hint",
-        [DNS_SVC_PARAM_KEY_DOHPATH]         = "dohpath",
-        [DNS_SVC_PARAM_KEY_OHTTP]           = "ohttp",
-};
-DEFINE_STRING_TABLE_LOOKUP_TO_STRING(dns_svc_param_key, int);
-
-const char* format_dns_svc_param_key(uint16_t i, char buf[static DECIMAL_STR_MAX(uint16_t)+3]) {
-        assert(buf);
-
-        const char *p = dns_svc_param_key_to_string(i);
-        if (p)
-                return p;
-
-        return snprintf_ok(buf, DECIMAL_STR_MAX(uint16_t)+3, "key%i", i);
-}
-
 int dns_resolver_transports_to_strv(sd_dns_alpn_flags transports, char ***ret) {
         _cleanup_strv_free_ char **ans = NULL;
 
@@ -283,8 +252,8 @@ int dnr_parse_svc_params(const uint8_t *option, size_t len, sd_dns_resolver *res
                         return -EBADMSG;
 
                 case DNS_SVC_PARAM_KEY_DOHPATH:
-                        r = make_cstring((const char*) &option[offset], plen,
-                                        MAKE_CSTRING_REFUSE_TRAILING_NUL, &dohpath);
+                        r = make_cstring(&option[offset], plen,
+                                         MAKE_CSTRING_REFUSE_TRAILING_NUL, &dohpath);
                         if (ERRNO_IS_NEG_RESOURCE(r))
                                 return r;
                         if (r < 0)
@@ -330,7 +299,7 @@ int dns_resolvers_to_dot_addrs(const sd_dns_resolver *resolvers, size_t n_resolv
 
         struct in_addr_full **addrs = NULL;
         size_t n = 0;
-        CLEANUP_ARRAY(addrs, n, in_addr_full_array_free);
+        CLEANUP_ARRAY(addrs, n, in_addr_full_free_array);
 
         FOREACH_ARRAY(res, resolvers, n_resolvers) {
                 if (!FLAGS_SET(res->transports, SD_DNS_ALPN_DOT))
@@ -371,7 +340,7 @@ int dns_resolvers_to_dot_strv(const sd_dns_resolver *resolvers, size_t n_resolve
 
         struct in_addr_full **addrs = NULL;
         size_t n = 0;
-        CLEANUP_ARRAY(addrs, n, in_addr_full_array_free);
+        CLEANUP_ARRAY(addrs, n, in_addr_full_free_array);
 
         r = dns_resolvers_to_dot_addrs(resolvers, n_resolvers, &addrs, &n);
         if (r < 0)

@@ -59,72 +59,44 @@ static void test_rename_process_now(const char *p, int ret) {
 }
 
 static void test_rename_process_one(const char *p, int ret) {
-        siginfo_t si;
-        pid_t pid;
+        int r;
 
         log_info("/* %s(%s) */", __func__, p);
 
-        pid = fork();
-        assert_se(pid >= 0);
+        r = ASSERT_OK(pidref_safe_fork("(rename)", FORK_WAIT|FORK_LOG|FORK_DEATHSIG_SIGKILL, /* ret= */ NULL));
 
-        if (pid == 0) {
+        if (r == 0) {
                 /* child */
                 test_rename_process_now(p, ret);
                 _exit(EXIT_SUCCESS);
         }
-
-        assert_se(wait_for_terminate(pid, &si) >= 0);
-        assert_se(si.si_code == CLD_EXITED);
-        assert_se(si.si_status == EXIT_SUCCESS);
 }
 
 TEST(rename_process_invalid) {
-        assert_se(rename_process(NULL) == -EINVAL);
-        assert_se(rename_process("") == -EINVAL);
+        ASSERT_ERROR(rename_process(NULL), EINVAL);
+        ASSERT_ERROR(rename_process(""), EINVAL);
 }
 
 TEST(rename_process_multi) {
-        pid_t pid;
+        int r;
 
-        pid = fork();
-        assert_se(pid >= 0);
+        r = ASSERT_OK(pidref_safe_fork("(rename)", FORK_WAIT|FORK_LOG|FORK_DEATHSIG_SIGKILL, /* ret= */ NULL));
 
-        if (pid > 0) {
-                siginfo_t si;
-
-                assert_se(wait_for_terminate(pid, &si) >= 0);
-                assert_se(si.si_code == CLD_EXITED);
-                assert_se(si.si_status == EXIT_SUCCESS);
-
-                return;
+        if (r == 0) {
+                /* child */
+                test_rename_process_now("one", 1);
+                test_rename_process_now("more", 0); /* longer than "one", hence truncated */
+                (void) setresuid(99, 99, 99); /* change uid when running privileged */
+                test_rename_process_now("time!", 0);
+                test_rename_process_now("0", 1); /* shorter than "one", should fit */
+                _exit(EXIT_SUCCESS);
         }
-
-        /* child */
-        test_rename_process_now("one", 1);
-        test_rename_process_now("more", 0); /* longer than "one", hence truncated */
-        (void) setresuid(99, 99, 99); /* change uid when running privileged */
-        test_rename_process_now("time!", 0);
-        test_rename_process_now("0", 1); /* shorter than "one", should fit */
-        _exit(EXIT_SUCCESS);
 }
 
 TEST(rename_process) {
         test_rename_process_one("foo", 1); /* should always fit */
         test_rename_process_one("this is a really really long process name, followed by some more words", 0); /* unlikely to fit */
         test_rename_process_one("1234567", 1); /* should always fit */
-}
-
-TEST(argv_help) {
-        assert_se(argv_looks_like_help(1, STRV_MAKE("program")));
-        assert_se(argv_looks_like_help(2, STRV_MAKE("program", "help")));
-        assert_se(argv_looks_like_help(3, STRV_MAKE("program", "arg1", "--help")));
-        assert_se(argv_looks_like_help(4, STRV_MAKE("program", "arg1", "arg2", "-h")));
-        assert_se(!argv_looks_like_help(2, STRV_MAKE("program", "arg1")));
-        assert_se(!argv_looks_like_help(4, STRV_MAKE("program", "arg1", "arg2", "--h")));
-        assert_se(!argv_looks_like_help(3, STRV_MAKE("program", "Help", "arg2")));
-        assert_se(argv_looks_like_help(5, STRV_MAKE("program", "--help", "arg1", "-h", "--help")));
-        assert_se(!argv_looks_like_help(4, STRV_MAKE("program","arg1", "arg2", "-H")));
-        assert_se(!argv_looks_like_help(3, STRV_MAKE("program", "--Help", "arg2")));
 }
 
 static int intro(void) {

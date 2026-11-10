@@ -17,6 +17,9 @@ typedef enum PTYForwardFlags {
 
         /* Don't tint the background, or set window title */
         PTY_FORWARD_DUMB_TERMINAL          = 1 << 3,
+
+        /* Don't interpret escape sequences (^] exit, hotkeys), just forward everything as-is */
+        PTY_FORWARD_TRANSPARENT            = 1 << 4,
 } PTYForwardFlags;
 
 typedef int (*PTYForwardHangupHandler)(PTYForward *f, int rcode, void *userdata);
@@ -31,8 +34,8 @@ PTYForward* pty_forward_free(PTYForward *f);
 int pty_forward_honor_vhangup(PTYForward *f);
 bool pty_forward_vhangup_honored(const PTYForward *f);
 
-void pty_forward_set_hangup_handler(PTYForward *f, PTYForwardHangupHandler handler, void *userdata);
-void pty_forward_set_hotkey_handler(PTYForward *f, PTYForwardHotkeyHandler handler, void *userdata);
+void pty_forward_set_hangup_handler(PTYForward *f, PTYForwardHangupHandler cb, void *userdata);
+void pty_forward_set_hotkey_handler(PTYForward *f, PTYForwardHotkeyHandler cb, void *userdata);
 
 int pty_forward_drain(PTYForward *f);
 

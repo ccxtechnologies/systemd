@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "sd-bus.h"
 #include "sd-netlink.h"
 #include "sd-network.h"
 
@@ -13,8 +12,7 @@
 #include "networkctl-list.h"
 #include "networkctl-util.h"
 
-int list_links(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+int verb_list_links(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
         _cleanup_(link_info_array_freep) LinkInfo *links = NULL;
         _cleanup_(table_unrefp) Table *table = NULL;
@@ -23,10 +21,6 @@ int list_links(int argc, char *argv[], void *userdata) {
 
         r = dump_description(argc, argv);
         if (r != 0)
-                return r;
-
-        r = acquire_bus(&bus);
-        if (r < 0)
                 return r;
 
         r = sd_netlink_open(&rtnl);
@@ -85,9 +79,9 @@ int list_links(int argc, char *argv[], void *userdata) {
                         return table_log_add_error(r);
         }
 
-        r = table_print(table, NULL);
+        r = table_print_or_warn(table);
         if (r < 0)
-                return table_log_print_error(r);
+                return r;
 
         if (arg_legend)
                 printf("\n%i links listed.\n", c);

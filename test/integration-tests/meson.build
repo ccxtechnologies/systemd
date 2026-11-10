@@ -31,6 +31,11 @@ integration_test_template = {
         'sanitizer-exclude-regex' : '',
         'rtc' : false,
         'tpm' : false,
+        # Bind the mkosi output (built images) read-only into the boot-mode container at /work/vm-images, for
+        # tests that boot a nested VM from a full image.
+        'vm-images' : false,
+        'coco' : '',
+        'suppress-sync' : true,
 }
 
 foreach dirname : [
@@ -70,7 +75,7 @@ foreach dirname : [
         'TEST-46-HOMED',
         'TEST-50-DISSECT',
         'TEST-52-HONORFIRSTSHUTDOWN',
-        'TEST-53-ISSUE-16347',
+        'TEST-53-TIMER',
         'TEST-54-CREDS',
         'TEST-55-OOMD',
         'TEST-58-REPART',
@@ -90,19 +95,23 @@ foreach dirname : [
         'TEST-73-LOCALE',
         'TEST-74-AUX-UTILS',
         'TEST-75-RESOLVED',
-        'TEST-76-SYSCTL',
         'TEST-78-SIGQUEUE',
-        'TEST-79-MEMPRESS',
+        'TEST-79-PRESSURE',
         'TEST-80-NOTIFYACCESS',
         'TEST-81-GENERATORS',
         'TEST-82-SOFTREBOOT',
-        'TEST-83-BTRFS',
         'TEST-84-STORAGETM',
         'TEST-85-NETWORK',
         'TEST-86-MULTI-PROFILE-UKI',
         'TEST-87-AUX-UTILS-VM',
         'TEST-88-UPGRADE',
         'TEST-89-RESOLVED-MDNS',
+        'TEST-90-RESTRICT-FSACCESS',
+        'TEST-91-LIVEUPDATE',
+        'TEST-92-TPM2-SWTPM',
+        'TEST-93-CLONESETUP',
+        'TEST-94-COCO',
+        'TEST-95-DBUS-RECONNECT',
 ]
         subdir(dirname)
 endforeach
@@ -132,12 +141,24 @@ foreach integration_test : integration_tests
                 integration_test_args += ['--tpm']
         endif
 
+        if integration_test['vm-images']
+                integration_test_args += ['--vm-images']
+        endif
+
+        if integration_test['coco'] != ''
+                integration_test_args += ['--coco', integration_test['coco']]
+        endif
+
         if not integration_test['enabled']
                 integration_test_args += ['--skip']
         endif
 
         if mkosi.found()
                 integration_test_args += ['--mkosi', mkosi.full_path()]
+        endif
+
+        if integration_test['suppress-sync']
+                integration_test_args += ['--suppress-sync']
         endif
 
         integration_test_args += ['--']

@@ -7,17 +7,14 @@ set -o pipefail
 # shellcheck source=test/units/util.sh
 . "$(dirname "$0")"/util.sh
 
+# shellcheck disable=SC2329
 at_exit() (
     set +e
 
     [[ -d "$TMPDIR" ]] && rm -rf "$TMPDIR"
-
-    udevadm control --log-level=info
 )
 
 trap at_exit EXIT
-
-udevadm control --log-level=debug
 
 TMPDIR="$(mktemp -d)"
 truncate -s 16M "$TMPDIR"/foo.raw

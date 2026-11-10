@@ -6,10 +6,11 @@
 
 TEST(strerror_not_threadsafe) {
         /* Just check that strerror really is not thread-safe. */
-        log_info("strerror(%d) → %s", 200, strerror(200));
-        log_info("strerror(%d) → %s", 201, strerror(201));
-        log_info("strerror(%d) → %s", INT_MAX, strerror(INT_MAX));
+        log_info("strerror(%d) → %s", 200, strerror(200));              /* NOLINT(bugprone-unsafe-functions) */
+        log_info("strerror(%d) → %s", 201, strerror(201));              /* NOLINT(bugprone-unsafe-functions) */
+        log_info("strerror(%d) → %s", INT_MAX, strerror(INT_MAX));      /* NOLINT(bugprone-unsafe-functions) */
 
+        /* NOLINTNEXTLINE(bugprone-unsafe-functions) */
         log_info("strerror(%d), strerror(%d) → %p, %p", 200, 201, strerror(200), strerror(201));
 
         /* This call is not allowed, because the first returned string becomes invalid when
@@ -40,10 +41,10 @@ TEST(STRERROR) {
         ASSERT_NOT_NULL(strstr(c, buf));
 }
 
-TEST(STRERROR_OR_ELSE) {
-        log_info("STRERROR_OR_ELSE(0, \"EOF\") → %s", STRERROR_OR_EOF(0));
-        log_info("STRERROR_OR_ELSE(EPERM, \"EOF\") → %s", STRERROR_OR_EOF(EPERM));
-        log_info("STRERROR_OR_ELSE(-EPERM, \"EOF\") → %s", STRERROR_OR_EOF(-EPERM));
+TEST(STRERROR_OR_EOF) {
+        log_info("STRERROR_OR_EOF(0, \"EOF\") → %s", STRERROR_OR_EOF(0));
+        log_info("STRERROR_OR_EOF(EPERM, \"EOF\") → %s", STRERROR_OR_EOF(EPERM));
+        log_info("STRERROR_OR_EOF(-EPERM, \"EOF\") → %s", STRERROR_OR_EOF(-EPERM));
 }
 
 TEST(PROTECT_ERRNO) {

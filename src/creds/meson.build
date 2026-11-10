@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+if conf.get('HAVE_LIBMOUNT') != 1
+        subdir_done()
+endif
+
 executables += [
         executable_template + {
                 'name' : 'systemd-creds',
                 'public' : true,
                 'sources' : files('creds.c'),
                 'dependencies' : [
-                        libmount,
-                        libopenssl,
-                        threads,
+                        libmount_cflags,
+                        libopenssl_cflags,
+                        tpm2_cflags,
                 ],
         },
 ]

@@ -1,18 +1,21 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 
+#include "sd-json.h"
+
+#include "build.h"
 #include "devnum-util.h"
 #include "fd-util.h"
 #include "libudev-list-internal.h"
 #include "log.h"
 #include "main-func.h"
 #include "libudev-util.h"
+#include "options.h"
 #include "string-util.h"
 #include "tests.h"
-#include "version.h"
+#include "verbs.h"
 
 static bool arg_monitor = false;
 
@@ -404,49 +407,46 @@ static void test_list(void) {
         assert_se(!udev_list_entry_get_by_name(e, "ccc"));
 }
 
+COMMAND(
+        "test-libudev\0",
+        "Test libudev functions.",
+);
+
 static int parse_args(int argc, char *argv[], const char **syspath, const char **subsystem) {
-        static const struct option options[] = {
-                { "syspath",   required_argument, NULL, 'p' },
-                { "subsystem", required_argument, NULL, 's' },
-                { "debug",     no_argument,       NULL, 'd' },
-                { "help",      no_argument,       NULL, 'h' },
-                { "version",   no_argument,       NULL, 'V' },
-                { "monitor",   no_argument,       NULL, 'm' },
-                {}
-        };
-        int c;
+        assert(argc >= 0);
+        assert(argv);
+        assert(syspath);
+        assert(subsystem);
 
-        while ((c = getopt_long(argc, argv, "p:s:dhVm", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
-                case 'p':
-                        *syspath = optarg;
+
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION_WITH_V:
+                        return version_only();
+
+                OPTION('p', "syspath", "PATH", "Syspath to test"):
+                        *syspath = opts.arg;
                         break;
 
-                case 's':
-                        *subsystem = optarg;
+                OPTION('s', "subsystem", "SUBSYSTEM", "Subsystem to enumerate"):
+                        *subsystem = opts.arg;
                         break;
 
-                case 'd':
+                OPTION('d', "debug", NULL, "Enable debug logging"):
                         log_set_max_level(LOG_DEBUG);
                         break;
 
-                case 'h':
-                        printf("--debug --syspath= --subsystem= --help\n");
-                        return 0;
-
-                case 'V':
-                        printf("%s\n", GIT_VERSION);
-                        return 0;
-
-                case 'm':
+                OPTION('m', "monitor", NULL, "Run monitor test"):
                         arg_monitor = true;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         return 1;

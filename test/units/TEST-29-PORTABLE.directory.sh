@@ -17,8 +17,25 @@ if [[ -v ASAN_OPTIONS || -v UBSAN_OPTIONS ]]; then
     ARGS+=(--profile=trusted)
 fi
 
-unsquashfs -no-xattrs -d /tmp/minimal_0 /usr/share/minimal_0.raw
-unsquashfs -no-xattrs -d /tmp/minimal_1 /usr/share/minimal_1.raw
+unsquashfs -force -no-xattrs -d /tmp/minimal_0 /usr/share/minimal_0.raw
+unsquashfs -force -no-xattrs -d /tmp/minimal_1 /usr/share/minimal_1.raw
+
+rm -rf /tmp/mismatched-name
+cp -a /tmp/minimal_0 /tmp/mismatched-name
+portablectl inspect /tmp/mismatched-name | grep -F "minimal-app0.service" >/dev/null
+
+rm -rf /tmp/remove-relative
+cp -a /tmp/minimal_0 /tmp/remove-relative
+(cd /tmp && portablectl remove ./remove-relative)
+test ! -e /tmp/remove-relative
+
+rm -rf /tmp/symlink-unit
+cp -a /tmp/minimal_0 /tmp/symlink-unit
+printf '[Service]\nExecStart=/bin/true\n' >/tmp/portable-host-unit
+rm -f /tmp/symlink-unit/usr/lib/systemd/system/minimal-app0.service
+ln -s /tmp/portable-host-unit /tmp/symlink-unit/usr/lib/systemd/system/minimal-app0.service
+(! portablectl inspect --cat /tmp/symlink-unit minimal-app0.service)
+rm -f /tmp/portable-host-unit
 
 portablectl "${ARGS[@]}" attach --copy=symlink --now --runtime /tmp/minimal_0 minimal-app0
 
@@ -32,13 +49,13 @@ systemctl is-active minimal-app0.service
 systemctl is-active minimal-app0-bar.service
 systemctl is-active minimal-app0-foo.service && exit 1
 
-portablectl list | grep -q -F "minimal_1"
-busctl tree org.freedesktop.portable1 --no-pager | grep -q -F '/org/freedesktop/portable1/image/minimal_5f1'
+portablectl list | grep -F "minimal_1" >/dev/null
+busctl tree org.freedesktop.portable1 --no-pager | grep -F '/org/freedesktop/portable1/image/minimal_5f1' >/dev/null
 
 portablectl detach --now --enable --runtime /tmp/minimal_1 minimal-app0
 
-portablectl list | grep -q -F "No images."
-busctl tree org.freedesktop.portable1 --no-pager | grep -q -F '/org/freedesktop/portable1/image/minimal_5f1' && exit 1
+portablectl list | grep -F "No images." >/dev/null
+busctl tree org.freedesktop.portable1 --no-pager | grep -F '/org/freedesktop/portable1/image/minimal_5f1' && exit 1 >/dev/null
 
 mkdir /tmp/rootdir /tmp/app0 /tmp/app1 /tmp/overlay /tmp/os-release-fix /tmp/os-release-fix/etc
 mount /tmp/app0.raw /tmp/app0
@@ -90,11 +107,11 @@ portablectl "${ARGS[@]}" attach --copy=symlink --now --runtime --extension /tmp/
 systemctl is-active app0.service
 systemctl is-active app1.service
 
-portablectl inspect --cat --extension app0 --extension app1 rootdir app0 app1 | grep -q -f /tmp/rootdir/usr/lib/os-release
-portablectl inspect --cat --extension app0 --extension app1 rootdir app0 app1 | grep -q -f /tmp/app0/usr/lib/extension-release.d/extension-release.app0
-portablectl inspect --cat --extension app0 --extension app1 rootdir app0 app1 | grep -q -f /tmp/app1/usr/lib/extension-release.d/extension-release.app2
-portablectl inspect --cat --extension app0 --extension app1 rootdir app0 app1 | grep -q -f /tmp/app1/usr/lib/systemd/system/app1.service
-portablectl inspect --cat --extension app0 --extension app1 rootdir app0 app1 | grep -q -f /tmp/app0/usr/lib/systemd/system/app0.service
+portablectl inspect --cat --extension app0 --extension app1 rootdir app0 app1 | grep -f /tmp/rootdir/usr/lib/os-release >/dev/null
+portablectl inspect --cat --extension app0 --extension app1 rootdir app0 app1 | grep -f /tmp/app0/usr/lib/extension-release.d/extension-release.app0 >/dev/null
+portablectl inspect --cat --extension app0 --extension app1 rootdir app0 app1 | grep -f /tmp/app1/usr/lib/extension-release.d/extension-release.app2 >/dev/null
+portablectl inspect --cat --extension app0 --extension app1 rootdir app0 app1 | grep -f /tmp/app1/usr/lib/systemd/system/app1.service >/dev/null
+portablectl inspect --cat --extension app0 --extension app1 rootdir app0 app1 | grep -f /tmp/app0/usr/lib/systemd/system/app0.service >/dev/null
 
 grep -q -F "LogExtraFields=PORTABLE=app0" /run/systemd/system.attached/app0.service.d/20-portable.conf
 grep -q -F "LogExtraFields=PORTABLE_ROOT=rootdir" /run/systemd/system.attached/app0.service.d/20-portable.conf
@@ -127,18 +144,46 @@ test -L /run/systemd/system.attached/app0.service.d/10-profile.conf
 test -L /run/systemd/system.attached/app1.service.d/10-profile.conf
 portablectl detach --runtime --extension /tmp/app0 --extension /tmp/app1 /tmp/rootdir app0 app1
 
+# Ensure that --force works with directory extensions, and that ExtensionDirectories=
+# is not decorated with :x-systemd.relax-extension-release-check
+portablectl "${ARGS[@]}" attach --force --copy=symlink --now --runtime --extension /tmp/app0 /tmp/rootdir app0
+
+systemctl is-active app0.service
+status="$(portablectl is-attached --extension app0 rootdir)"
+[[ "${status}" == "running-runtime" ]]
+
+grep -q -F "ExtensionDirectories=" /run/systemd/system.attached/app0.service.d/20-portable.conf
+(! grep -q -F "x-systemd.relax-extension-release-check" /run/systemd/system.attached/app0.service.d/20-portable.conf)
+
+portablectl detach --now --runtime --extension /tmp/app0 /tmp/rootdir app0
+
+rm -rf /tmp/app10
+cp -a /tmp/app0 /tmp/app10
+portablectl "${ARGS[@]}" attach --force --copy=symlink --runtime --extension /tmp/app10 /tmp/rootdir app0
+portablectl inspect --force --cat --extension /tmp/app10 /tmp/rootdir app0 | grep -f /tmp/app10/usr/lib/extension-release.d/extension-release.app0 >/dev/null
+portablectl detach --runtime --extension /tmp/app10 /tmp/rootdir app0
+rm -rf /tmp/app10
+
 # Attempt to disable the app unit during detaching. Requires --copy=symlink to reproduce.
 # Provides coverage for https://github.com/systemd/systemd/issues/23481
 portablectl "${ARGS[@]}" attach --copy=symlink --now --runtime /tmp/rootdir minimal-app0
 portablectl detach --now --runtime --enable /tmp/rootdir minimal-app0
-# attach and detach again to check if all drop-in configs are removed even if the main unit files are removed
+# Attach and detach again to check if drop-in-only leftovers are still recognized and removed.
 portablectl "${ARGS[@]}" attach --copy=symlink --now --runtime /tmp/rootdir minimal-app0
+rm /run/systemd/system.attached/minimal-app0*.service
+status="$(portablectl is-attached --runtime /tmp/rootdir)"
+[[ "${status}" == "running-runtime" ]]
+systemctl stop minimal-app0.service minimal-app0-foo.service
+status="$(portablectl is-attached --runtime /tmp/rootdir)"
+[[ "${status}" == "attached-runtime" ]]
 portablectl detach --now --runtime --enable /tmp/rootdir minimal-app0
+[[ ! -d /run/systemd/system.attached/minimal-app0.service.d ]]
+[[ ! -d /run/systemd/system.attached/minimal-app0-foo.service.d ]]
 
 # The wrong file should be ignored, given the right one has the xattr set
 trap 'rm -rf /var/cache/wrongext' EXIT
 mkdir -p /var/cache/wrongext/usr/lib/extension-release.d /var/cache/wrongext/usr/lib/systemd/system/
-echo "[Service]" > /var/cache/wrongext/usr/lib/systemd/system/app0.service
+echo "[Service]" >/var/cache/wrongext/usr/lib/systemd/system/app0.service
 touch /var/cache/wrongext/usr/lib/extension-release.d/extension-release.wrongext_somethingwrong.txt
 cp /tmp/rootdir/usr/lib/os-release /var/cache/wrongext/usr/lib/extension-release.d/extension-release.app0
 setfattr -n user.extension-release.strict -v "false" /var/cache/wrongext/usr/lib/extension-release.d/extension-release.app0

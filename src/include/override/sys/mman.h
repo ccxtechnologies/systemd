@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include_next <sys/mman.h>
+#include_next <sys/mman.h>      /* IWYU pragma: export */
 
 #include <assert.h>
 
@@ -17,4 +17,11 @@ static_assert(MFD_NOEXEC_SEAL == 0x0008U, "");
 #  define MFD_EXEC 0x0010U
 #else
 static_assert(MFD_EXEC == 0x0010U, "");
+#endif
+
+/* since Linux 6.13 / glibc-2.42 */
+#ifndef MADV_GUARD_INSTALL
+#  define MADV_GUARD_INSTALL 102
+#else
+static_assert(MADV_GUARD_INSTALL == 102, "");
 #endif

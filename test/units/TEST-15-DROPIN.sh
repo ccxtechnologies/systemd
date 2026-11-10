@@ -116,16 +116,16 @@ testcase_basic_dropins() {
 
     echo "*** test service.d/ top level drop-in"
     create_services test15-a test15-b
-    check_ko test15-a ExecCondition "/bin/echo a"
-    check_ko test15-b ExecCondition "/bin/echo b"
+    check_ko test15-a ExecCondition "echo a"
+    check_ko test15-b ExecCondition "echo b"
     mkdir -p /run/systemd/system/service.d
     cat >/run/systemd/system/service.d/override.conf <<EOF
 [Service]
-ExecCondition=/bin/echo %n
+ExecCondition=echo %n
 EOF
     systemctl daemon-reload
-    check_ok test15-a ExecCondition "/bin/echo test15-a"
-    check_ok test15-b ExecCondition "/bin/echo test15-b"
+    check_ok test15-a ExecCondition "echo test15-a"
+    check_ok test15-b ExecCondition "echo test15-b"
     rm -rf /run/systemd/system/service.d
 
     clear_units test15-{a,b,c,c1}.service
@@ -708,6 +708,17 @@ EOF
     touch /tmp/TEST-15-DROPIN-test15-a-dropin-directory-regular
     ln -s /tmp/TEST-15-DROPIN-test15-a-dropin-directory-regular /usr/lib/systemd/system/test15-a.service.d
     check_ok test15-a Description hogehoge
+
+    clear_units test15-a.service
+}
+
+testcase_order_dropin_paths_set_property() {
+    # For issue #35710.
+    echo "Testing the order of dropin paths that are created by set-property"
+
+    create_service test15-a
+    systemctl set-property test15-a DevicePolicy=strict DeviceAllow="char-* m"
+    check_ok test15-a NeedDaemonReload no
 
     clear_units test15-a.service
 }

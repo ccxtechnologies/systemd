@@ -8,8 +8,6 @@ set -o pipefail
 # shellcheck source=test/units/util.sh
 . "$(dirname "$0")"/util.sh
 
-systemd-analyze log-level debug
-
 # Ensure that the init.scope.d drop-in is applied on boot
 test "$(cat /sys/fs/cgroup/init.scope/memory.high)" != "max"
 
@@ -21,6 +19,20 @@ if [[ -s /skipped ]]; then
     exit 77
 fi
 
+# stress-ng can fail with SIGILL because GCC's target_clones / ifunc resolver
+# picks an AVX-512 variant of a stressor function based on CPUID, even when
+# the actual CPU (e.g. in some VMs) does not implement AVX-512
+STRESS_NG_BROKEN=0
+stress_ng_preflight_out=$(mktemp)
+if ! timeout --kill-after=5s 10s stress-ng --timeout 2s --vm 4 --vm-bytes 10M --vm-keep \
+        >"$stress_ng_preflight_out" 2>&1; then
+    if grep -E "caught SIG(ILL|SEGV|BUS|FPE)" "$stress_ng_preflight_out" >/dev/null; then
+        STRESS_NG_BROKEN=1
+    fi
+fi
+rm -f "$stress_ng_preflight_out"
+unset stress_ng_preflight_out
+
 # Activate swap file if we are in a VM
 if systemd-detect-virt --vm --quiet; then
     swapoff --all
@@ -28,7 +40,7 @@ if systemd-detect-virt --vm --quiet; then
     if [[ "$(findmnt -n -o FSTYPE /)" == btrfs ]]; then
         btrfs filesystem mkswapfile -s 64M /swapfile
     else
-        dd if=/dev/zero of=/swapfile bs=1M count=64
+        fallocate -l 64M /swapfile
         chmod 0600 /swapfile
         mkswap /swapfile
     fi
@@ -48,6 +60,13 @@ mkdir -p /run/systemd/system/-.slice.d/
 cat >/run/systemd/system/-.slice.d/99-oomd-test.conf <<EOF
 [Slice]
 ManagedOOMSwap=auto
+EOF
+
+mkdir -p /run/systemd/system/system.slice.d/
+cat >/run/systemd/system/system.slice.d/99-oomd-test.conf <<EOF
+[Slice]
+ManagedOOMMemoryPressure=auto
+ManagedOOMMemoryPressureLimit=0%
 EOF
 
 mkdir -p /run/systemd/system/user@.service.d/
@@ -93,19 +112,21 @@ EOF
 else
     # Ensure that we can start services even with a very low hard memory cap without oom-kills, but skip
     # under sanitizers as they balloon memory usage.
-    systemd-run -t -p MemoryMax=10M -p MemorySwapMax=0 -p MemoryZSwapMax=0 /bin/true
+    systemd-run -t -p MemoryMax=10M -p MemorySwapMax=0 -p MemoryZSwapMax=0 true
 fi
 
 test_basic() {
     local cgroup_path="${1:?}"
     shift
 
+    [[ "$STRESS_NG_BROKEN" == "1" ]] && { echo "stress-ng is broken on this host, skipping ${FUNCNAME[0]}"; return 0; }
+
     systemctl "$@" start TEST-55-OOMD-testchill.service
     systemctl "$@" status TEST-55-OOMD-testchill.service
     systemctl "$@" status TEST-55-OOMD-workload.slice
 
     # Verify systemd-oomd is monitoring the expected units.
-    timeout 1m bash -xec "until oomctl | grep -q -F 'Path: $cgroup_path'; do sleep 1; done"
+    timeout 1m bash -xec "until oomctl | grep -F 'Path: $cgroup_path' >/dev/null; do sleep 1; done"
     assert_in 'Memory Pressure Limit: 20.00%' \
               "$(oomctl | tac | sed -e '/Memory Pressure Monitored CGroups:/q' | tac | grep -A8 "Path: $cgroup_path")"
 
@@ -124,6 +145,8 @@ test_basic() {
     # testbloat should be killed and testchill should be fine
     if systemctl "$@" status TEST-55-OOMD-testbloat.service; then exit 42; fi
     if ! systemctl "$@" status TEST-55-OOMD-testchill.service; then exit 24; fi
+
+    assert_eq "$(systemctl "$@" show TEST-55-OOMD-testbloat.service -P ManagedOOMKills)" "1"
 
     systemctl "$@" kill --signal=KILL TEST-55-OOMD-testbloat.service || :
     systemctl "$@" stop TEST-55-OOMD-testbloat.service
@@ -151,6 +174,8 @@ testcase_preference_avoid() {
         echo "cgroup does not support user xattrs, skipping test for ManagedOOMPreference=avoid"
         return 0
     fi
+
+    [[ "$STRESS_NG_BROKEN" == "1" ]] && { echo "stress-ng is broken on this host, skipping ${FUNCNAME[0]}"; return 0; }
 
     mkdir -p /run/systemd/system/TEST-55-OOMD-testbloat.service.d/
     cat >/run/systemd/system/TEST-55-OOMD-testbloat.service.d/99-managed-oom-preference.conf <<EOF
@@ -213,6 +238,8 @@ EOF
 
 testcase_duration_override() {
     # Verify memory pressure duration can be overridden to non-zero values
+    [[ "$STRESS_NG_BROKEN" == "1" ]] && { echo "stress-ng is broken on this host, skipping ${FUNCNAME[0]}"; return 0; }
+
     mkdir -p /run/systemd/system/TEST-55-OOMD-testmunch.service.d/
     cat >/run/systemd/system/TEST-55-OOMD-testmunch.service.d/99-duration-test.conf <<EOF
 [Service]
@@ -298,8 +325,217 @@ testcase_reload() {
     assert_in 'Default Memory Pressure Duration: 2s' "$(oomctl)"
 }
 
-run_testcases
+testcase_kernel_oom() {
+    cat >/tmp/script.sh <<"EOF"
+#!/usr/bin/env bash
+set -x
+choom --adjust '+1000' -- bash -c 'echo f >/proc/sysrq-trigger && exec sleep infinity'
+choom --adjust '+1000' -p $$
+echo f >/proc/sysrq-trigger
+exec sleep infinity
+EOF
+    chmod +x /tmp/script.sh
 
-systemd-analyze log-level info
+    (! systemd-run --wait --unit oom-kill -p OOMPolicy=continue /tmp/script.sh)
+    # With OOMPolicy=continue, we shouldn't get the oom-kill result.
+    assert_eq "$(systemctl show oom-kill -P Result)" "signal"
+    # Check that OOMKills reports 2 individual processes killed.
+    assert_eq "$(systemctl show oom-kill -P OOMKills)" "2"
+    systemctl reset-failed
+
+    (! systemd-run --wait --unit oom-kill -p OOMPolicy=kill /tmp/script.sh)
+    # Check that a regular kernel oom kill with OOMPolicy=kill results in the oom-kill result.
+    assert_eq "$(systemctl show oom-kill -P Result)" "oom-kill"
+    # Check that OOMKills reports 1 oom group kill instead of the number of processes that were killed.
+    assert_eq "$(systemctl show oom-kill -P OOMKills)" "1"
+    systemctl reset-failed
+
+    cat >/tmp/script.sh <<"EOF"
+#!/usr/bin/env bash
+set -x
+echo '+memory' >/sys/fs/cgroup/system.slice/oom-kill.service/cgroup.subtree_control
+mkdir /sys/fs/cgroup/system.slice/oom-kill.service/sub
+echo 1 >/sys/fs/cgroup/system.slice/oom-kill.service/sub/memory.oom.group
+
+# Start a child process in the subcgroup that will trigger OOM and be killed but keep the main process
+# outside the subcgroup to avoid a race condition where the kernel SIGKILLs the main process before systemd
+# can process the OOM notification. With the main process still alive, systemd should have time to receive
+# the OOM event and enter the 'oom-kill' state before the service exits.
+(
+    echo $BASHPID >/sys/fs/cgroup/system.slice/oom-kill.service/sub/cgroup.procs
+    choom --adjust '+1000' -p $BASHPID
+    echo f >/proc/sysrq-trigger
+    exec sleep infinity
+) &
+wait $! || :
+exec sleep infinity
+EOF
+    chmod +x /tmp/script.sh
+
+    (! systemd-run --wait --unit oom-kill -p OOMPolicy=kill -p Delegate=yes -p DelegateSubgroup=init.scope /tmp/script.sh)
+    # Test that an oom-kill in a delegated unit in a subcgroup with memory.oom.group=1 also results in the
+    # oom-kill exit status.
+    assert_eq "$(systemctl show oom-kill -P Result)" "oom-kill"
+    assert_eq "$(systemctl show oom-kill -P OOMKills)" "1"
+    systemctl reset-failed
+}
+
+testcase_oom_rulesets() {
+    [[ "$STRESS_NG_BROKEN" == "1" ]] && { echo "stress-ng is broken on this host, skipping ${FUNCNAME[0]}"; return 0; }
+
+    # Create a ruleset that triggers on any memory pressure with no delay
+    mkdir -p /run/systemd/oomd/rules.d/
+    cat >/run/systemd/oomd/rules.d/testrule.oomrule <<'EOF'
+[Rule]
+MemoryPressureAbove=0%
+Action=kill-all
+LastingSec=0
+EOF
+
+    systemctl reload systemd-oomd.service
+
+    # Run a transient service with OOMRules=testrule that generates memory pressure
+    (! systemd-run --wait --unit=TEST-55-OOMD-testrules \
+        -p MemoryHigh=3M \
+        -p OOMRules=testrule \
+        stress-ng --timeout 3m --vm 10 --vm-bytes 50M --vm-keep)
+
+    # Verify in the journal that the rule triggered
+    journalctl --sync
+    journalctl -u systemd-oomd.service --since "-2min" | grep "Rule 'testrule' conditions met" >/dev/null
+
+    # clean up
+    rm -f /run/systemd/oomd/rules.d/testrule.oomrule
+    systemctl reload systemd-oomd.service
+}
+
+testcase_oom_rulesets_invalid_name() {
+    # Invalid rule names must be rejected at property-set time (filename_is_valid check).
+    # "foo/bar" contains a slash and "." and ".." are disallowed by filename_is_valid.
+    set +e
+    err=$(systemd-run --wait --unit=TEST-55-OOMD-badname1 -p 'OOMRules=foo/bar' true 2>&1)
+    rc=$?
+    set -e
+    [[ $rc -ne 0 ]]
+    echo "$err" | grep "Invalid rule name" >/dev/null
+
+    set +e
+    err=$(systemd-run --wait --unit=TEST-55-OOMD-badname2 -p 'OOMRules=.' true 2>&1)
+    rc=$?
+    set -e
+    [[ $rc -ne 0 ]]
+    echo "$err" | grep "Invalid rule name" >/dev/null
+}
+
+testcase_oom_rulesets_missing_warning() {
+    # A unit that references a ruleset which does not exist must produce a
+    # warn_missing_rulesets warning in oomd's journal (once, at subscription time).
+    mkdir -p /run/systemd/oomd/rules.d/
+    rm -f /run/systemd/oomd/rules.d/absentrule.oomrule
+    systemctl reload systemd-oomd.service
+
+    # Start a long-lived transient unit that references a ruleset that doesn't exist.
+    systemd-run --unit=TEST-55-OOMD-missing --remain-after-exit \
+        -p OOMRules=absentrule \
+        sleep infinity
+
+    # Give oomd a moment to receive the subscription, then verify the warning fires once.
+    timeout 30 bash -c '
+        until journalctl --sync && journalctl -u systemd-oomd.service --since "-1min" 2>/dev/null | grep "references undefined ruleset .absentrule." >/dev/null; do
+            sleep 1
+        done
+    '
+
+    # And when we now add the ruleset and reload, oomd must pick it up without
+    # the unit needing to restart. Verify by checking for the debug-log line that
+    # reports the ruleset was registered.
+    cat >/run/systemd/oomd/rules.d/absentrule.oomrule <<'EOF'
+[Rule]
+SwapUsageMax=99%
+Action=kill-all
+LastingSec=0
+EOF
+    systemctl reload systemd-oomd.service
+
+    journalctl --sync
+    journalctl -u systemd-oomd.service --since "-1min" | grep "Registered ruleset: absentrule" >/dev/null
+
+    # cleanup
+    systemctl stop TEST-55-OOMD-missing.service
+    rm -f /run/systemd/oomd/rules.d/absentrule.oomrule
+    systemctl reload systemd-oomd.service
+}
+
+testcase_oom_rulesets_lasting_sec() {
+    # A rule with LastingSec > 0 must NOT trigger during the waiting period.
+    # Baseline proof: with the same workload but LastingSec=0 (testcase_oom_rulesets
+    # above) oomd kills the unit within a couple of seconds, so an active unit after
+    # ~6 s demonstrates LastingSec is being respected.
+    [[ "$STRESS_NG_BROKEN" == "1" ]] && { echo "stress-ng is broken on this host, skipping ${FUNCNAME[0]}"; return 0; }
+
+    mkdir -p /run/systemd/oomd/rules.d/
+    cat >/run/systemd/oomd/rules.d/slowrule.oomrule <<'EOF'
+[Rule]
+MemoryPressureAbove=0%
+Action=kill-all
+LastingSec=1h
+EOF
+
+    systemctl reload systemd-oomd.service
+
+    # Start the unit without --wait so we can check mid-run state. The
+    # stress-ng timeout bounds the test if anything goes wrong.
+    systemd-run --unit=TEST-55-OOMD-slowrule \
+        -p MemoryHigh=3M \
+        -p OOMRules=slowrule \
+        stress-ng --timeout 15s --vm 10 --vm-bytes 50M --vm-keep
+
+    # Wait long enough for oomd's 1s rule-check loop to evaluate the condition
+    # many times. With LastingSec=1h the kill must not fire.
+    sleep 6
+
+    # Unit must still be active — if it were killed, Result= would be oom-kill.
+    assert_eq "$(systemctl show TEST-55-OOMD-slowrule.service -P ActiveState)" "active"
+    assert_eq "$(systemctl show TEST-55-OOMD-slowrule.service -P Result)" "success"
+
+    systemctl stop TEST-55-OOMD-slowrule.service 2>/dev/null || true
+
+    # cleanup
+    rm -f /run/systemd/oomd/rules.d/slowrule.oomrule
+    systemctl reload systemd-oomd.service
+}
+
+testcase_prekill_hook() {
+    [[ "$STRESS_NG_BROKEN" == "1" ]] && { echo "stress-ng is broken on this host, skipping ${FUNCNAME[0]}"; return 0; }
+
+    cat >/run/systemd/oomd.conf.d/99-oomd-prekill-test.conf <<'EOF'
+[OOM]
+PrekillHookTimeoutSec=3s
+EOF
+
+    # no hooks
+    systemctl reload systemd-oomd.service
+    ! systemctl start --wait TEST-55-OOMD-testbloat.service || exit 1
+
+    # one hook
+    mkdir -p /run/systemd/oomd.prekill.hook/
+    socat -u UNIX-LISTEN:/run/systemd/oomd.prekill.hook/althook STDOUT >/tmp/oomd_event.json &
+    ! systemctl start --wait TEST-55-OOMD-testbloat.service || exit 1
+    [[ $(jq -r .method </tmp/oomd_event.json) = 'io.systemd.oom.Prekill.Notify' ]]
+
+    rm -f /run/systemd/oomd.prekill.hook/* /tmp/oomd_event.json
+
+    # many hooks
+    for i in {1..4}; do
+        socat -u "UNIX-LISTEN:/run/systemd/oomd.prekill.hook/althook$i" STDOUT >"/tmp/oomd_event$i.json" &
+    done
+
+    ! systemctl start --wait TEST-55-OOMD-testbloat.service || exit 1
+    for j in /tmp/oomd_event*.json; do
+        [[ $(jq -r .method <"$j") = 'io.systemd.oom.Prekill.Notify' ]]
+    done
+}
+
+run_testcases
 
 touch /testok

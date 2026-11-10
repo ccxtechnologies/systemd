@@ -3,6 +3,17 @@
 set -eux
 set -o pipefail
 
+# Verify PrivateIPC= works and creates a separate IPC namespace even if POSIX
+# message queues are not supported.
+host_ipcns=$(readlink /proc/self/ns/ipc)
+private_ipcns=$(systemd-run --quiet --wait --pipe -p PrivateIPC=yes readlink /proc/self/ns/ipc)
+[[ "$private_ipcns" != "$host_ipcns" ]]
+
+if [[ ! -d /proc/sys/fs/mqueue ]]; then
+    echo "POSIX message queues are not supported, skipping ownership checks"
+    exit 77
+fi
+
 # Verify ownership attributes are applied to message queues
 
 # Select arbitrary non-default attributes to apply to the queue.
@@ -19,7 +30,7 @@ at_exit() {
 }
 trap at_exit EXIT
 
-cat << EOF > /run/systemd/system/mqueue-ownership.socket
+cat <<EOF >/run/systemd/system/mqueue-ownership.socket
 [Unit]
 Description=Create a message queue with customized ownership
 [Socket]
@@ -30,12 +41,12 @@ SocketGroup=$group
 SocketMode=$mode
 EOF
 
-cat << 'EOF' > /run/systemd/system/mqueue-ownership.service
+cat <<EOF >/run/systemd/system/mqueue-ownership.service
 [Unit]
 Description=Dummy service for the socket unit
 Requires=%N.socket
 [Service]
-ExecStart=/usr/bin/true
+ExecStart=true
 Type=oneshot
 EOF
 

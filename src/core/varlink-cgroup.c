@@ -4,7 +4,6 @@
 
 #include "bpf-program.h"
 #include "cgroup.h"
-#include "cpu-set-util.h"
 #include "json-util.h"
 #include "in-addr-prefix-util.h"
 #include "ip-protocol-list.h"
@@ -12,35 +11,7 @@
 #include "set.h"
 #include "unit.h"
 #include "varlink-cgroup.h"
-
-#define JSON_BUILD_PAIR_CONDITION_UNSIGNED(condition, name, value) \
-        SD_JSON_BUILD_PAIR_CONDITION(condition, name, SD_JSON_BUILD_UNSIGNED(value))
-
-static int cpu_set_build_json(sd_json_variant **ret, const char *name, void *userdata) {
-        _cleanup_free_ uint8_t *array = NULL;
-        CPUSet *cpuset = ASSERT_PTR(userdata);
-        size_t allocated;
-        int r;
-
-        assert(ret);
-        assert(name);
-
-        if (!cpuset->set)
-                goto empty;
-
-        r = cpu_set_to_dbus(cpuset, &array, &allocated);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to call cpu_set_to_dbus(): %m");
-
-        if (allocated == 0)
-                goto empty;
-
-        return sd_json_variant_new_array_bytes(ret, array, allocated);
-
-empty:
-        *ret = NULL;
-        return 0;
-}
+#include "varlink-common.h"
 
 static int tasks_max_build_json(sd_json_variant **ret, const char *name, void *userdata) {
         CGroupTasksMax *tasks_max = ASSERT_PTR(userdata);
@@ -141,7 +112,7 @@ static int ip_address_access_build_json(sd_json_variant **ret, const char *name,
                 r = sd_json_variant_append_arraybo(
                                 &v,
                                 SD_JSON_BUILD_PAIR_INTEGER("family", i->family),
-                                JSON_BUILD_PAIR_IN_ADDR("address", &i->address, i->family),
+                                JSON_BUILD_PAIR_IN_ADDR("address", i->family, &i->address),
                                 SD_JSON_BUILD_PAIR_UNSIGNED("prefixLength", i->prefixlen));
                 if (r < 0)
                         return r;
@@ -223,6 +194,8 @@ static int device_allow_build_json(sd_json_variant **ret, const char *name, void
         CGroupDeviceAllow *allow = userdata;
         int r;
 
+        assert(ret);
+
         LIST_FOREACH(device_allow, a, allow) {
                 r = sd_json_variant_append_arraybo(
                                 &v,
@@ -248,7 +221,7 @@ static int controllers_build_json(sd_json_variant **ret, const char *name, void 
                 if (!FLAGS_SET(*mask, CGROUP_CONTROLLER_TO_MASK(ctrl)))
                         continue;
 
-                r = sd_json_variant_append_arrayb(&v, SD_JSON_BUILD_STRING(cgroup_controller_to_string(ctrl)));
+                r = sd_json_variant_append_arrayb(&v, JSON_BUILD_STRING_UNDERSCORIFY(cgroup_controller_to_string(ctrl)));
                 if (r < 0)
                         return r;
         }
@@ -283,17 +256,15 @@ int unit_cgroup_context_build_json(sd_json_variant **ret, const char *name, void
                         JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL("StartupCPUWeight", c->startup_cpu_weight, CGROUP_WEIGHT_INVALID),
                         JSON_BUILD_PAIR_FINITE_USEC("CPUQuotaPerSecUSec", c->cpu_quota_per_sec_usec),
                         JSON_BUILD_PAIR_FINITE_USEC("CPUQuotaPeriodUSec", c->cpu_quota_period_usec),
-                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("AllowedCPUs", cpu_set_build_json, &c->cpuset_cpus),
-                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("StartupAllowedCPUs", cpu_set_build_json, &c->startup_cpuset_cpus),
+                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("AllowedCPUs", cpuset_build_json, &c->cpuset_cpus),
+                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("StartupAllowedCPUs", cpuset_build_json, &c->startup_cpuset_cpus),
+                        JSON_BUILD_PAIR_ENUM("CPUSetPartition", cpuset_partition_to_string(c->cpuset_partition)),
 
                         /* Memory Accounting and Control */
                         SD_JSON_BUILD_PAIR_BOOLEAN("MemoryAccounting", c->memory_accounting),
-                        JSON_BUILD_PAIR_CONDITION_UNSIGNED(c->memory_min_set, "MemoryMin", c->memory_min),
-                        JSON_BUILD_PAIR_CONDITION_UNSIGNED(c->default_memory_min_set, "DefaultMemoryMin", c->default_memory_min),
-                        JSON_BUILD_PAIR_CONDITION_UNSIGNED(c->memory_low_set, "MemoryLow", c->memory_low),
-                        JSON_BUILD_PAIR_CONDITION_UNSIGNED(c->default_memory_low_set, "DefaultMemoryLow", c->default_memory_low),
+                        JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL("MemoryMin", c->memory_min, CGROUP_LIMIT_MIN),
+                        JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL("MemoryLow", c->memory_low, CGROUP_LIMIT_MIN),
                         JSON_BUILD_PAIR_CONDITION_UNSIGNED(c->startup_memory_low_set, "StartupMemoryLow", c->startup_memory_low),
-                        JSON_BUILD_PAIR_CONDITION_UNSIGNED(c->default_startup_memory_low_set, "DefaultStartupMemoryLow", c->default_startup_memory_low),
                         JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL("MemoryHigh", c->memory_high, CGROUP_LIMIT_MAX),
                         JSON_BUILD_PAIR_CONDITION_UNSIGNED(c->startup_memory_high_set, "StartupMemoryHigh", c->startup_memory_high),
                         JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL("MemoryMax", c->memory_max, CGROUP_LIMIT_MAX),
@@ -303,8 +274,8 @@ int unit_cgroup_context_build_json(sd_json_variant **ret, const char *name, void
                         JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL("MemoryZSwapMax", c->memory_zswap_max, CGROUP_LIMIT_MAX),
                         JSON_BUILD_PAIR_CONDITION_UNSIGNED(c->startup_memory_zswap_max_set, "StartupMemoryZSwapMax", c->startup_memory_zswap_max),
                         SD_JSON_BUILD_PAIR_BOOLEAN("MemoryZSwapWriteback", c->memory_zswap_writeback),
-                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("AllowedMemoryNodes", cpu_set_build_json, &c->cpuset_mems),
-                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("StartupAllowedMemoryNodes", cpu_set_build_json, &c->startup_cpuset_mems),
+                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("AllowedMemoryNodes", cpuset_build_json, &c->cpuset_mems),
+                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("StartupAllowedMemoryNodes", cpuset_build_json, &c->startup_cpuset_mems),
 
                         /* Process Accounting and Control */
                         SD_JSON_BUILD_PAIR_BOOLEAN("TasksAccounting", c->tasks_accounting),
@@ -331,6 +302,7 @@ int unit_cgroup_context_build_json(sd_json_variant **ret, const char *name, void
                                         SD_JSON_BUILD_OBJECT(
                                                 SD_JSON_BUILD_PAIR_BOOLEAN("isAllowList", c->restrict_network_interfaces_is_allow_list),
                                                 JSON_BUILD_PAIR_STRING_SET("interfaces", c->restrict_network_interfaces))),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("BindNetworkInterface", c->bind_network_interface),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("NFTSet", nft_set_build_json, &c->nft_set_context),
 
                         /* BPF programs */
@@ -340,7 +312,7 @@ int unit_cgroup_context_build_json(sd_json_variant **ret, const char *name, void
 
                         /* Device Access */
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("DeviceAllow", device_allow_build_json, c->device_allow),
-                        SD_JSON_BUILD_PAIR_STRING("DevicePolicy", cgroup_device_policy_to_string(c->device_policy)),
+                        JSON_BUILD_PAIR_ENUM("DevicePolicy", cgroup_device_policy_to_string(c->device_policy)),
 
                         /* Control Group Management */
                         SD_JSON_BUILD_PAIR_BOOLEAN("Delegate", c->delegate),
@@ -349,13 +321,18 @@ int unit_cgroup_context_build_json(sd_json_variant **ret, const char *name, void
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("DisableControllers", controllers_build_json, &c->disable_controllers),
 
                         /* Memory Pressure Control */
-                        SD_JSON_BUILD_PAIR_STRING("ManagedOOMSwap", managed_oom_mode_to_string(c->moom_swap)),
-                        SD_JSON_BUILD_PAIR_STRING("ManagedOOMMemoryPressure", managed_oom_mode_to_string(c->moom_mem_pressure)),
+                        JSON_BUILD_PAIR_ENUM("ManagedOOMSwap", managed_oom_mode_to_string(c->moom_swap)),
+                        JSON_BUILD_PAIR_ENUM("ManagedOOMMemoryPressure", managed_oom_mode_to_string(c->moom_mem_pressure)),
                         JSON_BUILD_PAIR_UNSIGNED_NON_ZERO("ManagedOOMMemoryPressureLimit", c->moom_mem_pressure_limit),
                         JSON_BUILD_PAIR_FINITE_USEC("ManagedOOMMemoryPressureDurationUSec", c->moom_mem_pressure_duration_usec),
-                        SD_JSON_BUILD_PAIR_STRING("ManagedOOMPreference", managed_oom_preference_to_string(c->moom_preference)),
-                        SD_JSON_BUILD_PAIR_STRING("MemoryPressureWatch", cgroup_pressure_watch_to_string(c->memory_pressure_watch)),
-                        JSON_BUILD_PAIR_FINITE_USEC("MemoryPressureThresholdUSec", c->memory_pressure_threshold_usec),
+                        JSON_BUILD_PAIR_ENUM("ManagedOOMPreference", managed_oom_preference_to_string(c->moom_preference)),
+                        JSON_BUILD_PAIR_STRV_NON_EMPTY("OOMRules", c->moom_rules),
+                        JSON_BUILD_PAIR_ENUM("MemoryPressureWatch", cgroup_pressure_watch_to_string(c->pressure[PRESSURE_MEMORY].watch)),
+                        JSON_BUILD_PAIR_FINITE_USEC("MemoryPressureThresholdUSec", c->pressure[PRESSURE_MEMORY].threshold_usec),
+                        JSON_BUILD_PAIR_ENUM("CPUPressureWatch", cgroup_pressure_watch_to_string(c->pressure[PRESSURE_CPU].watch)),
+                        JSON_BUILD_PAIR_FINITE_USEC("CPUPressureThresholdUSec", c->pressure[PRESSURE_CPU].threshold_usec),
+                        JSON_BUILD_PAIR_ENUM("IOPressureWatch", cgroup_pressure_watch_to_string(c->pressure[PRESSURE_IO].watch)),
+                        JSON_BUILD_PAIR_FINITE_USEC("IOPressureThresholdUSec", c->pressure[PRESSURE_IO].threshold_usec),
 
                         /* Others */
                         SD_JSON_BUILD_PAIR_BOOLEAN("CoredumpReceive", c->coredump_receive));
@@ -478,7 +455,7 @@ static int effective_cpuset_build_json(sd_json_variant **ret, const char *name, 
         if (r < 0)
                 return log_debug_errno(r, "Failed to get cpu set '%s': %m", cpuset_name);
 
-        return cpu_set_build_json(ret, name, &cpus);
+        return cpuset_build_json(ret, name, &cpus);
 }
 
 static inline int effective_cpus_build_json(sd_json_variant **ret, const char *name, void *userdata) {
@@ -615,5 +592,9 @@ int unit_cgroup_runtime_build_json(sd_json_variant **ret, const char *name, void
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("IOReadBytes", get_io_counter_build_json, u),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("IOReadOperations", get_io_counter_build_json, u),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("IOWriteBytes", get_io_counter_build_json, u),
-                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("IOWriteOperations", get_io_counter_build_json, u));
+                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("IOWriteOperations", get_io_counter_build_json, u),
+
+                        /* OOM */
+                        SD_JSON_BUILD_PAIR_UNSIGNED("OOMKills", crt->oom_kill_last),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("ManagedOOMKills", crt->managed_oom_kill_last));
 }

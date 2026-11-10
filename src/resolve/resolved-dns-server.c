@@ -5,6 +5,7 @@
 
 #include "alloc-util.h"
 #include "dns-domain.h"
+#include "dns-packet.h"
 #include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
@@ -13,7 +14,6 @@
 #include "resolved-bus.h"
 #include "resolved-dns-cache.h"
 #include "resolved-dns-delegate.h"
-#include "resolved-dns-packet.h"
 #include "resolved-dns-scope.h"
 #include "resolved-dns-search-domain.h"
 #include "resolved-dns-server.h"
@@ -30,9 +30,6 @@
 /* The amount of time to wait before retrying with a full feature set */
 #define DNS_SERVER_FEATURE_GRACE_PERIOD_MAX_USEC (6 * USEC_PER_HOUR)
 #define DNS_SERVER_FEATURE_GRACE_PERIOD_MIN_USEC (5 * USEC_PER_MINUTE)
-
-/* The number of times we will attempt a certain feature set before degrading */
-#define DNS_SERVER_FEATURE_RETRY_ATTEMPTS 3
 
 int dns_server_new(
                 Manager *m,
@@ -271,9 +268,11 @@ static void dns_server_verified(DnsServer *s, DnsServerFeatureLevel level) {
                           dns_server_feature_level_to_string(level),
                           strna(dns_server_string_full(s)));
                 s->verified_feature_level = level;
-        }
 
-        assert_se(sd_event_now(s->manager->event, CLOCK_BOOTTIME, &s->verified_usec) >= 0);
+                /* Restart the grace period, but only when a new level was verified, not on every reply, or
+                 * it never elapses on a server in continuous use. See also dns_server_reset_counters(). */
+                assert_se(sd_event_now(s->manager->event, CLOCK_BOOTTIME, &s->verified_usec) >= 0);
+        }
 }
 
 static void dns_server_reset_counters(DnsServer *s) {
@@ -284,7 +283,13 @@ static void dns_server_reset_counters(DnsServer *s) {
         s->n_failed_tls = 0;
         s->packet_truncated = false;
         s->packet_invalid = false;
-        s->verified_usec = 0;
+
+        /* Restart the grace period, on the event loop's clock like dns_server_grace_period_expired(). This
+         * also runs from dns_server_new(), before the manager has an event loop, hence the fallback. */
+        if (s->manager->event)
+                assert_se(sd_event_now(s->manager->event, CLOCK_BOOTTIME, &s->verified_usec) >= 0);
+        else
+                s->verified_usec = now(CLOCK_BOOTTIME);
 
         /* Note that we do not reset s->packet_bad_opt and s->packet_rrsig_missing here. We reset them only when the
          * grace period ends, but not when lowering the possible feature level, as a lower level feature level should
@@ -444,9 +449,6 @@ static bool dns_server_grace_period_expired(DnsServer *s) {
 
         assert(s);
         assert(s->manager);
-
-        if (s->verified_usec == 0)
-                return false;
 
         assert_se(sd_event_now(s->manager->event, CLOCK_BOOTTIME, &ts) >= 0);
 
@@ -685,7 +687,7 @@ int dns_server_adjust_opt(DnsServer *server, DnsPacket *packet, DnsServerFeature
 
         log_debug("Announcing packet size %zu in egress EDNS(0) packet.", packet_size);
 
-        return dns_packet_append_opt(packet, packet_size, edns_do, /* include_rfc6975 = */ true, NULL, 0, NULL);
+        return dns_packet_append_opt(packet, packet_size, edns_do, /* include_rfc6975= */ true, NULL, 0, NULL);
 }
 
 int dns_server_ifindex(const DnsServer *s) {
@@ -817,7 +819,7 @@ static int dns_server_compare_func(const DnsServer *x, const DnsServer *y) {
         if (r != 0)
                 return r;
 
-        return streq_ptr(x->server_name, y->server_name);
+        return strcmp_ptr(x->server_name, y->server_name);
 }
 
 DEFINE_HASH_OPS(dns_server_hash_ops, DnsServer, dns_server_hash_func, dns_server_compare_func);
@@ -1036,7 +1038,8 @@ DnsServer *manager_set_dns_server(Manager *m, DnsServer *s) {
         dns_server_unref(m->current_dns_server);
         m->current_dns_server = dns_server_ref(s);
 
-        if (m->unicast_scope)
+        /* Skip flushing the cache if server stale feature is enabled. */
+        if (m->unicast_scope && m->stale_retention_usec == 0)
                 dns_cache_flush(&m->unicast_scope->cache);
 
         (void) manager_send_changed(m, "CurrentDNSServer");
@@ -1153,6 +1156,10 @@ void dns_server_flush_cache(DnsServer *s) {
                 s->delegate ? s->delegate->scope :
                               s->manager->unicast_scope;
         if (!scope)
+                return;
+
+        /* Skip flushing the cache if server stale feature is enabled. */
+        if (s->manager->stale_retention_usec > 0)
                 return;
 
         dns_cache_flush(&scope->cache);
@@ -1373,7 +1380,8 @@ int dns_server_dump_configuration_to_json(DnsServer *server, sd_json_variant **r
 
         return sd_json_buildo(
                         ret,
-                        JSON_BUILD_PAIR_IN_ADDR("address", &server->address, server->family),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("addressString", dns_server_string(server)),
+                        JSON_BUILD_PAIR_IN_ADDR("address", server->family, &server->address),
                         SD_JSON_BUILD_PAIR_INTEGER("family", server->family),
                         SD_JSON_BUILD_PAIR_UNSIGNED("port", dns_server_port(server)),
                         SD_JSON_BUILD_PAIR_CONDITION(ifindex > 0, "ifindex", SD_JSON_BUILD_UNSIGNED(ifindex)),

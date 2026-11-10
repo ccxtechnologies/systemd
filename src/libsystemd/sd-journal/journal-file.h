@@ -6,9 +6,9 @@
 
 #include "compress.h"
 #include "forward.h"
-#include "gcrypt-util.h"
 #include "journal-def.h"
 #include "mmap-cache.h"
+#include "ratelimit.h"
 #include "sparse-endian.h"
 
 typedef struct JournalMetrics {
@@ -98,20 +98,7 @@ typedef struct JournalFile {
         void *compress_buffer;
 #endif
 
-        gcry_md_hd_t hmac;
-        bool hmac_running;
-
-        FSSHeader *fss_file;
-        size_t fss_file_size;
-
-        uint64_t fss_start_usec;
-        uint64_t fss_interval_usec;
-
-        void *fsprg_state;
-        size_t fsprg_state_size;
-
-        void *fsprg_seed;
-        size_t fsprg_seed_size;
+        JournalAuthContext *auth_context;
 
         /* When we insert this file into the per-boot priority queue 'newest_by_boot_id' in sd_journal, then by these keys */
         sd_id128_t newest_boot_id;
@@ -121,6 +108,7 @@ typedef struct JournalFile {
         unsigned newest_boot_id_prioq_idx;
         uint64_t newest_entry_offset;
         uint8_t newest_state;
+        RateLimit tail_timestamp_ratelimit; /* rate-limits journal_file_read_tail_timestamp() calls during iteration */
 } JournalFile;
 
 typedef enum JournalFileFlags {
@@ -150,7 +138,7 @@ int journal_file_open(
                 JournalFile **ret);
 
 int journal_file_set_offline_thread_join(JournalFile *f);
-JournalFile* journal_file_close(JournalFile *j);
+JournalFile* journal_file_close(JournalFile *f);
 int journal_file_fstat(JournalFile *f);
 DEFINE_TRIVIAL_CLEANUP_FUNC(JournalFile*, journal_file_close);
 
@@ -232,7 +220,7 @@ int journal_file_data_payload(
                 const char *field,
                 size_t field_length,
                 size_t data_threshold,
-                void **ret_data,
+                const void **ret_data,
                 size_t *ret_size);
 
 static inline size_t journal_file_data_payload_offset(JournalFile *f) {
@@ -335,7 +323,7 @@ uint64_t journal_file_hash_data(JournalFile *f, const void *data, size_t sz);
 
 bool journal_field_valid(const char *p, size_t l, bool allow_protected);
 
-const char* journal_object_type_to_string(ObjectType type) _const_;
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(journal_object_type, ObjectType);
 
 static inline Compression COMPRESSION_FROM_OBJECT(const Object *o) {
         assert(o);

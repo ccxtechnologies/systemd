@@ -25,7 +25,7 @@
 _SD_BEGIN_DECLARATIONS;
 
 /* This implements the Varlink Interface Definition Language ("Varlink IDL"),
- * i.e. https://varlink.org/Interface-Definition
+ * i.e. https://uapi-group.org/specifications/specs/varlink/#interface-definition
  *
  * Primarily allows encoding static interface definitions in C code, that can be converted to the textual IDL
  * format on-the-fly. Can also parse the textual format back to C structures. Validates the interface
@@ -52,7 +52,9 @@ __extension__ typedef enum _SD_ENUM_TYPE_S64(sd_varlink_symbol_type_t) {
 __extension__ typedef enum _SD_ENUM_TYPE_S64(sd_varlink_symbol_flags_t) {
         SD_VARLINK_SUPPORTS_MORE         = 1 << 0, /* Call supports "more" flag */
         SD_VARLINK_REQUIRES_MORE         = 1 << 1, /* Call requires "more" flag */
-        _SD_VARLINK_SYMBOL_FLAGS_MAX     = (1 << 2) - 1,
+        SD_VARLINK_SUPPORTS_UPGRADE      = 1 << 2, /* Call supports "upgrade" flag */
+        SD_VARLINK_REQUIRES_UPGRADE      = 1 << 3, /* Call requires "upgrade" flag */
+        _SD_VARLINK_SYMBOL_FLAGS_MAX     = (1 << 4) - 1,
         _SD_VARLINK_SYMBOL_FLAGS_INVALID = -EINVAL,
         _SD_ENUM_FORCE_S64(SD_VARLINK_SYMBOL_FLAGS)
 } sd_varlink_symbol_flags_t;
@@ -69,6 +71,7 @@ __extension__ typedef enum _SD_ENUM_TYPE_S64(sd_varlink_field_type_t) {
         SD_VARLINK_OBJECT,
         SD_VARLINK_ENUM_VALUE,
         _SD_VARLINK_FIELD_COMMENT,        /* Not really a field, just a comment about a field */
+        SD_VARLINK_ANY,
         _SD_VARLINK_FIELD_TYPE_MAX,
         _SD_VARLINK_FIELD_TYPE_INVALID = -EINVAL,
         _SD_ENUM_FORCE_S64(SD_VARLINK_FIELD)

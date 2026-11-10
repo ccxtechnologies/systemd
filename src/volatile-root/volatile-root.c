@@ -7,6 +7,7 @@
 #include "blockdev-util.h"
 #include "chase.h"
 #include "devnum-util.h"
+#include "dlopen-note.h"
 #include "escape.h"
 #include "log.h"
 #include "main-func.h"
@@ -122,6 +123,8 @@ static int run(int argc, char *argv[]) {
         dev_t devt;
         int r;
 
+        LIBMOUNT_NOTE(recommended);
+
         log_setup();
 
         if (argc > 3)
@@ -157,7 +160,7 @@ static int run(int argc, char *argv[]) {
         if (!IN_SET(m, VOLATILE_YES, VOLATILE_OVERLAY))
                 return 0;
 
-        r = path_is_mount_point_full(path, /* root = */ NULL, AT_SYMLINK_FOLLOW);
+        r = path_is_mount_point_full(path, /* root= */ NULL, AT_SYMLINK_FOLLOW);
         if (r < 0)
                 return log_error_errno(r, "Couldn't determine whether %s is a mount point: %m", path);
         if (r == 0)

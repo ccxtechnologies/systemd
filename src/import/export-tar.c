@@ -1,17 +1,20 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "sd-daemon.h"
 #include "sd-event.h"
 
 #include "alloc-util.h"
 #include "btrfs-util.h"
+#include "dissect-image.h"
 #include "export-tar.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "import-common.h"
 #include "log.h"
+#include "pidref.h"
 #include "pretty-print.h"
 #include "process-util.h"
 #include "ratelimit.h"
@@ -20,21 +23,23 @@
 #include "time-util.h"
 #include "tmpfile-util.h"
 
-#define COPY_BUFFER_SIZE (16*1024)
-
 typedef struct TarExport {
         sd_event *event;
 
         TarExportFinished on_finished;
         void *userdata;
 
+        ImportFlags flags;
+
         char *path;
         char *temp_path;
 
-        int output_fd;
-        int tar_fd;
+        int output_fd; /* compressed tar file in the fs */
+        int tar_fd;    /* uncompressed tar stream coming from child doing the libarchive loop */
+        int tree_fd;   /* directory fd of the tree to set up */
+        int userns_fd;
 
-        ImportCompress compress;
+        Compressor *compress;
 
         sd_event_source *output_event_source;
 
@@ -45,7 +50,7 @@ typedef struct TarExport {
         uint64_t written_compressed;
         uint64_t written_uncompressed;
 
-        pid_t tar_pid;
+        PidRef tar_pid;
 
         struct stat st;
         uint64_t quota_referenced;
@@ -54,7 +59,6 @@ typedef struct TarExport {
         RateLimit progress_ratelimit;
 
         bool eof;
-        bool tried_splice;
 } TarExport;
 
 TarExport *tar_export_unref(TarExport *e) {
@@ -63,15 +67,14 @@ TarExport *tar_export_unref(TarExport *e) {
 
         sd_event_source_unref(e->output_event_source);
 
-        if (e->tar_pid > 1)
-                sigkill_wait(e->tar_pid);
+        pidref_done_sigkill_wait(&e->tar_pid);
 
         if (e->temp_path) {
                 (void) btrfs_subvol_remove(e->temp_path, BTRFS_REMOVE_QUOTA);
                 free(e->temp_path);
         }
 
-        import_compress_free(&e->compress);
+        e->compress = compressor_free(e->compress);
 
         sd_event_unref(e->event);
 
@@ -100,11 +103,14 @@ int tar_export_new(
         *e = (TarExport) {
                 .output_fd = -EBADF,
                 .tar_fd = -EBADF,
+                .tree_fd = -EBADF,
+                .userns_fd = -EBADF,
                 .on_finished = on_finished,
                 .userdata = userdata,
                 .quota_referenced = UINT64_MAX,
                 .last_percent = UINT_MAX,
                 .progress_ratelimit = { 100 * USEC_PER_MSEC, 1 },
+                .tar_pid = PIDREF_NULL,
         };
 
         if (event)
@@ -160,10 +166,13 @@ static int tar_export_finish(TarExport *e) {
         assert(e);
         assert(e->tar_fd >= 0);
 
-        if (e->tar_pid > 0) {
-                r = wait_for_terminate_and_check("tar", TAKE_PID(e->tar_pid), WAIT_LOG);
+        if (pidref_is_set(&e->tar_pid)) {
+                r = pidref_wait_for_terminate_and_check("tar", &e->tar_pid, WAIT_LOG);
                 if (r < 0)
                         return r;
+
+                pidref_done(&e->tar_pid);
+
                 if (r != EXIT_SUCCESS)
                         return -EPROTO;
         }
@@ -179,29 +188,8 @@ static int tar_export_process(TarExport *e) {
 
         assert(e);
 
-        if (!e->tried_splice && e->compress.type == IMPORT_COMPRESS_UNCOMPRESSED) {
-
-                l = splice(e->tar_fd, NULL, e->output_fd, NULL, COPY_BUFFER_SIZE, 0);
-                if (l < 0) {
-                        if (errno == EAGAIN)
-                                return 0;
-
-                        e->tried_splice = true;
-                } else if (l == 0) {
-                        r = tar_export_finish(e);
-                        goto finish;
-                } else {
-                        e->written_uncompressed += l;
-                        e->written_compressed += l;
-
-                        tar_export_report_progress(e);
-
-                        return 0;
-                }
-        }
-
         while (e->buffer_size <= 0) {
-                uint8_t input[COPY_BUFFER_SIZE];
+                uint8_t input[COMPRESS_PIPE_BUFFER_SIZE];
 
                 if (e->eof) {
                         r = tar_export_finish(e);
@@ -216,10 +204,10 @@ static int tar_export_process(TarExport *e) {
 
                 if (l == 0) {
                         e->eof = true;
-                        r = import_compress_finish(&e->compress, &e->buffer, &e->buffer_size, &e->buffer_allocated);
+                        r = compressor_finish(e->compress, &e->buffer, &e->buffer_size, &e->buffer_allocated);
                 } else {
                         e->written_uncompressed += l;
-                        r = import_compress(&e->compress, input, l, &e->buffer, &e->buffer_size, &e->buffer_allocated);
+                        r = compressor_start(e->compress, input, l, &e->buffer, &e->buffer_size, &e->buffer_allocated);
                 }
                 if (r < 0) {
                         r = log_error_errno(r, "Failed to encode: %m");
@@ -269,15 +257,21 @@ static int tar_export_on_defer(sd_event_source *s, void *userdata) {
         return tar_export_process(i);
 }
 
-int tar_export_start(TarExport *e, const char *path, int fd, ImportCompressType compress) {
+int tar_export_start(
+                TarExport *e,
+                const char *path,
+                int fd,
+                Compression compress,
+                ImportFlags flags) {
+
         _cleanup_close_ int sfd = -EBADF;
         int r;
 
         assert(e);
         assert(path);
         assert(fd >= 0);
-        assert(compress < _IMPORT_COMPRESS_TYPE_MAX);
-        assert(compress != IMPORT_COMPRESS_UNKNOWN);
+        assert(compress >= 0);
+        assert(compress < _COMPRESSION_MAX);
 
         if (e->output_fd >= 0)
                 return -EBUSY;
@@ -297,6 +291,7 @@ int tar_export_start(TarExport *e, const char *path, int fd, ImportCompressType 
         if (r < 0)
                 return r;
 
+        e->flags = flags;
         e->quota_referenced = UINT64_MAX;
 
         if (btrfs_might_be_subvol(&e->st)) {
@@ -320,7 +315,7 @@ int tar_export_start(TarExport *e, const char *path, int fd, ImportCompressType 
                 }
         }
 
-        r = import_compress_init(&e->compress, compress);
+        r = compressor_new(&e->compress, compress);
         if (r < 0)
                 return r;
 
@@ -335,7 +330,38 @@ int tar_export_start(TarExport *e, const char *path, int fd, ImportCompressType 
         if (r < 0)
                 return r;
 
-        e->tar_fd = import_fork_tar_c(e->temp_path ?: e->path, &e->tar_pid);
+        const char *p = e->temp_path ?: e->path;
+
+        if (FLAGS_SET(e->flags, IMPORT_FOREIGN_UID)) {
+                r = import_make_foreign_userns(&e->userns_fd);
+                if (r < 0)
+                        return r;
+
+                _cleanup_close_ int directory_fd = open(p, O_DIRECTORY|O_CLOEXEC|O_PATH);
+                if (directory_fd < 0)
+                        return log_error_errno(r, "Failed to open '%s': %m", p);
+
+                _cleanup_close_ int mapped_fd = -EBADF;
+                r = mountfsd_mount_directory_fd(
+                                /* vl= */ NULL,
+                                directory_fd,
+                                e->userns_fd,
+                                DISSECT_IMAGE_FOREIGN_UID,
+                                &mapped_fd);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to mount directory via mountfsd: %m");
+
+                /* Drop O_PATH */
+                e->tree_fd = fd_reopen(mapped_fd, O_DIRECTORY|O_CLOEXEC);
+                if (e->tree_fd < 0)
+                        return log_error_errno(errno, "Failed to re-open mapped '%s': %m", p);
+        } else {
+                e->tree_fd = open(p, O_DIRECTORY|O_CLOEXEC);
+                if (e->tree_fd < 0)
+                        return log_error_errno(errno, "Failed to open '%s': %m", p);
+        }
+
+        e->tar_fd = import_fork_tar_c(e->tree_fd, e->userns_fd, &e->tar_pid);
         if (e->tar_fd < 0) {
                 e->output_event_source = sd_event_source_unref(e->output_event_source);
                 return e->tar_fd;

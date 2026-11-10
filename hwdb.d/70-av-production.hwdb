@@ -37,6 +37,10 @@ usb:v2982p1967*
 usb:v33AEp0001*
  ID_AV_PRODUCTION_CONTROLLER=1
 
+# Beacn Mic (alt mode)
+usb:v33AEp8001*
+ ID_AV_PRODUCTION_CONTROLLER=1
+
 # Beacn Studio
 usb:v33AEp0003*
  ID_AV_PRODUCTION_CONTROLLER=1
@@ -51,6 +55,13 @@ usb:v33AEp0004*
 
 # Beacn Mix Create
 usb:v33AEp0007*
+ ID_AV_PRODUCTION_CONTROLLER=1
+
+###################
+# Blue Microphones
+###################
+# Yeti X
+usb:v046Dp0AAF*
  ID_AV_PRODUCTION_CONTROLLER=1
 
 ################
@@ -116,6 +127,13 @@ usb:v0FD9p0084*
 
 # Stream Deck Pedal
 usb:v0FD9p0086*
+ ID_AV_PRODUCTION_CONTROLLER=1
+
+################
+# Griffin
+################
+# PowerMate
+usb:v077Dp0410*
  ID_AV_PRODUCTION_CONTROLLER=1
 
 #############################
@@ -229,6 +247,25 @@ usb:v17CCp1210*
 
 # Traktor Kontrol Z2
 usb:v17CCp1130*
+ ID_AV_PRODUCTION_CONTROLLER=1
+
+# Traktor MX2
+usb:v17CCp2420*
+ ID_AV_PRODUCTION_CONTROLLER=1
+
+####################
+# PCPanel
+####################
+# PCPanel Mini
+usb:v0483pA3C4*
+ ID_AV_PRODUCTION_CONTROLLER=1
+
+# PCPanel Pro
+usb:v0483pA3C5*
+ ID_AV_PRODUCTION_CONTROLLER=1
+
+# PCPanel RGB
+usb:v04D8pEB52*
  ID_AV_PRODUCTION_CONTROLLER=1
 
 ####################

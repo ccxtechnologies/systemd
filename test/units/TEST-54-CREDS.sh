@@ -6,8 +6,6 @@ set -eux
 # shellcheck source=test/units/util.sh
 . "$(dirname "$0")"/util.sh
 
-systemd-analyze log-level debug
-
 run_with_cred_compare() (
     local cred="${1:?}"
     local exp="${2?}"
@@ -19,12 +17,13 @@ run_with_cred_compare() (
     trap "rm -f '$log_file'" RETURN
 
     set -o pipefail
-    systemd-run -p SetCredential="$cred" --wait --pipe -- systemd-creds "$@" | tee "$log_file"
+    # This has been observed to get stuck under ASAN, so add a timeout as precaution
+    timeout 120 systemd-run -p SetCredential="$cred" --wait --pipe -- systemd-creds "$@" | tee "$log_file"
     diff "$log_file" <(echo -ne "$exp")
 )
 
 test_mount_with_credential() {
-    local credfile tmpdir unit
+    local credfile tmpdir unit mount_path mount_test
     credfile="/tmp/mount-cred"
     tmpdir="/tmp/test-54-mount"
     unit=$(systemd-escape --suffix mount --path "$tmpdir")
@@ -42,19 +41,21 @@ LoadCredential=loadcred:$credfile
 EOF
 
     # Set up test mount type
-    cat >/usr/sbin/mount.thisisatest <<EOF
+    mount_path="$(command -v mount 2>/dev/null)"
+    mount_test="${mount_path/\/bin/\/sbin}.thisisatest"
+    cat >"$mount_test" <<EOF
 #!/usr/bin/env bash
 # Mount after verifying credential file content
 if [ \$(cat \${CREDENTIALS_DIRECTORY}/loadcred) = "foo" ]; then
     mount -t tmpfs \$1 \$2
 fi
 EOF
-    chmod +x /usr/sbin/mount.thisisatest
+    chmod +x "$mount_test"
 
     # Verify mount succeeds
     systemctl daemon-reload
     systemctl start "$unit"
-    systemctl --no-pager show -p SubState --value "$unit" | grep -q mounted
+    systemctl --no-pager show -p SubState --value "$unit" | grep mounted >/dev/null
 
     # Verify mount fails with different credential file content
     echo bar >"$credfile"
@@ -62,7 +63,7 @@ EOF
 
     # Stop unit and delete files
     systemctl stop "$unit"
-    rm -f "$credfile" /run/systemd/system/"$unit" /usr/sbin/mount.thisisatest
+    rm -f "$credfile" /run/systemd/system/"$unit" "$mount_test"
     rm -rf "$tmpdir"
 }
 
@@ -114,10 +115,9 @@ run_with_cred_compare "mycred:" "" cat mycred
 run_with_cred_compare "mycred:\n" "\n" cat mycred
 run_with_cred_compare "mycred:foo" "foo" cat mycred
 run_with_cred_compare "mycred:foo" "foofoofoo" cat mycred mycred mycred
-# Note: --newline= does nothing when stdout is not a tty, which is the case here
-run_with_cred_compare "mycred:foo" "foo" --newline=yes cat mycred
-run_with_cred_compare "mycred:foo" "foo" --newline=no cat mycred
 run_with_cred_compare "mycred:foo" "foo" --newline=auto cat mycred
+run_with_cred_compare "mycred:foo" "foo" --newline=no cat mycred
+run_with_cred_compare "mycred:foo" "foo\n" --newline=yes cat mycred
 run_with_cred_compare "mycred:foo" "foo" --transcode=no cat mycred
 run_with_cred_compare "mycred:foo" "foo" --transcode=0 cat mycred
 run_with_cred_compare "mycred:foo" "foo" --transcode=false cat mycred
@@ -165,6 +165,50 @@ rm -f /tmp/cred.{enc,dec}
 systemd-creds --not-after="+1d" encrypt /tmp/cred.orig /tmp/cred.enc
 (! systemd-creds --timestamp="+2d" decrypt /tmp/cred.enc /tmp/cred.dec)
 systemd-creds decrypt /tmp/cred.enc /tmp/cred.dec
+diff /tmp/cred.orig /tmp/cred.dec
+rm -f /tmp/cred.{enc,dec}
+ts="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+(! systemd-creds --with-key=null --timestamp="$ts" --not-after="$ts" encrypt /tmp/cred.orig /tmp/cred.enc)
+
+# Null-key credentials and the systemd.credentials_boot_policy= setting.
+#
+# A null-key credential ("--with-key=null") is wrapped in the normal systemd-creds
+# envelope but offers neither confidentiality nor authenticity, so whether it is
+# accepted at decrypt time is governed by systemd.credentials_boot_policy= and the system
+# state. We only assert the branches that are deterministic regardless of the test
+# bed's TPM2/SecureBoot state (which is fixed and has no test override here); the
+# full accepts_null() truth table for all states is covered by test-creds.c.
+systemd-creds --name=nullcred --with-key=null encrypt /tmp/cred.orig /tmp/cred.enc
+
+# --allow-null bypasses the policy, even under the strictest setting.
+SYSTEMD_PROC_CMDLINE="systemd.credentials_boot_policy=strict" \
+    systemd-creds --name=nullcred --allow-null decrypt /tmp/cred.enc /tmp/cred.dec
+diff /tmp/cred.orig /tmp/cred.dec
+rm -f /tmp/cred.dec
+
+# --refuse-null always refuses, even under the most permissive setting.
+(! SYSTEMD_PROC_CMDLINE="systemd.credentials_boot_policy=off" \
+    systemd-creds --name=nullcred --refuse-null decrypt /tmp/cred.enc /tmp/cred.dec)
+
+# strict never accepts a null key, regardless of system state.
+(! SYSTEMD_PROC_CMDLINE="systemd.credentials_boot_policy=strict" \
+    systemd-creds --name=nullcred decrypt /tmp/cred.enc /tmp/cred.dec)
+
+# off always accepts a null key, regardless of system state.
+SYSTEMD_PROC_CMDLINE="systemd.credentials_boot_policy=off" \
+    systemd-creds --name=nullcred decrypt /tmp/cred.enc /tmp/cred.dec
+diff /tmp/cred.orig /tmp/cred.dec
+rm -f /tmp/cred.dec
+
+# An invalid policy value falls back to the default (relaxed), which accepts during first boot.
+SYSTEMD_PROC_CMDLINE="systemd.credentials_boot_policy=bogus" SYSTEMD_FIRST_BOOT=1 \
+    systemd-creds --name=nullcred decrypt /tmp/cred.enc /tmp/cred.dec
+diff /tmp/cred.orig /tmp/cred.dec
+rm -f /tmp/cred.dec
+
+# tofu accepts during first boot, independent of TPM2/SecureBoot.
+SYSTEMD_PROC_CMDLINE="systemd.credentials_boot_policy=tofu" SYSTEMD_FIRST_BOOT=1 \
+    systemd-creds --name=nullcred decrypt /tmp/cred.enc /tmp/cred.dec
 diff /tmp/cred.orig /tmp/cred.dec
 rm -f /tmp/cred.{enc,dec}
 
@@ -408,7 +452,7 @@ systemd-run -p "ImportCredentialEx=test.creds.first" \
 cmp /tmp/ts54-concat <(echo -n aaa)
 
 # Now test encrypted credentials (only supported when built with OpenSSL though)
-if systemctl --version | grep -q -- +OPENSSL ; then
+if systemctl --version | grep -- +OPENSSL  >/dev/null; then
     echo -n $RANDOM >/tmp/test-54-plaintext
     systemd-creds encrypt --name=test-54 /tmp/test-54-plaintext /tmp/test-54-ciphertext
     systemd-creds decrypt --name=test-54 /tmp/test-54-ciphertext | cmp /tmp/test-54-plaintext
@@ -446,6 +490,13 @@ systemd-run -p DynamicUser=yes -p 'LoadCredential=os:/etc/os-release' \
             --service-type=oneshot --wait --pipe \
             true | cmp /etc/os-release
 
+# https://github.com/systemd/systemd/issues/35788
+systemd-run -p DynamicUser=yes -p 'LoadCredential=os:/etc/os-release' \
+            -p 'ExecCondition=systemd-creds cat os' \
+            --unit=test-54-exec-condition.service \
+            --service-type=oneshot --wait --pipe \
+            true | cmp /etc/os-release
+
 # https://github.com/systemd/systemd/pull/24734#issuecomment-1925440546
 # Also ExecStartPre= should be able to update creds
 dd if=/dev/urandom of=/tmp/cred-huge bs=600K count=1
@@ -477,18 +528,38 @@ if ! systemd-detect-virt -q -c ; then
     grep -q /injected /proc/self/mountinfo
 
     # Make sure the getty generator processed the credentials properly
-    systemctl -P Wants show getty.target | grep -q container-getty@idontexist.service
+    systemctl -P Wants show getty.target | grep container-getty@idontexist.service >/dev/null
 fi
 
 # Decrypt/encrypt via varlink
 
-echo '{"data":"Zm9vYmFyCg=="}' > /tmp/vlcredsdata
+DATA="Zm9vYmFyCg=="
+echo "{\"data\":\"$DATA\"}" >/tmp/vlcredsdata
 
 varlinkctl call /run/systemd/io.systemd.Credentials io.systemd.Credentials.Encrypt "$(cat /tmp/vlcredsdata)" | \
-    varlinkctl call --json=short /run/systemd/io.systemd.Credentials io.systemd.Credentials.Decrypt > /tmp/vlcredsdata2
+    varlinkctl call --json=short /run/systemd/io.systemd.Credentials io.systemd.Credentials.Decrypt >/tmp/vlcredsdata2
+
+cmp /tmp/vlcredsdata /tmp/vlcredsdata2
+rm /tmp/vlcredsdata2
+
+# Pick a key type explicitly
+varlinkctl call /run/systemd/io.systemd.Credentials io.systemd.Credentials.Encrypt "{\"data\":\"$DATA\",\"withKey\":\"host\"}" | \
+    varlinkctl call --json=short /run/systemd/io.systemd.Credentials io.systemd.Credentials.Decrypt >/tmp/vlcredsdata2
+
+cmp /tmp/vlcredsdata /tmp/vlcredsdata2
+rm /tmp/vlcredsdata2
+
+varlinkctl call /run/systemd/io.systemd.Credentials io.systemd.Credentials.Encrypt "{\"data\":\"$DATA\",\"withKey\":\"null\"}" | \
+    jq '.["allowNull"] = true' |
+    varlinkctl call --json=short /run/systemd/io.systemd.Credentials io.systemd.Credentials.Decrypt >/tmp/vlcredsdata2
 
 cmp /tmp/vlcredsdata /tmp/vlcredsdata2
 rm /tmp/vlcredsdata /tmp/vlcredsdata2
+
+# Ensure allowNull works
+(! varlinkctl call /run/systemd/io.systemd.Credentials io.systemd.Credentials.Encrypt "{\"data\":\"$DATA\",\"withKey\":\"null\"}" | \
+    jq '.["allowNull"] = false' |
+    varlinkctl call --json=short /run/systemd/io.systemd.Credentials io.systemd.Credentials.Decrypt )
 
 clean_usertest() {
     rm -f /tmp/usertest.data /tmp/usertest.data /tmp/brummbaer.data
@@ -527,6 +598,123 @@ run0 -u testuser --pipe mkdir -p /home/testuser/.config/credstore.encrypted
 run0 -u testuser --pipe systemd-creds encrypt --user --name=brummbaer - /home/testuser/.config/credstore.encrypted/brummbaer < /tmp/brummbaer.data
 run0 -u testuser --pipe systemd-run --user --pipe -p ImportCredential=brummbaer systemd-creds cat brummbaer | cmp /tmp/brummbaer.data
 
-systemd-analyze log-level info
+# https://github.com/systemd/systemd/pull/40108
+run0 -u testuser --pipe systemd-run --user --wait -p ImportCredential=brummbaer -p ExecStartPre='ls -l $CREDENTIALS_DIRECTORY' bash -c 'systemd-creds cat brummbaer | cmp /tmp/brummbaer.data'
+
+# https://github.com/systemd/systemd/pull/39651
+TESTUSER_CRED_DIR="/run/user/$(id -u testuser)/credentials"
+
+PID="$(systemd-notify --fork -- systemd-run -M testuser@ --user --wait --unit=brummbaer.service -p LoadCredential=brummbaer sleep infinity)"
+[[ -d "$TESTUSER_CRED_DIR/brummbaer.service" ]]
+[[ -f "$TESTUSER_CRED_DIR/brummbaer.service/brummbaer" ]]
+
+systemd-run -M testuser@ --user --wait -p PrivateMounts=yes -p ImportCredential=brummbaer \
+    bash -xec "[[ ! -d '$TESTUSER_CRED_DIR/brummbaer.service' ]] && [[ \$(stat -c %a /run/credentials) -eq 0 ]]"
+systemd-run -M testuser@ --user --wait -p ImportCredential=brummbaer \
+    test -d "$TESTUSER_CRED_DIR/brummbaer.service"
+
+kill "$PID"
+
+# Now test credential refreshing
+
+UNIT_NAME="TEST-54-CREDS-refreshing-$RANDOM.service"
+OUTPUT_FILE="/tmp/$UNIT_NAME.out"
+POST_FLAG_FILE="/tmp/$UNIT_NAME.post-flag"
+
+cat >/run/systemd/system/"$UNIT_NAME" <<EOF
+[Service]
+Type=notify-reload
+ImportCredential=test.creds.*
+ExecStart=/usr/lib/systemd/tests/testdata/TEST-54-CREDS.units/refresh.sh $OUTPUT_FILE
+EOF
+
+systemctl start "$UNIT_NAME"
+ls -l /run/credentials/"$UNIT_NAME"/
+
+echo "neu" >/run/credstore/test.creds.new-refresh-1
+[[ ! -e /run/credentials/"$UNIT_NAME"/test.creds.new-refresh-1 ]]
+
+systemctl reload "$UNIT_NAME"
+[[ ! -e /run/credentials/"$UNIT_NAME"/test.creds.new-refresh-1 ]]
+(! grep -q "test.creds.new-refresh-1" "$OUTPUT_FILE")
+
+echo "RefreshOnReload=credentials" >>/run/systemd/system/"$UNIT_NAME"
+systemctl daemon-reload
+systemctl reload "$UNIT_NAME"
+diff /run/credstore/test.creds.new-refresh-1 /run/credentials/"$UNIT_NAME"/test.creds.new-refresh-1
+diff "$OUTPUT_FILE" <(grep . /run/credentials/"$UNIT_NAME"/*)
+
+systemctl stop "$UNIT_NAME"
+cat >>/run/systemd/system/"$UNIT_NAME" <<EOF
+ProtectSystem=strict
+ReadWritePaths=/tmp
+ExecReloadPost=bash -c 'diff $OUTPUT_FILE <(grep . %d/*) || rm -v $POST_FLAG_FILE'
+EOF
+
+systemctl daemon-reload
+systemctl start "$UNIT_NAME"
+diff /run/credstore/test.creds.new-refresh-1 /run/credentials/"$UNIT_NAME"/test.creds.new-refresh-1
+diff "$OUTPUT_FILE" <(grep . /run/credentials/"$UNIT_NAME"/*)
+
+systemctl reload "$UNIT_NAME"
+diff "$OUTPUT_FILE" <(grep . /run/credentials/"$UNIT_NAME"/*)
+
+echo "2" >/run/credstore/test.creds.new-refresh-2
+[[ ! -e /run/credentials/"$UNIT_NAME"/test.creds.new-refresh-2 ]]
+
+systemctl reload "$UNIT_NAME"
+diff /run/credstore/test.creds.new-refresh-2 /run/credentials/"$UNIT_NAME"/test.creds.new-refresh-2
+diff "$OUTPUT_FILE" <(grep . /run/credentials/"$UNIT_NAME"/*)
+
+echo "3" >/run/credstore/test.creds.new-refresh-3
+[[ ! -e /run/credentials/"$UNIT_NAME"/test.creds.new-refresh-3 ]]
+
+rm "$OUTPUT_FILE"
+systemctl edit --runtime --stdin "$UNIT_NAME" <<EOF
+[Service]
+Type=notify
+ExecReloadPost=
+EOF
+systemctl reload "$UNIT_NAME"
+diff /run/credstore/test.creds.new-refresh-3 /run/credentials/"$UNIT_NAME"/test.creds.new-refresh-3
+[[ ! -e "$OUTPUT_FILE" ]]
+
+echo "RefreshOnReload=no" >>/run/systemd/system/"$UNIT_NAME"
+systemctl daemon-reload
+assert_eq "$(systemctl show "$UNIT_NAME" -P CanReload)" "no"
+systemctl revert "$UNIT_NAME"
+assert_eq "$(systemctl show "$UNIT_NAME" -P CanReload)" "yes"
+
+echo "BOGUS" >/run/credstore/test.creds.refresh-bogus
+touch "$POST_FLAG_FILE"
+systemctl reload "$UNIT_NAME"
+diff /run/credstore/test.creds.new-refresh-3 /run/credentials/"$UNIT_NAME"/test.creds.new-refresh-3
+[[ ! -e /run/credentials/"$UNIT_NAME"/test.creds.refresh-bogus ]]
+diff "$OUTPUT_FILE" <(grep . /run/credentials/"$UNIT_NAME"/*)
+[[ ! -e "$POST_FLAG_FILE" ]]
+
+OUTPUT_FILE_USER="/tmp/TEST-54-CREDS-refreshing-user.out"
+
+systemd-notify --fork -- \
+    systemd-run -M testuser@ --user --wait \
+        --unit=brummbaer-refresh.service \
+        --service-type=notify-reload \
+        -p NotifyAccess=all \
+        -p 'ImportCredential=brummbaer*' \
+        -p RefreshOnReload=credentials \
+        -p ProtectSystem=strict \
+        -p ReadWritePaths=/tmp \
+        /usr/lib/systemd/tests/testdata/TEST-54-CREDS.units/refresh.sh "$OUTPUT_FILE_USER"
+
+[[ -f "$TESTUSER_CRED_DIR/brummbaer-refresh.service/brummbaer" ]]
+diff "$OUTPUT_FILE_USER" <(grep . "$TESTUSER_CRED_DIR"/brummbaer-refresh.service/*)
+
+run0 -u testuser --pipe -i \
+     --property=EnvironmentFile=-/usr/lib/systemd/systemd-asan-env \
+     'mkdir -p .config/credstore && echo "refreshed" >.config/credstore/brummbaer.refreshed'
+
+systemctl -M testuser@ --user reload brummbaer-refresh.service
+assert_eq "$(cat "$TESTUSER_CRED_DIR"/brummbaer-refresh.service/brummbaer.refreshed)" "refreshed"
+diff "$OUTPUT_FILE_USER" <(grep . "$TESTUSER_CRED_DIR"/brummbaer-refresh.service/*)
 
 touch /testok

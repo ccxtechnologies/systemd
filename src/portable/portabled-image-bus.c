@@ -61,7 +61,7 @@ int bus_image_common_get_os_release(
                 return 1;
 
         if (!image->metadata_valid) {
-                r = image_read_metadata(image, &image_policy_service);
+                r = image_read_metadata(image, /* root= */ NULL, &image_policy_service, m->runtime_scope);
                 if (r < 0)
                         return sd_bus_error_set_errnof(error, r, "Failed to read image metadata: %m");
         }
@@ -145,11 +145,20 @@ int bus_image_common_get_metadata(
                 flags |= input_flags;
         }
 
+        /* Inspecting an image loop-mounts it as root, so we authenticate extension images that are
+         * specified by path like the image itself. */
+        bool extension_by_path = false;
+        STRV_FOREACH(i, extension_images)
+                if (!image_name_is_valid(*i)) {
+                        extension_by_path = true;
+                        break;
+                }
+
         r = bus_image_acquire(m,
                               message,
                               name_or_path,
                               image,
-                              BUS_IMAGE_AUTHENTICATE_BY_PATH,
+                              extension_by_path ? BUS_IMAGE_AUTHENTICATE_ALL : BUS_IMAGE_AUTHENTICATE_BY_PATH,
                               "org.freedesktop.portable1.inspect-images",
                               &image,
                               error);
@@ -454,16 +463,18 @@ static int bus_image_method_detach(
                         flags |= PORTABLE_RUNTIME;
         }
 
-        r = bus_verify_polkit_async(
-                        message,
-                        "org.freedesktop.portable1.attach-images",
-                        /* details= */ NULL,
-                        &m->polkit_registry,
-                        error);
-        if (r < 0)
-                return r;
-        if (r == 0)
-                return 1; /* Will call us back */
+        if (m->runtime_scope != RUNTIME_SCOPE_USER) {
+                r = bus_verify_polkit_async(
+                                message,
+                                "org.freedesktop.portable1.attach-images",
+                                /* details= */ NULL,
+                                &m->polkit_registry,
+                                error);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 1; /* Will call us back */
+        }
 
         r = portable_detach(
                         m->runtime_scope,
@@ -488,7 +499,7 @@ int bus_image_common_remove(
                 sd_bus_error *error) {
 
         _cleanup_close_pair_ int errno_pipe_fd[2] = EBADF_PAIR;
-        _cleanup_(sigkill_waitp) pid_t child = 0;
+        _cleanup_(pidref_done_sigkill_wait) PidRef child = PIDREF_NULL;
         PortableState state;
         int r;
 
@@ -533,13 +544,13 @@ int bus_image_common_remove(
         if (pipe2(errno_pipe_fd, O_CLOEXEC|O_NONBLOCK) < 0)
                 return sd_bus_error_set_errnof(error, errno, "Failed to create pipe: %m");
 
-        r = safe_fork("(sd-imgrm)", FORK_RESET_SIGNALS, &child);
+        r = pidref_safe_fork("(sd-imgrm)", FORK_RESET_SIGNALS, &child);
         if (r < 0)
                 return sd_bus_error_set_errnof(error, r, "Failed to fork(): %m");
         if (r == 0) {
                 errno_pipe_fd[0] = safe_close(errno_pipe_fd[0]);
 
-                r = image_remove(image);
+                r = image_remove(image, m->runtime_scope);
                 if (r < 0) {
                         (void) write(errno_pipe_fd[1], &r, sizeof(r));
                         _exit(EXIT_FAILURE);
@@ -550,11 +561,11 @@ int bus_image_common_remove(
 
         errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
 
-        r = operation_new(m, child, message, errno_pipe_fd[0], NULL);
+        r = operation_new(m, &child, message, errno_pipe_fd[0], NULL);
         if (r < 0)
                 return r;
 
-        child = 0;
+        /* We don't need to disarm child cleanup here because operation_new() takes over ownership internally. */
         errno_pipe_fd[0] = -EBADF;
 
         return 1;
@@ -588,14 +599,6 @@ static int normalize_portable_changes(
                 return -ENOMEM;
 
         CLEANUP_ARRAY(changes, n_changes, portable_changes_free);
-
-        /* Corner case: only detached, nothing attached */
-        if (n_changes_attached == 0) {
-                memcpy(changes, changes_detached, sizeof(PortableChange) * n_changes_detached);
-                *ret_changes = TAKE_PTR(changes);
-                *ret_n_changes = n_changes_detached;
-                return 0;
-        }
 
         for (size_t i = 0; i < n_changes_detached; ++i) {
                 bool found = false;
@@ -720,6 +723,11 @@ int bus_image_common_reattach(
         if (r == 0) /* Will call us back */
                 return 1;
 
+        /* portable_attach() checks this too, but by then the image is detached already. */
+        r = portable_profile_validate(m->runtime_scope, profile, error);
+        if (r < 0)
+                return r;
+
         r = portable_detach(
                         m->runtime_scope,
                         sd_bus_message_get_bus(message),
@@ -801,7 +809,7 @@ int bus_image_common_mark_read_only(
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = image_read_only(image, read_only);
+        r = image_read_only(image, read_only, m->runtime_scope);
         if (r < 0)
                 return r;
 
@@ -865,7 +873,7 @@ const sd_bus_vtable image_vtable[] = {
         SD_BUS_PROPERTY("Name", "s", NULL, offsetof(Image, name), 0),
         SD_BUS_PROPERTY("Path", "s", NULL, offsetof(Image, path), 0),
         SD_BUS_PROPERTY("Type", "s", property_get_type,  offsetof(Image, type), 0),
-        SD_BUS_PROPERTY("ReadOnly", "b", bus_property_get_bool, offsetof(Image, read_only), 0),
+        SD_BUS_PROPERTY("ReadOnly", "b", bus_property_get_image_is_read_only, 0, 0),
         SD_BUS_PROPERTY("CreationTimestamp", "t", NULL, offsetof(Image, crtime), 0),
         SD_BUS_PROPERTY("ModificationTimestamp", "t", NULL, offsetof(Image, mtime), 0),
         SD_BUS_PROPERTY("Usage", "t", NULL, offsetof(Image, usage), 0),
@@ -1015,7 +1023,7 @@ int bus_image_acquire(
 
         /* Acquires an 'Image' object if not acquired yet, and enforces necessary authentication while doing so. */
 
-        if (mode == BUS_IMAGE_AUTHENTICATE_ALL) {
+        if (mode == BUS_IMAGE_AUTHENTICATE_ALL && m->runtime_scope != RUNTIME_SCOPE_USER) {
                 r = bus_verify_polkit_async(
                                 message,
                                 polkit_action,
@@ -1066,7 +1074,7 @@ int bus_image_acquire(
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
                                                  "Image path '%s' is not normalized.", name_or_path);
 
-                if (mode == BUS_IMAGE_AUTHENTICATE_BY_PATH) {
+                if (mode == BUS_IMAGE_AUTHENTICATE_BY_PATH && m->runtime_scope != RUNTIME_SCOPE_USER) {
                         r = bus_verify_polkit_async(
                                         message,
                                         polkit_action,

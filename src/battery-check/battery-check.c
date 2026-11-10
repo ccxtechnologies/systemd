@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
-#include <sys/socket.h>
+#include <sys/socket.h>         /* IWYU pragma: keep */
 
+#include "sd-json.h"
 #include "sd-messages.h"
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "battery-util.h"
 #include "build.h"
 #include "fd-util.h"
@@ -13,10 +14,10 @@
 #include "log.h"
 #include "main-func.h"
 #include "plymouth-util.h"
-#include "pretty-print.h"
 #include "proc-cmdline.h"
 #include "terminal-util.h"
 #include "time-util.h"
+#include "verbs.h"
 
 #define BATTERY_LOW_MESSAGE \
         "Battery level critically low. Please connect your charger or the system will power off in 10 seconds."
@@ -25,26 +26,11 @@
 
 static bool arg_doit = true;
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-battery-check", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s\n\n"
-               "%sCheck battery level to see whether there's enough charge.%s\n\n"
-               "   -h --help            Show this help\n"
-               "      --version         Show package version\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               link);
-
-        return 0;
-}
+COMMAND(
+        "systemd-battery-check\0",
+        "Check battery level to see whether there's enough charge.",
+        .man_pages = "systemd-battery-check(8)\0",
+);
 
 static int plymouth_send_message(const char *mode, const char *message) {
         _cleanup_free_ char *plymouth_message = NULL;
@@ -70,41 +56,26 @@ static int plymouth_send_message(const char *mode, const char *message) {
         return 0;
 }
 
-static int parse_argv(int argc, char * argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-        };
-
-        static const struct option options[] = {
-                { "help",    no_argument, NULL, 'h'         },
-                { "version", no_argument, NULL, ARG_VERSION },
-                {}
-        };
-
-        int c;
-
+static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (optind < argc)
+        if (option_parser_get_n_args(&opts) != 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "%s takes no argument.",
                                        program_invocation_short_name);
@@ -147,10 +118,10 @@ static int run(int argc, char *argv[]) {
                 log_warning_errno(fd, "Failed to open console, ignoring: %m");
         else
                 dprintf(fd, ANSI_HIGHLIGHT_RED "%s " BATTERY_LOW_MESSAGE ANSI_NORMAL "\n",
-                        glyph_full(GLYPH_LOW_BATTERY, /* force_utf = */ false));
+                        glyph_full(GLYPH_LOW_BATTERY, /* force_utf= */ false));
 
         if (asprintf(&plymouth_message, "%s " BATTERY_LOW_MESSAGE,
-                     glyph_full(GLYPH_LOW_BATTERY, /* force_utf = */ true)) < 0)
+                     glyph_full(GLYPH_LOW_BATTERY, /* force_utf= */ true)) < 0)
                 return log_oom();
 
         (void) plymouth_send_message("shutdown", plymouth_message);

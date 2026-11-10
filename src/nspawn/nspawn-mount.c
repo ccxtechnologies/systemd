@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <linux/magic.h>
+#include <sched.h>
 #include <sys/mount.h>
 #include <unistd.h>
 
@@ -13,7 +14,7 @@
 #include "format-util.h"
 #include "fs-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "namespace-util.h"
@@ -533,7 +534,7 @@ int mount_all(const char *dest,
               const char *selinux_apifs_context) {
 
 #define PROC_INACCESSIBLE_REG(path)                                     \
-        { "/run/systemd/inaccessible/reg", (path), NULL, NULL, MS_BIND, \
+        { "/run/host/inaccessible/reg", (path), NULL, NULL, MS_BIND,    \
           MOUNT_IN_USERNS|MOUNT_APPLY_APIVFS_RO }, /* Bind mount first ... */ \
         { NULL, (path), NULL, NULL, MS_BIND|MS_RDONLY|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_REMOUNT, \
           MOUNT_IN_USERNS|MOUNT_APPLY_APIVFS_RO } /* Then, make it r/o */
@@ -756,12 +757,13 @@ int mount_all(const char *dest,
 }
 
 static int parse_mount_bind_options(const char *options, unsigned long *open_tree_flags, char **mount_opts, RemountIdmapping *idmapping) {
-        unsigned long flags = *open_tree_flags;
+        unsigned long flags = *ASSERT_PTR(open_tree_flags);
         char *opts = NULL;
-        RemountIdmapping new_idmapping = *idmapping;
+        RemountIdmapping new_idmapping = *ASSERT_PTR(idmapping);
         int r;
 
         assert(options);
+        assert(mount_opts);
 
         for (;;) {
                 _cleanup_free_ char *word = NULL;
@@ -814,9 +816,20 @@ static int mount_bind(const char *dest, CustomMount *m, uid_t uid_shift, uid_t u
                         return r;
         }
 
+        /* ID remapping cannot be done if user namespaces are not in use (uid_shift is UID_INVALID).
+         * Fail if idmapping was explicitly requested in this state. Otherwise, treat UID_INVALID
+         * as 0 for ownership operations. */
+        if (idmapping != REMOUNT_IDMAPPING_NONE && !uid_is_valid(uid_shift))
+                return log_error_errno(
+                                SYNTHETIC_ERRNO(EINVAL),
+                                "ID remapping requested for %s, but user namespacing is not enabled.",
+                                m->source);
+
+        uid_t chown_uid = uid_is_valid(uid_shift) ? uid_shift : 0;
+
         /* If this is a bind mount from a temporary sources change ownership of the source to the container's
          * root UID. Otherwise it would always show up as "nobody" if user namespacing is used. */
-        if (m->rm_rf_tmpdir && chown(m->source, uid_shift, uid_shift) < 0)
+        if (m->rm_rf_tmpdir && chown(m->source, chown_uid, chown_uid) < 0)
                 return log_error_errno(errno, "Failed to chown %s: %m", m->source);
 
         /* UID/GIDs of idmapped mounts are always resolved in the caller's user namespace. In other
@@ -826,17 +839,16 @@ static int mount_bind(const char *dest, CustomMount *m, uid_t uid_shift, uid_t u
          * caller's userns *without* any mount idmapping in place. To get that uid, we clone the
          * mount source tree and clear any existing idmapping and temporarily mount that tree over
          * the mount source before we stat the mount source to figure out the source uid. */
-        _cleanup_close_ int fd_clone = open_tree_attr_with_fallback(
+        _cleanup_close_ int fd_clone =
+                idmapping == REMOUNT_IDMAPPING_NONE ?
+                RET_NERRNO(open_tree(
                         AT_FDCWD,
                         m->source,
-                        open_tree_flags,
-                        &(struct mount_attr) {
-                                .attr_clr = idmapping != REMOUNT_IDMAPPING_NONE ? MOUNT_ATTR_IDMAP : 0,
-                        });
-        if (ERRNO_IS_NEG_NOT_SUPPORTED(fd_clone))
-                /* We can only clear idmapped mounts with open_tree_attr(), but there might not be one in
-                 * the first place, so we keep going if we get a not supported error. */
-                fd_clone = open_tree(AT_FDCWD, m->source, open_tree_flags);
+                        open_tree_flags)) :
+                open_tree_try_drop_idmap(
+                        AT_FDCWD,
+                        m->source,
+                        open_tree_flags);
         if (fd_clone < 0)
                 return log_error_errno(errno, "Failed to clone %s: %m", m->source);
 
@@ -851,7 +863,7 @@ static int mount_bind(const char *dest, CustomMount *m, uid_t uid_shift, uid_t u
                 if (stat(where, &dest_st) < 0)
                         return log_error_errno(errno, "Failed to stat %s: %m", where);
 
-                dest_uid = uid_is_valid(m->destination_uid) ? uid_shift + m->destination_uid : dest_st.st_uid;
+                dest_uid = uid_is_valid(m->destination_uid) ? chown_uid + m->destination_uid : dest_st.st_uid;
 
                 if (S_ISDIR(source_st.st_mode) && !S_ISDIR(dest_st.st_mode))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -864,7 +876,7 @@ static int mount_bind(const char *dest, CustomMount *m, uid_t uid_shift, uid_t u
                                                m->source, where);
 
         } else { /* Path doesn't exist yet? */
-                r = mkdir_parents_safe_label(dest, where, 0755, uid_shift, uid_shift, MKDIR_IGNORE_EXISTING);
+                r = mkdir_parents_safe_label(dest, where, 0755, chown_uid, chown_uid, MKDIR_IGNORE_EXISTING);
                 if (r < 0)
                         return log_error_errno(r, "Failed to make parents of %s: %m", where);
 
@@ -879,10 +891,10 @@ static int mount_bind(const char *dest, CustomMount *m, uid_t uid_shift, uid_t u
                 if (r < 0)
                         return log_error_errno(r, "Failed to create mount point %s: %m", where);
 
-                if (chown(where, uid_shift, uid_shift) < 0)
+                if (chown(where, chown_uid, chown_uid) < 0)
                         return log_error_errno(errno, "Failed to chown %s: %m", where);
 
-                dest_uid = uid_shift + (uid_is_valid(m->destination_uid) ? m->destination_uid : 0);
+                dest_uid = chown_uid + (uid_is_valid(m->destination_uid) ? m->destination_uid : 0);
         }
 
         if (move_mount(fd_clone, "", AT_FDCWD, where, MOVE_MOUNT_F_EMPTY_PATH) < 0)
@@ -1359,7 +1371,9 @@ int pivot_root_parse(char **pivot_root_new, char **pivot_root_old, const char *s
 
         if (!path_is_absolute(root_new))
                 return -EINVAL;
-        if (root_old && !path_is_absolute(root_old))
+        if (!path_is_normalized(root_new))
+                return -EINVAL;
+        if (root_old && (!path_is_absolute(root_old) || !path_is_normalized(root_old)))
                 return -EINVAL;
 
         free_and_replace(*pivot_root_new, root_new);
@@ -1481,7 +1495,7 @@ static int do_wipe_fully_visible_api_fs(void) {
 
 int wipe_fully_visible_api_fs(int mntns_fd) {
         _cleanup_close_ int orig_mntns_fd = -EBADF;
-        int r, rr;
+        int r;
 
         log_debug("Wiping fully visible API FS");
 
@@ -1489,23 +1503,13 @@ int wipe_fully_visible_api_fs(int mntns_fd) {
         if (orig_mntns_fd < 0)
                 return log_error_errno(orig_mntns_fd, "Failed to pin originating mount namespace: %m");
 
-        r = namespace_enter(/* pidns_fd = */ -EBADF,
-                            mntns_fd,
-                            /* netns_fd = */ -EBADF,
-                            /* userns_fd = */ -EBADF,
-                            /* root_fd = */ -EBADF);
-        if (r < 0)
-                return log_error_errno(r, "Failed to enter mount namespace: %m");
+        if (setns(mntns_fd, CLONE_NEWNS) < 0)
+                return log_error_errno(errno, "Failed to enter mount namespace: %m");
 
-        rr = do_wipe_fully_visible_api_fs();
+        r = do_wipe_fully_visible_api_fs();
 
-        r = namespace_enter(/* pidns_fd = */ -EBADF,
-                            orig_mntns_fd,
-                            /* netns_fd = */ -EBADF,
-                            /* userns_fd = */ -EBADF,
-                            /* root_fd = */ -EBADF);
-        if (r < 0)
-                return log_error_errno(r, "Failed to enter original mount namespace: %m");
+        if (setns(orig_mntns_fd, CLONE_NEWNS) < 0)
+                return log_error_errno(errno, "Failed to enter original mount namespace: %m");
 
-        return rr;
+        return r;
 }

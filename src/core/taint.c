@@ -6,15 +6,16 @@
 #include "clock-util.h"
 #include "constants.h"
 #include "errno-util.h"
-#include "fileio.h"
 #include "fs-util.h"
 #include "log.h"
 #include "os-util.h"
 #include "path-util.h"
 #include "string-util.h"
 #include "strv.h"
+#include "sysctl-util.h"
 #include "taint.h"
 #include "uid-range.h"
+#include "user-util.h"
 
 static int short_uid_gid_range(UIDRangeUsernsMode mode) {
         _cleanup_(uid_range_freep) UIDRange *p = NULL;
@@ -35,6 +36,7 @@ static int short_uid_gid_range(UIDRangeUsernsMode mode) {
 char** taint_strv(void) {
         const char *stage[11] = {};
         size_t n = 0;
+        int r;
 
         /* Returns a "taint string", e.g. "local-hwclock:var-run-bad". Only things that are detected at
          * runtime should be tagged here. For stuff that is known during compilation, emit a warning in the
@@ -42,15 +44,18 @@ char** taint_strv(void) {
 
         _cleanup_free_ char *bin = NULL, *usr_sbin = NULL, *var_run = NULL;
 
-        if (readlink_malloc("/bin", &bin) < 0 || !PATH_IN_SET(bin, "usr/bin", "/usr/bin"))
+        r = readlink_malloc("/bin", &bin);
+        if (r != -ENOENT && (r < 0 || !PATH_IN_SET(bin, "usr/bin", "/usr/bin")))
                 stage[n++] = "unmerged-usr";
 
         /* Note that the check is different from default_PATH(), as we want to taint on uncanonical symlinks
          * too. */
-        if (readlink_malloc("/usr/sbin", &usr_sbin) < 0 || !PATH_IN_SET(usr_sbin, "bin", "/usr/bin"))
+        r = readlink_malloc("/usr/sbin", &usr_sbin);
+        if (r != -ENOENT && (r < 0 || !PATH_IN_SET(usr_sbin, "bin", "/usr/bin")))
                 stage[n++] = "unmerged-bin";
 
-        if (readlink_malloc("/var/run", &var_run) < 0 || !PATH_IN_SET(var_run, "../run", "/run"))
+        r = readlink_malloc("/var/run", &var_run);
+        if (r != -ENOENT && (r < 0 || !PATH_IN_SET(var_run, "../run", "/run")))
                 stage[n++] = "var-run-bad";
 
         if (clock_is_localtime(NULL) > 0)
@@ -64,12 +69,15 @@ char** taint_strv(void) {
         if (strverscmp_improved(uts.release, KERNEL_BASELINE_VERSION) < 0)
                 stage[n++] = "old-kernel";
 
-        _cleanup_free_ char *overflowuid = NULL, *overflowgid = NULL;
-        if (read_one_line_file("/proc/sys/kernel/overflowuid", &overflowuid) >= 0 &&
-            !streq(overflowuid, "65534"))
+        /* Taint if the value is not the expected one, or cannot be parsed (-EINVAL/-ERANGE), but not if
+         * the sysctl cannot be read at all. */
+        uid_t overflowuid;
+        r = sysctl_read_uint32("kernel/overflowuid", &overflowuid);
+        if (IN_SET(r, -EINVAL, -ERANGE) || (r >= 0 && overflowuid != UID_NOBODY))
                 stage[n++] = "overflowuid-not-65534";
-        if (read_one_line_file("/proc/sys/kernel/overflowgid", &overflowgid) >= 0 &&
-            !streq(overflowgid, "65534"))
+        gid_t overflowgid;
+        r = sysctl_read_uint32("kernel/overflowgid", &overflowgid);
+        if (IN_SET(r, -EINVAL, -ERANGE) || (r >= 0 && overflowgid != GID_NOBODY))
                 stage[n++] = "overflowgid-not-65534";
 
         if (short_uid_gid_range(UID_RANGE_USERNS_INSIDE) > 0)

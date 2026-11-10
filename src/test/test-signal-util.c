@@ -13,8 +13,9 @@ TEST(rt_signals) {
         info(SIGRTMIN);
         info(SIGRTMAX);
 
-        /* We use signals SIGRTMIN+0 to SIGRTMIN+30 unconditionally */
-        assert_se(SIGRTMAX - SIGRTMIN >= 30);
+        /* We use signals SIGRTMIN+0 to SIGRTMIN+29 unconditionally. SIGRTMIN+30 can be used only when
+         * built with glibc. */
+        assert_se(SIGRTMAX - SIGRTMIN >= 29);
 }
 
 static void test_signal_to_string_one(int val) {
@@ -100,6 +101,17 @@ TEST(signal_from_string) {
         test_signal_from_string_number("  +5", 5);
         test_signal_from_string_number("10000", -ERANGE);
         test_signal_from_string_number("-2", -ERANGE);
+}
+
+TEST(signal_code_to_string) {
+        assert_se(streq_ptr(signal_code_to_string(SIGSEGV, SEGV_MAPERR), "SEGV_MAPERR"));
+        assert_se(streq_ptr(signal_code_to_string(SIGILL, ILL_ILLOPC), "ILL_ILLOPC"));
+        assert_se(streq_ptr(signal_code_to_string(SIGCHLD, CLD_CONTINUED), "CLD_CONTINUED"));
+        assert_se(streq_ptr(signal_code_to_string(SIGABRT, SI_TKILL), "SI_TKILL"));
+        assert_se(streq_ptr(signal_code_to_string(SIGABRT, SI_USER), "SI_USER"));
+        assert_se(streq_ptr(signal_code_to_string(SIGABRT, SI_KERNEL), "SI_KERNEL"));
+        assert_se(streq_ptr(signal_code_to_string(SIGSYS, SYS_SECCOMP), "SYS_SECCOMP"));
+        assert_se(signal_code_to_string(SIGABRT, 99) == NULL);
 }
 
 TEST(block_signals) {

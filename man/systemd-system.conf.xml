@@ -326,6 +326,34 @@
 
         <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
+
+      <varlistentry>
+        <term><varname>DefaultCPUPressureWatch=</varname></term>
+        <term><varname>DefaultCPUPressureThresholdSec=</varname></term>
+
+        <listitem><para>Configures the default settings for the per-unit
+        <varname>CPUPressureWatch=</varname> and <varname>CPUPressureThresholdSec=</varname>
+        settings. See
+        <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        for details. Defaults to <literal>auto</literal> and <literal>200ms</literal>, respectively. This
+        also sets the CPU pressure monitoring threshold for the service manager itself.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>DefaultIOPressureWatch=</varname></term>
+        <term><varname>DefaultIOPressureThresholdSec=</varname></term>
+
+        <listitem><para>Configures the default settings for the per-unit
+        <varname>IOPressureWatch=</varname> and <varname>IOPressureThresholdSec=</varname>
+        settings. See
+        <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        for details. Defaults to <literal>auto</literal> and <literal>200ms</literal>, respectively. This
+        also sets the IO pressure monitoring threshold for the service manager itself.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
+      </varlistentry>
     </variablelist>
   </refsect1>
 
@@ -505,6 +533,56 @@
       </varlistentry>
 
       <varlistentry>
+        <term><varname>RestrictFileSystemAccess=</varname></term>
+
+        <listitem><para>Takes a boolean argument or the special value <literal>exec</literal>. Defaults to
+        <literal>no</literal>. When enabled, PID 1 loads a BPF LSM program that enforces a deny-default
+        execution policy: only binaries residing on signed dm-verity block devices (and the initramfs during
+        early boot) are permitted to execute. Execution from tmpfs, procfs, sysfs, unsigned dm-verity devices,
+        and anonymous executable memory mappings is denied.</para>
+
+        <para>This setting is intended as one component of an image-based, fully verified system, where the
+        whole boot chain (firmware, kernel image, kernel command line, initramfs) is measured and attested.
+        On a general-purpose system without such guarantees it does not provide a meaningful security
+        boundary on its own: an attacker with sufficient privilege to edit
+        <filename>system.conf</filename>, modify the kernel command line, or kexec into an unsigned initrd
+        can disable or bypass the policy.</para>
+
+        <para>The enforcement hooks block <function>execve()</function> of untrusted binaries
+        (<literal>bprm_check_security</literal>), <constant>PROT_EXEC</constant> memory mappings including
+        shared libraries (<literal>mmap_file</literal>), and write-to-execute transitions such as JIT
+        compilation (<literal>file_mprotect</literal>).</para>
+
+        <para>The policy also enforces W^X system-wide: no mapping may be writable and executable at the
+        same time, and a private file mapping that has been modified through copy-on-write may not be made
+        executable afterwards.</para>
+
+        <para>Since v262, files on overlayfs mounts are resolved to the layer that hosts their data, so
+        execution from an overlay whose data resides on a signed dm-verity device is permitted, while files
+        in a writable upper layer are denied. This requires kernel v7.2 or newer; on older kernels execution from
+        overlayfs mounts is denied entirely. Note that only the file data is checked, so an untrusted upper
+        layer may still control a binary's ownership and setuid bits. Multi-device filesystems such as
+        btrfs are unsupported.</para>
+
+        <para>Note that, without further measures to secure the system, kexec can be used to circumvent
+        this.</para>
+
+        <para>This requires the kernel to be booted with <literal>dm_verity.require_signatures=1</literal>
+        and <literal>proc_mem.force_override=never</literal> on the kernel command line, and with BPF LSM
+        enabled (<literal>lsm=...,bpf</literal>).</para>
+
+        <para>The value <literal>yes</literal> is equivalent to <literal>exec</literal>. Additional
+        modes may be added in the future.</para>
+
+        <para>This option may also be set via the <varname>systemd.restrict_filesystem_access=</varname> kernel command
+        line option, see
+        <citerefentry><refentrytitle>kernel-command-line</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>SystemCallArchitectures=</varname></term>
 
         <listitem><para>Takes a space-separated list of architecture
@@ -581,9 +659,9 @@
         </para>
 
         <para><varname>DefaultTimeoutStartSec=</varname> and <varname>DefaultTimeoutStopSec=</varname>
-        default to &DEFAULT_TIMEOUT; in the system manager and &DEFAULT_USER_TIMEOUT; in the user manager.
-        <varname>DefaultTimeoutAbortSec=</varname> is not set by default so that all units fall back to
-        <varname>TimeoutStopSec=</varname>. <varname>DefaultRestartSec=</varname> defaults to 100 ms.
+        default to &DEFAULT_TIMEOUT_SEC; in the system manager and &DEFAULT_USER_TIMEOUT_SEC; in the user
+        manager. <varname>DefaultTimeoutAbortSec=</varname> is not set by default so that all units fall back
+        to <varname>TimeoutStopSec=</varname>. <varname>DefaultRestartSec=</varname> defaults to 100 ms.
         </para>
 
         <xi:include href="version-info.xml" xpointer="v209"/></listitem>
@@ -597,8 +675,8 @@
         and <filename>/etc/crypttab</filename> (see
         <citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
         <citerefentry><refentrytitle>crypttab</refentrytitle><manvolnum>5</manvolnum></citerefentry>).
-        Defaults to &DEFAULT_TIMEOUT; in the system manager and &DEFAULT_USER_TIMEOUT; in the user manager.
-        </para>
+        Defaults to &DEFAULT_TIMEOUT_SEC; in the system manager and &DEFAULT_USER_TIMEOUT_SEC; in the user
+        manager.</para>
 
         <xi:include href="version-info.xml" xpointer="v252"/></listitem>
       </varlistentry>
@@ -633,6 +711,38 @@
 
         <xi:include href="version-info.xml" xpointer="v253"/></listitem>
       </varlistentry>
+
+      <varlistentry>
+        <term><varname>EventLoopRateLimitIntervalSec=</varname></term>
+        <term><varname>EventLoopRateLimitBurst=</varname></term>
+
+        <listitem><para>Configures the rate limiting applied to the manager's main event loop. If the event
+        loop iterates more than <varname>EventLoopRateLimitBurst=</varname> times within
+        <varname>EventLoopRateLimitIntervalSec=</varname>, event processing is briefly paused to prevent
+        excessive CPU usage. <varname>EventLoopRateLimitIntervalSec=</varname> defaults to 1s.
+        <varname>EventLoopRateLimitBurst=</varname> defaults to 50000. These settings can also be set on the
+        kernel command line via
+        <varname>systemd.event_loop_ratelimit_interval_sec=</varname> and
+        <varname>systemd.event_loop_ratelimit_burst=</varname>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>MinimumUptimeSec=</varname></term>
+
+        <listitem><para>Specifies the minimum uptime for the system which has to be reached before a shutdown
+        is executed. Defaults to 15s. This mechanism is introduced to avoid high frequency reboot loops, when
+        technical failures trigger an automatic shutdown during the boot process. Each reboot cycle is
+        delayed to the specified minimum time, giving the user a chance to review screen contents or
+        otherwise interact with the device before the shutdown proceeds. The delay takes place during the
+        very last phase of system shutdown, immediately before the <function>reboot()</function> system call
+        is executed. If the system is already running for longer than the specified time, this setting has no
+        effect. This logic is also skipped in container environments. Set to zero in order to disable this
+        logic.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
+      </varlistentry>
     </variablelist>
   </refsect1>
 
@@ -641,34 +751,14 @@
 
     <variablelist class='config-directives'>
       <varlistentry>
-        <term><varname>ManagerEnvironment=</varname></term>
-
-        <listitem><para>Takes the same arguments as <varname>DefaultEnvironment=</varname>, see above. Sets
-        environment variables for the manager process itself. These variables are inherited by processes
-        spawned by user managers, but not the system manager - use <varname>DefaultEnvironment=</varname>
-        for that. Note that these variables are merged into the existing environment block. In particular, in
-        case of the system manager, this includes variables set by the kernel based on the kernel command line.
-        As with <varname>DefaultEnvironment=</varname>, this environment block is internal, and changes are not
-        reflected in the manager's <filename>/proc/PID/environ</filename>.</para>
-
-        <para>Setting environment variables for the manager process may be useful to modify its behaviour.
-        See <ulink url="https://systemd.io/ENVIRONMENT">Known Environment Variables</ulink> for a
-        descriptions of some variables understood by <command>systemd</command>.</para>
-
-        <para>Simple <literal>%</literal>-specifier expansion is supported, see below for a list of supported
-        specifiers.</para>
-
-        <xi:include href="version-info.xml" xpointer="v248"/>
-        </listitem>
-      </varlistentry>
-
-      <varlistentry>
         <term><varname>DefaultEnvironment=</varname></term>
 
         <listitem><para>Configures environment variables passed to all executed processes. Takes a
         space-separated list of variable assignments. See <citerefentry
         project='man-pages'><refentrytitle>environ</refentrytitle><manvolnum>7</manvolnum></citerefentry> for
-        details about environment variables.</para>
+        details about environment variables. This environment block is internal, and changes are not
+        reflected in the manager's <filename>/proc/PID/environ</filename>.
+        </para>
 
         <para>Simple <literal>%</literal>-specifier expansion is supported, see below for a list of supported
         specifiers.</para>
@@ -683,6 +773,42 @@
         <literal>VAR3</literal>.</para>
 
         <xi:include href="version-info.xml" xpointer="v205"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>ManagerEnvironment=</varname></term>
+
+        <listitem><para>Sets environment variables for the manager process itself. Takes a space-separated
+        list of variable assignment in the same format as <varname>DefaultEnvironment=</varname>, see above.
+        These variables are merged into the existing environment block of the manager process. In particular,
+        in case of the system manager, this block includes variables set by the kernel based on the kernel
+        command line, and in case of the user manager, the variables passed by the system manager. After
+        those variables have been merged, they will persist until overridden, even if the manager is reloaded
+        or reexecuted. In case of the user manager, these variables are also inherited by processes spawned
+        by the manager. As with <varname>DefaultEnvironment=</varname>, this environment block is internal,
+        and changes are not reflected in the manager's <filename>/proc/PID/environ</filename>.</para>
+
+        <para>Setting environment variables for the manager process may be useful to modify its behaviour.
+        See <ulink url="https://systemd.io/ENVIRONMENT">Known Environment Variables</ulink> for a description
+        of some variables understood by <command>systemd</command>.</para>
+
+        <para>Simple <literal>%</literal>-specifier expansion is supported, see below for a list of supported
+        specifiers.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>DefaultMemoryZSwapWriteback=</varname></term>
+
+        <listitem><para>Takes a boolean argument. Defaults to true if unspecified. This is used as a default
+        for units which lack an explicit definition for <varname>MemoryZSwapWriteback=</varname>.
+        See <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        for the details.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/>
+        </listitem>
       </varlistentry>
     </variablelist>
   </refsect1>

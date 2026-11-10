@@ -3,6 +3,7 @@
 #include <linux/capability.h>
 
 #include "sd-bus.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "analyze-verify-util.h"
@@ -13,6 +14,7 @@
 #include "bus-map-properties.h"
 #include "bus-unit-util.h"
 #include "bus-util.h"
+#include "capability-util.h"
 #include "copy.h"
 #include "env-util.h"
 #include "fd-util.h"
@@ -106,6 +108,8 @@ typedef struct SecurityInfo {
         Set *system_call_filter;
 
         mode_t _umask;
+
+        RuntimeScope runtime_scope;
 } SecurityInfo;
 
 struct security_assessor {
@@ -135,7 +139,7 @@ static SecurityInfo *security_info_new(void) {
 
         *info = (SecurityInfo) {
                 .default_dependencies = true,
-                .capability_bounding_set = UINT64_MAX,
+                .capability_bounding_set = CAP_MASK_ALL,
                 .restrict_namespaces = UINT64_MAX,
                 ._umask = 0002,
         };
@@ -179,6 +183,13 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(SecurityInfo*, security_info_free);
 
 static bool security_info_runs_privileged(const SecurityInfo *i)  {
         assert(i);
+
+        /* For the common --user case the manager runs as a regular user and cannot switch
+         * UID, so user-scope services never end up privileged. We deliberately do not
+         * handle root-owned user managers (user@0.service) here: in that narrow case the
+         * service really is privileged and will be mis-classified. */
+        if (i->runtime_scope == RUNTIME_SCOPE_USER)
+                return false;
 
         if (STRPTR_IN_SET(i->user, "0", "root"))
                 return true;
@@ -229,6 +240,12 @@ static int assess_user(
                 b = 0;
         } else if (info->user && !STR_IN_SET(info->user, "0", "root", "")) {
                 d = "Service runs under a static non-root user identity";
+                b = 0;
+        } else if (info->runtime_scope == RUNTIME_SCOPE_USER) {
+                /* Same caveat as security_info_runs_privileged(): root-owned user
+                 * managers (user@0.service) will be reported as non-root here, which is
+                 * incorrect but matches the heuristic. */
+                d = "Service runs under the calling user's identity";
                 b = 0;
         } else {
                 *ret_badness = 10;
@@ -475,6 +492,12 @@ static int assess_remove_ipc(
         assert(ret_badness);
         assert(ret_description);
 
+        if (info->runtime_scope == RUNTIME_SCOPE_USER) {
+                *ret_badness = UINT64_MAX;
+                return strdup_to(ret_description,
+                                 "RemoveIPC= has no effect on per-user services");
+        }
+
         if (security_info_runs_privileged(info))
                 *ret_badness = UINT64_MAX;
         else
@@ -556,6 +579,8 @@ static int assess_system_call_architectures(
 }
 
 static bool syscall_names_in_filter(Set *s, bool allow_list, const SyscallFilterSet *f, const char **ret_offending_syscall) {
+        assert(ret_offending_syscall);
+
         NULSTR_FOREACH(syscall, f->value) {
                 if (syscall[0] == '@') {
                         const SyscallFilterSet *g;
@@ -568,13 +593,12 @@ static bool syscall_names_in_filter(Set *s, bool allow_list, const SyscallFilter
                 }
 
                 /* Let's see if the system call actually exists on this platform, before complaining */
-                if (seccomp_syscall_resolve_name(syscall) < 0)
+                if (sym_seccomp_syscall_resolve_name(syscall) < 0)
                         continue;
 
                 if (set_contains(s, syscall) == allow_list) {
                         log_debug("Offending syscall filter item: %s", syscall);
-                        if (ret_offending_syscall)
-                                *ret_offending_syscall = syscall;
+                        *ret_offending_syscall = syscall;
                         return true; /* bad! */
                 }
         }
@@ -601,6 +625,13 @@ static int assess_system_call_filter(
         char *d;
         uint64_t b;
         int r;
+
+        r = dlopen_libseccomp(LOG_DEBUG);
+        if (r < 0) {
+                *ret_badness = UINT64_MAX;
+                *ret_description = NULL;
+                return r;
+        }
 
         if (!info->system_call_filter_allow_list && set_isempty(info->system_call_filter)) {
                 r = strdup_to(&d, "Service does not filter system calls");
@@ -1876,7 +1907,7 @@ static int assess(const SecurityInfo *info,
                                 return log_error_errno(r, "Failed to set columns to display: %m");
                 }
 
-                r = table_print_with_pager(details_table, json_format_flags, pager_flags, /* show_header= */true);
+                r = table_print_with_pager(details_table, json_format_flags, pager_flags, /* show_header= */ true);
                 if (r < 0)
                         return r;
         }
@@ -2282,7 +2313,7 @@ static int property_read_device_allow(
         return sd_bus_message_exit_container(m);
 }
 
-static int acquire_security_info(sd_bus *bus, const char *name, SecurityInfo *info, AnalyzeSecurityFlags flags) {
+static int acquire_security_info(sd_bus *bus, const char *name, SecurityInfo *info, RuntimeScope scope, AnalyzeSecurityFlags flags) {
 
         static const struct bus_properties_map security_map[] = {
                 { "AmbientCapabilities",     "t",       NULL,                                    offsetof(SecurityInfo, ambient_capabilities)      },
@@ -2328,7 +2359,7 @@ static int acquire_security_info(sd_bus *bus, const char *name, SecurityInfo *in
                 { "RootImage",               "s",       NULL,                                    offsetof(SecurityInfo, root_image)                },
                 { "SupplementaryGroups",     "as",      NULL,                                    offsetof(SecurityInfo, supplementary_groups)      },
                 { "SystemCallArchitectures", "as",      property_read_syscall_archs,             0                                                 },
-                { "SystemCallFilter",        "(as)",    property_read_system_call_filter,        0                                                 },
+                { "SystemCallFilter",        "(bas)",   property_read_system_call_filter,        0                                                 },
                 { "Type",                    "s",       NULL,                                    offsetof(SecurityInfo, type)                      },
                 { "UMask",                   "u",       property_read_umask,                     0                                                 },
                 { "User",                    "s",       NULL,                                    offsetof(SecurityInfo, user)                      },
@@ -2403,12 +2434,15 @@ static int acquire_security_info(sd_bus *bus, const char *name, SecurityInfo *in
                 info->capability_bounding_set &= ~((UINT64_C(1) << CAP_MKNOD) |
                                                    (UINT64_C(1) << CAP_SYS_RAWIO));
 
+        info->runtime_scope = scope;
+
         return 0;
 }
 
 static int analyze_security_one(sd_bus *bus,
                                 const char *name,
                                 Table *overview_table,
+                                RuntimeScope scope,
                                 AnalyzeSecurityFlags flags,
                                 unsigned threshold,
                                 sd_json_variant *policy,
@@ -2424,7 +2458,7 @@ static int analyze_security_one(sd_bus *bus,
         assert(bus);
         assert(name);
 
-        r = acquire_security_info(bus, name, info, flags);
+        r = acquire_security_info(bus, name, info, scope, flags);
         if (r == -EMEDIUMTYPE) /* Ignore this one because not loaded or Type is oneshot */
                 return 0;
         if (r < 0)
@@ -2438,12 +2472,14 @@ static int analyze_security_one(sd_bus *bus,
 }
 
 /* Refactoring SecurityInfo so that it can make use of existing struct variables instead of reading from dbus */
-static int get_security_info(Unit *u, ExecContext *c, CGroupContext *g, SecurityInfo **ret_info) {
+static int get_security_info(Unit *u, ExecContext *c, CGroupContext *g, RuntimeScope scope, SecurityInfo **ret_info) {
         assert(ret_info);
 
         _cleanup_(security_info_freep) SecurityInfo *info = security_info_new();
         if (!info)
                 return log_oom();
+
+        info->runtime_scope = scope;
 
         if (u) {
                 if (u->id) {
@@ -2568,32 +2604,34 @@ static int get_security_info(Unit *u, ExecContext *c, CGroupContext *g, Security
                 info->_umask = c->umask;
 
 #if HAVE_SECCOMP
-                SET_FOREACH(key, c->syscall_archs) {
-                        const char *name;
+                if (dlopen_libseccomp(LOG_DEBUG) >= 0) {
+                        SET_FOREACH(key, c->syscall_archs) {
+                                const char *name;
 
-                        name = seccomp_arch_to_string(PTR_TO_UINT32(key) - 1);
-                        if (!name)
-                                continue;
+                                name = seccomp_arch_to_string(PTR_TO_UINT32(key) - 1);
+                                if (!name)
+                                        continue;
 
-                        if (set_put_strdup(&info->system_call_architectures, name) < 0)
-                                return log_oom();
-                }
+                                if (set_put_strdup(&info->system_call_architectures, name) < 0)
+                                        return log_oom();
+                        }
 
-                info->system_call_filter_allow_list = c->syscall_allow_list;
+                        info->system_call_filter_allow_list = c->syscall_allow_list;
 
-                void *id, *num;
-                HASHMAP_FOREACH_KEY(num, id, c->syscall_filter) {
-                        _cleanup_free_ char *name = NULL;
+                        void *id, *num;
+                        HASHMAP_FOREACH_KEY(num, id, c->syscall_filter) {
+                                _cleanup_free_ char *name = NULL;
 
-                        if (info->system_call_filter_allow_list && PTR_TO_INT(num) >= 0)
-                                continue;
+                                if (info->system_call_filter_allow_list && PTR_TO_INT(num) >= 0)
+                                        continue;
 
-                        name = seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, PTR_TO_INT(id) - 1);
-                        if (!name)
-                                continue;
+                                name = sym_seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, PTR_TO_INT(id) - 1);
+                                if (!name)
+                                        continue;
 
-                        if (set_ensure_consume(&info->system_call_filter, &string_hash_ops_free, TAKE_PTR(name)) < 0)
-                                return log_oom();
+                                if (set_ensure_consume(&info->system_call_filter, &string_hash_ops_free, TAKE_PTR(name)) < 0)
+                                        return log_oom();
+                        }
                 }
 #endif
         }
@@ -2642,6 +2680,7 @@ static int get_security_info(Unit *u, ExecContext *c, CGroupContext *g, Security
 }
 
 static int offline_security_check(Unit *u,
+                                  RuntimeScope scope,
                                   unsigned threshold,
                                   sd_json_variant *policy,
                                   PagerFlags pager_flags,
@@ -2657,7 +2696,7 @@ static int offline_security_check(Unit *u,
         if (DEBUG_LOGGING)
                 unit_dump(u, stdout, "\t");
 
-        r = get_security_info(u, unit_get_exec_context(u), unit_get_cgroup_context(u), &info);
+        r = get_security_info(u, unit_get_exec_context(u), unit_get_cgroup_context(u), scope, &info);
         if (r < 0)
               return r;
 
@@ -2701,7 +2740,7 @@ static int offline_security_checks(
 
         log_debug("Starting manager...");
 
-        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, root);
+        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, /* named_listen_fds= */ NULL, root);
         if (r < 0)
                 return r;
 
@@ -2742,7 +2781,7 @@ static int offline_security_checks(
                         (void) mkdir_parents(dropin, 0755);
 
                         if (!is_path(profile)) {
-                                r = find_portable_profile(profile, unit_name, &profile_path);
+                                r = find_portable_profile(scope, profile, unit_name, &profile_path);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to find portable profile %s: %m", profile);
                                 profile = profile_path;
@@ -2753,7 +2792,7 @@ static int offline_security_checks(
                                 return log_error_errno(r, "Failed to copy: %m");
                 }
 
-                k = manager_load_startable_unit_or_warn(m, NULL, prepared, &units[count]);
+                k = manager_load_startable_unit_or_warn(m, /* name= */ NULL, prepared, LOG_ERR, &units[count]);
                 if (k < 0) {
                         RET_GATHER(r, k);
                         continue;
@@ -2763,7 +2802,7 @@ static int offline_security_checks(
         }
 
         for (size_t i = 0; i < count; i++)
-                RET_GATHER(r, offline_security_check(units[i], threshold, policy, pager_flags, json_format_flags));
+                RET_GATHER(r, offline_security_check(units[i], scope, threshold, policy, pager_flags, json_format_flags));
 
         return r;
 }
@@ -2843,7 +2882,7 @@ static int analyze_security(sd_bus *bus,
                 flags |= ANALYZE_SECURITY_SHORT|ANALYZE_SECURITY_ONLY_LOADED|ANALYZE_SECURITY_ONLY_LONG_RUNNING;
 
                 STRV_FOREACH(i, list) {
-                        r = analyze_security_one(bus, *i, overview_table, flags, threshold, policy, pager_flags, json_format_flags);
+                        r = analyze_security_one(bus, *i, overview_table, scope, flags, threshold, policy, pager_flags, json_format_flags);
                         if (r < 0 && ret >= 0)
                                 ret = r;
                 }
@@ -2876,7 +2915,7 @@ static int analyze_security(sd_bus *bus,
                         } else
                                 name = mangled;
 
-                        r = analyze_security_one(bus, name, overview_table, flags, threshold, policy, pager_flags, json_format_flags);
+                        r = analyze_security_one(bus, name, overview_table, scope, flags, threshold, policy, pager_flags, json_format_flags);
                         if (r < 0 && ret >= 0)
                                 ret = r;
                 }
@@ -2887,14 +2926,14 @@ static int analyze_security(sd_bus *bus,
                         fflush(stdout);
                 }
 
-                r = table_print_with_pager(overview_table, json_format_flags, pager_flags, /* show_header= */true);
+                r = table_print_with_pager(overview_table, json_format_flags, pager_flags, /* show_header= */ true);
                 if (r < 0)
                         return r;
         }
         return ret;
 }
 
-int verb_security(int argc, char *argv[], void *userdata) {
+int verb_security(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *policy = NULL;
         int r;
@@ -2909,19 +2948,19 @@ int verb_security(int argc, char *argv[], void *userdata) {
 
         unsigned line = 0, column = 0;
         if (arg_security_policy) {
-                r = sd_json_parse_file(/*f=*/ NULL, arg_security_policy, /*flags=*/ 0, &policy, &line, &column);
+                r = sd_json_parse_file(/* f= */ NULL, arg_security_policy, SD_JSON_PARSE_MUST_BE_OBJECT, &policy, &line, &column);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse '%s' at %u:%u: %m", arg_security_policy, line, column);
         } else {
                 _cleanup_fclose_ FILE *f = NULL;
                 _cleanup_free_ char *pp = NULL;
 
-                r = search_and_fopen_nulstr("systemd-analyze-security.policy", "re", /*root=*/ NULL, CONF_PATHS_NULSTR("systemd"), &f, &pp);
+                r = search_and_fopen_nulstr("systemd-analyze-security.policy", "re", /* root= */ NULL, CONF_PATHS_NULSTR("systemd"), &f, &pp);
                 if (r < 0 && r != -ENOENT)
                         return r;
 
                 if (f) {
-                        r = sd_json_parse_file(f, pp, /*flags=*/ 0, &policy, &line, &column);
+                        r = sd_json_parse_file(f, pp, SD_JSON_PARSE_MUST_BE_OBJECT, &policy, &line, &column);
                         if (r < 0)
                                 return log_error_errno(r, "[%s:%u:%u] Failed to parse JSON policy: %m", pp, line, column);
                 }
@@ -2940,5 +2979,5 @@ int verb_security(int argc, char *argv[], void *userdata) {
                         arg_profile,
                         arg_json_format_flags,
                         arg_pager_flags,
-                        /*flags=*/ 0);
+                        /* flags= */ 0);
 }

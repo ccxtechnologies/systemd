@@ -1,14 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
-#include <getopt.h>
-#include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "sd-journal.h"
+#include "sd-json.h"
 
-#include "alloc-util.h"
 #include "build.h"
 #include "env-util.h"
 #include "fd-util.h"
@@ -16,9 +14,10 @@
 #include "log.h"
 #include "main-func.h"
 #include "parse-argument.h"
-#include "pretty-print.h"
 #include "string-util.h"
+#include "strv.h"
 #include "syslog-util.h"
+#include "verbs.h"
 
 static const char *arg_identifier = NULL;
 static const char *arg_namespace = NULL;
@@ -26,106 +25,65 @@ static int arg_priority = LOG_INFO;
 static int arg_stderr_priority = -1;
 static bool arg_level_prefix = true;
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
+COMMAND(
+        "systemd-cat\0",
+        "Execute process with stdout/stderr connected to the journal.",
+        .argspec = "[COMMAND…]\0",
+        .man_pages = "systemd-cat(1)\0",
+);
 
-        r = terminal_urlify_man("systemd-cat", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...] COMMAND ...\n"
-               "\n%sExecute process with stdout/stderr connected to the journal.%s\n\n"
-               "  -h --help                      Show this help\n"
-               "     --version                   Show package version\n"
-               "  -t --identifier=STRING         Set syslog identifier\n"
-               "  -p --priority=PRIORITY         Set priority value (0..7)\n"
-               "     --stderr-priority=PRIORITY  Set priority value (0..7) used for stderr\n"
-               "     --level-prefix=BOOL         Control whether level prefix shall be parsed\n"
-               "     --namespace=NAMESPACE       Connect to specified journal namespace\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               link);
-
-        return 0;
-}
-
-static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_STDERR_PRIORITY,
-                ARG_LEVEL_PREFIX,
-                ARG_NAMESPACE,
-        };
-
-        static const struct option options[] = {
-                { "help",            no_argument,       NULL, 'h'                 },
-                { "version",         no_argument,       NULL, ARG_VERSION         },
-                { "identifier",      required_argument, NULL, 't'                 },
-                { "priority",        required_argument, NULL, 'p'                 },
-                { "stderr-priority", required_argument, NULL, ARG_STDERR_PRIORITY },
-                { "level-prefix",    required_argument, NULL, ARG_LEVEL_PREFIX    },
-                { "namespace",       required_argument, NULL, ARG_NAMESPACE       },
-                {}
-        };
-
-        int c, r;
-
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
         assert(argv);
 
-        /* Resetting to 0 forces the invocation of an internal initialization routine of getopt_long()
-         * that checks for GNU extensions in optstring ('-' or '+' at the beginning). */
-        optind = 0;
-        while ((c = getopt_long(argc, argv, "+ht:p:", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv, OPTION_PARSER_STOP_AT_FIRST_NONOPTION };
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        help();
-                        return 0;
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case 't':
-                        arg_identifier = empty_to_null(optarg);
+                OPTION('t', "identifier", "STRING", "Set syslog identifier"):
+                        arg_identifier = empty_to_null(opts.arg);
                         break;
 
-                case 'p':
-                        arg_priority = log_level_from_string(optarg);
+                OPTION('p', "priority", "PRIORITY", "Set priority value (0..7)"):
+                        arg_priority = log_level_from_string(opts.arg);
                         if (arg_priority < 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Failed to parse priority value.");
                         break;
 
-                case ARG_STDERR_PRIORITY:
-                        arg_stderr_priority = log_level_from_string(optarg);
+                OPTION_LONG("stderr-priority", "PRIORITY",
+                            "Set priority value (0..7) used for stderr"):
+                        arg_stderr_priority = log_level_from_string(opts.arg);
                         if (arg_stderr_priority < 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Failed to parse stderr priority value.");
                         break;
 
-                case ARG_LEVEL_PREFIX:
-                        r = parse_boolean_argument("--level-prefix=", optarg, &arg_level_prefix);
+                OPTION_LONG("level-prefix", "BOOL",
+                            "Control whether level prefix shall be parsed"):
+                        r = parse_boolean_argument("--level-prefix=", opts.arg, &arg_level_prefix);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_NAMESPACE:
-                        arg_namespace = empty_to_null(optarg);
+                OPTION_LONG("namespace", "NAMESPACE",
+                            "Connect to specified journal namespace"):
+                        arg_namespace = empty_to_null(opts.arg);
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
+        *ret_args = option_parser_get_args(&opts);
         return 1;
 }
 
@@ -135,7 +93,8 @@ static int run(int argc, char *argv[]) {
 
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
@@ -157,8 +116,8 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to rearrange stdout/stderr: %m");
 
-        if (argc <= optind)
-                (void) execl("/bin/cat", "/bin/cat", NULL);
+        if (strv_isempty(args))
+                (void) execlp("cat", "cat", NULL);
         else {
                 struct stat st;
 
@@ -167,11 +126,11 @@ static int run(int argc, char *argv[]) {
                                                "Failed to fstat(%s): %m",
                                                FORMAT_PROC_FD_PATH(STDERR_FILENO));
 
-                r = setenvf("JOURNAL_STREAM", /* overwrite = */ true, DEV_FMT ":" INO_FMT, (dev_t) st.st_dev, st.st_ino);
+                r = setenvf("JOURNAL_STREAM", /* overwrite= */ true, DEV_FMT ":" INO_FMT, (dev_t) st.st_dev, st.st_ino);
                 if (r < 0)
                         return log_error_errno(r, "Failed to set environment variable JOURNAL_STREAM: %m");
 
-                (void) execvp(argv[optind], argv + optind);
+                (void) execvp(args[0], args);
         }
         r = -errno;
 

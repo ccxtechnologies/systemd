@@ -14,6 +14,7 @@
 #include "networkd-address.h"
 #include "networkd-address-generation.h"
 #include "networkd-dhcp-prefix-delegation.h"
+#include "networkd-ipv6ll.h"
 #include "networkd-link.h"
 #include "networkd-manager.h"
 #include "networkd-network.h"
@@ -378,7 +379,7 @@ set_dns:
                         n_dns,
                         dns,
                         link->network->router_dns_lifetime_usec,
-                        /* valid_until = */ USEC_INFINITY);
+                        /* valid_until= */ USEC_INFINITY);
 }
 
 static int radv_set_domains(Link *link, Link *uplink) {
@@ -416,13 +417,14 @@ set_domains:
                         link->radv,
                         s,
                         link->network->router_dns_lifetime_usec,
-                        /* valid_until = */ USEC_INFINITY);
+                        /* valid_until= */ USEC_INFINITY);
 }
 
 static int radv_find_uplink(Link *link, Link **ret) {
         int r;
 
         assert(link);
+        assert(ret);
 
         if (link->network->router_uplink_name)
                 return link_get_by_name(link->manager, link->network->router_uplink_name, ret);
@@ -556,7 +558,7 @@ static int radv_configure(Link *link) {
                                 link->radv,
                                 link->network->router_home_agent_preference,
                                 link->network->home_agent_lifetime_usec,
-                                /* valid_until = */ USEC_INFINITY);
+                                /* valid_until= */ USEC_INFINITY);
                 if (r < 0)
                         return r;
         }
@@ -583,7 +585,7 @@ static int radv_is_ready_to_configure(Link *link) {
         assert(link);
         assert(link->network);
 
-        if (!link_is_ready_to_configure(link, /* allow_unmanaged = */ false))
+        if (!link_is_ready_to_configure(link, /* allow_unmanaged= */ false))
                 return false;
 
         if (in6_addr_is_null(&link->ipv6ll_address))
@@ -695,6 +697,12 @@ int radv_start(Link *link) {
         if (in6_addr_is_null(&link->ipv6ll_address))
                 return 0;
 
+        /* Update the source IPv6LL before the running check so replacement IPv6LL handover can
+         * rebind RADV without requiring stop/start. */
+        r = sd_radv_set_link_local_address(link->radv, &link->ipv6ll_address);
+        if (r < 0)
+                return r;
+
         if (sd_radv_is_running(link->radv))
                 return 0;
 
@@ -703,10 +711,6 @@ int radv_start(Link *link) {
                 if (r < 0)
                         return log_link_debug_errno(link, r, "Failed to request DHCP delegated subnet prefix: %m");
         }
-
-        r = sd_radv_set_link_local_address(link->radv, &link->ipv6ll_address);
-        if (r < 0)
-                return r;
 
         log_link_debug(link, "Starting IPv6 Router Advertisements");
         return sd_radv_start(link->radv);
@@ -814,7 +818,8 @@ void network_adjust_radv(Network *network) {
                 /* For backward compatibility. */
                 network->dhcp_pd = FLAGS_SET(network->router_prefix_delegation, RADV_PREFIX_DELEGATION_DHCP6);
 
-        if (!FLAGS_SET(network->link_local, ADDRESS_FAMILY_IPV6)) {
+        if (!FLAGS_SET(network->link_local, ADDRESS_FAMILY_IPV6) &&
+            !network_has_static_ipv6ll_address(network)) {
                 if (network->router_prefix_delegation != RADV_PREFIX_DELEGATION_NONE)
                         log_warning("%s: IPv6PrefixDelegation= is enabled but IPv6 link-local addressing is disabled. "
                                     "Disabling IPv6PrefixDelegation=.", network->filename);

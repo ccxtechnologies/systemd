@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <linux/magic.h>
 #include <unistd.h>
 
@@ -8,11 +7,13 @@
 #include "sd-varlink.h"
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "build.h"
 #include "bus-polkit.h"
 #include "bus-util.h"
 #include "creds-util.h"
 #include "dirent-util.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "escape.h"
 #include "fileio.h"
@@ -28,7 +29,6 @@
 #include "parse-argument.h"
 #include "parse-util.h"
 #include "polkit-agent.h"
-#include "pretty-print.h"
 #include "stat-util.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -72,11 +72,18 @@ static bool arg_pretty = false;
 static bool arg_quiet = false;
 static bool arg_varlink = false;
 static uid_t arg_uid = UID_INVALID;
-static bool arg_allow_null = false;
+static CredentialFlags arg_credential_flags = 0;
 static bool arg_ask_password = true;
 
 STATIC_DESTRUCTOR_REGISTER(arg_tpm2_public_key, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_tpm2_signature, freep);
+
+COMMAND(
+        "systemd-creds\0",
+        "Display and process credentials.",
+        .man_pages = "systemd-creds(1)\0",
+        .pager_flags = &arg_pager_flags,
+);
 
 static const char* transcode_mode_table[_TRANSCODE_MAX] = {
         [TRANSCODE_OFF]      = "off",
@@ -99,7 +106,7 @@ typedef enum CredKeyType {
         CRED_KEY_TYPE_HOST_TPM2_PUBLIC,
         CRED_KEY_TYPE_TPM2_PUBLIC_HOST,
         CRED_KEY_TYPE_NULL,
-        CRED_KEY_TYPE_ABSENT,
+        CRED_KEY_TYPE_TPM2_ABSENT,
         _CRED_KEY_TYPE_MAX,
         _CRED_KEY_TYPE_INVALID = -EINVAL,
 } CredKeyType;
@@ -115,7 +122,7 @@ static const char* cred_key_type_table[_CRED_KEY_TYPE_MAX] = {
         [CRED_KEY_TYPE_HOST_TPM2_PUBLIC] = "host+tpm2-with-public-key",
         [CRED_KEY_TYPE_TPM2_PUBLIC_HOST] = "tpm2-with-public-key+host",
         [CRED_KEY_TYPE_NULL]             = "null",
-        [CRED_KEY_TYPE_ABSENT]           = "tpm2-absent",
+        [CRED_KEY_TYPE_TPM2_ABSENT]      = "tpm2-absent",  /* legacy alias */
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP(cred_key_type, CredKeyType);
@@ -124,14 +131,14 @@ static sd_id128_t cred_key_id[_CRED_KEY_TYPE_MAX] = {
         [CRED_KEY_TYPE_AUTO]             = _CRED_AUTO,
         [CRED_KEY_TYPE_AUTO_INITRD]      = _CRED_AUTO_INITRD,
         [CRED_KEY_TYPE_HOST]             = CRED_AES256_GCM_BY_HOST,
-        [CRED_KEY_TYPE_TPM2]             = CRED_AES256_GCM_BY_TPM2_HMAC,
-        [CRED_KEY_TYPE_TPM2_PUBLIC]      = CRED_AES256_GCM_BY_TPM2_HMAC_WITH_PK,
-        [CRED_KEY_TYPE_HOST_TPM2]        = CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC,
-        [CRED_KEY_TYPE_TPM2_HOST]        = CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC,
-        [CRED_KEY_TYPE_HOST_TPM2_PUBLIC] = CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK,
-        [CRED_KEY_TYPE_TPM2_PUBLIC_HOST] = CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK,
+        [CRED_KEY_TYPE_TPM2]             = CRED_AES256_GCM_BY_TPM2_HMAC_PINNED_SRK,
+        [CRED_KEY_TYPE_TPM2_PUBLIC]      = CRED_AES256_GCM_BY_TPM2_HMAC_WITH_PK_PINNED_SRK,
+        [CRED_KEY_TYPE_HOST_TPM2]        = CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_PINNED_SRK,
+        [CRED_KEY_TYPE_TPM2_HOST]        = CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_PINNED_SRK,
+        [CRED_KEY_TYPE_HOST_TPM2_PUBLIC] = CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_PINNED_SRK,
+        [CRED_KEY_TYPE_TPM2_PUBLIC_HOST] = CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_PINNED_SRK,
         [CRED_KEY_TYPE_NULL]             = CRED_AES256_GCM_BY_NULL,
-        [CRED_KEY_TYPE_ABSENT]           = CRED_AES256_GCM_BY_NULL,
+        [CRED_KEY_TYPE_TPM2_ABSENT]      = CRED_AES256_GCM_BY_NULL,
 };
 
 static int open_credential_directory(
@@ -148,17 +155,14 @@ static int open_credential_directory(
         if (arg_system)
                 /* PID 1 ensures that system credentials are always accessible under the same fixed path. It
                  * will create symlinks if necessary to guarantee that. */
-                p = encrypted ?
-                        ENCRYPTED_SYSTEM_CREDENTIALS_DIRECTORY :
-                        SYSTEM_CREDENTIALS_DIRECTORY;
-        else {
+                r = (encrypted ? get_encrypted_system_credentials_dir : get_system_credentials_dir)(&p);
+        else
                 /* Otherwise take the dirs from the env vars we got passed */
                 r = (encrypted ? get_encrypted_credentials_dir : get_credentials_dir)(&p);
-                if (r == -ENXIO) /* No environment variable? */
-                        goto not_found;
-                if (r < 0)
-                        return log_error_errno(r, "Failed to get credentials directory: %m");
-        }
+        if (r == -ENXIO) /* No environment variable? */
+                goto not_found;
+        if (r < 0)
+                return log_error_errno(r, "Failed to get credentials directory: %m");
 
         d = opendir(p);
         if (!d) {
@@ -191,19 +195,23 @@ static int is_tmpfs_with_noswap(dev_t devno) {
         _cleanup_(mnt_free_tablep) struct libmnt_table *table = NULL;
         int r;
 
-        table = mnt_new_table();
-        if (!table)
-                return -ENOMEM;
-
-        r = mnt_table_parse_mtab(table, /* filename= */ NULL);
+        r = dlopen_libmount(LOG_DEBUG);
         if (r < 0)
                 return r;
 
-        struct libmnt_fs *fs = mnt_table_find_devno(table, devno, MNT_ITER_FORWARD);
+        table = sym_mnt_new_table();
+        if (!table)
+                return -ENOMEM;
+
+        r = sym_mnt_table_parse_mtab(table, /* filename= */ NULL);
+        if (r < 0)
+                return r;
+
+        struct libmnt_fs *fs = sym_mnt_table_find_devno(table, devno, MNT_ITER_FORWARD);
         if (!fs)
                 return -ENODEV;
 
-        r = mnt_fs_get_option(fs, "noswap", /* value= */ NULL, /* valuesz= */ NULL);
+        r = sym_mnt_fs_get_option(fs, "noswap", /* value= */ NULL, /* valuesz= */ NULL);
         if (r < 0)
                 return r;
 
@@ -268,7 +276,7 @@ static int add_credentials_to_table(Table *t, bool encrypted) {
                 } else {
                         struct statfs sfs;
                         if (fstatfs(fd, &sfs) < 0)
-                                return log_error_errno(r, "fstatfs() failed on '%s': %m", de->d_name);
+                                return log_error_errno(errno, "fstatfs() failed on '%s': %m", de->d_name);
 
                         bool is_secure;
                         if (is_fs_type(&sfs, RAMFS_MAGIC))
@@ -304,7 +312,8 @@ static int add_credentials_to_table(Table *t, bool encrypted) {
         return 1; /* Creds dir set */
 }
 
-static int verb_list(int argc, char **argv, void *userdata) {
+VERB_DEFAULT_NOARG(verb_list, "list", "Show list of passed credentials");
+static int verb_list(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(table_unrefp) Table *t = NULL;
         int r, q;
 
@@ -397,8 +406,6 @@ static int transcode(
 }
 
 static int print_newline(FILE *f, const char *data, size_t l) {
-        int fd;
-
         assert(f);
         assert(data || l == 0);
 
@@ -410,12 +417,14 @@ static int print_newline(FILE *f, const char *data, size_t l) {
         if (l > 0 && data[l-1] == '\n')
                 return 0;
 
-        /* Don't bother unless this is a tty */
-        fd = fileno(f);
-        if (fd >= 0 && !isatty_safe(fd))
-                return 0;
+        /* If not explicitly requested, don't bother if the output is not a tty */
+        if (arg_newline < 0) {
+                int fd = fileno(f);
+                if (fd >= 0 && !isatty_safe(fd))
+                        return 0;
+        }
 
-        if (fputc('\n', f) != '\n')
+        if (fputc('\n', f) == EOF)
                 return log_error_errno(errno, "Failed to write trailing newline: %m");
 
         return 1;
@@ -464,14 +473,16 @@ static int write_blob(FILE *f, const void *data, size_t size) {
         return 0;
 }
 
-static int verb_cat(int argc, char **argv, void *userdata) {
+VERB(verb_cat, "cat", "CREDENTIAL...\0", 2, VERB_ANY, 0,
+     "Show contents of specified credentials");
+static int verb_cat(int argc, char *argv[], uintptr_t _data, void *userdata) {
         usec_t timestamp;
         int r, ret = 0;
 
         timestamp = arg_timestamp != USEC_INFINITY ? arg_timestamp : now(CLOCK_REALTIME);
 
         STRV_FOREACH(cn, strv_skip(argv, 1)) {
-                _cleanup_(erase_and_freep) void *data = NULL;
+                _cleanup_(erase_and_freep) void *content = NULL;
                 size_t size = 0;
                 int encrypted;
 
@@ -499,7 +510,7 @@ static int verb_cat(int argc, char **argv, void *userdata) {
                                         UINT64_MAX, SIZE_MAX,
                                         flags,
                                         NULL,
-                                        (char**) &data, &size);
+                                        (char**) &content, &size);
                         if (r == -ENOENT) /* Not found */
                                 continue;
                         if (r >= 0) /* Found */
@@ -521,8 +532,8 @@ static int verb_cat(int argc, char **argv, void *userdata) {
                                                 *cn,
                                                 timestamp,
                                                 uid_is_valid(arg_uid) ? arg_uid : getuid(),
-                                                &IOVEC_MAKE(data, size),
-                                                CREDENTIAL_ANY_SCOPE,
+                                                &IOVEC_MAKE(content, size),
+                                                arg_credential_flags | CREDENTIAL_ANY_SCOPE,
                                                 &plaintext);
                         else
                                 r = decrypt_credential_and_warn(
@@ -531,18 +542,18 @@ static int verb_cat(int argc, char **argv, void *userdata) {
                                                 arg_tpm2_device,
                                                 arg_tpm2_signature,
                                                 uid_is_valid(arg_uid) ? arg_uid : getuid(),
-                                                &IOVEC_MAKE(data, size),
-                                                CREDENTIAL_ANY_SCOPE,
+                                                &IOVEC_MAKE(content, size),
+                                                arg_credential_flags | CREDENTIAL_ANY_SCOPE,
                                                 &plaintext);
                         if (r < 0)
                                 return r;
 
-                        erase_and_free(data);
-                        data = TAKE_PTR(plaintext.iov_base);
+                        erase_and_free(content);
+                        content = TAKE_PTR(plaintext.iov_base);
                         size = plaintext.iov_len;
                 }
 
-                r = write_blob(stdout, data, size);
+                r = write_blob(stdout, content, size);
                 if (r < 0)
                         return r;
         }
@@ -550,7 +561,9 @@ static int verb_cat(int argc, char **argv, void *userdata) {
         return ret;
 }
 
-static int verb_encrypt(int argc, char **argv, void *userdata) {
+VERB(verb_encrypt, "encrypt", "INPUT OUTPUT\0", 3, 3, 0,
+     "Encrypt plaintext credential file and write to ciphertext credential file");
+static int verb_encrypt(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(iovec_done_erase) struct iovec plaintext = {}, output = {};
         _cleanup_free_ char *base64_buf = NULL, *fname = NULL;
         const char *input_path, *output_path, *name;
@@ -592,10 +605,10 @@ static int verb_encrypt(int argc, char **argv, void *userdata) {
 
         timestamp = arg_timestamp != USEC_INFINITY ? arg_timestamp : now(CLOCK_REALTIME);
 
-        if (arg_not_after != USEC_INFINITY && arg_not_after < timestamp)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Credential is invalidated before it is valid.");
+        if (arg_not_after != USEC_INFINITY && arg_not_after <= timestamp)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Credential is invalidated before or when it becomes valid.");
 
-        if (geteuid() != 0) {
+        if (geteuid() != 0 && !sd_id128_equal(arg_with_key, CRED_AES256_GCM_BY_NULL)) {
                 (void) polkit_agent_open_if_enabled(BUS_TRANSPORT_LOCAL, arg_ask_password);
 
                 r = ipc_encrypt_credential(
@@ -604,7 +617,7 @@ static int verb_encrypt(int argc, char **argv, void *userdata) {
                                 arg_not_after,
                                 arg_uid,
                                 &plaintext,
-                                arg_ask_password ? CREDENTIAL_IPC_ALLOW_INTERACTIVE : 0,
+                                arg_credential_flags,
                                 &output);
         } else
                 r = encrypt_credential_and_warn(
@@ -618,7 +631,7 @@ static int verb_encrypt(int argc, char **argv, void *userdata) {
                                 arg_tpm2_public_key_pcr_mask,
                                 arg_uid,
                                 &plaintext,
-                                /* flags= */ 0,
+                                arg_credential_flags,
                                 &output);
         if (r < 0)
                 return r;
@@ -658,7 +671,9 @@ static int verb_encrypt(int argc, char **argv, void *userdata) {
         return EXIT_SUCCESS;
 }
 
-static int verb_decrypt(int argc, char **argv, void *userdata) {
+VERB(verb_decrypt, "decrypt", "INPUT [OUTPUT]\0", 2, 3, 0,
+     "Decrypt ciphertext credential file and write to plaintext credential file");
+static int verb_decrypt(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(iovec_done_erase) struct iovec input = {}, plaintext = {};
         _cleanup_free_ char *fname = NULL;
         _cleanup_fclose_ FILE *output_file = NULL;
@@ -709,7 +724,7 @@ static int verb_decrypt(int argc, char **argv, void *userdata) {
                                 timestamp,
                                 arg_uid,
                                 &input,
-                                arg_ask_password ? CREDENTIAL_IPC_ALLOW_INTERACTIVE : 0,
+                                arg_credential_flags,
                                 &plaintext);
         } else
                 r = decrypt_credential_and_warn(
@@ -719,7 +734,7 @@ static int verb_decrypt(int argc, char **argv, void *userdata) {
                                 arg_tpm2_signature,
                                 arg_uid,
                                 &input,
-                                arg_allow_null ? CREDENTIAL_ALLOW_NULL : 0,
+                                arg_credential_flags,
                                 &plaintext);
         if (r < 0)
                 return r;
@@ -740,7 +755,9 @@ static int verb_decrypt(int argc, char **argv, void *userdata) {
         return EXIT_SUCCESS;
 }
 
-static int verb_setup(int argc, char **argv, void *userdata) {
+VERB_NOARG(verb_setup, "setup",
+           "Generate credentials host key, if not existing yet");
+static int verb_setup(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(iovec_done_erase) struct iovec host_key = {};
         int r;
 
@@ -753,212 +770,124 @@ static int verb_setup(int argc, char **argv, void *userdata) {
         return EXIT_SUCCESS;
 }
 
-static int verb_has_tpm2(int argc, char **argv, void *userdata) {
+/* For backward compatibility. Hidden from help. */
+VERB(verb_has_tpm2, "has-tpm2", NULL, VERB_ANY, 1, 0, /* help= */ NULL);
+static int verb_has_tpm2(int argc, char *argv[], uintptr_t _data, void *userdata) {
         if (!arg_quiet)
-                log_notice("The 'systemd-creds %1$s' command has been replaced by 'systemd-analyze %1$s'. Redirecting invocation.", argv[optind]);
+                log_notice("The 'systemd-creds %1$s' command has been replaced by 'systemd-analyze %1$s'. Redirecting invocation.", argv[0]);
 
         return verb_has_tpm2_generic(arg_quiet);
 }
 
-static int verb_help(int argc, char **argv, void *userdata) {
-        _cleanup_free_ char *link = NULL;
-        int r;
+VERB_COMMON_HELP_AUTO();
 
-        r = terminal_urlify_man("systemd-creds", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s [OPTIONS...] COMMAND ...\n"
-               "\n%5$sDisplay and Process Credentials.%6$s\n"
-               "\n%3$sCommands:%4$s\n"
-               "  list                    Show list of passed credentials\n"
-               "  cat CREDENTIAL...       Show contents of specified credentials\n"
-               "  setup                   Generate credentials host key, if not existing yet\n"
-               "  encrypt INPUT OUTPUT    Encrypt plaintext credential file and write to\n"
-               "                          ciphertext credential file\n"
-               "  decrypt INPUT [OUTPUT]  Decrypt ciphertext credential file and write to\n"
-               "                          plaintext credential file\n"
-               "\n%3$sOptions:%4$s\n"
-               "  -h --help               Show this help\n"
-               "     --version            Show package version\n"
-               "     --no-pager           Do not pipe output into a pager\n"
-               "     --no-legend          Do not show the headers and footers\n"
-               "     --json=pretty|short|off\n"
-               "                          Generate JSON output\n"
-               "     --system             Show credentials passed to system\n"
-               "     --transcode=base64|unbase64|hex|unhex\n"
-               "                          Transcode credential data\n"
-               "     --newline=auto|yes|no\n"
-               "                          Suffix output with newline\n"
-               "  -p --pretty             Output as SetCredentialEncrypted= line\n"
-               "     --name=NAME          Override filename included in encrypted credential\n"
-               "     --timestamp=TIME     Include specified timestamp in encrypted credential\n"
-               "     --not-after=TIME     Include specified invalidation time in encrypted\n"
-               "                          credential\n"
-               "     --with-key=host|tpm2|host+tpm2|null|auto|auto-initrd\n"
-               "                          Which keys to encrypt with\n"
-               "  -H                      Shortcut for --with-key=host\n"
-               "  -T                      Shortcut for --with-key=tpm2\n"
-               "     --tpm2-device=PATH\n"
-               "                          Pick TPM2 device\n"
-               "     --tpm2-pcrs=PCR1+PCR2+PCR3+…\n"
-               "                          Specify TPM2 PCRs to seal against (fixed hash)\n"
-               "     --tpm2-public-key=PATH\n"
-               "                          Specify PEM certificate to seal against\n"
-               "     --tpm2-public-key-pcrs=PCR1+PCR2+PCR3+…\n"
-               "                          Specify TPM2 PCRs to seal against (public key)\n"
-               "     --tpm2-signature=PATH\n"
-               "                          Specify signature for public key PCR policy\n"
-               "     --user               Select user-scoped credential encryption\n"
-               "     --uid=UID            Select user for scoped credentials\n"
-               "     --allow-null         Allow decrypting credentials with empty key\n"
-               "\nSee the %2$s for details.\n",
-               program_invocation_short_name,
-               link,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal());
-
-        return 0;
-}
-
-static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_NO_PAGER,
-                ARG_NO_LEGEND,
-                ARG_JSON,
-                ARG_SYSTEM,
-                ARG_TRANSCODE,
-                ARG_NEWLINE,
-                ARG_WITH_KEY,
-                ARG_TPM2_DEVICE,
-                ARG_TPM2_PCRS,
-                ARG_TPM2_PUBLIC_KEY,
-                ARG_TPM2_PUBLIC_KEY_PCRS,
-                ARG_TPM2_SIGNATURE,
-                ARG_NAME,
-                ARG_TIMESTAMP,
-                ARG_NOT_AFTER,
-                ARG_USER,
-                ARG_UID,
-                ARG_ALLOW_NULL,
-                ARG_NO_ASK_PASSWORD,
-        };
-
-        static const struct option options[] = {
-                { "help",                 no_argument,       NULL, 'h'                      },
-                { "version",              no_argument,       NULL, ARG_VERSION              },
-                { "no-pager",             no_argument,       NULL, ARG_NO_PAGER             },
-                { "no-legend",            no_argument,       NULL, ARG_NO_LEGEND            },
-                { "json",                 required_argument, NULL, ARG_JSON                 },
-                { "system",               no_argument,       NULL, ARG_SYSTEM               },
-                { "transcode",            required_argument, NULL, ARG_TRANSCODE            },
-                { "newline",              required_argument, NULL, ARG_NEWLINE              },
-                { "pretty",               no_argument,       NULL, 'p'                      },
-                { "with-key",             required_argument, NULL, ARG_WITH_KEY             },
-                { "tpm2-device",          required_argument, NULL, ARG_TPM2_DEVICE          },
-                { "tpm2-pcrs",            required_argument, NULL, ARG_TPM2_PCRS            },
-                { "tpm2-public-key",      required_argument, NULL, ARG_TPM2_PUBLIC_KEY      },
-                { "tpm2-public-key-pcrs", required_argument, NULL, ARG_TPM2_PUBLIC_KEY_PCRS },
-                { "tpm2-signature",       required_argument, NULL, ARG_TPM2_SIGNATURE       },
-                { "name",                 required_argument, NULL, ARG_NAME                 },
-                { "timestamp",            required_argument, NULL, ARG_TIMESTAMP            },
-                { "not-after",            required_argument, NULL, ARG_NOT_AFTER            },
-                { "quiet",                no_argument,       NULL, 'q'                      },
-                { "user",                 no_argument,       NULL, ARG_USER                 },
-                { "uid",                  required_argument, NULL, ARG_UID                  },
-                { "allow-null",           no_argument,       NULL, ARG_ALLOW_NULL           },
-                { "no-ask-password",      no_argument,       NULL, ARG_NO_ASK_PASSWORD      },
-                {}
-        };
-
-        int c, r;
-
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hHTpq", options, NULL)) >= 0) {
+        OptionParser opts = { argc, argv };
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return verb_help(0, NULL, NULL);
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_NO_PAGER:
+                OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
-                case ARG_NO_LEGEND:
+                OPTION_COMMON_NO_LEGEND:
                         arg_legend = false;
                         break;
 
-                case ARG_JSON:
-                        r = parse_json_argument(optarg, &arg_json_format_flags);
+                OPTION_COMMON_JSON:
+                        r = parse_json_argument(opts.arg, &arg_json_format_flags);
                         if (r <= 0)
                                 return r;
-
                         break;
 
-                case ARG_SYSTEM:
+                OPTION_LONG("system", NULL, "Show credentials passed to system"):
                         arg_system = true;
                         break;
 
-                case ARG_TRANSCODE:
-                        if (streq(optarg, "help")) {
+                OPTION_LONG("transcode", "METHOD",
+                            "Transcode credential data (base64, unbase64, hex, unhex)"):
+                        if (streq(opts.arg, "help")) {
                                 if (arg_legend)
                                         puts("Supported transcode types:");
 
                                 return DUMP_STRING_TABLE(transcode_mode, TranscodeMode, _TRANSCODE_MAX);
                         }
 
-                        if (parse_boolean(optarg) == 0) /* If specified as "false", turn transcoding off */
+                        if (parse_boolean(opts.arg) == 0) /* If specified as "false", turn transcoding off */
                                 arg_transcode = TRANSCODE_OFF;
                         else {
                                 TranscodeMode m;
 
-                                m = transcode_mode_from_string(optarg);
+                                m = transcode_mode_from_string(opts.arg);
                                 if (m < 0)
                                         return log_error_errno(m, "Failed to parse transcode mode: %m");
 
                                 arg_transcode = m;
                         }
-
                         break;
 
-                case ARG_NEWLINE:
-                        if (isempty(optarg) || streq(optarg, "auto"))
-                                arg_newline = -1;
-                        else {
-                                r = parse_boolean_argument("--newline=", optarg, NULL);
-                                if (r < 0)
-                                        return r;
-
-                                arg_newline = r;
-                        }
+                OPTION_LONG("newline", "auto|yes|no", "Suffix output with newline"):
+                        r = parse_tristate_argument_with_auto("--newline=", opts.arg, &arg_newline);
+                        if (r < 0)
+                                return r;
                         break;
 
-                case 'p':
+                OPTION('p', "pretty", NULL, "Output as SetCredentialEncrypted= line"):
                         arg_pretty = true;
                         break;
 
-                case ARG_WITH_KEY:
-                        if (streq(optarg, "help")) {
+                OPTION_LONG("name", "NAME",
+                            "Override filename included in encrypted credential"):
+                        if (isempty(opts.arg)) {
+                                arg_name = NULL;
+                                arg_name_any = true;
+                                break;
+                        }
+
+                        if (!credential_name_valid(opts.arg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid credential name: %s", opts.arg);
+
+                        arg_name = opts.arg;
+                        arg_name_any = false;
+                        break;
+
+                OPTION_LONG("timestamp", "TIME",
+                            "Include specified timestamp in encrypted credential"):
+                        r = parse_timestamp(opts.arg, &arg_timestamp);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse timestamp: %s", opts.arg);
+                        break;
+
+                OPTION_LONG("not-after", "TIME",
+                            "Include specified invalidation time in encrypted credential"):
+                        r = parse_timestamp(opts.arg, &arg_not_after);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse --not-after= timestamp: %s", opts.arg);
+                        break;
+
+                OPTION_LONG("with-key", "KEY",
+                            "Which keys to encrypt with (host, tpm2, host+tpm2, null, auto, auto-initrd)"):
+                        if (streq(opts.arg, "help")) {
                                 if (arg_legend)
                                         puts("Supported key types:");
-
                                 return DUMP_STRING_TABLE(cred_key_type, CredKeyType, _CRED_KEY_TYPE_MAX);
                         }
 
-                        if (isempty(optarg))
+                        if (isempty(opts.arg))
                                 arg_with_key = _CRED_AUTO;
                         else {
-                                CredKeyType t = cred_key_type_from_string(optarg);
+                                CredKeyType t = cred_key_type_from_string(opts.arg);
                                 if (t < 0)
                                         return log_error_errno(t, "Failed to parse key type: %m");
 
@@ -966,122 +895,101 @@ static int parse_argv(int argc, char *argv[]) {
                         }
                         break;
 
-                case 'H':
+                OPTION_SHORT('H', NULL, "Shortcut for --with-key=host"):
                         arg_with_key = CRED_AES256_GCM_BY_HOST;
                         break;
 
-                case 'T':
-                        arg_with_key = CRED_AES256_GCM_BY_TPM2_HMAC;
+                OPTION_SHORT('T', NULL, "Shortcut for --with-key=tpm2"):
+                        arg_with_key = _CRED_AUTO_TPM2;
                         break;
 
-                case ARG_TPM2_DEVICE:
-                        if (streq(optarg, "list"))
+                OPTION_LONG("tpm2-device", "PATH", "Pick TPM2 device"):
+                        if (streq(opts.arg, "list"))
                                 return tpm2_list_devices(arg_legend, arg_quiet);
 
-                        arg_tpm2_device = streq(optarg, "auto") ? NULL : optarg;
+                        arg_tpm2_device = streq(opts.arg, "auto") ? NULL : opts.arg;
                         break;
 
-                case ARG_TPM2_PCRS: /* For fixed hash PCR policies only */
-                        r = tpm2_parse_pcr_argument_to_mask(optarg, &arg_tpm2_pcr_mask);
+                OPTION_LONG("tpm2-pcrs", "PCR1+PCR2+PCR3+…",
+                            "Specify TPM2 PCRs to seal against (fixed hash)"):
+                        /* For fixed hash PCR policies only */
+                        r = tpm2_parse_pcr_argument_to_mask(opts.arg, &arg_tpm2_pcr_mask);
                         if (r < 0)
                                 return r;
-
                         break;
 
-                case ARG_TPM2_PUBLIC_KEY:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_tpm2_public_key);
+                OPTION_LONG("tpm2-public-key", "PATH",
+                            "Specify PEM certificate to seal against"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_tpm2_public_key);
                         if (r < 0)
                                 return r;
-
                         break;
 
-                case ARG_TPM2_PUBLIC_KEY_PCRS: /* For public key PCR policies only */
-                        r = tpm2_parse_pcr_argument_to_mask(optarg, &arg_tpm2_public_key_pcr_mask);
+                OPTION_LONG("tpm2-public-key-pcrs", "PCR1+PCR2+…",
+                            "Specify TPM2 PCRs to seal against (public key)"):
+                        /* For public key PCR policies only */
+                        r = tpm2_parse_pcr_argument_to_mask(opts.arg, &arg_tpm2_public_key_pcr_mask);
                         if (r < 0)
                                 return r;
-
                         break;
 
-                case ARG_TPM2_SIGNATURE:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_tpm2_signature);
+                OPTION_LONG("tpm2-signature", "PATH",
+                            "Specify signature for public key PCR policy"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_tpm2_signature);
                         if (r < 0)
                                 return r;
-
                         break;
 
-                case ARG_NAME:
-                        if (isempty(optarg)) {
-                                arg_name = NULL;
-                                arg_name_any = true;
-                                break;
-                        }
-
-                        if (!credential_name_valid(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid credential name: %s", optarg);
-
-                        arg_name = optarg;
-                        arg_name_any = false;
-                        break;
-
-                case ARG_TIMESTAMP:
-                        r = parse_timestamp(optarg, &arg_timestamp);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse timestamp: %s", optarg);
-
-                        break;
-
-                case ARG_NOT_AFTER:
-                        r = parse_timestamp(optarg, &arg_not_after);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse --not-after= timestamp: %s", optarg);
-
-                        break;
-
-                case ARG_USER:
+                OPTION_LONG("user", NULL, "Select user-scoped credential encryption"):
                         if (!uid_is_valid(arg_uid))
                                 arg_uid = getuid();
-
                         break;
 
-                case ARG_UID:
-                        if (isempty(optarg))
+                OPTION_LONG("uid", "UID", "Select user for scoped credentials"):
+                        if (isempty(opts.arg))
                                 arg_uid = UID_INVALID;
-                        else if (streq(optarg, "self"))
+                        else if (streq(opts.arg, "self"))
                                 arg_uid = getuid();
                         else {
-                                const char *name = optarg;
-
                                 r = get_user_creds(
-                                                &name,
+                                                opts.arg,
+                                                /* flags= */ 0,
+                                                /* ret_username= */ NULL,
                                                 &arg_uid,
                                                 /* ret_gid= */ NULL,
                                                 /* ret_home= */ NULL,
-                                                /* ret_shell= */ NULL,
-                                                /* flags= */ 0);
+                                                /* ret_shell= */ NULL);
                                 if (r < 0)
-                                        return log_error_errno(r, "Failed to resolve user '%s': %m", optarg);
+                                        return log_error_errno(r, "Failed to resolve user '%s': %s",
+                                                               opts.arg, STRERROR_USER(r));
                         }
                         break;
 
-                case ARG_ALLOW_NULL:
-                        arg_allow_null = true;
+                OPTION_LONG("allow-null", NULL,
+                            "Allow decrypting credentials with null key"):
+                        arg_credential_flags &= ~CREDENTIAL_REFUSE_NULL;
+                        arg_credential_flags |= CREDENTIAL_ALLOW_NULL;
                         break;
 
-                case ARG_NO_ASK_PASSWORD:
+                OPTION_LONG("refuse-null", NULL,
+                            "Refuse decrypting credentials with null key"):
+                        arg_credential_flags |= CREDENTIAL_REFUSE_NULL;
+                        arg_credential_flags &= ~CREDENTIAL_ALLOW_NULL;
+                        break;
+
+                OPTION_COMMON_NO_ASK_PASSWORD:
                         arg_ask_password = false;
                         break;
 
-                case 'q':
+                OPTION('q', "quiet", NULL, "Suppress informational messages"):
                         arg_quiet = true;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(arg_json_format_flags);
                 }
-        }
+
+        SET_FLAG(arg_credential_flags, CREDENTIAL_IPC_ALLOW_INTERACTIVE, arg_ask_password);
 
         if (uid_is_valid(arg_uid)) {
                 /* If a UID is specified, then switch to scoped credentials */
@@ -1094,6 +1002,10 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_with_key = CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED;
                 else if (sd_id128_in_set(arg_with_key, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED))
                         arg_with_key = CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED;
+                else if (sd_id128_in_set(arg_with_key, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_PINNED_SRK, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED_PINNED_SRK))
+                        arg_with_key = CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED_PINNED_SRK;
+                else if (sd_id128_in_set(arg_with_key, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_PINNED_SRK, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED_PINNED_SRK))
+                        arg_with_key = CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED_PINNED_SRK;
                 else
                         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Selected key not available in --uid= scoped mode, refusing.");
         }
@@ -1108,23 +1020,8 @@ static int parse_argv(int argc, char *argv[]) {
                 return log_error_errno(r, "Failed to check if invoked in Varlink mode: %m");
         arg_varlink = r;
 
+        *ret_args = option_parser_get_args(&opts);
         return 1;
-}
-
-static int creds_main(int argc, char *argv[]) {
-
-        static const Verb verbs[] = {
-                { "list",     VERB_ANY, 1,        VERB_DEFAULT, verb_list     },
-                { "cat",      2,        VERB_ANY, 0,            verb_cat      },
-                { "encrypt",  3,        3,        0,            verb_encrypt  },
-                { "decrypt",  2,        3,        0,            verb_decrypt  },
-                { "setup",    VERB_ANY, 1,        0,            verb_setup    },
-                { "help",     VERB_ANY, 1,        0,            verb_help     },
-                { "has-tpm2", VERB_ANY, 1,        0,            verb_has_tpm2 }, /* for backward compatibility */
-                {}
-        };
-
-        return dispatch_verb(argc, argv, verbs, NULL);
 }
 
 #define TIMESTAMP_FRESH_MAX (30*USEC_PER_SEC)
@@ -1163,6 +1060,7 @@ typedef struct MethodEncryptParameters {
         uint64_t timestamp;
         uint64_t not_after;
         CredentialScope scope;
+        sd_id128_t with_key;
         uid_t uid;
 } MethodEncryptParameters;
 
@@ -1216,6 +1114,71 @@ static int settle_scope(
         return 0;
 }
 
+static char normalize_separator(char c) {
+        if (IN_SET(c, '-', '+', '_'))
+                return '_';
+
+        return c;
+}
+
+static bool enum_name_equal(const char *x, const char *y) {
+        if (x == y)
+                return true;
+        if (!x || !y)
+                return false;
+
+        for (;; x++, y++) {
+                char a = normalize_separator(*x), b = normalize_separator(*y);
+                if (a != b)
+                        return false;
+                if (a == 0)
+                        return true;
+        }
+}
+
+static CredKeyType cred_key_type_from_string_harder(const char *s) {
+        if (!s)
+                return _CRED_KEY_TYPE_INVALID;
+
+        CredKeyType t = cred_key_type_from_string(s);
+        if (t >= 0)
+                return t;
+
+        /* Varlink doesn't like dashes and plusses in enum names. Try to match when considering them equal to underscores */
+        for (t = 0; t < _CRED_KEY_TYPE_MAX; t++)
+                if (enum_name_equal(cred_key_type_table[t], s))
+                        return t;
+
+        return _CRED_KEY_TYPE_INVALID;
+}
+
+static int dispatch_credential_key_type(
+                const char *name,
+                sd_json_variant *variant,
+                sd_json_dispatch_flags_t flags,
+                void *userdata) {
+
+        sd_id128_t *id = ASSERT_PTR(userdata);
+
+        if (sd_json_variant_is_null(variant)) {
+                *id = SD_ID128_NULL;
+                return 0;
+        }
+
+        const char *s = sd_json_variant_string(variant);
+        if (isempty(s)) {
+                *id = SD_ID128_NULL;
+                return 0;
+        }
+
+        CredKeyType t = cred_key_type_from_string_harder(s);
+        if (t < 0)
+                return json_log(variant, flags, t, "JSON field '%s' is not a valid key type.", strna(name));
+
+        *id = cred_key_id[t];
+        return 0;
+}
+
 static int vl_method_encrypt(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
 
         static const sd_json_dispatch_field dispatch_table[] = {
@@ -1225,6 +1188,7 @@ static int vl_method_encrypt(sd_varlink *link, sd_json_variant *parameters, sd_v
                 { "timestamp", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,       offsetof(MethodEncryptParameters, timestamp), 0 },
                 { "notAfter",  _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,       offsetof(MethodEncryptParameters, not_after), 0 },
                 { "scope",     SD_JSON_VARIANT_STRING,        dispatch_credential_scope,     offsetof(MethodEncryptParameters, scope),     0 },
+                { "withKey",   SD_JSON_VARIANT_STRING,        dispatch_credential_key_type,  offsetof(MethodEncryptParameters, with_key),  SD_JSON_NULLABLE },
                 { "uid",       _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uid_gid,      offsetof(MethodEncryptParameters, uid),       0 },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
@@ -1258,7 +1222,7 @@ static int vl_method_encrypt(sd_varlink *link, sd_json_variant *parameters, sd_v
                 timestamp_fresh = true;
         } else
                 timestamp_fresh = timestamp_is_fresh(p.timestamp);
-        if (p.not_after != UINT64_MAX && p.not_after < p.timestamp)
+        if (p.not_after != UINT64_MAX && p.not_after <= p.timestamp)
                 return sd_varlink_error_invalid_parameter_name(link, "notAfter");
 
         r = settle_scope(link, &p.scope, &p.uid, &cflags, /* any_scope_after_polkit= */ NULL);
@@ -1285,7 +1249,7 @@ static int vl_method_encrypt(sd_varlink *link, sd_json_variant *parameters, sd_v
         }
 
         r = encrypt_credential_and_warn(
-                        p.scope == CREDENTIAL_USER ? _CRED_AUTO_SCOPED : _CRED_AUTO,
+                        sd_id128_is_null(p.with_key) ? (p.scope == CREDENTIAL_USER ? _CRED_AUTO_SCOPED : _CRED_AUTO) : p.with_key,
                         p.name,
                         p.timestamp,
                         p.not_after,
@@ -1320,6 +1284,7 @@ typedef struct MethodDecryptParameters {
         uint64_t timestamp;
         CredentialScope scope;
         uid_t uid;
+        int allow_null;
 } MethodDecryptParameters;
 
 static void method_decrypt_parameters_done(MethodDecryptParameters *p) {
@@ -1331,11 +1296,12 @@ static void method_decrypt_parameters_done(MethodDecryptParameters *p) {
 static int vl_method_decrypt(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
 
         static const sd_json_dispatch_field dispatch_table[] = {
-                { "name",      SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string, offsetof(MethodDecryptParameters, name),      0                 },
-                { "blob",      SD_JSON_VARIANT_STRING,        json_dispatch_unbase64_iovec,  offsetof(MethodDecryptParameters, blob),      SD_JSON_MANDATORY },
-                { "timestamp", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,       offsetof(MethodDecryptParameters, timestamp), 0                 },
-                { "scope",     SD_JSON_VARIANT_STRING,        dispatch_credential_scope,     offsetof(MethodDecryptParameters, scope),     0                 },
-                { "uid",       _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uid_gid,      offsetof(MethodDecryptParameters, uid),       0                 },
+                { "name",      SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string, offsetof(MethodDecryptParameters, name),       0                 },
+                { "blob",      SD_JSON_VARIANT_STRING,        json_dispatch_unbase64_iovec,  offsetof(MethodDecryptParameters, blob),       SD_JSON_MANDATORY },
+                { "timestamp", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,       offsetof(MethodDecryptParameters, timestamp),  0                 },
+                { "scope",     SD_JSON_VARIANT_STRING,        dispatch_credential_scope,     offsetof(MethodDecryptParameters, scope),      0                 },
+                { "uid",       _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uid_gid,      offsetof(MethodDecryptParameters, uid),        0                 },
+                { "allowNull", SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_tristate,     offsetof(MethodDecryptParameters, allow_null), SD_JSON_NULLABLE  },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
         };
@@ -1343,6 +1309,7 @@ static int vl_method_decrypt(sd_varlink *link, sd_json_variant *parameters, sd_v
                 .timestamp = UINT64_MAX,
                 .scope = _CREDENTIAL_SCOPE_INVALID,
                 .uid = UID_INVALID,
+                .allow_null = -1,
         };
         bool timestamp_fresh, any_scope_after_polkit = false;
         _cleanup_(iovec_done_erase) struct iovec output = {};
@@ -1368,6 +1335,11 @@ static int vl_method_decrypt(sd_varlink *link, sd_json_variant *parameters, sd_v
         r = settle_scope(link, &p.scope, &p.uid, &cflags, &any_scope_after_polkit);
         if (r < 0)
                 return r;
+
+        if (p.allow_null > 0)
+                cflags |= CREDENTIAL_ALLOW_NULL;
+        else if (p.allow_null == 0)
+                cflags |= CREDENTIAL_REFUSE_NULL;
 
         r = sd_varlink_get_peer_uid(link, &peer_uid);
         if (r < 0)
@@ -1409,18 +1381,15 @@ static int vl_method_decrypt(sd_varlink *link, sd_json_variant *parameters, sd_v
                 ask_polkit = true;
         }
 
-        if (r == -EBADMSG)
-                return sd_varlink_error(link, "io.systemd.Credentials.BadFormat", NULL);
-        if (r == -EREMOTE)
-                return sd_varlink_error(link, "io.systemd.Credentials.NameMismatch", NULL);
-        if (r == -ESTALE)
-                return sd_varlink_error(link, "io.systemd.Credentials.TimeMismatch", NULL);
-        if (r == -ESRCH)
-                return sd_varlink_error(link, "io.systemd.Credentials.NoSuchUser", NULL);
-        if (r == -EMEDIUMTYPE)
-                return sd_varlink_error(link, "io.systemd.Credentials.BadScope", NULL);
-        if (r < 0)
+        if (ERRNO_IS_NEG_TPM2_UNSEAL_BAD_PCR(r))
+                return sd_varlink_error(link, "io.systemd.Credentials.UnexpectedPCRState", NULL);
+        if (r < 0) {
+                const CredentialsVarlinkError *e = credentials_varlink_error_by_errno(r);
+                if (e)
+                        return sd_varlink_error(link, e->id, NULL);
+
                 return r;
+        }
 
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
 
@@ -1433,49 +1402,56 @@ static int vl_method_decrypt(sd_varlink *link, sd_json_variant *parameters, sd_v
         return sd_varlink_reply(link, reply);
 }
 
+static int vl_server(void) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *varlink_server = NULL;
+        _cleanup_hashmap_free_ Hashmap *polkit_registry = NULL;
+        int r;
+
+        /* Invocation as Varlink service */
+
+        r = varlink_server_new(
+                        &varlink_server,
+                        SD_VARLINK_SERVER_ACCOUNT_UID|SD_VARLINK_SERVER_INHERIT_USERDATA|SD_VARLINK_SERVER_INPUT_SENSITIVE,
+                        &polkit_registry);
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate Varlink server: %m");
+
+        r = sd_varlink_server_add_interface(varlink_server, &vl_interface_io_systemd_Credentials);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add Varlink interface: %m");
+
+        r = sd_varlink_server_bind_method_many(
+                        varlink_server,
+                        "io.systemd.Credentials.Encrypt", vl_method_encrypt,
+                        "io.systemd.Credentials.Decrypt", vl_method_decrypt);
+        if (r < 0)
+                return log_error_errno(r, "Failed to bind Varlink methods: %m");
+
+        r = sd_varlink_server_loop_auto(varlink_server);
+        if (r < 0)
+                return log_error_errno(r, "Failed to run Varlink event loop: %m");
+
+        return 0;
+}
+
 static int run(int argc, char *argv[]) {
         int r;
 
+        LIBCRYPTO_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        TPM2_NOTE(suggested);
+
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
-        if (arg_varlink) {
-                _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *varlink_server = NULL;
-                _cleanup_hashmap_free_ Hashmap *polkit_registry = NULL;
+        if (arg_varlink)
+                return vl_server();
 
-                /* Invocation as Varlink service */
-
-                r = varlink_server_new(
-                                &varlink_server,
-                                SD_VARLINK_SERVER_ACCOUNT_UID|SD_VARLINK_SERVER_INHERIT_USERDATA|SD_VARLINK_SERVER_INPUT_SENSITIVE,
-                                NULL);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to allocate Varlink server: %m");
-
-                r = sd_varlink_server_add_interface(varlink_server, &vl_interface_io_systemd_Credentials);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to add Varlink interface: %m");
-
-                r = sd_varlink_server_bind_method_many(
-                                varlink_server,
-                                "io.systemd.Credentials.Encrypt", vl_method_encrypt,
-                                "io.systemd.Credentials.Decrypt", vl_method_decrypt);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to bind Varlink methods: %m");
-
-                sd_varlink_server_set_userdata(varlink_server, &polkit_registry);
-
-                r = sd_varlink_server_loop_auto(varlink_server);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to run Varlink event loop: %m");
-
-                return 0;
-        }
-
-        return creds_main(argc, argv);
+        return dispatch_verb(args, NULL);
 }
 
 DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);

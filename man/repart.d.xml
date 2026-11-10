@@ -238,7 +238,7 @@
         <constant>x86</constant> (32-bit, aka i386) and <constant>x86-64</constant> (64-bit, aka amd64).</para>
 
         <para>Most of the partition type UUIDs listed above are defined in the <ulink
-        url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable Partitions
+        url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">UAPI.2 Discoverable Partitions
         Specification</ulink>.</para>
 
         <xi:include href="version-info.xml" xpointer="v245"/></listitem>
@@ -249,11 +249,22 @@
 
         <listitem><para>The textual label to assign to the partition if none is assigned yet. Note that this
         setting is not used for matching. It is also not used when a label is already set for an existing
-        partition. It is thus only used when a partition is newly created or when an existing one had a no
+        partition. It is thus only used when a partition is newly created or when an existing one had no
         label set (that is: an empty label). If not specified, a label derived from the partition type is
         automatically used. Simple specifier expansion is supported, see below.</para>
 
         <xi:include href="version-info.xml" xpointer="v245"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>VolumeLabel=</varname></term>
+
+        <listitem><para>The textual label to assign to the LUKS superblock if applicable. If not specified
+        defaults to the same string as the partition label (see <varname>Label=</varname> above), however
+        prefixed with <literal>luks-</literal>. This setting has no effect if encryption is not enabled for
+        this partition.</para>
+
+        <xi:include href="version-info.xml" xpointer="v259"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -391,7 +402,7 @@
         be empty. If this option is used, the size allocation algorithm is slightly altered: the partition is
         created at least as big as required to fit the data in, i.e. the data size is an additional minimum
         size value taken into consideration for the allocation algorithm, similar to and in addition to the
-        <varname>SizeMin=</varname> value configured above.</para>
+        <varname>SizeMinBytes=</varname> value configured above.</para>
 
         <para>This option has no effect if the partition it is declared for already exists, i.e. existing
         data is never overwritten. Note that the data is copied in before the partition table is updated,
@@ -486,17 +497,6 @@
         in a user namespace with the current user mapped to the root user to make sure the files and
         directories in the image are owned by the root user.</para>
 
-        <para>Note that when populating XFS filesystems with <command>systemd-repart</command> and loop
-        devices are not available, populating XFS filesystems with files containing spaces, tabs or newlines
-        might fail on old versions of
-        <citerefentry project='man-pages'><refentrytitle>mkfs.xfs</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-        due to limitations of its protofile format.</para>
-
-        <para>Note that when populating XFS filesystems with <command>systemd-repart</command> and loop
-        devices are not available, extended attributes will not be copied into generated XFS filesystems
-        due to limitations <citerefentry project='man-pages'><refentrytitle>mkfs.xfs</refentrytitle><manvolnum>8</manvolnum></citerefentry>'s
-        protofile format.</para>
-
         <para>This option cannot be combined with <varname>CopyBlocks=</varname>.</para>
 
         <para>When
@@ -505,6 +505,26 @@
         relative to the specified directory. If <option>--copy-source=</option> is not used, but the
         <option>--image=</option> or <option>--root=</option> switches are used, the source paths are taken
         relative to the specified root directory or disk image root.</para>
+
+        <para>Note that when <varname>CopyFiles=</varname> is used with <varname>Format=xfs</varname>,
+        <command>xfsprogs</command> 6.17 or newer is required.</para>
+
+        <para>Note that <command>systemd-repart</command> always excludes the contents of a number of API
+        file systems and temporary directories, namely <filename>/proc/</filename>, <filename>/sys/</filename>,
+        <filename>/dev/</filename>, <filename>/tmp/</filename>, <filename>/run/</filename>, and
+        <filename>/var/tmp/</filename>, as their contents are not expected to be part of a disk image. The
+        directories themselves are still created (empty) in the new file system.</para>
+
+        <para>When a root partition is populated, the contents below the mount points of any other
+        partitions that are part of the same image are excluded too, so that data belonging to a separate
+        partition is not duplicated into the root file system. For example, if an <constant>esp</constant>
+        partition is part of the image, the contents of <filename>/boot/</filename> and
+        <filename>/efi/</filename> are not copied into the root partition.</para>
+
+        <para>To copy a directory that is excluded by the mount-point rule above, add an explicit
+        <varname>CopyFiles=</varname> entry for it. For example, <literal>CopyFiles=/boot:/boot</literal>
+        overrides the implicit exclusion and copies <filename>/boot/</filename> into the root
+        partition.</para>
 
         <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
@@ -612,6 +632,10 @@
                 <entry><literal>ro</literal></entry>
                 <entry>Make this subvolume read-only.</entry>
               </row>
+              <row id='C'>
+                <entry><literal>nodatacow</literal></entry>
+                <entry>Disable data CoW for this subvolume.</entry>
+              </row>
             </tbody>
           </tgroup>
         </table>
@@ -646,6 +670,39 @@
       </varlistentry>
 
       <varlistentry>
+        <term><varname>BlockDeviceReplace=</varname></term>
+
+        <listitem><para>Takes a path to a mountpoint. Its filesystem's backing device will be replaced
+        with the newly created partition. This works only for btrfs filesystems. This option is ignored for already existing partitions.</para>
+
+        <para>If after moving the filesystem, an error happens before the writing of the partition table is
+        finished, there will be an attempt to move the filesystem back to its original device. But if that
+        attempt also fails, the filesystem might be living on a partition that does not exist in the
+        partition table and will be lost on reboot. This feature is intended to save initially volatile
+        mounted filesystems into the new disk with no important data, like a live boot system. They might
+        need to be recreated after a failure writing the partition table.</para>
+
+        <para>This option is not compatible with <option>--offline=yes</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>VolumeName=</varname></term>
+
+        <listitem><para>If an encrypted partition is created through <varname>Encrypt=</varname>, and it will
+        stay activated after <command>systemd-repart</command> is done (using
+        <varname>BlockDeviceReplace=</varname>), then the name of the device mapper volume created will use
+        the name specified by <varname>VolumeName=</varname>.</para>
+
+        <para>The value must be a valid filename. If not specified, it will default to the value of
+        <varname>VolumeLabel=</varname> (which could be derived from <varname>Label=</varname>) if
+        valid.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>Encrypt=</varname></term>
 
         <listitem><para>Takes one of <literal>off</literal>, <literal>key-file</literal>,
@@ -669,7 +726,51 @@
 
         <para>This option has no effect if the partition already exists.</para>
 
+        <para>This option may be combined with <varname>Verity=data</varname> in order to place the
+        encrypted partition inside a dm-verity protection envelope, see the description of
+        <varname>Verity=</varname> below.</para>
+
         <xi:include href="version-info.xml" xpointer="v247"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>Discard=</varname></term>
+
+        <listitem><para>Takes a boolean argument. The default is <literal>no</literal> if
+        <option>--discard=no</option> is used for the invocation of <command>systemd-repart</command>
+        or if <varname>Integrity=inline</varname> is set. It is <literal>yes</literal> otherwise.</para>
+
+        <para>If set to <literal>yes</literal>, when creating the LUKS2 superblock for the partition, the
+        <literal>allow-discards</literal> activation flag will be set so that future activations will allow
+        discards by default.</para>
+
+        <para>This option has no effect if the partition already exists or if <varname>Encrypt=off</varname> is used.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>EncryptKDF=</varname></term>
+
+        <listitem><para>Specifies the key derivation function (KDF) to use for LUKS2 encryption keyslots.
+        Takes one of <literal>argon2id</literal>, <literal>pbkdf2</literal>, or <literal>minimal</literal>.
+        If not specified, the default is determined by the cryptsetup library (typically
+        <literal>argon2id</literal>). This option has no effect if <varname>Encrypt=</varname> is
+        <literal>off</literal>.</para>
+
+        <para>When set to <literal>argon2id</literal> or <literal>pbkdf2</literal>, the specified KDF is
+        used with parameters benchmarked by the cryptsetup library. When set to <literal>minimal</literal>,
+        PBKDF2 is used with SHA-512, 1000 iterations, and no benchmarking — this is appropriate for
+        high-entropy keys (e.g. generated by a hardware key manager or sealed to a TPM) where the KDF only
+        needs to satisfy the LUKS2 format requirement, not strengthen a weak passphrase.</para>
+
+        <para>Note that Argon2-based KDFs may require significant memory (up to 1GB) during key derivation.
+        In memory-constrained environments such as kdump with limited crashkernel memory,
+        <literal>minimal</literal> or <literal>pbkdf2</literal> may be more appropriate. When
+        <varname>Encrypt=</varname> includes <literal>tpm2</literal>, the TPM2 keyslot always uses a minimal
+        PBKDF2 configuration regardless of this setting.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -693,7 +794,19 @@
 
         <para>This option has no effect if the partition already exists.</para>
 
-        <para>Usage of this option in combination with <varname>Encrypt=</varname> is not supported.</para>
+        <para><literal>data</literal> may be combined with <varname>Encrypt=</varname>, in which case the
+        partition is first encrypted with LUKS2 and the verity hash data is then generated from the
+        resulting ciphertext, i.e. Verity is the outer protection envelope and LUKS2 the inner. Tools such
+        as <citerefentry><refentrytitle>systemd-dissect</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+        will then set up the dm-verity device first, and open the LUKS2 volume on top of it, so that all
+        encrypted data read is also authenticated via the verity root hash. Note that in this case the
+        verity hashes necessarily cover freshly generated ciphertext, hence the root hash (and thus the
+        default partition UUIDs derived from it) will change on every build, even if the plaintext contents
+        are fully reproducible. <varname>Encrypt=</varname> may not be combined with
+        <literal>Verity=hash</literal> or <literal>Verity=signature</literal>. Since the ciphertext is only
+        generated while the final image is built, <varname>Minimize=</varname> cannot be used for the hash
+        partition of an encrypted data partition; use <varname>SizeMaxBytes=</varname> on the data partition
+        to size the hash partition instead.</para>
 
         <para>For each unique <varname>VerityMatchKey=</varname> value, a single verity data partition
         (<literal>Verity=data</literal>) and a single verity hash partition (<literal>Verity=hash</literal>)
@@ -765,7 +878,7 @@
 
         <listitem><para>Configures the No-Auto, Read-Only and Grow-File-System partition flags (bit 63, 60
         and 59) of the partition table entry, as defined by the <ulink
-        url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable Partitions Specification</ulink>. Only
+        url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">UAPI.2 Discoverable Partitions Specification</ulink>. Only
         available for partition types supported by the specification. This option is a friendly way to set
         bits 63, 60 and 59 of the partition flags value without setting any of the other bits, and may be set
         via <varname>Flags=</varname> too, see above.</para>
@@ -819,9 +932,9 @@
         <literal>off</literal> when false, and <literal>best</literal> when true). Defaults to
         <literal>off</literal>. If set to <literal>best</literal>, the partition will have the minimal size
         required to store the sources configured with <varname>CopyFiles=</varname>. <literal>best</literal>
-        is currently only supported for read-only filesystems. If set to <literal>guess</literal>, the
-        partition is created at least as big as required to store the sources configured with
-        <varname>CopyFiles=</varname>. Note that unless the filesystem is a read-only filesystem,
+        is currently only supported for read-only filesystems and btrfs. If set to <literal>guess</literal>,
+        the partition is created at least as big as required to store the sources configured with
+        <varname>CopyFiles=</varname>. Note that unless the filesystem is a read-only filesystem or btrfs,
         <command>systemd-repart</command> will have to populate the filesystem twice to guess the minimal
         required size, so enabling this option might slow down repart when populating large partitions.
         </para>
@@ -854,19 +967,72 @@
         <term><varname>EncryptedVolume=</varname></term>
 
         <listitem><para>Specifies how the encrypted partition should be set up. Takes at least one and at most
-        three fields separated with a colon (<literal>:</literal>). The first field specifies the encrypted
+        four fields separated with a colon (<literal>:</literal>). The first field specifies the encrypted
         volume name under <filename>/dev/mapper/</filename>. If not specified, <literal>luks-UUID</literal>
         will be used where <literal>UUID</literal> is the LUKS UUID. The second field specifies the keyfile
         to use following the same format as specified in crypttab. The third field specifies a
-        comma-delimited list of crypttab options. These fields correspond to the first, third and fourth
+        comma-delimited list of crypttab options. These three fields correspond to the first, third and fourth
         column of the
         <citerefentry><refentrytitle>crypttab</refentrytitle><manvolnum>5</manvolnum></citerefentry> format.
+        The fourth field contains extra options, which are not directly reflected to crypttab options. Currently,
+        the only supported extra option is <varname>fixate-volume-key</varname>. When specified, the volume key
+        hash will be taken upon LUKS volume formatting and the result will be added to the list of crypttab options,
+        i.e. <varname>fixate-volume-key=expected-hash</varname> will be added to the fourth column of the generated
+        crypttab.
         </para>
 
         <para>Note that this setting is only taken into account when <option>--generate-crypttab=</option>
-        is specified on the <command>systemd-repart</command> command line.</para>
+        is specified on the <command>systemd-repart</command> command line. As the crypttab with the expected
+        hashes can only be generated after LUKS volumes are formatted, the crypttab itself cannot be put to
+        the generated volume.</para>
 
         <xi:include href="version-info.xml" xpointer="v256"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>TPM2PCRs=</varname></term>
+
+        <listitem><para>Configures the list of PCRs to use for LUKS2 volumes configured with
+        the <varname>Encrypt=tpm2</varname> setting in partition files.
+        This option take the same parameters as the similarly named options to
+        <citerefentry><refentrytitle>systemd-cryptenroll</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+        and have the same effect on partitions where TPM2 enrollment is requested.
+        This option will be overridden by the global <varname>--tpm2-pcrs=</varname> option.</para>
+
+        <xi:include href="version-info.xml" xpointer="v259"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>KeyFile=</varname></term>
+
+        <listitem><para>Takes a file system path. This path must be absolute, otherwise the option is ignored.
+        Configures the encryption key to use when setting up LUKS2 volumes configured with the
+        <varname>Encrypt=key-file</varname> setting in partition files. Please refer to the documentation of
+        <varname>--key-file=</varname> for more details. This option will be overridden by the global
+        <varname>--key-file=</varname> option.</para>
+
+        <xi:include href="version-info.xml" xpointer="v259"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>Integrity=</varname></term>
+
+        <listitem><para>Enable integrity checking for the partition. Currently, the only supported option
+        is <varname>Integrity=inline</varname> which enables authenticated disk encryption for LUKS2 devices.
+        The option requires <varname>Encrypt=</varname> setting and can only be used in online image build.
+        Defaults to <literal>off</literal>, i.e. integrity protection is disabled.</para>
+        <para>Note: authenticated disk encryption is considered EXPERIMENTAL by cryptsetup.</para>
+
+        <xi:include href="version-info.xml" xpointer="v260"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>IntegrityAlgorithm=</varname></term>
+        <listitem><para>Specify the integrity algorithm to be used for integrity verification. For
+        <varname>Integrity=inline</varname> the supported values are: <literal>hmac-sha1</literal>,
+        <literal>hmac-sha256</literal>(default), and <literal>hmac-sha512</literal>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v260"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -967,7 +1133,7 @@
         associated with it.</para>
 
         <para>For example, distributions can use this to implement <varname>$BOOT</varname> as defined in the
-        <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification/">Boot Loader
+        <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification/">UAPI.1 Boot Loader
         Specification</ulink>. Distributions may prefer to use the ESP as <varname>$BOOT</varname> whenever
         possible, but to adhere to the spec XBOOTLDR must sometimes be used instead. So, they should create
         two definitions: the first defining an ESP big enough to hold just the bootloader, and a second for
@@ -1043,8 +1209,8 @@
     <title>Specifiers</title>
 
     <para>Specifiers may be used in the <varname>Label=</varname>, <varname>CopyBlocks=</varname>,
-    <varname>CopyFiles=</varname>, <varname>MakeDirectories=</varname>, <varname>SplitName=</varname>
-    settings. The following expansions are understood:</para>
+    <varname>CopyFiles=</varname>, <varname>MakeDirectories=</varname>, <varname>MakeSymlinks=</varname>,
+    <varname>SplitName=</varname> settings. The following expansions are understood:</para>
       <table class='specifiers'>
         <title>Specifiers available</title>
         <tgroup cols='3' align='left' colsep='1' rowsep='1'>

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <linux/if_arp.h>
+#include <linux/netdevice.h>
 #include <unistd.h>
 
 #include "sd-netlink.h"
@@ -14,6 +15,7 @@
 #include "condition.h"
 #include "conf-files.h"
 #include "conf-parser.h"
+#include "device-private.h"
 #include "dummy.h"
 #include "fou-tunnel.h"
 #include "geneve.h"
@@ -277,6 +279,7 @@ static int netdev_attach_name_full(NetDev *netdev, const char *name, Hashmap **n
 
         assert(netdev);
         assert(name);
+        assert(netdevs);
 
         r = hashmap_ensure_put(netdevs, &string_hash_ops, name, netdev);
         if (r == -ENOMEM)
@@ -461,6 +464,7 @@ int netdev_set_ifindex_internal(NetDev *netdev, int ifindex) {
 
 static int netdev_set_ifindex_impl(NetDev *netdev, const char *name, int ifindex) {
         assert(netdev);
+        assert(netdev->ifname);
         assert(name);
         assert(ifindex > 0);
 
@@ -573,6 +577,21 @@ int netdev_generate_hw_addr(
 
                 if (!IN_SET(NETDEV_VTABLE(netdev)->iftype, ARPHRD_ETHER, ARPHRD_INFINIBAND))
                         goto finalize;
+
+                /* If the interface already exists and its MAC address has been set by userspace
+                 * (e.g. through MACAddress= in the matching .network file, or manually), do not
+                 * generate a new address. Otherwise, on reconfiguration the generated address would
+                 * override the one set by userspace and, as they differ, both would be re-applied on
+                 * every reload/restart. See issue #42457. */
+                Link *link;
+                unsigned addr_assign_type;
+                if (link_get_by_index(netdev->manager, netdev->ifindex, &link) >= 0 &&
+                    link->dev &&
+                    device_get_sysattr_unsigned(link->dev, "addr_assign_type", &addr_assign_type) >= 0 &&
+                    addr_assign_type == NET_ADDR_SET) {
+                        log_netdev_debug(netdev, "MAC address is already set by userspace, not generating a new one.");
+                        goto finalize;
+                }
 
                 r = net_get_unique_predictable_data_from_name(name, &HASH_KEY, &result);
                 if (r < 0) {
@@ -827,7 +846,7 @@ static bool link_is_ready_to_create_stacked_netdev_one(Link *link, bool allow_un
 }
 
 static bool link_is_ready_to_create_stacked_netdev(Link *link) {
-        return check_ready_for_all_sr_iov_ports(link, /* allow_unmanaged = */ false,
+        return check_ready_for_all_sr_iov_ports(link, /* allow_unmanaged= */ false,
                                                 link_is_ready_to_create_stacked_netdev_one);
 }
 
@@ -963,6 +982,13 @@ static int independent_netdev_process_request(Request *req, Link *link, void *us
                 return 1; /* Skip this request. */
         }
 
+        Link *existing;
+        if (link_get_by_index(netdev->manager, netdev->ifindex, &existing) >= 0 &&
+            IN_SET(existing->state,
+                   LINK_STATE_PENDING, /* Already exists and is being processed by udevd. Postpone the request. */
+                   LINK_STATE_LINGER)) /* Already removed; wait for the stale information to be cleared. */
+                return 0;
+
         r = netdev_is_ready_to_create(netdev, NULL);
         if (r <= 0)
                 return r;
@@ -1031,18 +1057,19 @@ int netdev_load_one(Manager *manager, const char *filename, NetDev **ret) {
 
         dropin_dirname = strjoina(file_basename, ".d");
         r = config_parse_many(
-                        STRV_MAKE_CONST(filename), NETWORK_DIRS, dropin_dirname, /* root = */ NULL,
+                        STRV_MAKE_CONST(filename),
+                        NETWORK_DIRS,
+                        dropin_dirname,
                         NETDEV_COMMON_SECTIONS NETDEV_OTHER_SECTIONS,
-                        config_item_perf_lookup, network_netdev_gperf_lookup,
+                        config_item_perf_lookup,
+                        network_netdev_gperf_lookup,
                         CONFIG_PARSE_WARN,
-                        netdev_raw,
-                        NULL,
-                        NULL);
+                        netdev_raw);
         if (r < 0)
                 return r; /* config_parse_many() logs internally. */
 
         /* skip out early if configuration does not match the environment */
-        if (!condition_test_list(netdev_raw->conditions, environ, NULL, NULL, NULL))
+        if (!condition_test_list_net(netdev_raw->conditions, environ, NULL, NULL, NULL))
                 return log_debug_errno(SYNTHETIC_ERRNO(ESTALE), "%s: Conditions in the file do not match the system environment, skipping.", filename);
 
         if (netdev_raw->kind == _NETDEV_KIND_INVALID)
@@ -1064,10 +1091,15 @@ int netdev_load_one(Manager *manager, const char *filename, NetDev **ret) {
         if (NETDEV_VTABLE(netdev)->init)
                 NETDEV_VTABLE(netdev)->init(netdev);
 
-        r = config_parse_many(
-                        STRV_MAKE_CONST(filename), NETWORK_DIRS, dropin_dirname, /* root = */ NULL,
+        r = config_parse_many_full(
+                        STRV_MAKE_CONST(filename),
+                        NETWORK_DIRS,
+                        dropin_dirname,
+                        /* root= */ NULL,
+                        /* root_fd= */ -EBADF,
                         NETDEV_VTABLE(netdev)->sections,
-                        config_item_perf_lookup, network_netdev_gperf_lookup,
+                        config_item_perf_lookup,
+                        network_netdev_gperf_lookup,
                         CONFIG_PARSE_WARN,
                         netdev,
                         &netdev->stats_by_path,
@@ -1086,7 +1118,7 @@ int netdev_load_one(Manager *manager, const char *filename, NetDev **ret) {
         if (!netdev->filename)
                 return log_oom();
 
-        log_syntax(/* unit = */ NULL, LOG_DEBUG, filename, /* config_line = */ 0, /* error = */ 0, "Successfully loaded.");
+        log_syntax(/* unit= */ NULL, LOG_DEBUG, filename, /* config_line= */ 0, /* error= */ 0, "Successfully loaded.");
 
         *ret = TAKE_PTR(netdev);
         return 0;
@@ -1098,7 +1130,7 @@ int netdev_load(Manager *manager) {
 
         assert(manager);
 
-        r = conf_files_list_strv(&files, ".netdev", NULL, 0, NETWORK_DIRS);
+        r = conf_files_list_strv(&files, ".netdev", /* root= */ NULL, CONF_FILES_WARN, NETWORK_DIRS);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate netdev files: %m");
 
@@ -1127,7 +1159,7 @@ int netdev_reload(Manager *manager) {
 
         assert(manager);
 
-        r = conf_files_list_strv(&files, ".netdev", NULL, 0, NETWORK_DIRS);
+        r = conf_files_list_strv(&files, ".netdev", /* root= */ NULL, CONF_FILES_WARN, NETWORK_DIRS);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate netdev files: %m");
 

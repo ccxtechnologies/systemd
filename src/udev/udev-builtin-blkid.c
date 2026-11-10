@@ -10,7 +10,6 @@
 #endif
 
 #include <fcntl.h>
-#include <getopt.h>
 #include <linux/loop.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -20,11 +19,13 @@
 #include "blockdev-util.h"
 #include "device-util.h"
 #include "devnum-util.h"
+#include "efi-api.h"
 #include "efi-loader.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "initrd-util.h"
 #include "gpt.h"
+#include "options.h"
 #include "parse-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -49,21 +50,21 @@ static void print_property(UdevEvent *event, const char *name, const char *value
                 udev_builtin_add_property(event, "ID_FS_VERSION", value);
 
         } else if (streq(name, "UUID")) {
-                blkid_safe_string(value, s, sizeof(s));
+                sym_blkid_safe_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_UUID", s);
-                blkid_encode_string(value, s, sizeof(s));
+                sym_blkid_encode_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_UUID_ENC", s);
 
         } else if (streq(name, "UUID_SUB")) {
-                blkid_safe_string(value, s, sizeof(s));
+                sym_blkid_safe_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_UUID_SUB", s);
-                blkid_encode_string(value, s, sizeof(s));
+                sym_blkid_encode_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_UUID_SUB_ENC", s);
 
         } else if (streq(name, "LABEL")) {
-                blkid_safe_string(value, s, sizeof(s));
+                sym_blkid_safe_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_LABEL", s);
-                blkid_encode_string(value, s, sizeof(s));
+                sym_blkid_encode_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_LABEL_ENC", s);
 
         } else if (STR_IN_SET(name, "FSSIZE", "FSLASTBLOCK", "FSBLOCKSIZE")) {
@@ -77,11 +78,11 @@ static void print_property(UdevEvent *event, const char *name, const char *value
                 udev_builtin_add_property(event, "ID_PART_TABLE_UUID", value);
 
         } else if (streq(name, "PART_ENTRY_NAME")) {
-                blkid_encode_string(value, s, sizeof(s));
+                sym_blkid_encode_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_PART_ENTRY_NAME", s);
 
         } else if (streq(name, "PART_ENTRY_TYPE")) {
-                blkid_encode_string(value, s, sizeof(s));
+                sym_blkid_encode_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_PART_ENTRY_TYPE", s);
 
         } else if (startswith(name, "PART_ENTRY_")) {
@@ -89,35 +90,35 @@ static void print_property(UdevEvent *event, const char *name, const char *value
                 udev_builtin_add_property(event, s, value);
 
         } else if (streq(name, "SYSTEM_ID")) {
-                blkid_encode_string(value, s, sizeof(s));
+                sym_blkid_encode_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_SYSTEM_ID", s);
 
         } else if (streq(name, "PUBLISHER_ID")) {
-                blkid_encode_string(value, s, sizeof(s));
+                sym_blkid_encode_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_PUBLISHER_ID", s);
 
         } else if (streq(name, "APPLICATION_ID")) {
-                blkid_encode_string(value, s, sizeof(s));
+                sym_blkid_encode_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_APPLICATION_ID", s);
 
         } else if (streq(name, "BOOT_SYSTEM_ID")) {
-                blkid_encode_string(value, s, sizeof(s));
+                sym_blkid_encode_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_BOOT_SYSTEM_ID", s);
 
         } else if (streq(name, "VOLUME_ID")) {
-                blkid_encode_string(value, s, sizeof(s));
+                sym_blkid_encode_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_VOLUME_ID", s);
 
         } else if (streq(name, "LOGICAL_VOLUME_ID")) {
-                blkid_encode_string(value, s, sizeof(s));
+                sym_blkid_encode_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_LOGICAL_VOLUME_ID", s);
 
         } else if (streq(name, "VOLUME_SET_ID")) {
-                blkid_encode_string(value, s, sizeof(s));
+                sym_blkid_encode_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_VOLUME_SET_ID", s);
 
         } else if (streq(name, "DATA_PREPARER_ID")) {
-                blkid_encode_string(value, s, sizeof(s));
+                sym_blkid_encode_string(value, s, sizeof(s));
                 udev_builtin_add_property(event, "ID_FS_DATA_PREPARER_ID", s);
         }
 }
@@ -186,7 +187,7 @@ static int find_gpt_root(UdevEvent *event, blkid_probe pr, const char *loop_back
                          * hence no need to bother with searching for ESP/XBOOTLDR */
                         need_esp_or_xbootldr = false;
                 } else
-                        /* We now know the the ESP/xbootldr UUID, but we cannot be sure yet it's on this block
+                        /* We now know the ESP/xbootldr UUID, but we cannot be sure yet it's on this block
                          * device, hence look for it among partitions now */
                         need_esp_or_xbootldr = true;
         } else {
@@ -222,7 +223,7 @@ static int find_gpt_root(UdevEvent *event, blkid_probe pr, const char *loop_back
         }
 
         errno = 0;
-        blkid_partlist pl = blkid_probe_get_partitions(pr);
+        blkid_partlist pl = sym_blkid_probe_get_partitions(pr);
         if (!pl)
                 return log_device_debug_errno(dev, errno_or_else(ENOMEM), "Failed to probe partitions: %m");
 
@@ -233,7 +234,7 @@ static int find_gpt_root(UdevEvent *event, blkid_probe pr, const char *loop_back
                 /* If we already know the root partition, let's verify its type ID and then directly query
                  * its ID */
 
-                blkid_partition root_partition = blkid_partlist_devno_to_partition(pl, root_devno);
+                blkid_partition root_partition = sym_blkid_partlist_devno_to_partition(pl, root_devno);
                 if (root_partition) {
                         sd_id128_t type;
                         r = blkid_partition_get_type_id128(root_partition, &type);
@@ -249,13 +250,13 @@ static int find_gpt_root(UdevEvent *event, blkid_probe pr, const char *loop_back
                 /* We do not know the root partition, let's search for it. */
 
                 _cleanup_free_ char *root_label = NULL;
-                int nvals = blkid_partlist_numof_partitions(pl);
+                int nvals = sym_blkid_partlist_numof_partitions(pl);
                 for (int i = 0; i < nvals; i++) {
                         blkid_partition pp;
                         const char *label;
                         sd_id128_t type, id;
 
-                        pp = blkid_partlist_get_partition(pl, i);
+                        pp = sym_blkid_partlist_get_partition(pl, i);
                         if (!pp)
                                 continue;
 
@@ -271,7 +272,7 @@ static int find_gpt_root(UdevEvent *event, blkid_probe pr, const char *loop_back
                                 continue;
                         }
 
-                        label = blkid_partition_get_name(pp); /* returns NULL if empty */
+                        label = sym_blkid_partition_get_name(pp); /* returns NULL if empty */
 
                         if (need_esp_or_xbootldr && sd_id128_in_set(type, SD_GPT_ESP, SD_GPT_XBOOTLDR)) {
 
@@ -282,7 +283,7 @@ static int find_gpt_root(UdevEvent *event, blkid_probe pr, const char *loop_back
                         } else if (sd_id128_equal(type, SD_GPT_ROOT_NATIVE)) {
                                 unsigned long long flags;
 
-                                flags = blkid_partition_get_flags(pp);
+                                flags = sym_blkid_partition_get_flags(pp);
                                 if (flags & SD_GPT_FLAG_NO_AUTO)
                                         continue;
 
@@ -320,34 +321,38 @@ static int probe_superblocks(blkid_probe pr) {
         struct stat st;
         int rc;
 
-        /* TODO: Return negative errno. */
-
-        if (fstat(blkid_probe_get_fd(pr), &st))
+        if (fstat(sym_blkid_probe_get_fd(pr), &st))
                 return -errno;
 
-        blkid_probe_enable_partitions(pr, 1);
+        sym_blkid_probe_enable_partitions(pr, 1);
 
         if (!S_ISCHR(st.st_mode) &&
-            blkid_probe_get_size(pr) <= 1024 * 1440 &&
-            blkid_probe_is_wholedisk(pr)) {
+            sym_blkid_probe_get_size(pr) <= 1024 * 1440 &&
+            sym_blkid_probe_is_wholedisk(pr)) {
                 /*
                  * check if the small disk is partitioned, if yes then
                  * don't probe for filesystems.
                  */
-                blkid_probe_enable_superblocks(pr, 0);
+                sym_blkid_probe_enable_superblocks(pr, 0);
 
-                rc = blkid_do_fullprobe(pr);
+                errno = 0;
+                rc = sym_blkid_do_fullprobe(pr);
                 if (rc < 0)
-                        return rc;        /* -1 = error, 1 = nothing, 0 = success */
+                        return errno_or_else(EIO);
 
-                if (blkid_probe_lookup_value(pr, "PTTYPE", NULL, NULL) == 0)
+                if (sym_blkid_probe_lookup_value(pr, "PTTYPE", NULL, NULL) == 0)
                         return 0;        /* partition table detected */
         }
 
-        blkid_probe_set_partitions_flags(pr, BLKID_PARTS_ENTRY_DETAILS);
-        blkid_probe_enable_superblocks(pr, 1);
+        sym_blkid_probe_set_partitions_flags(pr, BLKID_PARTS_ENTRY_DETAILS);
+        sym_blkid_probe_enable_superblocks(pr, 1);
 
-        return blkid_do_safeprobe(pr);
+        errno = 0;
+        rc = sym_blkid_do_safeprobe(pr);
+        if (rc < 0)
+                return errno_or_else(EIO);
+
+        return rc; /* 0 = success, 1 = nothing found */
 }
 
 static int read_loopback_backing_inode(
@@ -421,6 +426,92 @@ notloop:
         return 0;
 }
 
+static int gpt_boot_disk_needs_loop(sd_device *dev, int fd, ssize_t *ret_sector_size) {
+        int r;
+
+        assert(dev);
+        assert(fd >= 0);
+        assert(ret_sector_size);
+
+        /* Determine whether the boot disk needs a loop device to expose its partitions. For devices
+         * booted via El Torito, the GPT may use a different sector size than the device (e.g. a 512-byte
+         * GPT on a device with 2048-byte blocks). If there's a mismatch, check whether this is the boot
+         * disk by comparing GPT partition UUIDs with the ESP/XBOOTLDR UUID exported by the boot loader.
+         * The kernel can't parse the partition table itself in this case, so the caller sets up a loop
+         * device with the returned sector size.
+         *
+         * Even if the sector sizes match, if the device does not support partition scanning (e.g. some
+         * CD-ROM drives), the kernel still can't parse the partition table. In that case too, if the
+         * disk contains the ESP we booted from, a loop device is needed to expose the partitions.
+         *
+         * Returns 1 if the boot disk needs a loop device, 0 if not. On success the GPT sector size is
+         * returned in *ret_sector_size (0 if the disk has no GPT), regardless of whether a loop device
+         * is needed. */
+
+        _cleanup_free_ void *entries = NULL;
+        uint32_t n_entries, entry_size;
+        ssize_t gpt_ssz = gpt_probe(fd, /* ret_header= */ NULL, &entries, &n_entries, &entry_size);
+        if (gpt_ssz < 0)
+                return log_device_debug_errno(dev, gpt_ssz, "Failed to probe GPT: %m");
+        if (gpt_ssz == 0) {
+                *ret_sector_size = 0;
+                return 0;
+        }
+
+        uint32_t device_ssz;
+        r = blockdev_get_sector_size(fd, &device_ssz);
+        if (r < 0)
+                return log_device_debug_errno(dev, r, "Failed to get device sector size: %m");
+
+        bool sector_size_mismatch = (uint32_t) gpt_ssz != device_ssz;
+
+        if (!sector_size_mismatch) {
+                r = blockdev_partscan_enabled(dev);
+                if (r < 0)
+                        return log_device_debug_errno(dev, r, "Failed to check if partition scanning is enabled: %m");
+                if (r > 0) {
+                        /* The kernel can parse the partition table itself; no loop device needed. */
+                        *ret_sector_size = gpt_ssz;
+                        return 0;
+                }
+        }
+
+        if (sector_size_mismatch)
+                log_device_debug(dev, "GPT sector size %zi does not match device sector size %" PRIu32 ".",
+                                 gpt_ssz, device_ssz);
+        else
+                log_device_debug(dev, "Device does not support partition scanning.");
+
+        sd_id128_t loader_part_uuid;
+        r = efi_loader_get_device_part_uuid(&loader_part_uuid);
+        if (r < 0) {
+                if (r != -ENOENT && !ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                        return log_device_debug_errno(dev, r, "Failed to get loader partition UUID: %m");
+
+                /* No loader partition UUID set, can't tell whether this is the boot disk. */
+                *ret_sector_size = gpt_ssz;
+                return 0;
+        }
+
+        for (uint32_t i = 0; i < n_entries; i++) {
+                const GptPartitionEntry *entry = (const GptPartitionEntry *) ((const uint8_t *) entries + (size_t) entry_size * i);
+
+                sd_id128_t type = efi_guid_to_id128(entry->partition_type_guid);
+                if (!sd_id128_in_set(type, SD_GPT_ESP, SD_GPT_XBOOTLDR))
+                        continue;
+
+                if (!sd_id128_equal(efi_guid_to_id128(entry->unique_partition_guid), loader_part_uuid))
+                        continue;
+
+                log_device_debug(dev, "Found boot partition (ESP/XBOOTLDR) on disk where kernel cannot scan partitions.");
+                *ret_sector_size = gpt_ssz;
+                return 1; /* boot disk needs a loop device */
+        }
+
+        *ret_sector_size = gpt_ssz;
+        return 0;
+}
+
 static int builtin_blkid(UdevEvent *event, int argc, char *argv[]) {
         sd_device *dev = ASSERT_PTR(ASSERT_PTR(event)->dev);
         const char *devnode, *root_partition = NULL, *data, *name;
@@ -433,65 +524,41 @@ static int builtin_blkid(UdevEvent *event, int argc, char *argv[]) {
         int64_t offset = 0;
         int r;
 
-        static const struct option options[] = {
-                { "offset", required_argument, NULL, 'o' },
-                { "hint",   required_argument, NULL, 'H' },
-                { "noraid", no_argument,       NULL, 'R' },
-                {}
-        };
+        r = dlopen_libblkid(LOG_DEBUG);
+        if (r < 0)
+                return log_device_debug_errno(dev, r, "blkid not available: %m");
 
         errno = 0;
-        pr = blkid_new_probe();
+        pr = sym_blkid_new_probe();
         if (!pr)
                 return log_device_debug_errno(dev, errno_or_else(ENOMEM), "Failed to create blkid prober: %m");
 
-        for (;;) {
-                int option;
+        OptionParser opts = { argc, argv, .namespace = "udev-builtin-blkid" };
 
-                option = getopt_long(argc, argv, "o:H:R", options, NULL);
-                if (option == -1)
-                        break;
+        FOREACH_OPTION_OR_RETURN(c, &opts)
+                switch (c) {
 
-                switch (option) {
-                case 'H':
-#if HAVE_BLKID_PROBE_SET_HINT
+                OPTION_NAMESPACE("udev-builtin-blkid"): {}
+
+                OPTION('H', "hint", "HINT", NULL):
                         errno = 0;
-                        r = blkid_probe_set_hint(pr, optarg, 0);
+                        r = sym_blkid_probe_set_hint(pr, opts.arg, 0);
                         if (r < 0)
-                                return log_device_error_errno(dev, errno_or_else(ENOMEM), "Failed to use '%s' probing hint: %m", optarg);
+                                return log_device_error_errno(dev, errno_or_else(ENOMEM), "Failed to use '%s' probing hint: %m", opts.arg);
                         break;
-#else
-                        /* Use the hint <name>=<offset> as probing offset for old versions */
-                        optarg = strchr(optarg, '=');
-                        if (!optarg)
-                                /* no value means 0, do nothing for old versions */
-                                break;
-                        ++optarg;
-                        _fallthrough_;
-#endif
-                case 'o':
-                        r = safe_atoi64(optarg, &offset);
+
+                OPTION('o', "offset", "OFFSET", NULL):
+                        r = safe_atoi64(opts.arg, &offset);
                         if (r < 0)
-                                return log_device_error_errno(dev, r, "Failed to parse '%s' as an integer: %m", optarg);
+                                return log_device_error_errno(dev, r, "Failed to parse '%s' as an integer: %m", opts.arg);
                         if (offset < 0)
                                 return log_device_error_errno(dev, SYNTHETIC_ERRNO(EINVAL), "Invalid offset %"PRIi64".", offset);
                         break;
-                case 'R':
+
+                OPTION('R', "noraid", NULL, NULL):
                         noraid = true;
                         break;
                 }
-        }
-
-        blkid_probe_set_superblocks_flags(pr,
-                BLKID_SUBLKS_LABEL | BLKID_SUBLKS_UUID |
-                BLKID_SUBLKS_TYPE | BLKID_SUBLKS_SECTYPE |
-#ifdef BLKID_SUBLKS_FSINFO
-                BLKID_SUBLKS_FSINFO |
-#endif
-                BLKID_SUBLKS_USAGE | BLKID_SUBLKS_VERSION);
-
-        if (noraid)
-                blkid_probe_filter_superblocks_usage(pr, BLKID_FLTR_NOTIN, BLKID_USAGE_RAID);
 
         r = sd_device_get_devname(dev, &devnode);
         if (r < 0)
@@ -505,8 +572,37 @@ static int builtin_blkid(UdevEvent *event, int argc, char *argv[]) {
                 return ignore ? 0 : fd;
         }
 
+        /* If the kernel can't parse the boot disk's partition table, set properties so a udev rule sets
+         * up a loop device (with the correct sector size) to expose the partitions. We still probe the
+         * device itself below for its whole-disk properties (filesystem type, partition table UUID, and
+         * so on); partition and root discovery happen on the loop device instead. We don't need to
+         * suppress the latter here: blkid probes at the device's own logical sector size, so a GPT
+         * written for a different sector size is simply not detected, and both PART_ENTRY_* and
+         * find_gpt_root() only ever act on partitions the kernel actually registered — which, for a disk
+         * that needs a loop device, is none. */
+        if (offset == 0) {
+                ssize_t gpt_ssz = 0;
+
+                r = gpt_boot_disk_needs_loop(dev, fd, &gpt_ssz);
+                if (gpt_ssz > 0)
+                        udev_builtin_add_propertyf(event, "ID_PART_GPT_SECTOR_SIZE", "%zi", gpt_ssz);
+                if (r > 0)
+                        udev_builtin_add_property(event, "ID_PART_GPT_AUTO_ROOT_DISK_NEEDS_LOOP", "1");
+        }
+
+        sym_blkid_probe_set_superblocks_flags(pr,
+                BLKID_SUBLKS_LABEL | BLKID_SUBLKS_UUID |
+                BLKID_SUBLKS_TYPE | BLKID_SUBLKS_SECTYPE |
+#ifdef BLKID_SUBLKS_FSINFO /* since util-linux 2.39 */
+                BLKID_SUBLKS_FSINFO |
+#endif
+                BLKID_SUBLKS_USAGE | BLKID_SUBLKS_VERSION);
+
+        if (noraid)
+                sym_blkid_probe_filter_superblocks_usage(pr, BLKID_FLTR_NOTIN, BLKID_USAGE_RAID);
+
         errno = 0;
-        r = blkid_probe_set_device(pr, fd, offset, 0);
+        r = sym_blkid_probe_set_device(pr, fd, offset, 0);
         if (r < 0)
                 return log_device_debug_errno(dev, errno_or_else(ENOMEM), "Failed to set device to blkid prober: %m");
 
@@ -520,12 +616,12 @@ static int builtin_blkid(UdevEvent *event, int argc, char *argv[]) {
         (void) sd_device_get_property_value(dev, "ID_PART_GPT_AUTO_ROOT_UUID", &root_partition);
 
         errno = 0;
-        int nvals = blkid_probe_numof_values(pr);
+        int nvals = sym_blkid_probe_numof_values(pr);
         if (nvals < 0)
                 return log_device_debug_errno(dev, errno_or_else(ENOMEM), "Failed to get number of probed values: %m");
 
         for (int i = 0; i < nvals; i++) {
-                if (blkid_probe_get_value(pr, i, &name, &data, NULL) < 0)
+                if (sym_blkid_probe_get_value(pr, i, &name, &data, NULL) < 0)
                         continue;
 
                 print_property(event, name, data);
@@ -559,7 +655,7 @@ static int builtin_blkid(UdevEvent *event, int argc, char *argv[]) {
                         char encoded[sizeof_field(struct loop_info64, lo_file_name) * 4 + 1];
 
                         assert(strlen(backing_fname) < ELEMENTSOF(encoded) / 4);
-                        blkid_encode_string(backing_fname, encoded, ELEMENTSOF(encoded));
+                        sym_blkid_encode_string(backing_fname, encoded, ELEMENTSOF(encoded));
 
                         udev_builtin_add_property(event, "ID_LOOP_BACKING_FILENAME", backing_fname);
                         udev_builtin_add_property(event, "ID_LOOP_BACKING_FILENAME_ENC", encoded);

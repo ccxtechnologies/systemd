@@ -7,7 +7,6 @@
 #include <sys/eventfd.h>
 #include <sys/mount.h>
 #include <sys/personality.h>
-#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -24,21 +23,24 @@
 #include "errno-list.h"
 #include "errno-util.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "ioprio-util.h"
 #include "log.h"
 #include "namespace-util.h"
 #include "parse-util.h"
-#include "pidfd-util.h"
+#include "path-util.h"
 #include "pidref.h"
 #include "process-util.h"
 #include "procfs-util.h"
 #include "rlimit-util.h"
+#include "rm-rf.h"
 #include "signal-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
 #include "terminal-util.h"
 #include "tests.h"
 #include "time-util.h"
+#include "tmpfile-util.h"
 #include "user-util.h"
 #include "virt.h"
 
@@ -175,7 +177,7 @@ static void test_pid_get_comm_escape_one(const char *input, const char *output) 
 
         log_debug("input: <%s> — output: <%s>", input, output);
 
-        ASSERT_OK_ERRNO(prctl(PR_SET_NAME, input));
+        ASSERT_OK(proc_set_comm(input));
         ASSERT_OK(pid_get_comm(0, &n));
 
         log_debug("got: <%s>", n);
@@ -199,7 +201,7 @@ TEST(pid_get_comm_escape) {
         test_pid_get_comm_escape_one("xxxxäöüß", "xxxx\\303\\244\\303\\266\\303\\274\\303\\237");
         test_pid_get_comm_escape_one("xxxxxäöüß", "xxxxx\\303\\244\\303\\266\\303\\274\\303\\237");
 
-        ASSERT_OK_ERRNO(prctl(PR_SET_NAME, saved));
+        ASSERT_OK(proc_set_comm(saved));
 }
 
 TEST(pid_is_unwaited) {
@@ -263,7 +265,6 @@ TEST(pid_get_cmdline_harder) {
         _cleanup_close_ int fd = -EBADF;
         _cleanup_free_ char *line = NULL;
         _cleanup_strv_free_ char **args = NULL;
-        pid_t pid;
         int r;
 
         if (geteuid() != 0) {
@@ -286,297 +287,286 @@ TEST(pid_get_cmdline_harder) {
         }
 #endif
 
-        pid = fork();
-        if (pid > 0) {
-                siginfo_t si;
+        r = ASSERT_OK(pidref_safe_fork("(cmdline)", FORK_WAIT|FORK_LOG|FORK_DEATHSIG_SIGKILL, /* ret= */ NULL));
+        if (r == 0) {
+                r = detach_mount_namespace();
+                if (r < 0) {
+                        log_warning_errno(r, "detach mount namespace failed: %m");
+                        if (!ERRNO_IS_PRIVILEGE(r))
+                                ASSERT_OK(r);
+                        return;
+                }
 
-                (void) wait_for_terminate(pid, &si);
+                fd = mkostemp(path, O_CLOEXEC);
+                ASSERT_OK_ERRNO(fd);
 
-                ASSERT_EQ(si.si_code, CLD_EXITED);
-                ASSERT_OK_ZERO(si.si_status);
+                /* Note that we don't unmount the following bind-mount at the end of the test because the kernel
+                * will clear up its /proc/PID/ hierarchy automatically as soon as the test stops. */
+                if (mount(path, "/proc/self/cmdline", "bind", MS_BIND, NULL) < 0) {
+                        /* This happens under selinux… Abort the test in this case. */
+                        log_warning_errno(errno, "mount(..., \"/proc/self/cmdline\", \"bind\", ...) failed: %m");
+                        ASSERT_TRUE(IN_SET(errno, EPERM, EACCES));
+                        return;
+                }
 
-                return;
-        }
+                /* Set RLIMIT_STACK to infinity to test we don't try to allocate unnecessarily large values to read
+                * the cmdline. */
+                if (setrlimit(RLIMIT_STACK, &RLIMIT_MAKE_CONST(RLIM_INFINITY)) < 0)
+                        log_warning("Testing without RLIMIT_STACK=infinity");
 
-        ASSERT_OK_ZERO(pid);
+                ASSERT_OK_ERRNO(unlink(path));
 
-        r = detach_mount_namespace();
-        if (r < 0) {
-                log_warning_errno(r, "detach mount namespace failed: %m");
-                if (!ERRNO_IS_PRIVILEGE(r))
-                        ASSERT_OK(r);
-                return;
-        }
+                ASSERT_OK(proc_set_comm("testa"));
 
-        fd = mkostemp(path, O_CLOEXEC);
-        ASSERT_OK_ERRNO(fd);
+                ASSERT_ERROR(pid_get_cmdline(0, SIZE_MAX, 0, &line), ENOENT);
 
-        /* Note that we don't unmount the following bind-mount at the end of the test because the kernel
-         * will clear up its /proc/PID/ hierarchy automatically as soon as the test stops. */
-        if (mount(path, "/proc/self/cmdline", "bind", MS_BIND, NULL) < 0) {
-                /* This happens under selinux… Abort the test in this case. */
-                log_warning_errno(errno, "mount(..., \"/proc/self/cmdline\", \"bind\", ...) failed: %m");
-                ASSERT_TRUE(IN_SET(errno, EPERM, EACCES));
-                return;
-        }
+                ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "[testa]");
+                line = mfree(line);
 
-        /* Set RLIMIT_STACK to infinity to test we don't try to allocate unnecessarily large values to read
-         * the cmdline. */
-        if (setrlimit(RLIMIT_STACK, &RLIMIT_MAKE_CONST(RLIM_INFINITY)) < 0)
-                log_warning("Testing without RLIMIT_STACK=infinity");
+                ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_COMM_FALLBACK | PROCESS_CMDLINE_QUOTE, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "\"[testa]\""); /* quoting is enabled here */
+                line = mfree(line);
 
-        ASSERT_OK_ERRNO(unlink(path));
+                ASSERT_OK(pid_get_cmdline(0, 0, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "");
+                line = mfree(line);
 
-        ASSERT_OK_ERRNO(prctl(PR_SET_NAME, "testa"));
+                ASSERT_OK(pid_get_cmdline(0, 1, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                ASSERT_STREQ(line, "…");
+                line = mfree(line);
 
-        ASSERT_ERROR(pid_get_cmdline(0, SIZE_MAX, 0, &line), ENOENT);
+                ASSERT_OK(pid_get_cmdline(0, 2, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                ASSERT_STREQ(line, "[…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "[testa]");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 3, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                ASSERT_STREQ(line, "[t…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_COMM_FALLBACK | PROCESS_CMDLINE_QUOTE, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "\"[testa]\""); /* quoting is enabled here */
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 4, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                ASSERT_STREQ(line, "[te…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 0, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 5, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                ASSERT_STREQ(line, "[tes…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 1, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        ASSERT_STREQ(line, "…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 6, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                ASSERT_STREQ(line, "[test…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 2, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        ASSERT_STREQ(line, "[…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 7, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                ASSERT_STREQ(line, "[testa]");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 3, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        ASSERT_STREQ(line, "[t…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 8, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                ASSERT_STREQ(line, "[testa]");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 4, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        ASSERT_STREQ(line, "[te…");
-        line = mfree(line);
-
-        ASSERT_OK(pid_get_cmdline(0, 5, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        ASSERT_STREQ(line, "[tes…");
-        line = mfree(line);
-
-        ASSERT_OK(pid_get_cmdline(0, 6, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        ASSERT_STREQ(line, "[test…");
-        line = mfree(line);
-
-        ASSERT_OK(pid_get_cmdline(0, 7, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        ASSERT_STREQ(line, "[testa]");
-        line = mfree(line);
-
-        ASSERT_OK(pid_get_cmdline(0, 8, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        ASSERT_STREQ(line, "[testa]");
-        line = mfree(line);
-
-        ASSERT_OK(pid_get_cmdline_strv(0, PROCESS_CMDLINE_COMM_FALLBACK, &args));
-        ASSERT_TRUE(strv_equal(args, STRV_MAKE("[testa]")));
-        args = strv_free(args);
+                ASSERT_OK(pid_get_cmdline_strv(0, PROCESS_CMDLINE_COMM_FALLBACK, &args));
+                ASSERT_TRUE(strv_equal(args, STRV_MAKE("[testa]")));
+                args = strv_free(args);
 
         /* Test with multiple arguments that don't require quoting */
 
-        ASSERT_OK_EQ_ERRNO(write(fd, "foo\0bar", 8), 8);
+                ASSERT_OK_EQ_ERRNO(write(fd, "foo\0bar", 8), 8);
 
-        ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, 0, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo bar");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, 0, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo bar");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        ASSERT_STREQ(line, "foo bar");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                ASSERT_STREQ(line, "foo bar");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline_strv(0, PROCESS_CMDLINE_COMM_FALLBACK, &args));
-        ASSERT_TRUE(strv_equal(args, STRV_MAKE("foo", "bar")));
-        args = strv_free(args);
+                ASSERT_OK(pid_get_cmdline_strv(0, PROCESS_CMDLINE_COMM_FALLBACK, &args));
+                ASSERT_TRUE(strv_equal(args, STRV_MAKE("foo", "bar")));
+                args = strv_free(args);
 
-        ASSERT_OK_EQ_ERRNO(write(fd, "quux", 4), 4);
-        ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, 0, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo bar quux");
-        line = mfree(line);
+                ASSERT_OK_EQ_ERRNO(write(fd, "quux", 4), 4);
+                ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, 0, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo bar quux");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo bar quux");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo bar quux");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 1, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 1, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 2, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "f…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 2, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "f…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 3, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "fo…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 3, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "fo…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 4, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 4, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 5, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo …");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 5, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo …");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 6, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo b…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 6, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo b…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 7, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo ba…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 7, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo ba…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 8, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo bar…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 8, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo bar…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 9, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo bar …");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 9, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo bar …");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 10, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo bar q…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 10, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo bar q…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 11, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo bar qu…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 11, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo bar qu…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 12, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo bar quux");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 12, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo bar quux");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 13, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo bar quux");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 13, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo bar quux");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 14, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo bar quux");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 14, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo bar quux");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 1000, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "foo bar quux");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 1000, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "foo bar quux");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline_strv(0, PROCESS_CMDLINE_COMM_FALLBACK, &args));
-        ASSERT_TRUE(strv_equal(args, STRV_MAKE("foo", "bar", "quux")));
-        args = strv_free(args);
+                ASSERT_OK(pid_get_cmdline_strv(0, PROCESS_CMDLINE_COMM_FALLBACK, &args));
+                ASSERT_TRUE(strv_equal(args, STRV_MAKE("foo", "bar", "quux")));
+                args = strv_free(args);
 
-        ASSERT_OK_ERRNO(ftruncate(fd, 0));
-        ASSERT_OK_ERRNO(prctl(PR_SET_NAME, "aaaa bbbb cccc"));
+                ASSERT_OK_ERRNO(ftruncate(fd, 0));
+                ASSERT_OK(proc_set_comm("aaaa bbbb cccc"));
 
-        ASSERT_ERROR(pid_get_cmdline(0, SIZE_MAX, 0, &line), ENOENT);
+                ASSERT_ERROR(pid_get_cmdline(0, SIZE_MAX, 0, &line), ENOENT);
 
-        ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "[aaaa bbbb cccc]");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "[aaaa bbbb cccc]");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 10, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "[aaaa bbb…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 10, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "[aaaa bbb…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 11, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "[aaaa bbbb…");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 11, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "[aaaa bbbb…");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, 12, PROCESS_CMDLINE_COMM_FALLBACK, &line));
-        log_debug("'%s'", line);
-        ASSERT_STREQ(line, "[aaaa bbbb …");
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, 12, PROCESS_CMDLINE_COMM_FALLBACK, &line));
+                log_debug("'%s'", line);
+                ASSERT_STREQ(line, "[aaaa bbbb …");
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline_strv(0, PROCESS_CMDLINE_COMM_FALLBACK, &args));
-        ASSERT_TRUE(strv_equal(args, STRV_MAKE("[aaaa bbbb cccc]")));
-        args = strv_free(args);
+                ASSERT_OK(pid_get_cmdline_strv(0, PROCESS_CMDLINE_COMM_FALLBACK, &args));
+                ASSERT_TRUE(strv_equal(args, STRV_MAKE("[aaaa bbbb cccc]")));
+                args = strv_free(args);
 
-        /* Test with multiple arguments that do require quoting */
+                /* Test with multiple arguments that do require quoting */
 
 #define CMDLINE1 "foo\0'bar'\0\"bar$\"\0x y z\0!``\0"
 #define EXPECT1  "foo \"'bar'\" \"\\\"bar\\$\\\"\" \"x y z\" \"!\\`\\`\""
 #define EXPECT1p "foo $'\\'bar\\'' $'\"bar$\"' $'x y z' $'!``'"
 #define EXPECT1v STRV_MAKE("foo", "'bar'", "\"bar$\"", "x y z", "!``")
 
-        ASSERT_OK_ZERO_ERRNO(lseek(fd, SEEK_SET, 0));
-        ASSERT_OK_EQ_ERRNO(write(fd, CMDLINE1, sizeof(CMDLINE1)), (ssize_t) sizeof(CMDLINE1));
-        ASSERT_OK_ZERO_ERRNO(ftruncate(fd, sizeof(CMDLINE1)));
+                ASSERT_OK_ZERO_ERRNO(lseek(fd, 0, SEEK_SET));
+                ASSERT_OK_EQ_ERRNO(write(fd, CMDLINE1, sizeof(CMDLINE1)), (ssize_t) sizeof(CMDLINE1));
+                ASSERT_OK_ZERO_ERRNO(ftruncate(fd, sizeof(CMDLINE1)));
 
-        ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_QUOTE, &line));
-        log_debug("got: ==%s==", line);
-        log_debug("exp: ==%s==", EXPECT1);
-        ASSERT_STREQ(line, EXPECT1);
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_QUOTE, &line));
+                log_debug("got: ==%s==", line);
+                log_debug("exp: ==%s==", EXPECT1);
+                ASSERT_STREQ(line, EXPECT1);
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_QUOTE_POSIX, &line));
-        log_debug("got: ==%s==", line);
-        log_debug("exp: ==%s==", EXPECT1p);
-        ASSERT_STREQ(line, EXPECT1p);
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_QUOTE_POSIX, &line));
+                log_debug("got: ==%s==", line);
+                log_debug("exp: ==%s==", EXPECT1p);
+                ASSERT_STREQ(line, EXPECT1p);
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline_strv(0, 0, &args));
-        ASSERT_TRUE(strv_equal(args, EXPECT1v));
-        args = strv_free(args);
+                ASSERT_OK(pid_get_cmdline_strv(0, 0, &args));
+                ASSERT_TRUE(strv_equal(args, EXPECT1v));
+                args = strv_free(args);
 
 #define CMDLINE2 "foo\0\1\2\3\0\0"
 #define EXPECT2  "foo \"\\001\\002\\003\""
 #define EXPECT2p "foo $'\\001\\002\\003'"
 #define EXPECT2v STRV_MAKE("foo", "\1\2\3")
 
-        ASSERT_OK_ZERO_ERRNO(lseek(fd, SEEK_SET, 0));
-        ASSERT_OK_EQ_ERRNO(write(fd, CMDLINE2, sizeof(CMDLINE2)), (ssize_t) sizeof(CMDLINE2));
-        ASSERT_OK_ZERO_ERRNO(ftruncate(fd, sizeof CMDLINE2));
+                ASSERT_OK_ZERO_ERRNO(lseek(fd, 0, SEEK_SET));
+                ASSERT_OK_EQ_ERRNO(write(fd, CMDLINE2, sizeof(CMDLINE2)), (ssize_t) sizeof(CMDLINE2));
+                ASSERT_OK_ZERO_ERRNO(ftruncate(fd, sizeof CMDLINE2));
 
-        ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_QUOTE, &line));
-        log_debug("got: ==%s==", line);
-        log_debug("exp: ==%s==", EXPECT2);
-        ASSERT_STREQ(line, EXPECT2);
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_QUOTE, &line));
+                log_debug("got: ==%s==", line);
+                log_debug("exp: ==%s==", EXPECT2);
+                ASSERT_STREQ(line, EXPECT2);
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_QUOTE_POSIX, &line));
-        log_debug("got: ==%s==", line);
-        log_debug("exp: ==%s==", EXPECT2p);
-        ASSERT_STREQ(line, EXPECT2p);
-        line = mfree(line);
+                ASSERT_OK(pid_get_cmdline(0, SIZE_MAX, PROCESS_CMDLINE_QUOTE_POSIX, &line));
+                log_debug("got: ==%s==", line);
+                log_debug("exp: ==%s==", EXPECT2p);
+                ASSERT_STREQ(line, EXPECT2p);
+                line = mfree(line);
 
-        ASSERT_OK(pid_get_cmdline_strv(0, 0, &args));
-        ASSERT_TRUE(strv_equal(args, EXPECT2v));
-        args = strv_free(args);
+                ASSERT_OK(pid_get_cmdline_strv(0, 0, &args));
+                ASSERT_TRUE(strv_equal(args, EXPECT2v));
+                args = strv_free(args);
 
-        safe_close(fd);
-        _exit(EXIT_SUCCESS);
+                safe_close(fd);
+                _exit(EXIT_SUCCESS);
+        }
 }
 
 TEST(getpid_cached) {
-        siginfo_t si;
-        pid_t a, b, c, d, e, f, child;
+        pid_t a, b, c, d, e, f;
+        int r;
 
         a = getpid();
         b = getpid_cached();
@@ -585,10 +575,9 @@ TEST(getpid_cached) {
         ASSERT_EQ(a, b);
         ASSERT_EQ(a, c);
 
-        child = fork();
-        ASSERT_OK_ERRNO(child);
+        r = ASSERT_OK(pidref_safe_fork("(getpid)", FORK_WAIT|FORK_LOG|FORK_DEATHSIG_SIGKILL, /* ret= */ NULL));
 
-        if (child == 0) {
+        if (r == 0) {
                 /* In child */
                 a = getpid();
                 b = getpid_cached();
@@ -606,10 +595,6 @@ TEST(getpid_cached) {
         ASSERT_EQ(a, d);
         ASSERT_EQ(a, e);
         ASSERT_EQ(a, f);
-
-        ASSERT_OK(wait_for_terminate(child, &si));
-        ASSERT_EQ(si.si_status, 0);
-        ASSERT_EQ(si.si_code, CLD_EXITED);
 }
 
 TEST(getpid_measure) {
@@ -636,14 +621,13 @@ TEST(getpid_measure) {
         log_info("getpid_cached(): %lf μs each", (double) q / iterations);
 }
 
-TEST(safe_fork) {
+TEST(pidref_safe_fork) {
+        _cleanup_(pidref_done) PidRef child = PIDREF_NULL;
         siginfo_t status;
         pid_t pid;
         int r;
 
-        BLOCK_SIGNALS(SIGCHLD);
-
-        r = safe_fork("(test-child)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_REOPEN_LOG, &pid);
+        r = pidref_safe_fork("(test-child)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_REOPEN_LOG, &child);
         ASSERT_OK(r);
 
         if (r == 0) {
@@ -653,11 +637,11 @@ TEST(safe_fork) {
                 _exit(88);
         }
 
-        ASSERT_OK(wait_for_terminate(pid, &status));
+        ASSERT_OK(pidref_wait_for_terminate(&child, &status));
         ASSERT_EQ(status.si_code, CLD_EXITED);
         ASSERT_EQ(status.si_status, 88);
 
-        _cleanup_(pidref_done) PidRef child = PIDREF_NULL;
+        pidref_done(&child);
         r = pidref_safe_fork("(test-child)", FORK_DETACH, &child);
         if (r == 0) {
                 /* Don't freeze so this doesn't linger around forever in case something goes wrong. */
@@ -726,8 +710,10 @@ TEST(ioprio_class_from_to_string) {
 TEST(setpriority_closest) {
         int r;
 
-        r = safe_fork("(test-setprio)",
-                      FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_WAIT|FORK_LOG|FORK_REOPEN_LOG, NULL);
+        r = pidref_safe_fork(
+                        "(test-setprio)",
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_WAIT|FORK_LOG|FORK_REOPEN_LOG,
+                        NULL);
         ASSERT_OK(r);
 
         if (r == 0) {
@@ -925,7 +911,10 @@ TEST(get_process_threads) {
         int r;
 
         /* Run this test in a child, so that we can guarantee there's exactly one thread around in the child */
-        r = safe_fork("(nthreads)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_WAIT|FORK_LOG, NULL);
+        r = pidref_safe_fork(
+                        "(nthreads)",
+                        FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_WAIT|FORK_LOG,
+                        NULL);
         ASSERT_OK(r);
 
         if (r == 0) {
@@ -969,8 +958,10 @@ TEST(get_process_threads) {
 TEST(is_reaper_process) {
         int r;
 
-        r = safe_fork("(regular)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_REOPEN_LOG|FORK_WAIT, NULL);
-        ASSERT_OK(r);
+        r = ASSERT_OK(pidref_safe_fork(
+                        "(regular)",
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_REOPEN_LOG|FORK_WAIT,
+                        NULL));
         if (r == 0) {
                 /* child */
 
@@ -978,8 +969,10 @@ TEST(is_reaper_process) {
                 _exit(EXIT_SUCCESS);
         }
 
-        r = safe_fork("(newpid)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_REOPEN_LOG|FORK_WAIT, NULL);
-        ASSERT_OK(r);
+        r = ASSERT_OK(pidref_safe_fork(
+                        "(newpid)",
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_REOPEN_LOG|FORK_WAIT,
+                        NULL));
         if (r == 0) {
                 /* child */
 
@@ -990,8 +983,10 @@ TEST(is_reaper_process) {
                         }
                 }
 
-                r = safe_fork("(newpid1)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_REOPEN_LOG|FORK_WAIT, NULL);
-                ASSERT_OK(r);
+                r = ASSERT_OK(pidref_safe_fork(
+                                "(newpid1)",
+                                FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_REOPEN_LOG|FORK_WAIT,
+                                NULL));
                 if (r == 0) {
                         /* grandchild, which is PID1 in a pidns */
                         ASSERT_OK_EQ(getpid_cached(), 1);
@@ -1002,8 +997,10 @@ TEST(is_reaper_process) {
                 _exit(EXIT_SUCCESS);
         }
 
-        r = safe_fork("(subreaper)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_REOPEN_LOG|FORK_WAIT, NULL);
-        ASSERT_OK(r);
+        r = ASSERT_OK(pidref_safe_fork(
+                        "(subreaper)",
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_REOPEN_LOG|FORK_WAIT,
+                        NULL));
         if (r == 0) {
                 /* child */
                 ASSERT_OK(make_reaper_process(true));
@@ -1081,21 +1078,6 @@ TEST(pidref_from_same_root_fs) {
         ASSERT_OK_ZERO(pidref_from_same_root_fs(&child2, &self));
 }
 
-TEST(pidfd_get_inode_id_self_cached) {
-        int r;
-
-        log_info("pid=" PID_FMT, getpid_cached());
-
-        uint64_t id;
-        r = pidfd_get_inode_id_self_cached(&id);
-        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                log_info("pidfdid not supported");
-        else {
-                assert(r >= 0);
-                log_info("pidfdid=%" PRIu64, id);
-        }
-}
-
 TEST(getenv_for_pid) {
         _cleanup_strv_free_ char **copy_env = NULL;
         pid_t pid = getpid_cached();
@@ -1128,6 +1110,70 @@ TEST(getenv_for_pid) {
 
                 _exit(EXIT_SUCCESS);
         }
+}
+
+TEST(invoked_as) {
+        ASSERT_FALSE(invoked_as(NULL, "foobar"));
+        ASSERT_FALSE(invoked_as(NULL, "barbar"));
+
+        ASSERT_EQ(setenv("SYSTEMD_INVOKED_AS", "/usr/bin/foobar", 1), 0);
+
+        ASSERT_TRUE(invoked_as(NULL, "foobar"));
+        ASSERT_FALSE(invoked_as(NULL, "barbar"));
+        ASSERT_TRUE(invoked_as(NULL, "foo"));
+        ASSERT_TRUE(invoked_as(STRV_MAKE("barbar", "barbar", "y"), "foobar"));
+        ASSERT_FALSE(invoked_as(STRV_MAKE("barbar", "barbar", "y"), "barbar"));
+
+        ASSERT_EQ(unsetenv("SYSTEMD_INVOKED_AS"), 0);
+}
+
+#define EXIT_EXPECTED_ERROR 42
+
+static void test_execvp_safe_one(const char *name, const char *search_path, int expected_error) {
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        int r;
+
+        /* If expected_error is 0, the binary is expected to be executed and to exit successfully. Otherwise
+         * execvp_safe() is expected to return expected_error. */
+
+        r = ASSERT_OK(pidref_safe_fork("(execvp-safe)", FORK_DEATHSIG_SIGKILL|FORK_LOG, &pidref));
+        if (r == 0) {
+                if (search_path && setenv("PATH", search_path, /* overwrite= */ true) < 0) {
+                        log_error_errno(errno, "Failed to set $PATH: %m");
+                        _exit(EXIT_FAILURE);
+                }
+
+                r = execvp_safe(name, STRV_MAKE(name));
+                if (r != expected_error) {
+                        log_error_errno(r, "execvp_safe(\"%s\") returned unexpected error: %m", name);
+                        _exit(EXIT_FAILURE);
+                }
+
+                _exit(EXIT_EXPECTED_ERROR);
+        }
+
+        int expected_exit_status = expected_error == 0 ? EXIT_SUCCESS : EXIT_EXPECTED_ERROR;
+        ASSERT_OK_EQ(pidref_wait_for_terminate_and_check("(execvp-safe)", &pidref, WAIT_LOG_ABNORMAL),
+                     expected_exit_status);
+}
+
+TEST(execvp_safe) {
+        _cleanup_(rm_rf_physical_and_freep) char *d = NULL;
+        _cleanup_free_ char *p = NULL;
+
+        /* An empty executable file must make execvp_safe() fail with ENOEXEC, and must not be run as an
+         * empty shell script, which would exit successfully. */
+
+        ASSERT_OK(mkdtemp_malloc(NULL, &d));
+        ASSERT_NOT_NULL(p = path_join(d, "test-process-util-empty"));
+        ASSERT_OK(touch_file(p, /* parents= */ false, USEC_INFINITY, UID_INVALID, GID_INVALID, 0755));
+        if (access(p, X_OK) < 0) /* e.g. /tmp/ mounted noexec */
+                return (void) log_tests_skipped_errno(errno, "Cannot execute files in %s", d);
+
+        test_execvp_safe_one(p, /* search_path= */ NULL, -ENOEXEC);
+        test_execvp_safe_one("test-process-util-empty", d, -ENOEXEC);
+        test_execvp_safe_one("test-process-util-missing", d, -ENOENT);
+        test_execvp_safe_one("true", /* search_path= */ NULL, 0);
 }
 
 static int intro(void) {

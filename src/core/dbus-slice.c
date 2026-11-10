@@ -15,7 +15,7 @@ static int property_get_currently_active(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Slice *s = ASSERT_PTR(userdata);
 
@@ -34,6 +34,7 @@ const sd_bus_vtable bus_slice_vtable[] = {
          * systemctl set-property), hence they aren't marked as constant */
         SD_BUS_PROPERTY("ConcurrencyHardMax", "u", bus_property_get_unsigned, offsetof(Slice, concurrency_hard_max), 0),
         SD_BUS_PROPERTY("ConcurrencySoftMax", "u", bus_property_get_unsigned, offsetof(Slice, concurrency_soft_max), 0),
+        SD_BUS_PROPERTY("ActivatingConcurrencyMax", "u", bus_property_get_unsigned, offsetof(Slice, activating_concurrency_max), 0),
         SD_BUS_PROPERTY("NCurrentlyActive", "u", property_get_currently_active, 0, 0),
         SD_BUS_VTABLE_END
 };
@@ -43,7 +44,7 @@ static int bus_slice_set_transient_property(
                 const char *name,
                 sd_bus_message *message,
                 UnitWriteFlags flags,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Unit *u = UNIT(s);
 
@@ -54,10 +55,13 @@ static int bus_slice_set_transient_property(
         flags |= UNIT_PRIVATE;
 
         if (streq(name, "ConcurrencyHardMax"))
-                return bus_set_transient_unsigned(u, name, &s->concurrency_hard_max, message, flags, error);
+                return bus_set_transient_unsigned(u, name, &s->concurrency_hard_max, message, flags, reterr_error);
 
         if (streq(name, "ConcurrencySoftMax"))
-                return bus_set_transient_unsigned(u, name, &s->concurrency_soft_max, message, flags, error);
+                return bus_set_transient_unsigned(u, name, &s->concurrency_soft_max, message, flags, reterr_error);
+
+        if (streq(name, "ActivatingConcurrencyMax"))
+                return bus_set_transient_unsigned(u, name, &s->activating_concurrency_max, message, flags, reterr_error);
 
         return 0;
 }
@@ -67,7 +71,7 @@ int bus_slice_set_property(
                 const char *name,
                 sd_bus_message *message,
                 UnitWriteFlags flags,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Slice *s = SLICE(u);
         int r;
@@ -75,14 +79,14 @@ int bus_slice_set_property(
         assert(name);
         assert(u);
 
-        r = bus_cgroup_set_property(u, &s->cgroup_context, name, message, flags, error);
+        r = bus_cgroup_set_property(u, &s->cgroup_context, name, message, flags, reterr_error);
         if (r != 0)
                 return r;
 
         if (u->transient && u->load_state == UNIT_STUB) {
                 /* This is a transient unit, let's allow a little more */
 
-                r = bus_slice_set_transient_property(s, name, message, flags, error);
+                r = bus_slice_set_transient_property(s, name, message, flags, reterr_error);
                 if (r != 0)
                         return r;
         }

@@ -230,6 +230,7 @@
       <xi:include href="systemd.link.xml" xpointer="credential" />
       <xi:include href="systemd.link.xml" xpointer="architecture" />
       <xi:include href="systemd.link.xml" xpointer="firmware" />
+      <xi:include href="systemd.link.xml" xpointer="machine-tag" />
     </variablelist>
   </refsect1>
 
@@ -1059,7 +1060,7 @@ Ports=eth2</programlisting>
           <literal>prp</literal>. Defaults to <literal>hsr</literal>.</para>
 
           <para>Both protocols work by sending two copies of every outgoing frame, one for each of the two
-          ports. The destination node receives the two frames and and keeps only the first one. If a link
+          ports. The destination node receives the two frames and keeps only the first one. If a link
           fails, only one of the two frames is received. HSR uses a ring topology where the two outgoing
           frames are sent in opposite directions in the ring. PRP doesn't need a specific topology, but it
           requires two completely redundant networks attached to the two ports.</para>
@@ -1267,9 +1268,10 @@ Ports=eth2</programlisting>
       <varlistentry>
         <term><varname>Layer2SpecificHeader=</varname></term>
         <listitem>
-          <para>Specifies layer2specific header type of the session. One of <literal>none</literal> or <literal>default</literal>. Defaults to <literal>default</literal>.</para>
+          <para>Specifies the layer 2 specific header type of the session. One of <literal>none</literal> or
+          <literal>default</literal>. Defaults to <literal>default</literal>.</para>
 
-        <xi:include href="version-info.xml" xpointer="v242"/>
+          <xi:include href="version-info.xml" xpointer="v242"/>
         </listitem>
       </varlistentry>
     </variablelist>
@@ -2019,16 +2021,18 @@ Ports=eth2</programlisting>
       </varlistentry>
       <varlistentry>
         <term><varname>User=</varname></term>
-        <listitem><para>User to grant access to the <filename>/dev/net/tun</filename> device. The specified
-        user must be a system user.</para>
+        <listitem><para>User to grant access to the <filename>/dev/net/tun</filename> device.
+        Note that the user must be resolvable during early boot. Using non-system users
+        is deprecated.</para>
 
         <xi:include href="version-info.xml" xpointer="v215"/>
         </listitem>
       </varlistentry>
       <varlistentry>
         <term><varname>Group=</varname></term>
-        <listitem><para>Group to grant access to the <filename>/dev/net/tun</filename> device. The specified
-        group must be a system group.</para>
+        <listitem><para>Group to grant access to the <filename>/dev/net/tun</filename> device.
+        Note that the group must be resolvable during early boot. Using non-system groups
+        is deprecated.</para>
 
         <xi:include href="version-info.xml" xpointer="v215"/>
         </listitem>
@@ -2681,7 +2685,10 @@ Ports=eth2</programlisting>
       <varlistentry>
         <term><varname>Table=</varname></term>
         <listitem>
-          <para>The numeric routing table identifier. This setting is compulsory.</para>
+          <para>The routing table identifier. Takes a route table name or number. Route table names
+          may be predefined or configured with <varname>RouteTable=</varname> in
+          <citerefentry><refentrytitle>networkd.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+          This setting is compulsory.</para>
 
         <xi:include href="version-info.xml" xpointer="v243"/>
         </listitem>
@@ -2882,7 +2889,8 @@ Ports=eth2</programlisting>
           <literal>station</literal>, <literal>ap</literal>, <literal>ap-vlan</literal>,
           <literal>wds</literal>, <literal>monitor</literal>, <literal>mesh-point</literal>,
           <literal>p2p-client</literal>, <literal>p2p-go</literal>, <literal>p2p-device</literal>,
-          <literal>ocb</literal>, and <literal>nan</literal>. This option is mandatory.</para>
+          <literal>ocb</literal>, <literal>nan</literal>, <literal>nan-data</literal> and
+          <literal>pd</literal>. This option is mandatory.</para>
 
         <xi:include href="version-info.xml" xpointer="v251"/>
         </listitem>

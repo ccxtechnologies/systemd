@@ -7,7 +7,7 @@
 #include "forward.h"
 
 static inline bool mpol_is_valid(int t) {
-        return t >= MPOL_DEFAULT && t <= MPOL_LOCAL;
+        return t >= MPOL_DEFAULT && t <= MPOL_WEIGHTED_INTERLEAVE;
 }
 
 typedef struct NUMAPolicy {
@@ -29,9 +29,11 @@ static inline void numa_policy_reset(NUMAPolicy *p) {
 }
 
 int apply_numa_policy(const NUMAPolicy *policy);
-int numa_to_cpu_set(const NUMAPolicy *policy, CPUSet *set);
+int numa_node_get_cpus(size_t node, CPUSet *ret);
+int numa_to_cpu_set(const NUMAPolicy *policy, CPUSet *ret);
+
+int numa_get_node_from_cpu(unsigned cpu, unsigned *ret);
 
 int numa_mask_add_all(CPUSet *mask);
 
-const char* mpol_to_string(int i) _const_;
-int mpol_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(mpol, int);

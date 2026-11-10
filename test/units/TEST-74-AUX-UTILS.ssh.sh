@@ -5,7 +5,7 @@ set -o pipefail
 
 if ! command -v ssh >/dev/null || ! command -v sshd >/dev/null ; then
     echo "ssh/sshd not found, skipping test." >&2
-    exit 0
+    exit 77
 fi
 
 systemctl -q is-active sshd-unix-local.socket
@@ -31,7 +31,8 @@ removesshid() {
 
 ssh-keygen -N '' -C '' -t rsa -f "$ROOTID"
 
-mkdir -p 0700 /root/.ssh
+# shellcheck disable=SC2174
+mkdir -p -m 0700 /root/.ssh
 # Add a newline in case authorized_keys wasn't terminated correctly.
 echo >>/root/.ssh/authorized_keys
 cat "$ROOTID".pub >>/root/.ssh/authorized_keys
@@ -43,8 +44,17 @@ usermod -U root
 
 mkdir -p /etc/ssh
 test -f /etc/ssh/ssh_host_rsa_key || ssh-keygen -t rsa -C '' -N '' -f /etc/ssh/ssh_host_rsa_key
-echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
-echo "LogLevel DEBUG3" >> /etc/ssh/sshd_config
+
+SSHD_CONF_P="/etc/ssh/sshd_config.d/test.conf"
+mkdir -p "$(basename ${SSHD_CONF_P})"
+{
+    echo "PermitRootLogin yes"
+    echo "LogLevel DEBUG3"
+} >"${SSHD_CONF_P}"
+rm_sshd_conf() {
+    rm -f "${SSHD_CONF_P}"
+}
+trap rm_sshd_conf EXIT
 
 test -f /etc/ssh/ssh_config || {
     echo 'Include /etc/ssh/ssh_config.d/*.conf'

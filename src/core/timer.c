@@ -300,7 +300,7 @@ static void timer_set_state(Timer *t, TimerState state) {
         if (state != old_state)
                 log_unit_debug(UNIT(t), "Changed %s -> %s", timer_state_to_string(old_state), timer_state_to_string(state));
 
-        unit_notify(UNIT(t), state_translation_table[old_state], state_translation_table[state], /* reload_success = */ true);
+        unit_notify(UNIT(t), state_translation_table[old_state], state_translation_table[state], /* reload_success= */ true);
 }
 
 static void timer_enter_waiting(Timer *t, bool time_change);
@@ -324,7 +324,7 @@ static int timer_coldplug(Unit *u) {
 static void timer_enter_dead(Timer *t, TimerResult f) {
         assert(t);
 
-        if (t->result == TIMER_SUCCESS)
+        if (t->result == TIMER_SUCCESS || f == TIMER_FAILURE_START_LIMIT_HIT)
                 t->result = f;
 
         unit_log_result(UNIT(t), t->result == TIMER_SUCCESS, timer_result_to_string(t->result));
@@ -392,7 +392,9 @@ static void timer_enter_waiting(Timer *t, bool time_change) {
                         continue;
 
                 if (v->base == TIMER_CALENDAR) {
-                        usec_t b, rebased, random_offset = 0;
+                        bool rebase_after_boot_time = false;
+                        usec_t b, random_offset = 0;
+                        usec_t boot_monotonic = UNIT(t)->manager->timestamps[MANAGER_TIMESTAMP_USERSPACE].monotonic;
 
                         if (t->random_offset_usec != 0)
                                 random_offset = timer_get_fixed_delay_hash(t) % t->random_offset_usec;
@@ -400,12 +402,7 @@ static void timer_enter_waiting(Timer *t, bool time_change) {
                         /* If DeferReactivation= is enabled, schedule the job based on the last time
                          * the trigger unit entered inactivity. Otherwise, if we know the last time
                          * this was triggered, schedule the job based relative to that. If we don't,
-                         * just start from the activation time or realtime.
-                         *
-                         * Unless we have a real last-trigger time, we subtract the random_offset because
-                         * any event that elapsed within the last random_offset has actually been delayed
-                         * and thus hasn't truly elapsed yet. */
-
+                         * just start from the activation time or realtime. */
                         if (t->defer_reactivation &&
                             dual_timestamp_is_set(&trigger->inactive_enter_timestamp)) {
                                 if (dual_timestamp_is_set(&t->last_trigger))
@@ -413,12 +410,43 @@ static void timer_enter_waiting(Timer *t, bool time_change) {
                                                 t->last_trigger.realtime);
                                 else
                                         b = trigger->inactive_enter_timestamp.realtime;
-                        } else if (dual_timestamp_is_set(&t->last_trigger))
+                        } else if (dual_timestamp_is_set(&t->last_trigger)) {
                                 b = t->last_trigger.realtime;
-                        else if (dual_timestamp_is_set(&UNIT(t)->inactive_exit_timestamp))
-                                b = UNIT(t)->inactive_exit_timestamp.realtime - random_offset;
-                        else
-                                b = ts.realtime - random_offset;
+
+                                /* Check if the last_trigger timestamp is older than the current machine
+                                 * boot. If so, this means the timestamp came from a stamp file of a
+                                 * persistent timer and we need to rebase it to make RandomizedDelaySec=
+                                 * work (see below). */
+                                if (t->last_trigger.monotonic < boot_monotonic)
+                                        rebase_after_boot_time = true;
+                        } else if (dual_timestamp_is_set(&UNIT(t)->inactive_exit_timestamp))
+                                b = UNIT(t)->inactive_exit_timestamp.realtime;
+                        else {
+                                b = ts.realtime;
+                                rebase_after_boot_time = true;
+                        }
+
+                        if (b > ts.realtime) {
+                                /* The base we picked is in the future relative to the current realtime. This
+                                 * happens when the wall clock is set backwards while the timer is already
+                                 * waiting: the base was recorded from the old, later time. Feeding a future
+                                 * base to calendar_spec_next_usec() would schedule the next elapse relative to
+                                 * that stale time instead of now, so systemctl list-timers keeps showing the
+                                 * pre-adjustment elapse and the timer never catches up (see #6036). Clamp to
+                                 * now so we recalculate from the current time. */
+                                log_unit_debug(UNIT(t),
+                                               "Calendar timer base time %s is in the future, recalculating from the current time.",
+                                               FORMAT_TIMESTAMP(b));
+                                b = ts.realtime;
+                        }
+
+                        /* We always subtract random_offset from the base time because
+                         * calendar_spec_next_usec() finds the next calendar event, and then we add the
+                         * offset back afterwards (see below). The base time needs to be in "pre-offset"
+                         * space so the next calendar match is computed correctly. Without this, a timer
+                         * that fires late (e.g. persistent catch-up) would skip the next scheduled
+                         * activation. */
+                        b = usec_sub_unsigned(b, random_offset);
 
                         r = calendar_spec_next_usec(v->calendar_spec, b, &v->next_elapse);
                         if (r < 0)
@@ -426,14 +454,15 @@ static void timer_enter_waiting(Timer *t, bool time_change) {
 
                         v->next_elapse += random_offset;
 
-                        /* To make the delay due to RandomizedDelaySec= work even at boot, if the scheduled
-                         * time has already passed, set the time when systemd first started as the scheduled
-                         * time. Note that we base this on the monotonic timestamp of the boot, not the
-                         * realtime one, since the wallclock might have been off during boot. */
-                        rebased = map_clock_usec(UNIT(t)->manager->timestamps[MANAGER_TIMESTAMP_USERSPACE].monotonic,
-                                                 CLOCK_MONOTONIC, CLOCK_REALTIME);
-                        if (v->next_elapse < rebased)
-                                v->next_elapse = rebased;
+                        if (rebase_after_boot_time) {
+                                /* To make the delay due to RandomizedDelaySec= work even at boot, if the scheduled
+                                 * time has already passed, set the time when systemd first started as the scheduled
+                                 * time. Note that we base this on the monotonic timestamp of the boot, not the
+                                 * realtime one, since the wallclock might have been off during boot. */
+                                usec_t rebased = map_clock_usec(boot_monotonic, CLOCK_MONOTONIC, CLOCK_REALTIME);
+                                if (v->next_elapse < rebased)
+                                        v->next_elapse = rebased;
+                        }
 
                         if (!found_realtime)
                                 t->next_elapse_realtime = v->next_elapse;
@@ -486,16 +515,23 @@ static void timer_enter_waiting(Timer *t, bool time_change) {
                                 assert_not_reached();
                         }
 
-                        if (!time_change)
-                                v->next_elapse = usec_add(usec_shift_clock(base, CLOCK_MONOTONIC, TIMER_MONOTONIC_CLOCK(t)), v->value);
+                        if (!time_change) {
+                                bool is_oneshot = IN_SET(v->base, TIMER_ACTIVE, TIMER_BOOT, TIMER_STARTUP);
 
-                        if (dual_timestamp_is_set(&t->last_trigger) &&
-                            !time_change &&
-                            v->next_elapse < triple_timestamp_by_clock(&ts, TIMER_MONOTONIC_CLOCK(t)) &&
-                            IN_SET(v->base, TIMER_ACTIVE, TIMER_BOOT, TIMER_STARTUP)) {
-                                /* This is a one time trigger, disable it now */
-                                v->disabled = true;
-                                continue;
+                                /* Skip recalculating the next elapse timestamp for one-shot timers for which
+                                 * we've already calculated the value in this activation cycle. */
+                                if (!(v->next_elapse > 0 &&
+                                      t->last_trigger.monotonic > base &&
+                                      is_oneshot))
+                                        v->next_elapse = usec_add(usec_shift_clock(base, CLOCK_MONOTONIC, TIMER_MONOTONIC_CLOCK(t)), v->value);
+
+                                if (dual_timestamp_is_set(&t->last_trigger) &&
+                                    v->next_elapse < triple_timestamp_by_clock(&ts, TIMER_MONOTONIC_CLOCK(t)) &&
+                                    is_oneshot) {
+                                        /* This is a one time trigger, disable it now. */
+                                        v->disabled = true;
+                                        continue;
+                                }
                         }
 
                         if (!found_monotonic)
@@ -656,15 +692,9 @@ static int timer_start(Unit *u) {
 
         assert(IN_SET(t->state, TIMER_DEAD, TIMER_FAILED));
 
-        r = unit_test_trigger_loaded(u);
-        if (r < 0)
-                return r;
-
         r = unit_acquire_invocation_id(u);
         if (r < 0)
                 return r;
-
-        t->last_trigger = DUAL_TIMESTAMP_NULL;
 
         /* Reenable all timers that depend on unit activation time */
         LIST_FOREACH(value, v, t->values)
@@ -903,9 +933,13 @@ static int timer_can_clean(Unit *u, ExecCleanMask *ret) {
         return 0;
 }
 
-static int timer_can_start(Unit *u) {
+static int timer_test_startable(Unit *u) {
         Timer *t = ASSERT_PTR(TIMER(u));
         int r;
+
+        r = unit_test_trigger_loaded(u);
+        if (r < 0)
+                return r;
 
         r = unit_test_start_limit(u);
         if (r < 0) {
@@ -913,7 +947,7 @@ static int timer_can_start(Unit *u) {
                 return r;
         }
 
-        return 1;
+        return true;
 }
 
 static void activation_details_timer_serialize(const ActivationDetails *details, FILE *f) {
@@ -930,6 +964,7 @@ static int activation_details_timer_deserialize(const char *key, const char *val
 
         assert(key);
         assert(value);
+        POINTER_MAY_BE_NULL(details);
 
         if (!details || !*details)
                 return -EINVAL;
@@ -1090,7 +1125,7 @@ const UnitVTable timer_vtable = {
 
         .bus_set_property = bus_timer_set_property,
 
-        .can_start = timer_can_start,
+        .test_startable = timer_test_startable,
 };
 
 const ActivationDetailsVTable activation_details_timer_vtable = {

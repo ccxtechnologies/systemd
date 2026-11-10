@@ -12,7 +12,6 @@
 #include "strv.h"
 #include "systemctl.h"
 #include "systemctl-is-enabled.h"
-#include "systemctl-sysv-compat.h"
 #include "systemctl-util.h"
 
 static int show_installation_targets_client_side(const char *name) {
@@ -28,7 +27,7 @@ static int show_installation_targets_client_side(const char *name) {
         flags = UNIT_FILE_DRY_RUN |
                 (arg_runtime ? UNIT_FILE_RUNTIME : 0);
 
-        r = unit_file_disable(arg_runtime_scope, flags, NULL, p, &changes, &n_changes);
+        r = unit_file_disable(arg_runtime_scope, flags, arg_root, p, &changes, &n_changes);
         if (r < 0)
                 return log_error_errno(r, "Failed to get file links for %s: %m", name);
 
@@ -66,23 +65,16 @@ static int show_installation_targets(sd_bus *bus, const char *name) {
         return 0;
 }
 
-int verb_is_enabled(int argc, char *argv[], void *userdata) {
+int verb_is_enabled(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_strv_free_ char **names = NULL;
-        bool not_found, enabled;
+        bool not_found = true, enabled = false;
         int r;
 
         r = mangle_names("to check", strv_skip(argv, 1), &names);
         if (r < 0)
                 return r;
 
-        r = enable_sysv_units(argv[0], names);
-        if (r < 0)
-                return r;
-
-        not_found = r == 0; /* Doesn't have SysV support or SYSV_UNIT_NOT_FOUND */
-        enabled = r == SYSV_UNIT_ENABLED;
-
-        if (install_client_side())
+        if (install_client_side() != INSTALL_CLIENT_SIDE_NO)
                 STRV_FOREACH(name, names) {
                         UnitFileState state;
 

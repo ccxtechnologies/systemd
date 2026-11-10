@@ -120,6 +120,15 @@ rerun the test.
 `TEST_NO_KVM=1`: Disable qemu KVM auto-detection (may be necessary when you're
 trying to run the *vanilla* qemu and have both qemu and qemu-kvm installed)
 
+`TEST_MKOSI_ARGS=options`: Extra options (split like a shell command line)
+passed to the `mkosi` invocation that launches the test image, without
+affecting the image build. Only the `--option=value` syntax is accepted. For example,
+`TEST_MKOSI_ARGS="--format=directory --output-dir=build/mkosi.output.dir"`
+boots the test container from a directory format output (which has to be built
+beforehand, into a separate output directory), allowing boot mode tests to run
+in environments that can't dissect disk images, such as unprivileged
+containers, where loop devices and udev are not available.
+
 `TEST_MATCH_SUBTEST=subtest`:  If the test makes use of `run_subtests` use this
 variable to provide a POSIX extended regex to run only subtests matching the
 expression.
@@ -140,6 +149,24 @@ journal file will be saved only when the test is failed. Defaults to `fail`.
 `TEST_JOURNAL_USE_TMP=1`: Write test journal to `/tmp` while the test is in
 progress and only move the journal to its final location in the build directory
 (`$BUILD_DIR/test/journal`) when the test is finished.
+
+## Confidential computing (coco) tests
+
+Tests that exercise systemd inside a confidential VM (currently `TEST-94-COCO`)
+launch a real Intel TDX or AMD SEV-SNP guest with `systemd-vmspawn --coco=`. They
+only run on a coco-capable host and skip everywhere else. A confidential VM cannot
+be nested, so these tests run in boot (nspawn) mode on a bare-metal coco host,
+as root. The host must have coco enabled in firmware and in the kernel (for SEV-SNP
+e.g. `kvm_amd.sev_snp=1`, with `/dev/sev` accessible). On a host without the requested
+technology, or when running in `mkosi vm` mode, the tests are skipped.
+
+```
+meson test
+  └─ integration-test-wrapper.py
+      └─ mkosi boot  ──►  systemd-nspawn container
+          └─ TEST-94-COCO.sh
+              └─ systemd-vmspawn --coco=<type>  ──►  confidential VM
+```
 
 ## Running the integration tests without building systemd from source
 
@@ -231,12 +258,12 @@ The 5 characters at the end of the last directory are not random, but the first
 the build plus the completion timestamp, such as:
 
 ```shell
-$ echo -n 'systemd-upstream {"build-git": "https://salsa.debian.org/systemd-team/systemd.git#debian/master", "env": ["UPSTREAM_REPO=https://github.com/systemd/systemd.git", "CFLAGS=-O0", "DEB_BUILD_PROFILES=pkg.systemd.upstream noudeb", "TEST_UPSTREAM=1", "CONFFLAGS_UPSTREAM=--werror -Dslow-tests=true", "UPSTREAM_PULL_REQUEST=31444", "GITHUB_STATUSES_URL=https://api.github.com/repos/systemd/systemd/statuses/c27f600a1c47f10b22964eaedfb5e9f0d4279cd9"], "ppas": ["upstream-systemd-ci/systemd-ci"], "submit-time": "2024-02-27 17:06:27", "uuid": "02cd262f-af22-4f82-ac91-53fa5a9e7811"}' | sha1sum | cut -c1-5
+$ echo -n 'systemd-upstream {"build-git": "https://github.com/systemd/systemd-deb.git#deb/main", "env": ["UPSTREAM_REPO=https://github.com/systemd/systemd.git", "CFLAGS=-O0", "DEB_BUILD_PROFILES=pkg.systemd.upstream noudeb", "TEST_UPSTREAM=1", "CONFFLAGS_UPSTREAM=--werror -Dslow-tests=true", "UPSTREAM_PULL_REQUEST=31444", "GITHUB_STATUSES_URL=https://api.github.com/repos/systemd/systemd/statuses/c27f600a1c47f10b22964eaedfb5e9f0d4279cd9"], "ppas": ["upstream-systemd-ci/systemd-ci"], "submit-time": "2024-02-27 17:06:27", "uuid": "02cd262f-af22-4f82-ac91-53fa5a9e7811"}' | sha1sum | cut -c1-5
 ```
 
 To add new dependencies or new binaries to the packages used during the tests,
-a merge request can be sent to: https://salsa.debian.org/systemd-team/systemd
-targeting the 'upstream-ci' branch.
+a pull request can be sent to: https://github.com/systemd/systemd-deb
+targeting the 'deb/main' branch.
 
 The cloud-side infrastructure, that is hooked into the Github interface, is
 located at:
@@ -292,12 +319,12 @@ In some situations one may want/need to run one of the tests run by Ubuntu CI
 locally for debugging purposes. For this, you need a machine (or a VM) with
 the same Ubuntu release as is used by Ubuntu CI (Jammy ATTOW).
 
-First of all, clone the Debian systemd repository and sync it with the code of
+First of all, clone the deb packaging repository and sync it with the code of
 the PR (set by the `$UPSTREAM_PULL_REQUEST` env variable) you'd like to debug:
 
 ```shell
-$ git clone https://salsa.debian.org/systemd-team/systemd.git
-$ cd systemd
+$ git clone https://github.com/systemd/systemd-deb.git
+$ cd systemd-deb
 $ git checkout ci/v<XYZ>-stable
 $ TEST_UPSTREAM=1 UPSTREAM_PULL_REQUEST=12345 ./debian/extra/checkout-upstream
 ```
@@ -338,71 +365,6 @@ $ autopkgtest -o logs *.deb systemd/ \
 where `--test-name=` is the name of the test you want to run/debug. The
 `--shell-fail` option will pause the execution in case the test fails and shows
 you the information how to connect to the testbed for further debugging.
-
-## Manually running CodeQL analysis
-
-This is mostly useful for debugging various CodeQL quirks.
-
-Download the CodeQL Bundle from https://github.com/github/codeql-action/releases
-and unpack it somewhere. From now the 'tutorial' assumes you have the `codeql`
-binary from the unpacked archive in $PATH for brevity.
-
-Switch to the systemd repository if not already:
-
-```shell
-$ cd <systemd-repo>
-```
-
-Create an initial CodeQL database:
-
-```shell
-$ CCACHE_DISABLE=1 codeql database create codeqldb --language=cpp -vvv
-```
-
-Disabling ccache is important, otherwise you might see CodeQL complaining:
-
-No source code was seen and extracted to
-/home/mrc0mmand/repos/@ci-incubator/systemd/codeqldb. This can occur if the
-specified build commands failed to compile or process any code.
- - Confirm that there is some source code for the specified language in the
-   project.
- - For codebases written in Go, JavaScript, TypeScript, and Python, do not
-   specify an explicit --command.
- - For other languages, the --command must specify a "clean" build which
-   compiles all the source code files without reusing existing build artefacts.
-
-If you want to run all queries systemd uses in CodeQL, run:
-
-```shell
-$ codeql database analyze codeqldb/ --format csv --output results.csv .github/codeql-custom.qls .github/codeql-queries/*.ql -vvv
-```
-
-Note: this will take a while.
-
-If you're interested in a specific check, the easiest way (without hunting down
-the specific CodeQL query file) is to create a custom query suite. For example:
-
-```shell
-$ cat >test.qls <<EOF
-- queries: .
-  from: codeql/cpp-queries
-- include:
-    id:
-        - cpp/missing-return
-EOF
-```
-
-And then execute it in the same way as above:
-
-```shell
-$ codeql database analyze codeqldb/ --format csv --output results.csv test.qls -vvv
-```
-
-More about query suites here: https://codeql.github.com/docs/codeql-cli/creating-codeql-query-suites/
-
-The results are then located in the `results.csv` file as a comma separated
-values list (obviously), which is the most human-friendly output format the
-CodeQL utility provides (so far).
 
 ## Running Coverity locally
 

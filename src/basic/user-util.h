@@ -9,14 +9,29 @@
 #include <shadow.h>
 
 #include "forward.h"
+#include "errno-util.h"
 
-/* Users managed by systemd-homed. See https://systemd.io/UIDS-GIDS for details how this range fits into the rest of the world */
+/* Users managed by systemd-homed. See https://systemd.io/UIDS-GIDS for details
+ * how this range fits into the rest of the world. */
 #define HOME_UID_MIN ((uid_t) 60001)
 #define HOME_UID_MAX ((uid_t) 60513)
 
 /* Users mapped from host into a container */
 #define MAP_UID_MIN ((uid_t) 60514)
 #define MAP_UID_MAX ((uid_t) 60577)
+
+/* A helper to print an error message when user or group resolution fails. */
+const char* strerror_user(int errnum, char *buf, size_t buflen);
+#define STRERROR_USER(errnum) strerror_user(errnum, (char[ERRNO_BUF_LEN]){}, ERRNO_BUF_LEN)
+const char* strerror_group(int errnum, char *buf, size_t buflen);
+#define STRERROR_GROUP(errnum) strerror_group(errnum, (char[ERRNO_BUF_LEN]){}, ERRNO_BUF_LEN)
+
+static inline bool ERRNO_IS_NEG_BAD_ACCOUNT(intmax_t r) {
+        return IN_SET(r,
+                      -ESRCH,
+                      -ENOEXEC);
+}
+_DEFINE_ABS_WRAPPER(BAD_ACCOUNT);
 
 bool uid_is_valid(uid_t uid) _const_;
 
@@ -47,8 +62,14 @@ typedef enum UserCredsFlags {
         USER_CREDS_SUPPRESS_PLACEHOLDER = 1 << 3,  /* suppress home and/or shell fields if value is placeholder (root/empty/nologin) */
 } UserCredsFlags;
 
-int get_user_creds(const char **username, uid_t *ret_uid, gid_t *ret_gid, const char **ret_home, const char **ret_shell, UserCredsFlags flags);
-int get_group_creds(const char **groupname, gid_t *ret_gid, UserCredsFlags flags);
+int get_user_creds(
+                const char *username,
+                UserCredsFlags flags,
+                char **ret_username,
+                uid_t *ret_uid, gid_t *ret_gid,
+                char **ret_home,
+                char **ret_shell);
+int get_group_creds(const char *groupname, UserCredsFlags flags, char **ret_name, gid_t *ret_gid);
 
 char* uid_to_name(uid_t uid);
 char* gid_to_name(gid_t gid);
@@ -56,7 +77,7 @@ char* gid_to_name(gid_t gid);
 int in_gid(gid_t gid);
 int in_group(const char *name);
 
-int merge_gid_lists(const gid_t *list1, size_t size1, const gid_t *list2, size_t size2, gid_t **result);
+int merge_gid_lists(const gid_t *list1, size_t size1, const gid_t *list2, size_t size2, gid_t **ret);
 int getgroups_alloc(gid_t **ret);
 
 int get_home_dir(char **ret);
@@ -74,6 +95,10 @@ int take_etc_passwd_lock(const char *root);
 
 #define UID_NOBODY ((uid_t) 65534U)
 #define GID_NOBODY ((gid_t) 65534U)
+
+/* Conventional size of a user-namespace UID/GID delegation block (64K).
+ * Untyped so it can be used in both UID and GID contexts without casts. */
+#define USERNS_RANGE_SIZE 0x10000U
 
 /* If REMOUNT_IDMAPPING_HOST_ROOT is set for remount_idmap() we'll include a mapping here that maps the host
  * root user accessing the idmapped mount to the this user ID on the backing fs. This is the last valid UID in
@@ -134,6 +159,10 @@ static inline bool hashed_password_is_locked_or_invalid(const char *password) {
         return password && password[0] != '$';
 }
 
+/* Places where we will try to load account data from */
+#define PASSWD_FILES STRV_MAKE("/etc/passwd", "/usr/lib/passwd")
+#define GROUP_FILES STRV_MAKE("/etc/group", "/usr/lib/group")
+
 /* A locked *and* invalid password for "struct spwd"'s .sp_pwdp and "struct passwd"'s .pw_passwd field */
 #define PASSWORD_LOCKED_AND_INVALID "!*"
 
@@ -147,6 +176,27 @@ static inline bool hashed_password_is_locked_or_invalid(const char *password) {
  * Also see https://github.com/systemd/systemd/pull/24680#pullrequestreview-1439464325.
  */
 #define PASSWORD_UNPROVISIONED "!unprovisioned"
+
+int sysconf_ngroups_max(void);
+
+int lookup_pwent_in_files(
+                char * const *files,
+                const char *name,
+                uid_t uid,
+                struct passwd **ret);
+int lookup_grent_in_files(
+                char * const *files,
+                const char *name,
+                gid_t gid,
+                struct group **ret);
+
+ssize_t lookup_groups_in_files(
+                char * const *files,
+                const char *name,
+                gid_t gid,
+                gid_t **ret);
+int getgrouplist_malloc(const char *user, gid_t gid, gid_t **ret);
+int initgroups_wrapper(const char *user, gid_t gid);
 
 int getpwuid_malloc(uid_t uid, struct passwd **ret);
 int getpwnam_malloc(const char *name, struct passwd **ret);

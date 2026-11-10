@@ -1,17 +1,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "sd-id128.h"
 
 #include "alloc-util.h"
+#include "copy.h"
 #include "dirent-util.h"
 #include "escape.h"
 #include "fd-util.h"
 #include "hexdecoct.h"
 #include "io-util.h"
+#include "iovec-util.h"
 #include "log.h"
 #include "memory-util.h"
 #include "os-util.h"
 #include "path-util.h"
+#include "pidref.h"
 #include "process-util.h"
 #include "pull-common.h"
 #include "pull-job.h"
@@ -118,6 +123,22 @@ static int hash_url(const char *url, char **ret) {
                 return -ENOMEM;
 
         return 0;
+}
+
+static int keyring_add_if_exists(char ***keyrings, const char *path) {
+        assert(keyrings);
+        assert(path);
+
+        if (access(path, F_OK) < 0) {
+                if (errno != ENOENT)
+                        log_warning_errno(errno,
+                                          "Failed to check if keyring '%s' exists, ignoring: %m",
+                                          path);
+
+                return 0;
+        }
+
+        return strv_extend(keyrings, path);
 }
 
 int pull_make_path(const char *url, const char *etag, const char *image_root, const char *prefix, const char *suffix, char **ret) {
@@ -248,7 +269,6 @@ int pull_make_verification_jobs(
                 PullJob **ret_checksum_job,
                 PullJob **ret_signature_job,
                 ImportVerify verify,
-                const char *checksum, /* set if literal checksum verification is requested, in which case 'verify' is set to _IMPORT_VERIFY_INVALID */
                 const char *url,
                 CurlGlue *glue,
                 PullJobFinished on_finished,
@@ -262,13 +282,13 @@ int pull_make_verification_jobs(
         assert(ret_signature_job);
         assert(verify == _IMPORT_VERIFY_INVALID || verify < _IMPORT_VERIFY_MAX);
         assert(verify == _IMPORT_VERIFY_INVALID || verify >= 0);
-        assert((verify < 0) || !checksum);
         assert(url);
         assert(glue);
 
         /* If verification is turned off, or if the checksum to validate is already specified we don't need
          * to download a checksum file or signature, hence shortcut things */
-        if (verify == IMPORT_VERIFY_NO || checksum) {
+        if (verify < 0 ||                  /* verification already done (via literal checksum) */
+            verify == IMPORT_VERIFY_NO) {  /* verification turned off */
                 *ret_checksum_job = *ret_signature_job = NULL;
                 return 0;
         }
@@ -352,7 +372,7 @@ static int verify_one(PullJob *checksum_job, PullJob *job) {
                 return 0;
 
         assert(job->calc_checksum);
-        assert(job->checksum);
+        assert(iovec_is_set(&job->checksum));
 
         r = import_url_last_component(job->url, &fn);
         if (r < 0)
@@ -366,6 +386,10 @@ static int verify_one(PullJob *checksum_job, PullJob *job) {
                 return log_error_errno(SYNTHETIC_ERRNO(ELOOP),
                                        "Cannot verify checksum/signature files via themselves.");
 
+        _cleanup_free_ char *cs = hexmem(job->checksum.iov_base, job->checksum.iov_len);
+        if (!cs)
+                return log_oom();
+
         const char *p = NULL;
         FOREACH_STRING(separator,
                        " *", /* separator for binary mode */
@@ -373,12 +397,12 @@ static int verify_one(PullJob *checksum_job, PullJob *job) {
                        " "   /* non-standard separator used by linuxcontainers.org */) {
                 _cleanup_free_ char *line = NULL;
 
-                line = strjoin(job->checksum, separator, fn, "\n");
+                line = strjoin(cs, separator, fn, "\n");
                 if (!line)
                         return log_oom();
 
-                p = memmem_safe(checksum_job->payload,
-                                checksum_job->payload_size,
+                p = memmem_safe(checksum_job->payload.iov_base,
+                                checksum_job->payload.iov_len,
                                 line,
                                 strlen(line));
                 if (p)
@@ -386,7 +410,7 @@ static int verify_one(PullJob *checksum_job, PullJob *job) {
         }
 
         /* Only counts if found at beginning of a line */
-        if (!p || (p != (char*) checksum_job->payload && p[-1] != '\n'))
+        if (!p || (p != (char*) checksum_job->payload.iov_base && p[-1] != '\n'))
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
                                        "DOWNLOAD INVALID: Checksum of %s file did not check out, file has been tampered with.", fn);
 
@@ -395,30 +419,40 @@ static int verify_one(PullJob *checksum_job, PullJob *job) {
 }
 
 static int verify_gpg(
-                const void *payload, size_t payload_size,
-                const void *signature, size_t signature_size) {
+                const struct iovec *payload,
+                const struct iovec *signature) {
 
         _cleanup_close_pair_ int gpg_pipe[2] = EBADF_PAIR;
         _cleanup_(rm_rf_physical_and_freep) char *gpg_home = NULL;
         char sig_file_path[] = "/tmp/sigXXXXXX";
-        _cleanup_(sigkill_waitp) pid_t pid = 0;
+        _cleanup_(pidref_done_sigkill_wait) PidRef pidref = PIDREF_NULL;
+        _cleanup_strv_free_ char **cmd = NULL;
+        _cleanup_strv_free_ char **keyring_sources = NULL, **keyring_copies = NULL;
+        const char *keyring_override;
         int r;
 
-        assert(payload || payload_size == 0);
-        assert(signature || signature_size == 0);
+        assert(iovec_is_valid(payload));
+        assert(iovec_is_set(signature));
+
+        /* Support using a custom keyring, see docs/ENVIRONMENT.md. */
+        keyring_override = empty_to_null(secure_getenv("SYSTEMD_OPENPGP_KEYRING"));
+        if (keyring_override && !(path_is_absolute(keyring_override) && path_is_normalized(keyring_override)))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "$SYSTEMD_OPENPGP_KEYRING must be an absolute, normalized path, got '%s'.",
+                                       keyring_override);
 
         r = pipe2(gpg_pipe, O_CLOEXEC);
         if (r < 0)
                 return log_error_errno(errno, "Failed to create pipe for gpg: %m");
 
-        if (signature_size > 0) {
+        {
                 _cleanup_close_ int sig_file = -EBADF;
 
                 sig_file = mkostemp(sig_file_path, O_RDWR);
                 if (sig_file < 0)
                         return log_error_errno(errno, "Failed to create temporary file: %m");
 
-                r = loop_write(sig_file, signature, signature_size);
+                r = loop_write(sig_file, signature->iov_base, signature->iov_len);
                 if (r < 0) {
                         log_error_errno(r, "Failed to write to temporary file: %m");
                         goto finish;
@@ -431,15 +465,67 @@ static int verify_gpg(
                 goto finish;
         }
 
-        r = safe_fork_full("(gpg)",
-                           (int[]) { gpg_pipe[0], -EBADF, STDERR_FILENO },
-                           NULL, 0,
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
-                           &pid);
-        if (r < 0)
-                return r;
-        if (r == 0) {
-                const char *cmd[] = {
+        if (keyring_override) {
+                r = strv_extend(&keyring_sources, keyring_override);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to store custom keyring path: %m");
+                        goto finish;
+                }
+        } else {
+                r = keyring_add_if_exists(&keyring_sources, USER_KEYRING_PATH);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to collect keyring '%s': %m", USER_KEYRING_PATH);
+                        goto finish;
+                }
+
+                if (strv_isempty(keyring_sources)) {
+                        r = keyring_add_if_exists(&keyring_sources, USER_KEYRING_PATH_LEGACY);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to collect keyring '%s': %m", USER_KEYRING_PATH_LEGACY);
+                                goto finish;
+                        }
+                }
+
+                r = keyring_add_if_exists(&keyring_sources, VENDOR_KEYRING_PATH);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to collect keyring '%s': %m", VENDOR_KEYRING_PATH);
+                        goto finish;
+                }
+        }
+
+        if (strv_isempty(keyring_sources)) {
+                r = log_error_errno(SYNTHETIC_ERRNO(ENOENT),
+                                    "No OpenPGP keyrings found, checked '%s', '%s', and '%s'.",
+                                    USER_KEYRING_PATH, USER_KEYRING_PATH_LEGACY, VENDOR_KEYRING_PATH);
+                goto finish;
+        }
+
+        /* For whatever reason gpg --auto-key-import writes the key material embedded in the signature
+         * (the signing subkey) back into the keyring it verifies against instead of just using it
+         * temporarily. Verify against a throwaway copy in the tmp home so we never write to the
+         * original keyring. */
+        STRV_FOREACH(keyring_source, keyring_sources) {
+                _cleanup_free_ char *copy = NULL;
+
+                if (asprintf(&copy, "%s/keyring-%zu.gpg", gpg_home, strv_length(keyring_copies)) < 0) {
+                        r = log_oom();
+                        goto finish;
+                }
+
+                r = copy_file(*keyring_source, copy, 0, 0600, /* copy_flags= */ 0);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to copy keyring '%s': %m", *keyring_source);
+                        goto finish;
+                }
+
+                r = strv_consume(&keyring_copies, TAKE_PTR(copy));
+                if (r < 0) {
+                        log_error_errno(r, "Failed to store temporary keyring path: %m");
+                        goto finish;
+                }
+        }
+
+        cmd = strv_new(
                         "gpg",
                         "--no-options",
                         "--no-default-keyring",
@@ -447,54 +533,66 @@ static int verify_gpg(
                         "--no-auto-check-trustdb",
                         "--batch",
                         "--trust-model=always",
-                        NULL, /* --homedir=  */
-                        NULL, /* --keyring= */
-                        NULL, /* --verify */
-                        NULL, /* signature file */
-                        NULL, /* dash */
-                        NULL  /* trailing NULL */
-                };
-                size_t k = ELEMENTSOF(cmd) - 6;
+                        "--auto-key-import",
+                        "--import-options=merge-only,import-clean");
+        if (!cmd) {
+                r = log_oom();
+                goto finish;
+        }
 
+        r = strv_extendf(&cmd, "--homedir=%s", gpg_home);
+        if (r < 0) {
+                log_error_errno(r, "Failed to build gpg command line: %m");
+                goto finish;
+        }
+
+        STRV_FOREACH(keyring_source, keyring_copies) {
+                r = strv_extendf(&cmd, "--keyring=%s", *keyring_source);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to build gpg command line: %m");
+                        goto finish;
+                }
+        }
+
+        r = strv_extend_many(&cmd, "--verify", sig_file_path, "-");
+        if (r < 0) {
+                log_error_errno(r, "Failed to build gpg command line: %m");
+                goto finish;
+        }
+
+        r = pidref_safe_fork_full(
+                        "(gpg)",
+                        (int[]) { gpg_pipe[0], -EBADF, STDERR_FILENO },
+                        /* except_fds= */ NULL, /* n_except_fds= */ 0,
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
+                        &pidref);
+        if (r < 0)
+                goto finish;
+        if (r == 0) {
                 /* Child */
 
-                cmd[k++] = strjoina("--homedir=", gpg_home);
-
-                /* We add the user keyring only to the command line arguments, if it's around since gpg fails
-                 * otherwise. */
-                if (access(USER_KEYRING_PATH, F_OK) >= 0)
-                        cmd[k++] = "--keyring=" USER_KEYRING_PATH;
-                else if (access(USER_KEYRING_PATH_LEGACY, F_OK) >= 0)
-                        cmd[k++] = "--keyring=" USER_KEYRING_PATH_LEGACY;
-                else
-                        cmd[k++] = "--keyring=" VENDOR_KEYRING_PATH;
-
-                cmd[k++] = "--verify";
-                if (signature) {
-                        cmd[k++] = sig_file_path;
-                        cmd[k++] = "-";
-                        cmd[k++] = NULL;
-                }
-
-                execvp("gpg2", (char * const *) cmd);
-                execvp("gpg", (char * const *) cmd);
+                execvp("gpg2", cmd);
+                execvp("gpg", cmd);
                 log_error_errno(errno, "Failed to execute gpg: %m");
                 _exit(EXIT_FAILURE);
         }
 
         gpg_pipe[0] = safe_close(gpg_pipe[0]);
 
-        r = loop_write(gpg_pipe[1], payload, payload_size);
-        if (r < 0) {
-                log_error_errno(r, "Failed to write to pipe: %m");
-                goto finish;
+        if (iovec_is_set(payload)) {
+                r = loop_write(gpg_pipe[1], payload->iov_base, payload->iov_len);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to write to pipe: %m");
+                        goto finish;
+                }
         }
 
         gpg_pipe[1] = safe_close(gpg_pipe[1]);
 
-        r = wait_for_terminate_and_check("gpg", TAKE_PID(pid), WAIT_LOG_ABNORMAL);
+        r = pidref_wait_for_terminate_and_check("gpg", &pidref, WAIT_LOG_ABNORMAL);
         if (r < 0)
                 goto finish;
+        pidref_done(&pidref);
         if (r != EXIT_SUCCESS)
                 r = log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
                                     "DOWNLOAD INVALID: Signature verification failed.");
@@ -504,14 +602,12 @@ static int verify_gpg(
         }
 
 finish:
-        if (signature_size > 0)
-                (void) unlink(sig_file_path);
+        (void) unlink(sig_file_path);
 
         return r;
 }
 
 int pull_verify(ImportVerify verify,
-                const char *checksum, /* Verify with literal checksum */
                 PullJob *main_job,
                 PullJob *checksum_job,
                 PullJob *signature_job,
@@ -521,38 +617,17 @@ int pull_verify(ImportVerify verify,
                 PullJob *verity_job) {
 
         _cleanup_free_ char *fn = NULL;
-        VerificationStyle style;
         PullJob *verify_job;
         int r;
 
         assert(verify == _IMPORT_VERIFY_INVALID || verify < _IMPORT_VERIFY_MAX);
         assert(verify == _IMPORT_VERIFY_INVALID || verify >= 0);
-        assert((verify < 0) || !checksum);
         assert(main_job);
         assert(main_job->state == PULL_JOB_DONE);
 
-        if (verify == IMPORT_VERIFY_NO) /* verification turned off */
+        if (verify < 0 ||               /* verification already done (via literal checksum) */
+            verify == IMPORT_VERIFY_NO) /* verification turned off */
                 return 0;
-
-        if (checksum) {
-                /* Verification by literal checksum */
-                assert(!checksum_job);
-                assert(!signature_job);
-                assert(!settings_job);
-                assert(!roothash_job);
-                assert(!roothash_signature_job);
-                assert(!verity_job);
-
-                assert(main_job->calc_checksum);
-                assert(main_job->checksum);
-
-                if (!strcaseeq(checksum, main_job->checksum))
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
-                                               "DOWNLOAD INVALID: Checksum of %s file did not check out, file has been tampered with.",
-                                               main_job->url);
-
-                return 0;
-        }
 
         r = import_url_last_component(main_job->url, &fn);
         if (r < 0)
@@ -567,11 +642,11 @@ int pull_verify(ImportVerify verify,
                 verify_job = main_job;
         } else {
                 assert(main_job->calc_checksum);
-                assert(main_job->checksum);
+                assert(iovec_is_set(&main_job->checksum));
                 assert(checksum_job);
                 assert(checksum_job->state == PULL_JOB_DONE);
 
-                if (!checksum_job->payload || checksum_job->payload_size <= 0)
+                if (!iovec_is_set(&checksum_job->payload))
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
                                                "Checksum is empty, cannot verify.");
 
@@ -589,19 +664,14 @@ int pull_verify(ImportVerify verify,
                 return 0;
 
         assert(verify_job);
-
-        r = verification_style_from_url(verify_job->url, &style);
-        if (r < 0)
-                return log_error_errno(r, "Failed to determine verification style from URL '%s': %m", verify_job->url);
-
         assert(signature_job);
         assert(signature_job->state == PULL_JOB_DONE);
 
-        if (!signature_job->payload || signature_job->payload_size <= 0)
+        if (!iovec_is_set(&signature_job->payload))
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
                                        "Signature is empty, cannot verify.");
 
-        return verify_gpg(verify_job->payload, verify_job->payload_size, signature_job->payload, signature_job->payload_size);
+        return verify_gpg(&verify_job->payload, &signature_job->payload);
 }
 
 int verification_style_from_url(const char *url, VerificationStyle *ret) {
@@ -635,6 +705,7 @@ int pull_job_restart_with_sha256sum(PullJob *j, char **ret) {
         int r;
 
         assert(j);
+        assert(ret);
 
         /* Generic implementation of a PullJobNotFound handler, that restarts the job requesting SHA256SUMS */
 
@@ -688,6 +759,7 @@ int pull_job_restart_with_signature(PullJob *j, char **ret) {
         int r;
 
         assert(j);
+        assert(ret);
 
         /* Generic implementation of a PullJobNotFound handler, that restarts the job requesting a different
          * signature file. After the initial file, additional *.sha256.gpg, SHA256SUMS.gpg and SHA256SUMS.asc

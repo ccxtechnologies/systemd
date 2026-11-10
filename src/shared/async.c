@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sched.h>
-#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -64,7 +63,7 @@ int asynchronous_fsync(int fd, PidRef *ret_pid) {
 static int close_func(void *p) {
         unsigned v = PTR_TO_UINT(p);
 
-        (void) prctl(PR_SET_NAME, (unsigned long*) "(sd-close)");
+        (void) proc_set_comm("(sd-close)");
 
         /* Note: 💣 This function is invoked in a child process created via glibc's clone() wrapper. In such
          *       children memory allocation is not allowed, since glibc does not release malloc mutexes in
@@ -149,7 +148,7 @@ int asynchronous_rm_rf(const char *p, RemoveFlags flags) {
         /* Forks off a child that destroys the specified path. This will be best effort only, i.e. the child
          * will attempt to do its thing, but we won't wait for it or check its success. */
 
-        r = safe_fork("(sd-rmrf)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DETACH, NULL);
+        r = pidref_safe_fork("(sd-rmrf)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DETACH, /* ret= */ NULL);
         if (r != 0)
                 return r;
 

@@ -11,7 +11,10 @@ typedef enum ExecDirectoryFlags {
         _EXEC_DIRECTORY_FLAGS_INVALID = -EINVAL,
 } ExecDirectoryFlags;
 
-ExecDirectoryFlags exec_directory_flags_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP_FROM_STRING(exec_directory_flags, ExecDirectoryFlags);
+/* Empty string for no flags, "ro" for the public read-only flag, NULL for unknown or private bits.
+ * Take the full D-Bus width so high bits cannot be silently truncated to ExecDirectoryFlags. */
+const char* exec_directory_flags_to_string(uint64_t flags);
 
 typedef struct UnitInfo {
         const char *machine;

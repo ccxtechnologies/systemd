@@ -144,7 +144,7 @@ static int property_get_idle_hint(
         assert(bus);
         assert(reply);
 
-        return sd_bus_message_append(reply, "b", user_get_idle_hint(u, NULL) > 0);
+        return sd_bus_message_append(reply, "b", user_get_idle_hint(u, /* ret_timestamp= */ NULL));
 }
 
 static int property_get_idle_since_hint(
@@ -163,7 +163,7 @@ static int property_get_idle_since_hint(
         assert(bus);
         assert(reply);
 
-        (void) user_get_idle_hint(u, &t);
+        user_get_idle_hint(u, &t);
         k = streq(property, "IdleSinceHint") ? t.realtime : t.monotonic;
 
         return sd_bus_message_append(reply, "t", k);
@@ -202,13 +202,14 @@ int bus_user_method_terminate(sd_bus_message *message, void *userdata, sd_bus_er
                         u->user_record->uid,
                         /* flags= */ 0,
                         &u->manager->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = user_stop(u, /* force = */ true);
+        r = user_stop(u, /* force= */ true);
         if (r < 0)
                 return r;
 
@@ -229,6 +230,7 @@ int bus_user_method_kill(sd_bus_message *message, void *userdata, sd_bus_error *
                         u->user_record->uid,
                         /* flags= */ 0,
                         &u->manager->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -367,7 +369,7 @@ static const sd_bus_vtable user_vtable[] = {
         SD_BUS_PROPERTY("IdleHint", "b", property_get_idle_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("IdleSinceHint", "t", property_get_idle_since_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("IdleSinceHintMonotonic", "t", property_get_idle_since_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
-        SD_BUS_PROPERTY("Linger", "b", property_get_linger, 0, 0),
+        SD_BUS_PROPERTY("Linger", "b", property_get_linger, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 
         SD_BUS_METHOD("Terminate", NULL, NULL, bus_user_method_terminate, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD_WITH_ARGS("Kill",

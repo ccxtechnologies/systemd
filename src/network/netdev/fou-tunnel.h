@@ -4,7 +4,6 @@
 #include <linux/fou.h>
 
 #include "in-addr-util.h"
-#include "forward.h"
 #include "netdev.h"
 
 typedef enum FooOverUDPEncapType {
@@ -34,8 +33,7 @@ typedef struct FouTunnel {
 DEFINE_NETDEV_CAST(FOU, FouTunnel);
 extern const NetDevVTable foutnl_vtable;
 
-const char* fou_encap_type_to_string(FooOverUDPEncapType d) _const_;
-FooOverUDPEncapType fou_encap_type_from_string(const char *d) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(fou_encap_type, FooOverUDPEncapType);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_fou_encap_type);
 CONFIG_PARSER_PROTOTYPE(config_parse_fou_tunnel_address);

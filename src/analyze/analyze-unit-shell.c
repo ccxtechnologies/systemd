@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -14,13 +13,14 @@
 #include "fd-util.h"
 #include "log.h"
 #include "namespace-util.h"
+#include "pidref.h"
 #include "process-util.h"
 #include "runtime-scope.h"
 #include "strv.h"
 #include "unit-def.h"
 #include "unit-name.h"
 
-int verb_unit_shell(int argc, char *argv[], void *userdata) {
+int verb_unit_shell(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -79,18 +79,21 @@ int verb_unit_shell(int argc, char *argv[], void *userdata) {
                         return log_oom();
         }
 
-        pid_t child;
-        r = namespace_fork(
+        _cleanup_(pidref_done) PidRef child = PIDREF_NULL;
+        r = namespace_fork_full(
                         "(unit-shell-ns)",
                         "(unit-shell)",
-                        /* except_fds= */ NULL,
-                        /* n_except_fds= */ 0,
+                        /* except_fds= */ NULL, /* n_except_fds= */ 0,
                         FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGKILL,
                         pidns_fd,
                         mntns_fd,
                         netns_fd,
                         userns_fd,
                         root_fd,
+                        /* We usually become root in the unit's user namespace. If it doesn't map root,
+                         * e.g. for user units or with UserNamespacePath=, still provide a shell, as
+                         * ourselves. */
+                        NAMESPACE_ENTER_KEEP_UID_GID_IF_ROOT_UNMAPPED,
                         &child);
         if (r < 0)
                 return log_error_errno(r, "Failed to fork and enter the namespace of %s: %m", unit);
@@ -118,8 +121,8 @@ int verb_unit_shell(int argc, char *argv[], void *userdata) {
                 _exit(EXIT_FAILURE);
         }
 
-        return wait_for_terminate_and_check(
+        return pidref_wait_for_terminate_and_check(
                         "(unit-shell)",
-                        child,
+                        &child,
                         WAIT_LOG_ABNORMAL|WAIT_LOG_NON_ZERO_EXIT_STATUS);
 }

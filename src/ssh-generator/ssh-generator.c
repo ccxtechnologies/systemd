@@ -4,6 +4,7 @@
 
 #include "alloc-util.h"
 #include "creds-util.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -17,6 +18,7 @@
 #include "socket-netlink.h"
 #include "socket-util.h"
 #include "special.h"
+#include "ssh-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "virt.h"
@@ -32,9 +34,10 @@
  * The first two provide a nice way for hosts to connect to containers and VMs they invoke via the usual SSH
  * logic, but without waiting for networking or suchlike. The third allows the same for local clients. */
 
-static const char *arg_dest = NULL;
 static bool arg_auto = true;
 static char **arg_listen_extra = NULL;
+
+STATIC_DESTRUCTOR_REGISTER(arg_listen_extra, strv_freep);
 
 static int parse_proc_cmdline_item(const char *key, const char *value, void *data) {
         int r;
@@ -85,7 +88,7 @@ static int make_sshd_template_unit(
         assert(sshd_binary);
         assert(generated_sshd_template_unit);
 
-        /* If the system has a suitable template already, symlink it to the name we want to reuse it */
+        /* If the system has a suitable template already, symlink it under the name we want to use */
         if (found_sshd_template_service)
                 return generator_add_symlink(
                                 dest,
@@ -96,25 +99,31 @@ static int make_sshd_template_unit(
         if (!*generated_sshd_template_unit) {
                 _cleanup_fclose_ FILE *f = NULL;
 
+                /* We use a generic name for the unit, since we'll use it for both AF_UNIX and AF_VSOCK  */
                 r = generator_open_unit_file_full(
                                 dest,
                                 /* source= */ NULL,
-                                "sshd-generated@.service", /* Give this generated unit a generic name, since we want to use it for both AF_UNIX and AF_VSOCK */
+                                "sshd-generated@.service",
                                 &f,
                                 generated_sshd_template_unit,
                                 /* ret_temp_path= */ NULL);
                 if (r < 0)
                         return r;
 
+                /* sshd reads AuthorizedKeysFile after dropping to the authenticating user's UID, so the
+                 * 0400 credential file under $CREDENTIALS_DIRECTORY is unreadable for non-root users.
+                 * Materialize a 0444 copy in a RuntimeDirectory so the ephemeral key works for any user. */
                 fprintf(f,
                         "[Unit]\n"
                         "Description=OpenSSH Per-Connection Server Daemon\n"
                         "Documentation=man:systemd-ssh-generator(8) man:sshd(8)\n"
                         "\n"
                         "[Service]\n"
-                        "ExecStart=-%s -i -o \"AuthorizedKeysFile ${CREDENTIALS_DIRECTORY}/ssh.ephemeral-authorized_keys-all .ssh/authorized_keys\"\n"
+                        "ExecStartPre=systemd-tmpfiles --create --inline 'f^ /run/sshd-generated-%%i/authorized_keys 0444 root root - ssh.ephemeral-authorized_keys-all'\n"
+                        "ExecStart=-%s -i -o \"AuthorizedKeysFile /run/sshd-generated-%%i/authorized_keys .ssh/authorized_keys\"\n"
                         "StandardInput=socket\n"
-                        "ImportCredential=ssh.ephemeral-authorized_keys-all\n",
+                        "ImportCredential=ssh.ephemeral-authorized_keys-all\n"
+                        "RuntimeDirectory=sshd-generated-%%i\n",
                         sshd_binary);
 
                 r = fflush_and_check(f);
@@ -211,29 +220,15 @@ static int add_vsock_socket(
                 return 0;
         }
 
-        _cleanup_close_ int vsock_fd = socket(AF_VSOCK, SOCK_STREAM|SOCK_CLOEXEC, 0);
-        if (vsock_fd < 0) {
-                if (ERRNO_IS_NOT_SUPPORTED(errno)) {
-                        log_debug("Not creating AF_VSOCK ssh listener, since AF_VSOCK is not available.");
-                        return 0;
-                }
-
-                return log_error_errno(errno, "Unable to test if AF_VSOCK is available: %m");
-        }
-
-        vsock_fd = safe_close(vsock_fd);
+        r = vsock_open_or_warn(/* ret= */ NULL);
+        if (r <= 0)
+                return r;
 
         /* Determine the local CID so that we can log it to help users to connect to this VM */
         unsigned local_cid;
-        r = vsock_get_local_cid(&local_cid);
-        if (r < 0) {
-                if (ERRNO_IS_DEVICE_ABSENT(r)) {
-                        log_debug("Not creating AF_VSOCK ssh listener, since /dev/vsock is not available (even though AF_VSOCK is).");
-                        return 0;
-                }
-
-                return log_error_errno(r, "Failed to query local AF_VSOCK CID: %m");
-        }
+        r = vsock_get_local_cid_or_warn(&local_cid);
+        if (r <= 0)
+                return r;
 
         r = make_sshd_template_unit(
                         dest,
@@ -249,14 +244,18 @@ static int add_vsock_socket(
                         "sshd-vsock.socket",
                         "vsock::22",
                         "AF_VSOCK",
-                        "ExecStartPost=-/usr/lib/systemd/systemd-ssh-issue --make-vsock\n"
-                        "ExecStopPre=-/usr/lib/systemd/systemd-ssh-issue --rm-vsock\n",
+                        "ExecStartPost=-/usr/lib/systemd/systemd-ssh-issue make-vsock\n"
+                        "ExecStopPre=-/usr/lib/systemd/systemd-ssh-issue rm-vsock\n",
                         /* with_ssh_access_target_dependency= */ true);
         if (r < 0)
                 return r;
 
-        log_debug("Binding SSH to AF_VSOCK vsock::22.\n"
-                  "→ connect via 'ssh vsock/%u' from host", local_cid);
+        if (VSOCK_CID_IS_REGULAR(local_cid))
+                log_debug("Binding SSH to AF_VSOCK vsock::22.\n"
+                          "→ connect via 'ssh vsock/%u' from host", local_cid);
+        else
+                log_debug("Binding SSH to AF_VSOCK vsock::22.");
+
         return 0;
 }
 
@@ -349,7 +348,7 @@ static int add_export_unix_socket(
                 return r;
 
         log_debug("Binding SSH to AF_UNIX socket /run/host/unix-export/ssh\n"
-                  "→ connect via 'ssh unix/run/systemd/nspawn/unix-export/\?\?\?/ssh' from host");
+                  "→ connect via 'ssh unix/run/systemd/nspawn/\?\?\?/unix-export/ssh' from host");
 
         return 0;
 }
@@ -366,9 +365,6 @@ static int add_extra_sockets(
         assert(dest);
         assert(sshd_binary);
         assert(generated_sshd_template_unit);
-
-        if (strv_isempty(arg_listen_extra))
-                return 0;
 
         STRV_FOREACH(i, arg_listen_extra) {
                 _cleanup_free_ char *service = NULL, *socket = NULL;
@@ -457,7 +453,10 @@ static int parse_credentials(void) {
 static int run(const char *dest, const char *dest_early, const char *dest_late) {
         int r;
 
-        assert_se(arg_dest = dest);
+        assert(dest);
+
+        LIBCRYPTO_NOTE(suggested);
+        TPM2_NOTE(suggested);
 
         r = proc_cmdline_parse(parse_proc_cmdline_item, /* userdata= */ NULL, /* flags= */ 0);
         if (r < 0)
@@ -487,7 +486,10 @@ static int run(const char *dest, const char *dest_early, const char *dest_late) 
                 return r;
 
         _cleanup_free_ char *found_sshd_template_unit = NULL;
-        r = unit_file_exists_full(RUNTIME_SCOPE_SYSTEM, &lp, "sshd@.service", &found_sshd_template_unit);
+        r = unit_file_exists_full(RUNTIME_SCOPE_SYSTEM, &lp,
+                                  SEARCH_FOLLOW_CONFIG_SYMLINKS,
+                                  "sshd@.service",
+                                  &found_sshd_template_unit);
         if (r < 0)
                 return log_error_errno(r, "Unable to detect if sshd@.service exists: %m");
 

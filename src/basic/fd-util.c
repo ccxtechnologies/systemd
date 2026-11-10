@@ -12,19 +12,16 @@
 #include "dirent-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "format-util.h"
 #include "fs-util.h"
 #include "log.h"
-#include "mountpoint-util.h"
-#include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
-#include "socket-util.h"
 #include "sort-util.h"
 #include "stat-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
+#include "sysctl-util.h"
 
 /* The maximum number of iterations in the loop to close descriptors in the fallback case
  * when /proc/self/fd/ is inaccessible. */
@@ -168,6 +165,15 @@ int fd_nonblock(int fd, bool nonblock) {
         return 1;
 }
 
+void nonblock_resetp(int *fd) {
+        assert(fd);
+
+        PROTECT_ERRNO;
+
+        if (*fd >= 0)
+                (void) fd_nonblock(*fd, false);
+}
+
 int stdio_disable_nonblock(void) {
         int ret = 0;
 
@@ -248,15 +254,14 @@ int get_max_fd(void) {
         return (int) (m - 1);
 }
 
-static int close_all_fds_frugal(const int except[], size_t n_except) {
+int close_all_fds_frugal(const int except[], size_t n_except) {
         int max_fd, r = 0;
 
         assert(except || n_except == 0);
 
-        /* This is the inner fallback core of close_all_fds(). This never calls malloc() or opendir() or so
-         * and hence is safe to be called in signal handler context. Most users should call close_all_fds(),
-         * but when we assume we are called from signal handler context, then use this simpler call
-         * instead. */
+        /* This is the inner fallback core of close_all_fds(). This never calls malloc() or so and hence is
+         * safe to be called in signal handler context. Most users should call close_all_fds(), but when we
+         * assume we are called from signal handler context, then use this simpler call instead. */
 
         max_fd = get_max_fd();
         if (max_fd < 0)
@@ -282,17 +287,12 @@ static int close_all_fds_frugal(const int except[], size_t n_except) {
         return r;
 }
 
-static bool have_close_range = true; /* Assume we live in the future */
-
 static int close_all_fds_special_case(const int except[], size_t n_except) {
         assert(n_except == 0 || except);
 
         /* Handles a few common special cases separately, since they are common and can be optimized really
          * nicely, since we won't need sorting for them. Returns > 0 if the special casing worked, 0
          * otherwise. */
-
-        if (!have_close_range)
-                return 0;
 
         if (n_except == 1 && except[0] < 0) /* Minor optimization: if we only got one fd, and it's invalid,
                                              * we got none */
@@ -302,31 +302,22 @@ static int close_all_fds_special_case(const int except[], size_t n_except) {
 
         case 0:
                 /* Close everything. Yay! */
+                if (close_range(3, INT_MAX, 0) < 0)
+                        return -errno;
 
-                if (close_range(3, INT_MAX, 0) >= 0)
-                        return 1;
-
-                if (ERRNO_IS_NOT_SUPPORTED(errno) || ERRNO_IS_PRIVILEGE(errno)) {
-                        have_close_range = false;
-                        return 0;
-                }
-
-                return -errno;
+                return 1;
 
         case 1:
                 /* Close all but exactly one, then we don't need no sorting. This is a pretty common
                  * case, hence let's handle it specially. */
 
-                if ((except[0] <= 3 || close_range(3, except[0]-1, 0) >= 0) &&
-                    (except[0] >= INT_MAX || close_range(MAX(3, except[0]+1), -1, 0) >= 0))
-                        return 1;
+                if (except[0] > 3 && close_range(3, except[0] - 1, 0) < 0)
+                        return -errno;
 
-                if (ERRNO_IS_NOT_SUPPORTED(errno) || ERRNO_IS_PRIVILEGE(errno)) {
-                        have_close_range = false;
-                        return 0;
-                }
+                if (except[0] < INT_MAX && close_range(MAX(3, except[0] + 1), -1, 0) < 0)
+                        return -errno;
 
-                return -errno;
+                return 1;
 
         default:
                 return 0;
@@ -348,8 +339,7 @@ int close_all_fds_without_malloc(const int except[], size_t n_except) {
 }
 
 int close_all_fds(const int except[], size_t n_except) {
-        _cleanup_closedir_ DIR *d = NULL;
-        int r = 0;
+        int r;
 
         assert(n_except == 0 || except);
 
@@ -359,104 +349,60 @@ int close_all_fds(const int except[], size_t n_except) {
         if (r > 0) /* special case worked! */
                 return 0;
 
-        if (have_close_range) {
-                _cleanup_free_ int *sorted_malloc = NULL;
-                size_t n_sorted;
-                int *sorted;
+        _cleanup_free_ int *sorted_malloc = NULL;
+        size_t n_sorted;
+        int *sorted;
 
-                /* In the best case we have close_range() to close all fds between a start and an end fd,
-                 * which we can use on the "inverted" exception array, i.e. all intervals between all
-                 * adjacent pairs from the sorted exception array. This changes loop complexity from O(n)
-                 * where n is number of open fds to O(m⋅log(m)) where m is the number of fds to keep
-                 * open. Given that we assume n ≫ m that's preferable to us. */
+        /* In the best case we have close_range() to close all fds between a start and an end fd, which we
+         * can use on the "inverted" exception array, i.e. all intervals between all adjacent pairs from the
+         * sorted exception array. This changes loop complexity from O(n) where n is number of open fds to
+         * O(m⋅log(m)) where m is the number of fds to keep open. Given that we assume n ≫ m that's
+         * preferable to us. */
 
-                assert(n_except < SIZE_MAX);
-                n_sorted = n_except + 1;
+        assert(n_except < SIZE_MAX);
+        n_sorted = n_except + 1;
 
-                if (n_sorted > 64) /* Use heap for large numbers of fds, stack otherwise */
-                        sorted = sorted_malloc = new(int, n_sorted);
-                else
-                        sorted = newa(int, n_sorted);
+        if (n_sorted > ALLOCA_MAX / sizeof(int)) /* Use heap for large numbers of fds, stack otherwise */
+                sorted = sorted_malloc = new(int, n_sorted);
+        else
+                sorted = newa(int, n_sorted);
 
-                if (sorted) {
-                        memcpy(sorted, except, n_except * sizeof(int));
+        if (!sorted) /* Fallback on OOM. */
+                return close_all_fds_frugal(except, n_except);
 
-                        /* Let's add fd 2 to the list of fds, to simplify the loop below, as this
-                         * allows us to cover the head of the array the same way as the body */
-                        sorted[n_sorted-1] = 2;
+        memcpy(sorted, except, n_except * sizeof(int));
 
-                        typesafe_qsort(sorted, n_sorted, cmp_int);
+        /* Let's add fd 2 to the list of fds, to simplify the loop below, as this
+         * allows us to cover the head of the array the same way as the body */
+        sorted[n_sorted-1] = 2;
 
-                        for (size_t i = 0; i < n_sorted-1; i++) {
-                                int start, end;
+        typesafe_qsort(sorted, n_sorted, cmp_int);
 
-                                start = MAX(sorted[i], 2); /* The first three fds shall always remain open */
-                                end = MAX(sorted[i+1], 2);
+        for (size_t i = 0; i < n_sorted-1; i++) {
+                int start, end;
 
-                                assert(end >= start);
+                start = MAX(sorted[i], 2); /* The first three fds shall always remain open */
+                end = MAX(sorted[i+1], 2);
 
-                                if (end - start <= 1)
-                                        continue;
+                assert(end >= start);
 
-                                /* Close everything between the start and end fds (both of which shall stay open) */
-                                if (close_range(start + 1, end - 1, 0) < 0) {
-                                        if (!ERRNO_IS_NOT_SUPPORTED(errno) && !ERRNO_IS_PRIVILEGE(errno))
-                                                return -errno;
+                if (end - start <= 1)
+                        continue;
 
-                                        have_close_range = false;
-                                        break;
-                                }
-                        }
-
-                        if (have_close_range) {
-                                /* The loop succeeded. Let's now close everything beyond the end */
-
-                                if (sorted[n_sorted-1] >= INT_MAX) /* Dont let the addition below overflow */
-                                        return 0;
-
-                                if (close_range(sorted[n_sorted-1] + 1, INT_MAX, 0) >= 0)
-                                        return 0;
-
-                                if (!ERRNO_IS_NOT_SUPPORTED(errno) && !ERRNO_IS_PRIVILEGE(errno))
-                                        return -errno;
-
-                                have_close_range = false;
-                        }
-                }
-
-                /* Fallback on OOM or if close_range() is not supported */
+                /* Close everything between the start and end fds (both of which shall stay open) */
+                if (close_range(start + 1, end - 1, 0) < 0)
+                        return -errno;
         }
 
-        d = opendir("/proc/self/fd");
-        if (!d)
-                return close_all_fds_frugal(except, n_except); /* ultimate fallback if /proc/ is not available */
+        /* The loop succeeded. Let's now close everything beyond the end */
 
-        FOREACH_DIRENT(de, d, return -errno) {
-                int fd = -EBADF, q;
+        if (sorted[n_sorted-1] >= INT_MAX) /* Dont let the addition below overflow */
+                return 0;
 
-                if (!IN_SET(de->d_type, DT_LNK, DT_UNKNOWN))
-                        continue;
+        if (close_range(sorted[n_sorted-1] + 1, INT_MAX, 0) < 0)
+                return -errno;
 
-                fd = parse_fd(de->d_name);
-                if (fd < 0)
-                        /* Let's better ignore this, just in case */
-                        continue;
-
-                if (fd < 3)
-                        continue;
-
-                if (fd == dirfd(d))
-                        continue;
-
-                if (fd_in_set(fd, except, n_except))
-                        continue;
-
-                q = close_nointr(fd);
-                if (q < 0 && q != -EBADF && r >= 0) /* Valgrind has its own FD and doesn't want to have it closed */
-                        r = q;
-        }
-
-        return r;
+        return 0;
 }
 
 int pack_fds(int fds[], size_t n_fds) {
@@ -634,10 +580,12 @@ bool fdname_is_valid(const char *s) {
 int fd_get_path(int fd, char **ret) {
         int r;
 
-        assert(fd >= 0 || fd == AT_FDCWD);
+        assert(wildcard_fd_is_valid(fd));
 
         if (fd == AT_FDCWD)
                 return safe_getcwd(ret);
+        if (fd == XAT_FDROOT)
+                return strdup_to(ret, "/");
 
         r = readlink_malloc(FORMAT_PROC_FD_PATH(fd), ret);
         if (r == -ENOENT)
@@ -832,7 +780,7 @@ finish:
 }
 
 int fd_reopen(int fd, int flags) {
-        assert(fd >= 0 || fd == AT_FDCWD);
+        assert(wildcard_fd_is_valid(fd));
         assert(!FLAGS_SET(flags, O_CREAT));
 
         /* Reopens the specified fd with new flags. This is useful for convert an O_PATH fd into a regular one, or to
@@ -843,6 +791,8 @@ int fd_reopen(int fd, int flags) {
          * This implicitly resets the file read index to 0.
          *
          * If AT_FDCWD is specified as file descriptor gets an fd to the current cwd.
+         *
+         * If XAT_FDROOT is specified as fd get an fd to the root directory.
          *
          * If the specified file descriptor refers to a symlink via O_PATH, then this function cannot be used
          * to follow that symlink. Because we cannot have non-O_PATH fds to symlinks reopening it without
@@ -856,6 +806,9 @@ int fd_reopen(int fd, int flags) {
                  * the only reason we add it here is so that the O_DIRECTORY special case (see below) behaves
                  * the same way as the non-O_DIRECTORY case. */
                 return -ELOOP;
+
+        if (fd == XAT_FDROOT)
+                return RET_NERRNO(open("/", flags | O_DIRECTORY));
 
         if (FLAGS_SET(flags, O_DIRECTORY) || fd == AT_FDCWD)
                 /* If we shall reopen the fd as directory we can just go via "." and thus bypass the whole
@@ -873,7 +826,7 @@ int fd_reopen(int fd, int flags) {
         return new_fd;
 }
 
-int fd_reopen_propagate_append_and_position(int fd, int flags) {
+static int fd_reopen_propagate_append_and_position(int fd, int flags) {
         /* Invokes fd_reopen(fd, flags), but propagates O_APPEND if set on original fd, and also tries to
          * keep current file position.
          *
@@ -913,6 +866,39 @@ int fd_reopen_propagate_append_and_position(int fd, int flags) {
         return new_fd;
 }
 
+int fd_dup_or_reopen_stdio_nonblock(int fd, int mode) {
+        /* IO on some fd types (pipes, ttys, …) might block, while on others (regular files, block devices, …)
+         * it never does. In asynchronous programs it's hence often desirable to acquire O_NONBLOCK copies of
+         * existing fds, without disturbing the O_NONBLOCK flag for everything else that has the fd open.
+         * However, we shouldn't copy too eagerly, because decoupling O_NONBLOCK via fd_reopen() also
+         * decouples the file offset, which might not be desirable. Thankfully, potentially blocking fds
+         * typically have no file offset concept, while those which never block do. Hence, let's do a simple
+         * dup for the latter and an fd_reopen() for the former.
+         *
+         * This is particularly useful when operating with generic fds such as stdin/stdout/stderr, where we
+         * want temporarily asynchronous behaviour but still update the file offset regularly, as in
+         * "{ echo header; systemd-run --pty echo hello; echo trailer; } > out".
+         *
+         * Input is always reopened privately though: we read ahead whether or not the data is consumed, and
+         * a shared offset would eat input the caller still expects to read itself, as in
+         * "while read -r l; do systemd-run --pty ...; done < list". */
+
+        assert(fd >= 0);
+        assert(IN_SET(mode, O_RDONLY, O_WRONLY));
+
+        if (mode == O_WRONLY) {
+                struct stat st;
+                if (fstat(fd, &st) < 0)
+                        return -errno;
+
+                if (S_ISREG(st.st_mode) || S_ISBLK(st.st_mode))
+                        return RET_NERRNO(fcntl(fd, F_DUPFD_CLOEXEC, 3));
+        }
+
+        /* O_NOCTTY, so that reopening a tty doesn't make it our controlling terminal if we lack one */
+        return fd_reopen_propagate_append_and_position(fd, mode|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+}
+
 int fd_reopen_condition(
                 int fd,
                 int flags,
@@ -923,6 +909,7 @@ int fd_reopen_condition(
 
         assert(fd >= 0);
         assert(!FLAGS_SET(flags, O_CREAT));
+        assert(ret_new_fd);
 
         /* Invokes fd_reopen(fd, flags), but only if the existing F_GETFL flags don't match the specified
          * flags (masked by the specified mask). This is useful for converting O_PATH fds into real fds if
@@ -955,6 +942,59 @@ int fd_is_opath(int fd) {
                 return -errno;
 
         return FLAGS_SET(r, O_PATH);
+}
+
+int fd_vet_accmode(int fd, int mode) {
+        int flags;
+
+        /* Check if fd is opened with desired access mode.
+         *
+         * Returns > 0 on strict match, == 0 if opened for both reading and writing (partial match),
+         * -EPROTOTYPE otherwise. O_PATH fds are always refused with -EBADFD.
+         *
+         * Note that while on O_DIRECTORY -EISDIR will be returned, this should not be relied upon as
+         * the flag might not have been specified when open() was called originally. */
+
+        assert(fd >= 0);
+        assert(IN_SET(mode, O_RDONLY, O_WRONLY, O_RDWR));
+
+        flags = fcntl(fd, F_GETFL);
+        if (flags < 0)
+                return -errno;
+
+        /* O_TMPFILE in userspace is defined with O_DIRECTORY OR'ed in, so explicitly permit it.
+         *
+         * C.f. https://elixir.bootlin.com/linux/v6.17.7/source/include/uapi/asm-generic/fcntl.h#L92 */
+        if (FLAGS_SET(flags, O_DIRECTORY) && !FLAGS_SET(flags, O_TMPFILE))
+                return -EISDIR;
+
+        if (FLAGS_SET(flags, O_PATH))
+                return -EBADFD;
+
+        flags &= O_ACCMODE_STRICT;
+
+        if (flags == mode)
+                return 1;
+
+        if (flags == O_RDWR)
+                return 0;
+
+        return -EPROTOTYPE;
+}
+
+int fd_is_writable(int fd) {
+        int r;
+
+        assert(fd >= 0);
+
+        r = fd_vet_accmode(fd, O_WRONLY);
+        if (r >= 0)
+                return true;
+
+        if (IN_SET(r, -EPROTOTYPE, -EBADFD, -EISDIR))
+                return false;
+
+        return r;
 }
 
 int fd_verify_safe_flags_full(int fd, int extra_flags) {
@@ -990,24 +1030,17 @@ int fd_verify_safe_flags_full(int fd, int extra_flags) {
 }
 
 unsigned read_nr_open(void) {
-        _cleanup_free_ char *nr_open = NULL;
+        unsigned v;
         int r;
 
         /* Returns the kernel's current fd limit, either by reading it of /proc/sys if that works, or using the
          * hard-coded default compiled-in value of current kernels (1M) if not. This call will never fail. */
 
-        r = read_one_line_file("/proc/sys/fs/nr_open", &nr_open);
+        r = sysctl_read_unsigned("fs/nr_open", &v);
         if (r < 0)
-                log_debug_errno(r, "Failed to read /proc/sys/fs/nr_open, ignoring: %m");
-        else {
-                unsigned v;
-
-                r = safe_atou(nr_open, &v);
-                if (r < 0)
-                        log_debug_errno(r, "Failed to parse /proc/sys/fs/nr_open value '%s', ignoring: %m", nr_open);
-                else
-                        return v;
-        }
+                log_debug_errno(r, "Failed to read fs.nr_open sysctl, ignoring: %m");
+        else
+                return v;
 
         /* If we fail, fall back to the hard-coded kernel limit of 1024 * 1024. */
         return NR_OPEN_DEFAULT;
@@ -1034,80 +1067,99 @@ int fd_get_diskseq(int fd, uint64_t *ret) {
         return 0;
 }
 
+static bool is_literal_root(const char *p) {
+        if (!p)
+                return false;
+
+        /* Check if string consists of at least one '/', and possibly more, but nothing else */
+        size_t n = strspn(p, "/");
+        return n >= 1 && p[n] == 0;
+}
+
 int path_is_root_at(int dir_fd, const char *path) {
-        _cleanup_close_ int fd = -EBADF, pfd = -EBADF;
+        assert(wildcard_fd_is_valid(dir_fd));
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        if (dir_fd == XAT_FDROOT && isempty(path))
+                return true;
 
+        if (IN_SET(dir_fd, XAT_FDROOT, AT_FDCWD) && is_literal_root(path))
+                return true;
+
+        _cleanup_close_ int fd = -EBADF;
         if (!isempty(path)) {
-                fd = openat(dir_fd, path, O_PATH|O_DIRECTORY|O_CLOEXEC);
+                fd = xopenat(dir_fd, path, O_PATH|O_DIRECTORY|O_CLOEXEC);
+                if (fd == -ENOTDIR)
+                        return false; /* the root dir must be a dir */
                 if (fd < 0)
-                        return errno == ENOTDIR ? false : -errno;
+                        return fd;
 
                 dir_fd = fd;
         }
 
-        pfd = openat(dir_fd, "..", O_PATH|O_DIRECTORY|O_CLOEXEC);
-        if (pfd < 0)
-                return errno == ENOTDIR ? false : -errno;
-
-        /* Even if the parent directory has the same inode, the fd may not point to the root directory "/",
-         * and we also need to check that the mount ids are the same. Otherwise, a construct like the
-         * following could be used to trick us:
+        /* Even if the root directory has the same inode as our fd, the fd may not point to the root
+         * directory "/", and we also need to check that the mount ids are the same. Otherwise, a construct
+         * like the following could be used to trick us:
          *
-         * $ mkdir /tmp/x /tmp/x/y
-         * $ mount --bind /tmp/x /tmp/x/y
+         * $ mkdir /tmp/x
+         * $ mount --bind / /tmp/x
          */
 
-        return fds_are_same_mount(dir_fd, pfd);
+        return fds_inode_and_mount_same(dir_fd, XAT_FDROOT);
 }
 
-int fds_are_same_mount(int fd1, int fd2) {
-        struct statx sx1 = {}, sx2 = {}; /* explicitly initialize the struct to make msan silent. */
+int fds_inode_and_mount_same(int fd1, int fd2) {
+        struct statx sx1, sx2;
         int r;
 
-        assert(fd1 >= 0);
-        assert(fd2 >= 0);
+        assert(wildcard_fd_is_valid(fd1));
+        assert(wildcard_fd_is_valid(fd2));
 
-        if (statx(fd1, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sx1) < 0)
-                return -errno;
+        r = xstatx(fd1, /* path = */ NULL, AT_EMPTY_PATH,
+                   STATX_TYPE|STATX_INO|STATX_MNT_ID,
+                   &sx1);
+        if (r < 0)
+                return r;
 
-        if (statx(fd2, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sx2) < 0)
-                return -errno;
+        if (fd1 == fd2) /* Shortcut things if fds are the same (only after validating the fd) */
+                return true;
 
-        /* First, compare inode. If these are different, the fd does not point to the root directory "/". */
-        if (!statx_inode_same(&sx1, &sx2))
-                return false;
+        r = xstatx(fd2, /* path = */ NULL, AT_EMPTY_PATH,
+                   STATX_TYPE|STATX_INO|STATX_MNT_ID,
+                   &sx2);
+        if (r < 0)
+                return r;
 
-        /* Note, statx() does not provide the mount ID and path_get_mnt_id_at() does not work when an old
-         * kernel is used. In that case, let's assume that we do not have such spurious mount points in an
-         * early boot stage, and silently skip the following check. */
+        r = statx_mount_same(&sx1, &sx2);
+        if (r <= 0)
+                return r;
 
-        if (!FLAGS_SET(sx1.stx_mask, STATX_MNT_ID)) {
-                int mntid;
+        return statx_inode_same(&sx1, &sx2);
+}
 
-                r = path_get_mnt_id_at_fallback(fd1, "", &mntid);
-                if (r < 0)
-                        return r;
-                assert(mntid >= 0);
+int resolve_xat_fdroot(int *fd, const char **path, char **ret_buffer) {
+        assert(fd);
+        assert(path);
+        assert(ret_buffer);
 
-                sx1.stx_mnt_id = mntid;
-                sx1.stx_mask |= STATX_MNT_ID;
+        if (*fd != XAT_FDROOT) {
+                *ret_buffer = NULL;
+                return 0;
         }
 
-        if (!FLAGS_SET(sx2.stx_mask, STATX_MNT_ID)) {
-                int mntid;
+        if (isempty(*path)) {
+                *path = "/";
+                *ret_buffer = NULL;
+        } else if (!path_is_absolute(*path)) {
+                char *p = strjoin("/", *path);
+                if (!p)
+                        return -ENOMEM;
 
-                r = path_get_mnt_id_at_fallback(fd2, "", &mntid);
-                if (r < 0)
-                        return r;
-                assert(mntid >= 0);
-
-                sx2.stx_mnt_id = mntid;
-                sx2.stx_mask |= STATX_MNT_ID;
+                *path = *ret_buffer = p;
         }
 
-        return statx_mount_same(&sx1, &sx2);
+        *fd = AT_FDCWD;
+
+        return 1;
 }
 
 char* format_proc_fd_path(char buf[static PROC_FD_PATH_MAX], int fd) {

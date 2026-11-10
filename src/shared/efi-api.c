@@ -5,7 +5,7 @@
 #include "alloc-util.h"
 #include "dirent-util.h"
 #include "efi-api.h"
-#include "efi-fundamental.h"
+#include "efi.h"
 #include "efivars.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -15,7 +15,13 @@
 #include "stat-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
+#include "tpm2-util.h"                  /* IWYU pragma: keep */
 #include "utf8.h"
+
+#define EFI_TCG2_BOOT_HASH_ALG_SHA1   0x01
+#define EFI_TCG2_BOOT_HASH_ALG_SHA256 0x02
+#define EFI_TCG2_BOOT_HASH_ALG_SHA384 0x04
+#define EFI_TCG2_BOOT_HASH_ALG_SHA512 0x08
 
 #define LOAD_OPTION_ACTIVE            0x00000001
 #define MEDIA_DEVICE_PATH                   0x04
@@ -277,19 +283,23 @@ int efi_get_boot_option(
 
         if (header->path_len > 0) {
                 uint8_t *dbuf;
-                size_t dnext, doff;
+                size_t dnext, doff, path_len;
 
                 doff = offsetof(struct boot_option, title) + title_size;
                 dbuf = buf + doff;
-                if (header->path_len > l - doff)
-                        return -EINVAL;
+                path_len = MIN((size_t) header->path_len, l - doff);
 
                 dnext = 0;
-                while (dnext < header->path_len) {
+                while (dnext < path_len) {
                         struct device_path *dpath;
+                        size_t remaining = path_len - dnext;
+
+                        if (remaining < offsetof(struct device_path, path))
+                                break;
 
                         dpath = (struct device_path *)(dbuf + dnext);
-                        if (dpath->length < 4)
+                        if (dpath->length < offsetof(struct device_path, path) ||
+                            dpath->length > remaining)
                                 break;
 
                         /* Type 0x7F – End of Hardware Device Path, Sub-Type 0xFF – End Entire Device Path */
@@ -304,6 +314,9 @@ int efi_get_boot_option(
 
                         /* Sub-Type 1 – Hard Drive */
                         if (dpath->sub_type == MEDIA_HARDDRIVE_DP) {
+                                if (dpath->length < offsetof(struct device_path, drive) + sizeof(struct drive_path))
+                                        break;
+
                                 /* 0x02 – GUID Partition Table */
                                 if (dpath->drive.mbr_type != MBR_TYPE_EFI_PARTITION_TABLE_HEADER)
                                         continue;
@@ -319,9 +332,9 @@ int efi_get_boot_option(
 
                         /* Sub-Type 4 – File Path */
                         if (dpath->sub_type == MEDIA_FILEPATH_DP && !p && ret_path) {
-                                p = utf16_to_utf8(dpath->path, dpath->length-4);
+                                p = utf16_to_utf8(dpath->path, dpath->length - offsetof(struct device_path, path));
                                 if (!p)
-                                        return  -ENOMEM;
+                                        return -ENOMEM;
 
                                 efi_tilt_backslashes(p);
                                 continue;
@@ -517,24 +530,71 @@ int efi_get_boot_options(uint16_t **ret_options) {
 #endif
 }
 
+int efi_get_active_pcr_banks(uint32_t *ret) {
 #if ENABLE_EFI
-static int loader_has_tpm2(void) {
-        _cleanup_free_ char *active_pcr_banks = NULL;
-        uint32_t active_pcr_banks_value;
+        static uint32_t cache = 0;
+        static bool cache_valid = false;
         int r;
 
-        r = efi_get_variable_string(EFI_LOADER_VARIABLE_STR("LoaderTpm2ActivePcrBanks"), &active_pcr_banks);
-        if (r < 0) {
-                if (r != -ENOENT)
-                        log_debug_errno(r, "Failed to read LoaderTpm2ActivePcrBanks variable: %m");
-                return r;
+        /* Returns the enabled PCR banks as bitmask, as reported by firmware. If the bitmask is returned as
+         * UINT32_MAX, the firmware supports the TCG protocol, but in a version too old to report this
+         * information. */
+
+        if (!cache_valid) {
+                _cleanup_free_ char *active_pcr_banks = NULL;
+                r = efi_get_variable_string(EFI_LOADER_VARIABLE_STR("LoaderTpm2ActivePcrBanks"), &active_pcr_banks);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to read LoaderTpm2ActivePcrBanks variable: %m");
+
+                uint32_t efi_bits;
+                r = safe_atou32_full(active_pcr_banks, 16, &efi_bits);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to parse LoaderTpm2ActivePcrBanks variable: %m");
+
+                if (efi_bits == UINT32_MAX)
+                        /* UINT32_MAX means that the firmware API doesn't implement GetActivePcrBanks() and caller must guess */
+                        cache = UINT32_MAX;
+                else {
+                        /* EFI TPM protocol uses different bit values for the hash algorithms, let's convert */
+                        static const struct {
+                                uint32_t efi;
+                                uint32_t tcg;
+                        } table[] = {
+                                { EFI_TCG2_BOOT_HASH_ALG_SHA1,   1U << TPM2_ALG_SHA1   },
+                                { EFI_TCG2_BOOT_HASH_ALG_SHA256, 1U << TPM2_ALG_SHA256 },
+                                { EFI_TCG2_BOOT_HASH_ALG_SHA384, 1U << TPM2_ALG_SHA384 },
+                                { EFI_TCG2_BOOT_HASH_ALG_SHA512, 1U << TPM2_ALG_SHA512 },
+                        };
+
+                        uint32_t tcg_bits = 0;
+                        FOREACH_ELEMENT(t, table)
+                                SET_FLAG(tcg_bits, t->tcg, efi_bits & t->efi);
+
+                        cache = tcg_bits;
+                }
+
+                cache_valid = true;
         }
 
-        r = safe_atou32_full(active_pcr_banks, 16, &active_pcr_banks_value);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to parse LoaderTpm2ActivePcrBanks variable: %m");
+        if (ret)
+                *ret = cache;
 
-        return active_pcr_banks_value != 0;
+        return 0;
+#else
+        return -EOPNOTSUPP;
+#endif
+}
+
+#if ENABLE_EFI
+static int loader_has_tpm2(void) {
+        uint32_t active_pcr_banks;
+        int r;
+
+        r = efi_get_active_pcr_banks(&active_pcr_banks);
+        if (r < 0)
+                return r;
+
+        return active_pcr_banks != 0;
 }
 #endif
 
@@ -592,21 +652,25 @@ bool efi_has_tpm2(void) {
 }
 
 sd_id128_t efi_guid_to_id128(const void *guid) {
-        const EFI_GUID *uuid = ASSERT_PTR(guid); /* cast is safe, because struct efi_guid is packed */
+        EFI_GUID uuid;
         sd_id128_t id128;
 
-        id128.bytes[0] = (uuid->Data1 >> 24) & 0xff;
-        id128.bytes[1] = (uuid->Data1 >> 16) & 0xff;
-        id128.bytes[2] = (uuid->Data1 >> 8) & 0xff;
-        id128.bytes[3] = uuid->Data1 & 0xff;
+        /* The input pointer is not guaranteed to be aligned (e.g. when pointing into a serialized EFI
+         * variable buffer), so copy into a properly aligned local first. */
+        memcpy(&uuid, ASSERT_PTR(guid), sizeof(uuid));
 
-        id128.bytes[4] = (uuid->Data2 >> 8) & 0xff;
-        id128.bytes[5] = uuid->Data2 & 0xff;
+        id128.bytes[0] = (uuid.Data1 >> 24) & 0xff;
+        id128.bytes[1] = (uuid.Data1 >> 16) & 0xff;
+        id128.bytes[2] = (uuid.Data1 >> 8) & 0xff;
+        id128.bytes[3] = uuid.Data1 & 0xff;
 
-        id128.bytes[6] = (uuid->Data3 >> 8) & 0xff;
-        id128.bytes[7] = uuid->Data3 & 0xff;
+        id128.bytes[4] = (uuid.Data2 >> 8) & 0xff;
+        id128.bytes[5] = uuid.Data2 & 0xff;
 
-        memcpy(&id128.bytes[8], uuid->Data4, sizeof(uuid->Data4));
+        id128.bytes[6] = (uuid.Data3 >> 8) & 0xff;
+        id128.bytes[7] = uuid.Data3 & 0xff;
+
+        memcpy(&id128.bytes[8], uuid.Data4, sizeof(uuid.Data4));
 
         return id128;
 }

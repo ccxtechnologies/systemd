@@ -101,7 +101,7 @@ static void scope_set_state(Scope *s, ScopeState state) {
                 log_unit_debug(UNIT(s), "Changed %s -> %s",
                                scope_state_to_string(old_state), scope_state_to_string(state));
 
-        unit_notify(UNIT(s), state_translation_table[old_state], state_translation_table[state], /* reload_success = */ true);
+        unit_notify(UNIT(s), state_translation_table[old_state], state_translation_table[state], /* reload_success= */ true);
 }
 
 static int scope_add_default_dependencies(Scope *s) {
@@ -344,21 +344,21 @@ static int scope_enter_start_chown(Scope *s) {
                 gid_t gid = GID_INVALID;
 
                 if (!isempty(s->user)) {
-                        const char *user = s->user;
-
-                        r = get_user_creds(&user, &uid, &gid, NULL, NULL, 0);
+                        r = get_user_creds(s->user, /* flags= */ 0, NULL, &uid, &gid, NULL, NULL);
                         if (r < 0) {
-                                log_unit_error_errno(UNIT(s), r, "Failed to resolve user \"%s\": %m", user);
+                                log_unit_error_errno(UNIT(s), r,
+                                                     "Failed to resolve user '%s': %s",
+                                                     s->user, STRERROR_USER(r));
                                 _exit(EXIT_USER);
                         }
                 }
 
                 if (!isempty(s->group)) {
-                        const char *group = s->group;
-
-                        r = get_group_creds(&group, &gid, 0);
+                        r = get_group_creds(s->group, /* flags= */ 0, /* ret_name= */ NULL, &gid);
                         if (r < 0) {
-                                log_unit_error_errno(UNIT(s), r, "Failed to resolve group \"%s\": %m", group);
+                                log_unit_error_errno(UNIT(s), r,
+                                                     "Failed to resolve group '%s': %s",
+                                                     s->group, STRERROR_GROUP(r));
                                 _exit(EXIT_GROUP);
                         }
                 }
@@ -437,6 +437,10 @@ static int scope_start(Unit *u) {
         if (IN_SET(s->state, SCOPE_STOP_SIGTERM, SCOPE_STOP_SIGKILL))
                 return -EAGAIN;
 
+        /* Already starting up (waiting for the async cgroup chown helper)? Then there's nothing to do. */
+        if (s->state == SCOPE_START_CHOWN)
+                return 0;
+
         assert(s->state == SCOPE_DEAD);
 
         if (!u->transient && !MANAGER_IS_RELOADING(u->manager))
@@ -478,6 +482,8 @@ static int scope_get_timeout(Unit *u, usec_t *timeout) {
         Scope *s = ASSERT_PTR(SCOPE(u));
         usec_t t;
         int r;
+
+        assert(timeout);
 
         if (!s->timer_event_source)
                 return 0;
@@ -738,6 +744,7 @@ const UnitVTable scope_vtable = {
         .can_fail = true,
         .once_only = true,
         .can_set_managed_oom = true,
+        .track_orphaned = true,
 
         .init = scope_init,
         .load = scope_load,

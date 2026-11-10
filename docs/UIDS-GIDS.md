@@ -93,7 +93,7 @@ possible.
 `systemd` defines a number of special UID ranges:
 
 1. 60001…60513 → UIDs for home directories managed by
-   [`systemd-homed.service(8)`](https://www.freedesktop.org/software/systemd/man/systemd-homed.service.html).
+   [`systemd-homed.service(8)`](https://www.freedesktop.org/software/systemd/man/latest/systemd-homed.service.html).
    UIDs from this range are automatically assigned to any home directory discovered,
    and persisted locally on first login.
    On different systems the same user might get different UIDs assigned in case of conflict, though it is
@@ -113,7 +113,7 @@ possible.
 
 3. 61184…65519 → UIDs for dynamic users are allocated from this range (see the
    `DynamicUser=` documentation in
-   [`systemd.exec(5)`](https://www.freedesktop.org/software/systemd/man/systemd.exec.html)).
+   [`systemd.exec(5)`](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)).
    This range has been chosen so that it is below the 16-bit boundary
    (i.e. below 65535), in order to provide compatibility with container environments that
    assign a 64K range of UIDs to containers using user namespacing.
@@ -145,8 +145,13 @@ possible.
    available locally whose UID/GID ownerships do not make sense in the local
    context but only within the OS image itself. This 64K UID range can be used
    to have a clearly defined ownership even on the host, that can be mapped via
-   idmapped mount to a dynamic runtime UID range as needed. (These numbers in
-   hexadecimal are 0x7FFE0000…0x7FFEFFFF.)
+   idmapped mount to a dynamic runtime UID range as needed. These numbers in
+   hexadecimal are 0x7FFE0000…0x7FFEFFFF. Note that all users have full access
+   to the foreign UID range, hence it is recommended to never make foreign UID
+   range owned inodes accessible in directories accessible to other users. In
+   other words, always make sure each foreign UID range owned inode is inside
+   of a directory with mode `0700` (or stricter) owned by the only user that
+   should have access to the foreign UID range owned inode(s).
 
 Note for the `DynamicUser=` and the `systemd-nspawn` allocation ranges: when a
 UID allocation takes place NSS is checked for collisions first, and a different
@@ -275,18 +280,18 @@ i.e. somewhere below `/var/` or similar.
 |                   1…4 | 0x00000001…0x00000004 |          4 | System users                      | Distributions | `/etc/passwd`                 |
 |                     5 |            0x00000005 |          1 | `tty` group                       | `systemd`     | `/etc/passwd`                 |
 |                 6…999 | 0x00000006…0x000003E7 |        994 | System users                      | Distributions | `/etc/passwd`                 |
-|            1000…60000 | 0x000003E8…0x00001770 |      59000 | Regular users                     | Distributions | `/etc/passwd` + LDAP/NIS/…    |
+|            1000…60000 | 0x000003E8…0x0000EA60 |      59001 | Regular users                     | Distributions | `/etc/passwd` + LDAP/NIS/…    |
 |           60001…60513 | 0x0000EA61…0x0000EC61 |        513 | Human users (homed)               | `systemd`     | `nss-systemd`                 |
 |           60514…60577 | 0x0000EC62…0x0000ECA1 |         64 | Host users mapped into containers | `systemd`     | `systemd-nspawn`              |
 |           60578…60705 | 0x0000ECA2…0x0000ED21 |        128 | Dynamic greeter users             | `systemd`     | `nss-systemd`                 |
 |           60706…61183 | 0x0000ED22…0x0000EEFF |        478 | *unused*                          |               |                               |
 |           61184…65519 | 0x0000EF00…0x0000FFEF |       4336 | Dynamic service users             | `systemd`     | `nss-systemd`                 |
-|           65520…65533 | 0x0000FFF0…0x0000FFFD |         13 | *unused*                          |               |                               |
+|           65520…65533 | 0x0000FFF0…0x0000FFFD |         14 | *unused*                          |               |                               |
 |                 65534 |            0x0000FFFE |          1 | `nobody` user                     | Linux         | `/etc/passwd` + `nss-systemd` |
 |                 65535 |            0x0000FFFF |          1 | 16-bit `(uid_t) -1`               | Linux         |                               |
 |          65536…524287 | 0x00010000…0x0007FFFF |     458752 | *unused*                          |               |                               |
 |     524288…1879048191 | 0x00080000…0x6FFFFFFF | 1878523904 | Container UID ranges              | `systemd`     | `nss-systemd`                 |
-| 1879048192…2147352575 | 0x70000000…0x7FFDFFFF | 1879048192 | *unused*                          |               |                               |
+| 1879048192…2147352575 | 0x70000000…0x7FFDFFFF |  268304384 | *unused*                          |               |                               |
 | 2147352576…2147418111 | 0x7FFE0000…0x7FFEFFFF |      65536 | Foreign UID range                 | `systemd`     | `nss-systemd`                 |
 | 2147418112…2147483647 | 0x7FFF0000…0x7FFFFFFF |      65536 | *unused*                          |               |                               |
 | 2147483648…4294967294 | 0x80000000…0xFFFFFFFE | 2147483647 | *HIC SVNT LEONES*                 |               |                               |

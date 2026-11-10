@@ -3,12 +3,12 @@
 #include <stdio.h>
 
 #include "alloc-util.h"
+#include "dns-answer.h"
 #include "dns-domain.h"
+#include "dns-packet.h"
+#include "dns-rr.h"
 #include "list.h"
 #include "log.h"
-#include "resolved-dns-answer.h"
-#include "resolved-dns-packet.h"
-#include "resolved-dns-rr.h"
 #include "resolved-dns-scope.h"
 #include "resolved-dns-transaction.h"
 #include "resolved-dns-zone.h"
@@ -161,8 +161,15 @@ static int dns_zone_link_item(DnsZone *z, DnsZoneItem *i) {
                 assert_se(hashmap_replace(z->by_name, dns_resource_key_name(first->rr->key), first) >= 0);
         } else {
                 r = hashmap_put(z->by_name, dns_resource_key_name(i->rr->key), i);
-                if (r < 0)
+                if (r < 0) {
+                        first = hashmap_get(z->by_key, i->rr->key);
+                        LIST_REMOVE(by_key, first, i);
+                        if (first)
+                                assert_se(hashmap_replace(z->by_key, first->rr->key, first) >= 0);
+                        else
+                                hashmap_remove(z->by_key, i->rr->key);
                         return r;
+                }
         }
 
         return 0;

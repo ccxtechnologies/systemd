@@ -80,7 +80,11 @@ static int create_disk(
                 "SourcePath=%s\n"
                 "DefaultDependencies=no\n"
                 "IgnoreOnIsolate=true\n"
-                "After=integritysetup-pre.target systemd-udevd-kernel.socket\n"
+                /* The systemd-udevd.service ordering is mostly about shutdown, not startup: on stop the dm
+                 * device is detached via an ioctl carrying a udev cookie that blocks in dm_udev_wait() until
+                 * udev releases it (95-dm-notify.rules). Stopping before udevd keeps it around to service the
+                 * cookie; otherwise during soft-reboot/shutdown udevd may exit first and the detach hangs. */
+                "After=integritysetup-pre.target systemd-udevd-kernel.socket systemd-udevd.service\n"
                 "Before=blockdev@dev-mapper-%%i.target\n"
                 "Wants=blockdev@dev-mapper-%%i.target\n"
                 "Conflicts=umount.target\n"
@@ -104,8 +108,8 @@ static int create_disk(
                 "Type=oneshot\n"
                 "RemainAfterExit=yes\n"
                 "TimeoutSec=infinity\n"
-                "ExecStart=" LIBEXECDIR "/systemd-integritysetup attach '%s' '%s' '%s' '%s'\n"
-                "ExecStop=" LIBEXECDIR "/systemd-integritysetup detach '%s'\n",
+                "ExecStart=" SYSTEMD_INTEGRITYSETUP_PATH " attach '%s' '%s' '%s' '%s'\n"
+                "ExecStop=" SYSTEMD_INTEGRITYSETUP_PATH " detach '%s'\n",
                 name_escaped, device, empty_to_dash(key_file_escaped), empty_to_dash(options),
                 name_escaped);
 
@@ -134,8 +138,8 @@ static int add_integritytab_devices(void) {
 
         r = fopen_unlocked(arg_integritytab, "re", &f);
         if (r < 0) {
-                if (errno != ENOENT)
-                        log_error_errno(errno, "Failed to open %s: %m", arg_integritytab);
+                if (r != -ENOENT)
+                        log_error_errno(r, "Failed to open %s: %m", arg_integritytab);
                 return 0;
         }
 

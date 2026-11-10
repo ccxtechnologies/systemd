@@ -100,13 +100,16 @@ static bool output_show_machine(const char *name, char **patterns) {
 
 static int get_machine_list(
                 sd_bus *bus,
-                struct machine_info **_machine_infos,
+                struct machine_info **ret_machine_infos,
                 char **patterns) {
 
         struct machine_info *machine_infos = NULL;
         _cleanup_strv_free_ char **m = NULL;
         _cleanup_free_ char *hn = NULL;
         int c = 0, r;
+
+        assert(bus);
+        assert(ret_machine_infos);
 
         hn = gethostname_malloc();
         if (!hn)
@@ -153,7 +156,7 @@ static int get_machine_list(
                 c++;
         }
 
-        *_machine_infos = machine_infos;
+        *ret_machine_infos = machine_infos;
         return c;
 }
 
@@ -231,7 +234,7 @@ static int output_machines_list(struct machine_info *machine_infos, unsigned n) 
         return 0;
 }
 
-int verb_list_machines(int argc, char *argv[], void *userdata) {
+int verb_list_machines(int argc, char *argv[], uintptr_t _data, void *userdata) {
         struct machine_info *machine_infos = NULL;
         sd_bus *bus;
         int r, rc;

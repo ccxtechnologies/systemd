@@ -7,10 +7,11 @@
  */
 
 #include <fcntl.h>
-#include <getopt.h>
 #include <linux/hid.h>
 #include <stdio.h>
 #include <unistd.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
@@ -21,38 +22,42 @@
 #include "log.h"
 #include "main-func.h"
 #include "path-util.h"
+#include "strv.h"
 #include "udev-util.h"
+#include "verbs.h"
 
 static const char *arg_device = NULL;
 
-static int parse_argv(int argc, char *argv[]) {
-        static const struct option options[] = {
-                { "help",     no_argument, NULL, 'h' },
-                { "version",  no_argument, NULL, 'v' },
-                {}
-        };
-        int c;
+COMMAND(
+        "fido_id\0",
+        "Identify FIDO security tokens.",
+        .argspec = "[SYSFS_PATH]\0",
+);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+static int parse_argv(int argc, char *argv[]) {
+        assert(argc >= 0);
+        assert(argv);
+
+        OptionParser opts = { argc, argv };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
-                case 'h':
-                        printf("%s [OPTIONS...] SYSFS_PATH\n\n"
-                               "  -h --help     Show this help text\n"
-                               "     --version  Show package version\n",
-                               program_invocation_short_name);
-                        return 0;
-                case 'v':
+
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
                         return version();
-                case '?':
-                        return -EINVAL;
-                default:
-                        assert_not_reached();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (argc > 2)
+        char **args = option_parser_get_args(&opts);
+        if (strv_length(args) > 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Error: unexpected argument.");
 
-        arg_device = argv[optind];
+        arg_device = args[0];
         return 1;
 }
 

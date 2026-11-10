@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "forward.h"
 #include "fou-tunnel.h"
 #include "netdev.h"
 #include "networkd-link.h"
@@ -122,8 +121,7 @@ extern const NetDevVTable ip6gretap_vtable;
 extern const NetDevVTable ip6tnl_vtable;
 extern const NetDevVTable erspan_vtable;
 
-const char* tunnel_mode_to_string(TunnelMode d) _const_;
-TunnelMode tunnel_mode_from_string(const char *d) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(tunnel_mode, TunnelMode);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_tunnel_mode);
 CONFIG_PARSER_PROTOTYPE(config_parse_tunnel_local_address);

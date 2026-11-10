@@ -3,12 +3,13 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "btrfs.h"
+#include "btrfs-util.h"
 #include "chase.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
+#include "hashmap.h"
 #include "log.h"
 #include "mkdir.h"
 #include "path-util.h"
@@ -24,16 +25,17 @@ int mkdirat_safe_internal(
                 uid_t uid,
                 gid_t gid,
                 MkdirFlags flags,
-                mkdirat_func_t _mkdirat) {
+                mkdirat_func_t _mkdirat,
+                LabelContext *label_context) {
 
         struct stat st;
         int r;
 
         assert(path);
         assert(mode != MODE_INVALID);
-        assert(_mkdirat && _mkdirat != mkdirat);
+        assert(_mkdirat);
 
-        r = _mkdirat(dir_fd, path, mode);
+        r = _mkdirat(dir_fd, path, mode, label_context);
         if (r >= 0)
                 return chmod_and_chown_at(dir_fd, path, mode, uid, gid);
         if (r != -EEXIST)
@@ -45,13 +47,13 @@ int mkdirat_safe_internal(
         if ((flags & MKDIR_FOLLOW_SYMLINK) && S_ISLNK(st.st_mode)) {
                 _cleanup_free_ char *p = NULL;
 
-                r = chaseat(dir_fd, path, CHASE_NONEXISTENT, &p, NULL);
+                r = chaseat(XAT_FDROOT, dir_fd, path, CHASE_NONEXISTENT, &p, NULL);
                 if (r < 0)
                         return r;
                 if (r == 0)
                         return mkdirat_safe_internal(dir_fd, p, mode, uid, gid,
                                                      flags & ~MKDIR_FOLLOW_SYMLINK,
-                                                     _mkdirat);
+                                                     _mkdirat, label_context);
 
                 if (fstatat(dir_fd, p, &st, AT_SYMLINK_NOFOLLOW) < 0)
                         return -errno;
@@ -79,20 +81,20 @@ int mkdirat_safe_internal(
         return 0;
 }
 
-int mkdirat_errno_wrapper(int dirfd, const char *pathname, mode_t mode) {
+int mkdirat_errno_wrapper(int dirfd, const char *pathname, mode_t mode, LabelContext *label_context) {
         return RET_NERRNO(mkdirat(dirfd, pathname, mode));
 }
 
 int mkdirat_safe(int dir_fd, const char *path, mode_t mode, uid_t uid, gid_t gid, MkdirFlags flags) {
-        return mkdirat_safe_internal(dir_fd, path, mode, uid, gid, flags, mkdirat_errno_wrapper);
+        return mkdirat_safe_internal(dir_fd, path, mode, uid, gid, flags, mkdirat_errno_wrapper, /* label_context= */ NULL);
 }
 
-int mkdirat_parents_internal(int dir_fd, const char *path, mode_t mode, uid_t uid, gid_t gid, MkdirFlags flags, mkdirat_func_t _mkdirat) {
+int mkdirat_parents_internal(int dir_fd, const char *path, mode_t mode, uid_t uid, gid_t gid, MkdirFlags flags, mkdirat_func_t _mkdirat, LabelContext *label_context) {
         const char *e = NULL;
         int r;
 
         assert(path);
-        assert(_mkdirat != mkdirat);
+        assert(_mkdirat);
 
         if (isempty(path))
                 return 0;
@@ -112,7 +114,7 @@ int mkdirat_parents_internal(int dir_fd, const char *path, mode_t mode, uid_t ui
 
         /* drop the last component */
         path = strndupa_safe(path, e - path);
-        r = is_dir_at(dir_fd, path, /* follow = */ true);
+        r = is_dir_at(dir_fd, path, /* follow= */ true);
         if (r > 0)
                 return 0;
         if (r == 0)
@@ -133,7 +135,7 @@ int mkdirat_parents_internal(int dir_fd, const char *path, mode_t mode, uid_t ui
 
                 s[n] = '\0';
 
-                r = mkdirat_safe_internal(dir_fd, path, mode, uid, gid, flags | MKDIR_IGNORE_EXISTING, _mkdirat);
+                r = mkdirat_safe_internal(dir_fd, path, mode, uid, gid, flags | MKDIR_IGNORE_EXISTING, _mkdirat, label_context);
                 if (r < 0 && r != -EEXIST)
                         return r;
 
@@ -141,12 +143,12 @@ int mkdirat_parents_internal(int dir_fd, const char *path, mode_t mode, uid_t ui
         }
 }
 
-int mkdir_parents_internal(const char *prefix, const char *path, mode_t mode, uid_t uid, gid_t gid, MkdirFlags flags, mkdirat_func_t _mkdirat) {
+int mkdir_parents_internal(const char *prefix, const char *path, mode_t mode, uid_t uid, gid_t gid, MkdirFlags flags, mkdirat_func_t _mkdirat, LabelContext *label_context) {
         _cleanup_close_ int fd = AT_FDCWD;
         const char *p;
 
         assert(path);
-        assert(_mkdirat != mkdirat);
+        assert(_mkdirat);
 
         if (prefix) {
                 p = path_startswith_full(path, prefix, PATH_STARTSWITH_REFUSE_DOT_DOT);
@@ -159,34 +161,34 @@ int mkdir_parents_internal(const char *prefix, const char *path, mode_t mode, ui
         } else
                 p = path;
 
-        return mkdirat_parents_internal(fd, p, mode, uid, gid, flags, _mkdirat);
+        return mkdirat_parents_internal(fd, p, mode, uid, gid, flags, _mkdirat, label_context);
 }
 
 int mkdirat_parents(int dir_fd, const char *path, mode_t mode) {
-        return mkdirat_parents_internal(dir_fd, path, mode, UID_INVALID, UID_INVALID, 0, mkdirat_errno_wrapper);
+        return mkdirat_parents_internal(dir_fd, path, mode, UID_INVALID, UID_INVALID, 0, mkdirat_errno_wrapper, /* label_context= */ NULL);
 }
 
 int mkdir_parents_safe(const char *prefix, const char *path, mode_t mode, uid_t uid, gid_t gid, MkdirFlags flags) {
-        return mkdir_parents_internal(prefix, path, mode, uid, gid, flags, mkdirat_errno_wrapper);
+        return mkdir_parents_internal(prefix, path, mode, uid, gid, flags, mkdirat_errno_wrapper, /* label_context= */ NULL);
 }
 
-int mkdir_p_internal(const char *prefix, const char *path, mode_t mode, uid_t uid, gid_t gid, MkdirFlags flags, mkdirat_func_t _mkdirat) {
+int mkdir_p_internal(const char *prefix, const char *path, mode_t mode, uid_t uid, gid_t gid, MkdirFlags flags, mkdirat_func_t _mkdirat, LabelContext *label_context) {
         int r;
 
         /* Like mkdir -p */
 
-        assert(_mkdirat != mkdirat);
+        assert(_mkdirat);
 
-        r = mkdir_parents_internal(prefix, path, mode, uid, gid, flags | MKDIR_FOLLOW_SYMLINK, _mkdirat);
+        r = mkdir_parents_internal(prefix, path, mode, uid, gid, flags | MKDIR_FOLLOW_SYMLINK, _mkdirat, label_context);
         if (r < 0)
                 return r;
 
         if (!uid_is_valid(uid) && !gid_is_valid(gid) && flags == 0) {
-                r = _mkdirat(AT_FDCWD, path, mode);
+                r = _mkdirat(AT_FDCWD, path, mode, label_context);
                 if (r < 0 && (r != -EEXIST || is_dir(path, true) <= 0))
                         return r;
         } else {
-                r = mkdir_safe_internal(path, mode, uid, gid, flags, _mkdirat);
+                r = mkdir_safe_internal(path, mode, uid, gid, flags, _mkdirat, label_context);
                 if (r < 0 && r != -EEXIST)
                         return r;
         }
@@ -195,14 +197,14 @@ int mkdir_p_internal(const char *prefix, const char *path, mode_t mode, uid_t ui
 }
 
 int mkdir_p(const char *path, mode_t mode) {
-        return mkdir_p_internal(NULL, path, mode, UID_INVALID, UID_INVALID, 0, mkdirat_errno_wrapper);
+        return mkdir_p_internal(/* prefix= */ NULL, path, mode, UID_INVALID, UID_INVALID, 0, mkdirat_errno_wrapper, /* label_context= */ NULL);
 }
 
 int mkdir_p_safe(const char *prefix, const char *path, mode_t mode, uid_t uid, gid_t gid, MkdirFlags flags) {
-        return mkdir_p_internal(prefix, path, mode, uid, gid, flags, mkdirat_errno_wrapper);
+        return mkdir_p_internal(prefix, path, mode, uid, gid, flags, mkdirat_errno_wrapper, /* label_context= */ NULL);
 }
 
-int mkdir_p_root_full(const char *root, const char *p, uid_t uid, gid_t gid, mode_t m, usec_t ts, char **subvolumes) {
+int mkdir_p_root_full(const char *root, const char *p, uid_t uid, gid_t gid, mode_t m, usec_t ts, Hashmap *subvolumes) {
         _cleanup_free_ char *pp = NULL, *bn = NULL;
         _cleanup_close_ int dfd = -EBADF;
         int r;
@@ -237,20 +239,24 @@ int mkdir_p_root_full(const char *root, const char *p, uid_t uid, gid_t gid, mod
         if (r < 0)
                 return r;
 
-        if (path_strv_contains(subvolumes, p))
-                r = btrfs_subvol_make_fallback(dfd, bn, m);
-        else
-                r = RET_NERRNO(mkdirat(dfd, bn, m));
-        if (r == -EEXIST)
+        XOpenFlags flags = 0;
+        if (hashmap_contains(subvolumes, p)) {
+                flags = XO_SUBVOLUME;
+                if ((PTR_TO_INT(hashmap_get(subvolumes, p)) & BTRFS_SUBVOL_NODATACOW))
+                        flags |= XO_NOCOW;
+        }
+
+        _cleanup_close_ int nfd = xopenat_full(
+                                dfd, bn,
+                                O_DIRECTORY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,
+                                flags,
+                                m);
+        if (nfd == -EEXIST)
                 return 0;
-        if (r < 0)
-                return r;
-
-        if (ts == USEC_INFINITY && !uid_is_valid(uid) && !gid_is_valid(gid))
-                return 1;
-
-        _cleanup_close_ int nfd = openat(dfd, bn, O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW);
         if (nfd < 0)
+                return nfd;
+
+        if ((uid_is_valid(uid) || gid_is_valid(gid)) && fchown(nfd, uid, gid) < 0)
                 return -errno;
 
         if (ts != USEC_INFINITY) {
@@ -263,9 +269,6 @@ int mkdir_p_root_full(const char *root, const char *p, uid_t uid, gid_t gid, mod
                 if (futimens(nfd, (const struct timespec[2]) { tspec, tspec }) < 0)
                         return -errno;
         }
-
-        if ((uid_is_valid(uid) || gid_is_valid(gid)) && fchown(nfd, uid, gid) < 0)
-                return -errno;
 
         return 1;
 }

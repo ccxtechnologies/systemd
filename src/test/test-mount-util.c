@@ -7,6 +7,7 @@
 
 #include "alloc-util.h"
 #include "capability-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
@@ -14,15 +15,32 @@
 #include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
-#include "namespace-util.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "random-util.h"
 #include "rm-rf.h"
+#include "socket-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "tests.h"
 #include "tmpfile-util.h"
+#include "virt.h"
+
+#define FORK_COMMON_FLAGS                       \
+        (FORK_CLOSE_ALL_FDS |                   \
+         FORK_RESET_SIGNALS |                   \
+         FORK_DEATHSIG_SIGTERM |                \
+         FORK_LOG |                             \
+         FORK_REOPEN_LOG |                      \
+         FORK_WAIT |                            \
+         FORK_NEW_MOUNTNS |                     \
+         FORK_MOUNTNS_SLAVE)
+
+#define CHECK_PRIV                                                      \
+        if (geteuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0)   \
+                return (void) log_tests_skipped("Not privileged");      \
+        if (running_in_chroot() != 0)                                   \
+                return (void) log_tests_skipped("running in chroot");
 
 TEST(mount_option_mangle) {
         char *opts = NULL;
@@ -132,11 +150,9 @@ TEST(mount_flags_to_string) {
 TEST(bind_remount_recursive) {
         _cleanup_(rm_rf_physical_and_freep) char *tmp = NULL;
         _cleanup_free_ char *subdir = NULL;
+        int r;
 
-        if (geteuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0) {
-                (void) log_tests_skipped("not running privileged");
-                return;
-        }
+        CHECK_PRIV;
 
         assert_se(mkdtemp_malloc("/tmp/XXXXXX", &tmp) >= 0);
         subdir = path_join(tmp, "subdir");
@@ -144,15 +160,9 @@ TEST(bind_remount_recursive) {
         assert_se(mkdir(subdir, 0755) >= 0);
 
         FOREACH_STRING(p, "/usr", "/sys", "/", tmp) {
-                pid_t pid;
-
-                pid = fork();
-                assert_se(pid >= 0);
-
-                if (pid == 0) {
+                r = ASSERT_OK(pidref_safe_fork("(bind-remount-recursive)", FORK_COMMON_FLAGS, NULL));
+                if (r == 0) { /* child */
                         struct statvfs svfs;
-                        /* child */
-                        assert_se(detach_mount_namespace() >= 0);
 
                         /* Check that the subdir is writable (it must be because it's in /tmp) */
                         assert_se(statvfs(subdir, &svfs) >= 0);
@@ -178,28 +188,17 @@ TEST(bind_remount_recursive) {
 
                         _exit(EXIT_SUCCESS);
                 }
-
-                assert_se(wait_for_terminate_and_check("test-remount-rec", pid, WAIT_LOG) == EXIT_SUCCESS);
         }
 }
 
 TEST(bind_remount_one) {
-        pid_t pid;
+        int r;
 
-        if (geteuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0) {
-                (void) log_tests_skipped("not running privileged");
-                return;
-        }
+        CHECK_PRIV;
 
-        pid = fork();
-        assert_se(pid >= 0);
-
-        if (pid == 0) {
-                /* child */
-
+        r = ASSERT_OK(pidref_safe_fork("(remount-one-with-mountinfo)", FORK_COMMON_FLAGS, NULL));
+        if (r == 0) { /* child */
                 _cleanup_fclose_ FILE *proc_self_mountinfo = NULL;
-
-                assert_se(detach_mount_namespace() >= 0);
 
                 assert_se(fopen_unlocked("/proc/self/mountinfo", "re", &proc_self_mountinfo) >= 0);
 
@@ -212,16 +211,8 @@ TEST(bind_remount_one) {
                 _exit(EXIT_SUCCESS);
         }
 
-        assert_se(wait_for_terminate_and_check("test-remount-one-with-mountinfo", pid, WAIT_LOG) == EXIT_SUCCESS);
-
-        pid = fork();
-        assert_se(pid >= 0);
-
-        if (pid == 0) {
-                /* child */
-
-                assert_se(detach_mount_namespace() >= 0);
-
+        r = ASSERT_OK(pidref_safe_fork("(remount-one)", FORK_COMMON_FLAGS, NULL));
+        if (r == 0) { /* child */
                 assert_se(bind_remount_one("/run", MS_RDONLY, MS_RDONLY) >= 0);
                 assert_se(bind_remount_one("/run", MS_NOEXEC, MS_RDONLY|MS_NOEXEC) >= 0);
                 assert_se(bind_remount_one("/proc/idontexist", MS_RDONLY, MS_RDONLY) == -ENOENT);
@@ -230,8 +221,6 @@ TEST(bind_remount_one) {
 
                 _exit(EXIT_SUCCESS);
         }
-
-        assert_se(wait_for_terminate_and_check("test-remount-one", pid, WAIT_LOG) == EXIT_SUCCESS);
 }
 
 TEST(make_mount_point_inode) {
@@ -283,10 +272,7 @@ TEST(make_mount_switch_root) {
         _cleanup_free_ char *s = NULL;
         int r;
 
-        if (geteuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0) {
-                (void) log_tests_skipped("not running privileged");
-                return;
-        }
+        CHECK_PRIV;
 
         assert_se(mkdtemp_malloc(NULL, &t) >= 0);
 
@@ -305,18 +291,7 @@ TEST(make_mount_switch_root) {
         };
 
         FOREACH_ELEMENT(i, table) {
-                r = safe_fork("(switch-root)",
-                              FORK_RESET_SIGNALS |
-                              FORK_CLOSE_ALL_FDS |
-                              FORK_DEATHSIG_SIGTERM |
-                              FORK_WAIT |
-                              FORK_REOPEN_LOG |
-                              FORK_LOG |
-                              FORK_NEW_MOUNTNS |
-                              FORK_MOUNTNS_SLAVE,
-                              NULL);
-                assert_se(r >= 0);
-
+                r = ASSERT_OK(pidref_safe_fork("(switch-root)", FORK_COMMON_FLAGS, NULL));
                 if (r == 0) {
                         assert_se(make_mount_point(i->path) >= 0);
                         assert_se(mount_switch_root_full(i->path, /* mount_propagation_flag= */ 0, i->force_ms_move) >= 0);
@@ -357,23 +332,10 @@ TEST(umount_recursive) {
 
         int r;
 
+        CHECK_PRIV;
+
         FOREACH_ELEMENT(t, test_table) {
-
-                r = safe_fork("(umount-rec)",
-                              FORK_RESET_SIGNALS |
-                              FORK_CLOSE_ALL_FDS |
-                              FORK_DEATHSIG_SIGTERM |
-                              FORK_WAIT |
-                              FORK_REOPEN_LOG |
-                              FORK_LOG |
-                              FORK_NEW_MOUNTNS |
-                              FORK_MOUNTNS_SLAVE,
-                              NULL);
-
-                if (ERRNO_IS_NEG_PRIVILEGE(r))
-                        return (void) log_notice("Skipping umount_recursive() test, lacking privileges");
-
-                assert_se(r >= 0);
+                r = ASSERT_OK(pidref_safe_fork("(umount-rec)", FORK_COMMON_FLAGS, NULL));
                 if (r == 0) { /* child */
                         _cleanup_(mnt_free_tablep) struct libmnt_table *table = NULL;
                         _cleanup_(mnt_free_iterp) struct libmnt_iter *iter = NULL;
@@ -401,7 +363,7 @@ TEST(umount_recursive) {
                         for (;;) {
                                 struct libmnt_fs *fs;
 
-                                r = mnt_table_next_fs(table, iter, &fs);
+                                r = sym_mnt_table_next_fs(table, iter, &fs);
                                 if (r == 1)
                                         break;
                                 if (r < 0) {
@@ -409,11 +371,90 @@ TEST(umount_recursive) {
                                         _exit(EXIT_FAILURE);
                                 }
 
-                                log_debug("left after complete umount: %s", mnt_fs_get_target(fs));
+                                log_debug("left after complete umount: %s", sym_mnt_fs_get_target(fs));
                         }
 
                         _exit(EXIT_SUCCESS);
                 }
+        }
+}
+
+TEST(umount_recursive_stale_path) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        int r;
+
+        CHECK_PRIV;
+
+        ASSERT_OK(mkdtemp_malloc(NULL, &t));
+
+        r = ASSERT_OK(pidref_safe_fork("(umount-rec-stale)", FORK_COMMON_FLAGS, NULL));
+        if (r == 0) { /* child */
+                ASSERT_OK(mount_nofollow_verbose(LOG_INFO, "tmpfs", t, "tmpfs", 0, NULL));
+
+                _cleanup_free_ char
+                        *src = ASSERT_NOT_NULL(path_join(t, "src")),
+                        *outside = ASSERT_NOT_NULL(path_join(t, "outside")),
+                        *victim = ASSERT_NOT_NULL(path_join(t, "outside/y")),
+                        *prefix = ASSERT_NOT_NULL(path_join(t, "prefix")),
+                        *parent = ASSERT_NOT_NULL(path_join(t, "prefix/parent")),
+                        *link = ASSERT_NOT_NULL(path_join(t, "prefix/parent/x")),
+                        *child = ASSERT_NOT_NULL(path_join(t, "prefix/parent/x/y"));
+
+                ASSERT_OK(mkdir_p(src, 0755));
+                ASSERT_OK(mkdir_p(victim, 0755));
+                ASSERT_OK(mkdir_p(parent, 0755));
+                ASSERT_OK_ERRNO(symlink(outside, link));
+
+                /* The mount that later ends up below the parent has to be older than the parent, so that the
+                 * parent is reached first when the table is iterated backwards. Once the parent is detached
+                 * the path of the child resolves via the symlink it covered, to a mount outside of the prefix. */
+                ASSERT_OK(mount_nofollow_verbose(LOG_INFO, "tmpfs", src, "tmpfs", 0, NULL));
+                ASSERT_OK(mount_nofollow_verbose(LOG_INFO, "tmpfs", victim, "tmpfs", 0, NULL));
+                ASSERT_OK(mount_nofollow_verbose(LOG_INFO, "tmpfs", parent, "tmpfs", 0, NULL));
+                ASSERT_OK(mkdir_p(child, 0755));
+                ASSERT_OK(mount_nofollow_verbose(LOG_INFO, src, child, NULL, MS_MOVE, NULL));
+
+                ASSERT_OK_POSITIVE(umount_recursive(prefix, MNT_DETACH));
+
+                ASSERT_OK_ZERO(path_is_mount_point(parent));
+                ASSERT_OK_POSITIVE(path_is_mount_point(victim));
+
+                _exit(EXIT_SUCCESS);
+        }
+}
+
+TEST(umount_recursive_busy) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        int r;
+
+        CHECK_PRIV;
+
+        ASSERT_OK(mkdtemp_malloc(NULL, &t));
+
+        r = ASSERT_OK(pidref_safe_fork("(umount-rec-busy)", FORK_COMMON_FLAGS, NULL));
+        if (r == 0) { /* child */
+                ASSERT_OK(mount_nofollow_verbose(LOG_INFO, "tmpfs", t, "tmpfs", 0, NULL));
+
+                _cleanup_free_ char
+                        *prefix = ASSERT_NOT_NULL(path_join(t, "prefix")),
+                        *older = ASSERT_NOT_NULL(path_join(t, "prefix/older")),
+                        *busy = ASSERT_NOT_NULL(path_join(t, "prefix/busy"));
+
+                ASSERT_OK(mkdir_p(older, 0755));
+                ASSERT_OK(mkdir_p(busy, 0755));
+
+                /* The busy mount is newer, hence reached first. It must not stop the walk. */
+                ASSERT_OK(mount_nofollow_verbose(LOG_INFO, "tmpfs", older, "tmpfs", 0, NULL));
+                ASSERT_OK(mount_nofollow_verbose(LOG_INFO, "tmpfs", busy, "tmpfs", 0, NULL));
+
+                _unused_ _cleanup_close_ int fd = ASSERT_OK_ERRNO(open(busy, O_DIRECTORY|O_CLOEXEC));
+
+                ASSERT_OK_EQ(umount_recursive(prefix, 0), 1);
+
+                ASSERT_OK_ZERO(path_is_mount_point(older));
+                ASSERT_OK_POSITIVE(path_is_mount_point(busy));
+
+                _exit(EXIT_SUCCESS);
         }
 }
 
@@ -422,10 +463,7 @@ TEST(fd_make_mount_point) {
         _cleanup_free_ char *s = NULL;
         int r;
 
-        if (geteuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0) {
-                (void) log_tests_skipped("not running privileged");
-                return;
-        }
+        CHECK_PRIV;
 
         assert_se(mkdtemp_malloc(NULL, &t) >= 0);
 
@@ -433,18 +471,7 @@ TEST(fd_make_mount_point) {
         assert_se(s);
         assert_se(mkdir(s, 0700) >= 0);
 
-        r = safe_fork("(make_mount-point)",
-                      FORK_RESET_SIGNALS |
-                      FORK_CLOSE_ALL_FDS |
-                      FORK_DEATHSIG_SIGTERM |
-                      FORK_WAIT |
-                      FORK_REOPEN_LOG |
-                      FORK_LOG |
-                      FORK_NEW_MOUNTNS |
-                      FORK_MOUNTNS_SLAVE,
-                      NULL);
-        assert_se(r >= 0);
-
+        r = ASSERT_OK(pidref_safe_fork("(make-mount-point)", FORK_COMMON_FLAGS, NULL));
         if (r == 0) {
                 _cleanup_close_ int fd = -EBADF, fd2 = -EBADF;
 
@@ -468,72 +495,127 @@ TEST(fd_make_mount_point) {
 
 TEST(bind_mount_submounts) {
         _cleanup_(rmdir_and_freep) char *a = NULL, *b = NULL;
-        _cleanup_free_ char *x = NULL;
         int r;
 
+        CHECK_PRIV;
+
         assert_se(mkdtemp_malloc(NULL, &a) >= 0);
-        r = mount_nofollow_verbose(LOG_INFO, "tmpfs", a, "tmpfs", 0, NULL);
-        if (ERRNO_IS_NEG_PRIVILEGE(r))
-                return (void) log_tests_skipped("Skipping bind_mount_submounts() test, lacking privileges");
-
-        assert_se(r >= 0);
-
-        assert_se(x = path_join(a, "foo"));
-        assert_se(touch(x) >= 0);
-        free(x);
-
-        assert_se(x = path_join(a, "x"));
-        assert_se(mkdir(x, 0755) >= 0);
-        assert_se(mount_nofollow_verbose(LOG_INFO, "tmpfs", x, "tmpfs", 0, NULL) >= 0);
-        free(x);
-
-        assert_se(x = path_join(a, "x/xx"));
-        assert_se(touch(x) >= 0);
-        free(x);
-
-        assert_se(x = path_join(a, "y"));
-        assert_se(mkdir(x, 0755) >= 0);
-        assert_se(mount_nofollow_verbose(LOG_INFO, "tmpfs", x, "tmpfs", 0, NULL) >= 0);
-        free(x);
-
-        assert_se(x = path_join(a, "y/yy"));
-        assert_se(touch(x) >= 0);
-        free(x);
-
         assert_se(mkdtemp_malloc(NULL, &b) >= 0);
-        assert_se(mount_nofollow_verbose(LOG_INFO, "tmpfs", b, "tmpfs", 0, NULL) >= 0);
 
-        assert_se(x = path_join(b, "x"));
-        assert_se(mkdir(x, 0755) >= 0);
-        free(x);
+        r = ASSERT_OK(pidref_safe_fork("(bind-mount-submounts)", FORK_COMMON_FLAGS, NULL));
+        if (r == 0) {
+                char *x;
 
-        assert_se(x = path_join(b, "y"));
-        assert_se(mkdir(x, 0755) >= 0);
-        free(x);
+                ASSERT_OK(mount_nofollow_verbose(LOG_INFO, "tmpfs", a, "tmpfs", 0, NULL));
 
-        assert_se(bind_mount_submounts(a, b) >= 0);
+                assert_se(x = path_join(a, "foo"));
+                assert_se(touch(x) >= 0);
+                free(x);
 
-        assert_se(x = path_join(b, "foo"));
-        assert_se(access(x, F_OK) < 0 && errno == ENOENT);
-        free(x);
+                assert_se(x = path_join(a, "x"));
+                assert_se(mkdir(x, 0755) >= 0);
+                assert_se(mount_nofollow_verbose(LOG_INFO, "tmpfs", x, "tmpfs", 0, NULL) >= 0);
+                free(x);
 
-        assert_se(x = path_join(b, "x/xx"));
-        assert_se(access(x, F_OK) >= 0);
-        free(x);
+                assert_se(x = path_join(a, "x/xx"));
+                assert_se(touch(x) >= 0);
+                free(x);
 
-        assert_se(x = path_join(b, "y/yy"));
-        assert_se(access(x, F_OK) >= 0);
-        free(x);
+                assert_se(x = path_join(a, "y"));
+                assert_se(mkdir(x, 0755) >= 0);
+                assert_se(mount_nofollow_verbose(LOG_INFO, "tmpfs", x, "tmpfs", 0, NULL) >= 0);
+                free(x);
 
-        assert_se(x = path_join(b, "x"));
-        assert_se(path_is_mount_point(x) > 0);
-        free(x);
+                assert_se(x = path_join(a, "y/yy"));
+                assert_se(touch(x) >= 0);
+                free(x);
 
-        assert_se(x = path_join(b, "y"));
-        assert_se(path_is_mount_point(x) > 0);
+                assert_se(mount_nofollow_verbose(LOG_INFO, "tmpfs", b, "tmpfs", 0, NULL) >= 0);
 
-        assert_se(umount_recursive(a, 0) >= 0);
-        assert_se(umount_recursive(b, 0) >= 0);
+                assert_se(x = path_join(b, "x"));
+                assert_se(mkdir(x, 0755) >= 0);
+                free(x);
+
+                assert_se(x = path_join(b, "y"));
+                assert_se(mkdir(x, 0755) >= 0);
+                free(x);
+
+                assert_se(bind_mount_submounts(a, b) >= 0);
+
+                assert_se(x = path_join(b, "foo"));
+                assert_se(access(x, F_OK) < 0 && errno == ENOENT);
+                free(x);
+
+                assert_se(x = path_join(b, "x/xx"));
+                assert_se(access(x, F_OK) >= 0);
+                free(x);
+
+                assert_se(x = path_join(b, "y/yy"));
+                assert_se(access(x, F_OK) >= 0);
+                free(x);
+
+                assert_se(x = path_join(b, "x"));
+                assert_se(path_is_mount_point(x) > 0);
+                free(x);
+
+                assert_se(x = path_join(b, "y"));
+                assert_se(path_is_mount_point(x) > 0);
+                free(x);
+
+                assert_se(umount_recursive(a, 0) >= 0);
+                assert_se(umount_recursive(b, 0) >= 0);
+
+                _exit(EXIT_SUCCESS);
+        }
+}
+
+TEST(get_sub_mounts) {
+        _cleanup_(rm_rf_physical_and_freep) char *a = NULL;
+        int r;
+
+        CHECK_PRIV;
+
+        ASSERT_OK(mkdtemp_malloc(NULL, &a));
+
+        r = ASSERT_OK(pidref_safe_fork("(get-sub-mounts)", FORK_COMMON_FLAGS, NULL));
+        if (r == 0) {
+                SubMount *mounts = NULL;
+                size_t n = 0;
+
+                CLEANUP_ARRAY(mounts, n, sub_mount_array_free);
+
+                /* Reproduces the layout that triggered the assertion crash in systemd-sysext on
+                 * Flatcar (https://github.com/flatcar/Flatcar/issues/2111): a mount nested inside
+                 * another mount under a sysext hierarchy. The dedup pass must keep only the outer
+                 * entry (the inner is covered by the outer's recursive open_tree() clone) and
+                 * compact the array — leaving NULL entries behind would crash the consumer. */
+
+                _cleanup_free_ char *outer = ASSERT_NOT_NULL(path_join(a, "outer"));
+                ASSERT_OK_ERRNO(mkdir(outer, 0755));
+                ASSERT_OK(mount_nofollow_verbose(LOG_INFO, "tmpfs", outer, "tmpfs", 0, NULL));
+
+                _cleanup_free_ char *inner = ASSERT_NOT_NULL(path_join(outer, "inner"));
+                ASSERT_OK_ERRNO(mkdir(inner, 0755));
+                ASSERT_OK(mount_nofollow_verbose(LOG_INFO, "tmpfs", inner, "tmpfs", 0, NULL));
+
+                r = get_sub_mounts(a, &mounts, &n);
+                if (r == -EOPNOTSUPP) {
+                        log_tests_skipped("libmount support not compiled in");
+                        _exit(EXIT_SUCCESS);
+                }
+                ASSERT_OK(r);
+
+                /* Only the outer entry should survive dedup; the inner is implied by the outer's
+                 * recursive clone. */
+                ASSERT_EQ(n, 1u);
+                ASSERT_NOT_NULL(mounts[0].path);
+                ASSERT_STREQ(mounts[0].path, outer);
+                ASSERT_OK(mounts[0].mount_fd);
+
+                ASSERT_OK(umount_recursive(a, 0));
+
+                _exit(EXIT_SUCCESS);
+        }
 }
 
 TEST(path_is_network_fs_harder) {
@@ -553,26 +635,12 @@ TEST(path_is_network_fs_harder) {
                 log_debug("path_is_network_fs_harder_at(root, %s) → %i: %s", q, r, r < 0 ? STRERROR(r) : yes_no(r));
         }
 
-        if (geteuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0) {
-                (void) log_tests_skipped("not running privileged");
-                return;
-        }
+        CHECK_PRIV;
 
         _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
         assert_se(mkdtemp_malloc("/tmp/test-mount-util.path_is_network_fs_harder.XXXXXXX", &t) >= 0);
 
-        r = safe_fork("(make_mount-point)",
-                      FORK_RESET_SIGNALS |
-                      FORK_CLOSE_ALL_FDS |
-                      FORK_DEATHSIG_SIGTERM |
-                      FORK_WAIT |
-                      FORK_REOPEN_LOG |
-                      FORK_LOG |
-                      FORK_NEW_MOUNTNS |
-                      FORK_MOUNTNS_SLAVE,
-                      NULL);
-        ASSERT_OK(r);
-
+        r = ASSERT_OK(pidref_safe_fork("(path-is-network-fs-harder)", FORK_COMMON_FLAGS, NULL));
         if (r == 0) {
                 ASSERT_OK(mount_nofollow_verbose(LOG_INFO, "tmpfs", t, "tmpfs", 0, NULL));
                 ASSERT_OK_ZERO(path_is_network_fs_harder(t));
@@ -587,7 +655,7 @@ TEST(path_is_network_fs_harder) {
 }
 
 TEST(umountat) {
-        int r;
+        CHECK_PRIV;
 
         _cleanup_(rm_rf_physical_and_freep) char *p = NULL;
         _cleanup_close_ int dfd = mkdtemp_open(NULL, O_CLOEXEC, &p);
@@ -597,13 +665,71 @@ TEST(umountat) {
 
         _cleanup_free_ char *q = ASSERT_PTR(path_join(p, "foo"));
 
-        r = mount_nofollow_verbose(LOG_ERR, "tmpfs", q, "tmpfs", 0, NULL);
-        if (ERRNO_IS_NEG_PRIVILEGE(r))
-                return (void) log_tests_skipped("not running privileged");
-
-        ASSERT_OK(r);
+        ASSERT_OK(mount_nofollow_verbose(LOG_ERR, "tmpfs", q, "tmpfs", 0, NULL));
         ASSERT_OK(umountat_detach_verbose(LOG_ERR, dfd, "foo"));
         ASSERT_ERROR(umountat_detach_verbose(LOG_ERR, dfd, "foo"), EINVAL);
+}
+
+TEST(mount_fd_clone) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_pair_ int fds[2] = EBADF_PAIR;
+        int r;
+
+        CHECK_PRIV;
+
+        ASSERT_OK(mkdtemp_malloc(NULL, &t));
+
+        /* Set up a socket pair to transfer the mount fd from the child (in a different mountns) to us. */
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, 0, fds));
+
+        r = ASSERT_OK(pidref_safe_fork_full(
+                        "(mount-fd-clone-setup)",
+                        /* stdio_fds= */ NULL,
+                        &fds[1], 1,
+                        FORK_COMMON_FLAGS,
+                        NULL));
+        if (r == 0) {
+                /* Create a tmpfs mount in this child's mountns. */
+                ASSERT_OK(mount_nofollow_verbose(LOG_ERR, "tmpfs", t, "tmpfs", 0, NULL));
+
+                /* Create a file in it to verify the mount later. */
+                _cleanup_free_ char *marker = ASSERT_NOT_NULL(path_join(t, "marker"));
+                ASSERT_OK(touch(marker));
+
+                /* Clone the mount as a detached mount fd. */
+                _cleanup_close_ int mount_fd = ASSERT_OK_ERRNO(open_tree(AT_FDCWD, t, OPEN_TREE_CLONE|OPEN_TREE_CLOEXEC));
+
+                /* Send the mount fd to the parent. */
+                ASSERT_OK(send_one_fd(fds[1], mount_fd, 0));
+
+                _exit(EXIT_SUCCESS);
+        }
+
+        fds[1] = safe_close(fds[1]);
+
+        /* Parent: Receive the mount fd, clone it with mount_fd_clone(), and verify we can attach it. */
+        _cleanup_close_ int foreign_mount_fd = ASSERT_OK(receive_one_fd(fds[0], 0));
+        _cleanup_close_ int first_clone = ASSERT_OK(
+                        mount_fd_clone(foreign_mount_fd, /* recursive= */ true, &foreign_mount_fd));
+        _cleanup_close_ _unused_ int second_clone = ASSERT_OK(
+                        mount_fd_clone(foreign_mount_fd, /* recursive= */ true, /* replacement_fd= */ NULL));
+        _cleanup_free_ char *target = ASSERT_NOT_NULL(path_join(t, "target"));
+        ASSERT_OK_ERRNO(mkdir(target, 0755));
+
+        r = ASSERT_OK(pidref_safe_fork_full(
+                        "(mount-fd-clone-verify)",
+                        /* stdio_fds= */ NULL,
+                        &first_clone, 1,
+                        FORK_COMMON_FLAGS,
+                        NULL));
+        if (r == 0) {
+                ASSERT_OK_ERRNO(move_mount(first_clone, "", AT_FDCWD, target, MOVE_MOUNT_F_EMPTY_PATH));
+
+                _cleanup_free_ char *marker = ASSERT_NOT_NULL(path_join(target, "marker"));
+                ASSERT_OK_ERRNO(access(marker, F_OK));
+
+                _exit(EXIT_SUCCESS);
+        }
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

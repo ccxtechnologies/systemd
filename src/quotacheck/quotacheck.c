@@ -36,9 +36,11 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                 if (proc_cmdline_value_missing(key, value))
                         return 0;
 
-                arg_mode = quota_check_mode_from_string(value);
-                if (arg_mode < 0)
-                        log_warning_errno(arg_mode, "Invalid quotacheck.mode= value, ignoring: %s", value);
+                QuotaCheckMode mode = quota_check_mode_from_string(value);
+                if (mode < 0)
+                        log_warning_errno(mode, "Invalid quotacheck.mode= value, ignoring: %s", value);
+                else
+                        arg_mode = mode;
 
         } else if (streq(key, "forcequotacheck") && !value)
                 arg_mode = QUOTA_CHECK_FORCE;
@@ -50,13 +52,15 @@ static void parse_credentials(void) {
         _cleanup_free_ char *value = NULL;
         int r;
 
-        r = read_credential("quotacheck.mode", (void**) &value, /* ret_size = */ NULL);
+        r = read_credential("quotacheck.mode", (void**) &value, /* ret_size= */ NULL);
         if (r < 0)
                 log_debug_errno(r, "Failed to read credential 'quotacheck.mode', ignoring: %m");
         else {
-                arg_mode = quota_check_mode_from_string(value);
-                if (arg_mode < 0)
-                        log_warning_errno(arg_mode, "Invalid 'quotacheck.mode' credential, ignoring: %s", value);
+                QuotaCheckMode mode = quota_check_mode_from_string(value);
+                if (mode < 0)
+                        log_warning_errno(mode, "Invalid 'quotacheck.mode' credential, ignoring: %s", value);
+                else
+                        arg_mode = mode;
         }
 }
 
@@ -99,7 +103,10 @@ static int run(int argc, char *argv[]) {
                         return log_oom();
         }
 
-        r = safe_fork("(quotacheck)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_RLIMIT_NOFILE_SAFE|FORK_WAIT|FORK_LOG, NULL);
+        r = pidref_safe_fork(
+                        "(quotacheck)",
+                        FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_RLIMIT_NOFILE_SAFE|FORK_WAIT|FORK_LOG,
+                        /* ret= */ NULL);
         if (r < 0)
                 return r;
         if (r == 0) {

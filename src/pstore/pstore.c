@@ -13,6 +13,7 @@
 #include "conf-parser.h"
 #include "copy.h"
 #include "dirent-util.h"
+#include "dlopen-note.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "iovec-util.h"
@@ -194,7 +195,7 @@ static int process_dmesg_files(PStoreList *list) {
          * The dmesg- filename contains the backend-type and the Common Platform Error Record, CPER,
          * record id, a 64-bit number.
          *
-         * Files are processed in reverse lexigraphical order so as to properly reconstruct original dmesg. */
+         * Files are processed in reverse lexicographical order so as to properly reconstruct original dmesg. */
 
         for (size_t n = list->n_entries; n > 0; n--) {
                 PStoreEntry *pe;
@@ -308,6 +309,8 @@ static int list_files(PStoreList *list, const char *sourcepath) {
 static int run(int argc, char *argv[]) {
         _cleanup_(pstore_entries_reset) PStoreList list = {};
         int r;
+
+        LIBSELINUX_NOTE(recommended);
 
         log_setup();
 

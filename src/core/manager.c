@@ -12,6 +12,7 @@
 #include "sd-bus.h"
 #include "sd-daemon.h"
 #include "sd-messages.h"
+#include "sd-netlink.h"
 #include "sd-path.h"
 
 #include "all-units.h"
@@ -20,6 +21,7 @@
 #include "audit-fd.h"
 #include "boot-timestamps.h"
 #include "bpf-restrict-fs.h"
+#include "bpf-restrict-fsaccess.h"
 #include "build-path.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
@@ -55,10 +57,11 @@
 #include "libaudit-util.h"
 #include "locale-setup.h"
 #include "log.h"
+#include "luo.h"
 #include "manager-dump.h"
 #include "manager-serialize.h"
 #include "manager.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "notify-recv.h"
 #include "parse-util.h"
@@ -74,6 +77,7 @@
 #include "rm-rf.h"
 #include "selinux-util.h"
 #include "serialize.h"
+#include "service.h"
 #include "set.h"
 #include "signal-util.h"
 #include "socket-util.h"
@@ -92,6 +96,7 @@
 #include "umask-util.h"
 #include "unit-name.h"
 #include "user-util.h"
+#include "varlink-unit.h"
 #include "varlink.h"
 #include "virt.h"
 #include "watchdog.h"
@@ -112,7 +117,7 @@
 /* How many units and jobs to process of the bus queue before returning to the event loop. */
 #define MANAGER_BUS_MESSAGE_BUDGET 100U
 
-#define DEFAULT_TASKS_MAX ((CGroupTasksMax) { 15U, 100U }) /* 15% */
+#define DEFAULT_TASKS_MAX ((const CGroupTasksMax) { 15U, 100U }) /* 15% */
 
 static int manager_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t revents, void *userdata);
 static int manager_dispatch_signal_fd(sd_event_source *source, int fd, uint32_t revents, void *userdata);
@@ -136,7 +141,7 @@ static usec_t manager_watch_jobs_next_time(Manager *m) {
                 /* Let the user manager without a timeout show status quickly, so the system manager can make
                  * use of it, if it wants to. */
                 timeout = JOBS_IN_PROGRESS_WAIT_USEC * 2 / 3;
-        else if (show_status_on(m->show_status))
+        else if (manager_get_show_status_on(m))
                 /* When status is on, just use the usual timeout. */
                 timeout = JOBS_IN_PROGRESS_WAIT_USEC;
         else
@@ -525,8 +530,9 @@ static int manager_setup_signals(Manager *m) {
 
         assert_se(sigaction(SIGCHLD, &sa, NULL) == 0);
 
-        /* We make liberal use of realtime signals here. On Linux/glibc we have 30 of them, between
-         * SIGRTMIN+0 ... SIGRTMIN+30 (aka SIGRTMAX). */
+        /* We make liberal use of realtime signals here. On Linux we have 29 of them, between
+         * SIGRTMIN+0 ... SIGRTMIN+29. The glibc has one more (SIGRTMAX is SIGRTMIN+30),
+         * but musl does not (SIGRTMAX is SIGRTMIN+29). */
 
         assert_se(sigemptyset(&mask) == 0);
         sigset_add_many(&mask,
@@ -571,7 +577,7 @@ static int manager_setup_signals(Manager *m) {
                         SIGRTMIN+28, /* systemd: set log target to kmsg */
                         SIGRTMIN+29, /* systemd: set log target to syslog-or-kmsg (obsolete) */
 
-                        /* ... one free signal here SIGRTMIN+30 ... */
+                        /* ... one free signal here SIGRTMIN+30 (glibc only) ... */
                         -1);
         assert_se(sigprocmask(SIG_SETMASK, &mask, NULL) == 0);
 
@@ -614,14 +620,19 @@ static char** sanitize_environment(char **l) {
                         l,
                         "CACHE_DIRECTORY",
                         "CONFIGURATION_DIRECTORY",
+                        "CPU_PRESSURE_WATCH",
+                        "CPU_PRESSURE_WRITE",
                         "CREDENTIALS_DIRECTORY",
                         "EXIT_CODE",
                         "EXIT_STATUS",
+                        "IO_PRESSURE_WATCH",
+                        "IO_PRESSURE_WRITE",
                         "INVOCATION_ID",
                         "JOURNAL_STREAM",
                         "LISTEN_FDNAMES",
                         "LISTEN_FDS",
                         "LISTEN_PID",
+                        "LISTEN_PIDFDID",
                         "LOGS_DIRECTORY",
                         "LOG_NAMESPACE",
                         "MAINPID",
@@ -694,6 +705,7 @@ int manager_default_environment(Manager *m) {
                                     "XDG_SESSION_CLASS",
                                     "XDG_SESSION_TYPE",
                                     "XDG_SESSION_DESKTOP",
+                                    "XDG_SESSION_EXTRA_DEVICE_ACCESS",
                                     "XDG_SEAT",
                                     "XDG_VTNR");
         }
@@ -792,26 +804,38 @@ static int manager_setup_sigchld_event_source(Manager *m) {
         return 0;
 }
 
-int manager_setup_memory_pressure_event_source(Manager *m) {
+typedef int (*pressure_add_t)(sd_event *, sd_event_source **, sd_event_handler_t, void *);
+typedef int (*pressure_set_period_t)(sd_event_source *, usec_t, usec_t);
+
+static const struct {
+        pressure_add_t add;
+        pressure_set_period_t set_period;
+} pressure_dispatch_table[_PRESSURE_RESOURCE_MAX] = {
+        [PRESSURE_MEMORY] = { sd_event_add_memory_pressure, sd_event_source_set_memory_pressure_period },
+        [PRESSURE_CPU]    = { sd_event_add_cpu_pressure,    sd_event_source_set_cpu_pressure_period    },
+        [PRESSURE_IO]     = { sd_event_add_io_pressure,     sd_event_source_set_io_pressure_period     },
+};
+
+int manager_setup_pressure_event_source(Manager *m, PressureResource t) {
         int r;
 
         assert(m);
+        assert(t >= 0 && t < _PRESSURE_RESOURCE_MAX);
 
-        m->memory_pressure_event_source = sd_event_source_disable_unref(m->memory_pressure_event_source);
+        m->pressure_event_source[t] = sd_event_source_disable_unref(m->pressure_event_source[t]);
 
-        r = sd_event_add_memory_pressure(m->event, &m->memory_pressure_event_source, NULL, NULL);
+        r = pressure_dispatch_table[t].add(m->event, &m->pressure_event_source[t], NULL, NULL);
         if (r < 0)
                 log_full_errno(ERRNO_IS_NOT_SUPPORTED(r) || ERRNO_IS_PRIVILEGE(r) || (r == -EHOSTDOWN) ? LOG_DEBUG : LOG_NOTICE, r,
-                               "Failed to establish memory pressure event source, ignoring: %m");
-        else if (m->defaults.memory_pressure_threshold_usec != USEC_INFINITY) {
+                               "Failed to establish %s pressure event source, ignoring: %m", pressure_resource_to_string(t));
+        else if (m->defaults.pressure[t].threshold_usec != USEC_INFINITY) {
 
-                /* If there's a default memory pressure threshold set, also apply it to the service manager itself */
-                r = sd_event_source_set_memory_pressure_period(
-                                m->memory_pressure_event_source,
-                                m->defaults.memory_pressure_threshold_usec,
-                                MEMORY_PRESSURE_DEFAULT_WINDOW_USEC);
+                r = pressure_dispatch_table[t].set_period(
+                                m->pressure_event_source[t],
+                                m->defaults.pressure[t].threshold_usec,
+                                PRESSURE_DEFAULT_WINDOW_USEC);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to adjust memory pressure threshold, ignoring: %m");
+                        log_warning_errno(r, "Failed to adjust %s pressure threshold, ignoring: %m", pressure_resource_to_string(t));
         }
 
         return 0;
@@ -871,6 +895,30 @@ usec_t manager_default_timeout(RuntimeScope scope) {
         return scope == RUNTIME_SCOPE_SYSTEM ? DEFAULT_TIMEOUT_USEC : DEFAULT_USER_TIMEOUT_USEC;
 }
 
+static int pin_executor_binary(int *ret_fd) {
+        _cleanup_free_ char *path = NULL;
+
+        assert(ret_fd);
+
+#if SYSTEMD_MULTICALL_BINARY
+        int r;
+
+        r = open_and_check_executable("/proc/self/exe", /* root= */ NULL, &path, ret_fd);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to pin executor binary %s: %m", "/proc/self/exe");
+#else
+        int fd;
+
+        fd = pin_callout_binary(SYSTEMD_EXECUTOR_BINARY_PATH, &path);
+        if (fd < 0)
+                return log_debug_errno(fd, "Failed to pin executor binary %s: %m", SYSTEMD_EXECUTOR_BINARY_PATH);
+        *ret_fd = fd;
+#endif
+
+        log_debug("Using systemd-executor binary %s.", path);
+        return 0;
+}
+
 int manager_new(RuntimeScope runtime_scope, ManagerTestRunFlags test_run_flags, Manager **ret) {
         _cleanup_(manager_freep) Manager *m = NULL;
         int r;
@@ -920,7 +968,12 @@ int manager_new(RuntimeScope runtime_scope, ManagerTestRunFlags test_run_flags, 
                 .dump_ratelimit = (const RateLimit) { .interval = 10 * USEC_PER_MINUTE, .burst = 10 },
 
                 .executor_fd = -EBADF,
+
+                .restrict_fsaccess_bss_map_fd = -EBADF,
         };
+
+        FOREACH_ELEMENT(fd, m->restrict_fsaccess_link_fds)
+                *fd = -EBADF;
 
         unit_defaults_init(&m->defaults, runtime_scope);
 
@@ -997,17 +1050,13 @@ int manager_new(RuntimeScope runtime_scope, ManagerTestRunFlags test_run_flags, 
                 if (r < 0)
                         return r;
 
-                r = manager_setup_memory_pressure_event_source(m);
-                if (r < 0)
-                        return r;
-
-#if HAVE_LIBBPF
-                if (MANAGER_IS_SYSTEM(m) && bpf_restrict_fs_supported(/* initialize = */ true)) {
-                        r = bpf_restrict_fs_setup(m);
+                for (PressureResource t = 0; t < _PRESSURE_RESOURCE_MAX; t++) {
+                        r = manager_setup_pressure_event_source(m, t);
                         if (r < 0)
-                                log_warning_errno(r, "Failed to setup LSM BPF, ignoring: %m");
+                                return r;
                 }
-#endif
+
+                (void) bpf_restrict_fs_setup(m);
         }
 
         if (test_run_flags == 0) {
@@ -1026,11 +1075,9 @@ int manager_new(RuntimeScope runtime_scope, ManagerTestRunFlags test_run_flags, 
         }
 
         if (!FLAGS_SET(test_run_flags, MANAGER_TEST_DONT_OPEN_EXECUTOR)) {
-                m->executor_fd = pin_callout_binary(SYSTEMD_EXECUTOR_BINARY_PATH, &m->executor_path);
-                if (m->executor_fd < 0)
-                        return log_debug_errno(m->executor_fd, "Failed to pin executor binary: %m");
-
-                log_debug("Using systemd-executor binary from '%s'.", m->executor_path);
+                r = pin_executor_binary(&m->executor_fd);
+                if (r < 0)
+                        return r;
         }
 
         /* Note that we do not set up the notify fd here. We do that after deserialization,
@@ -1464,7 +1511,7 @@ static int manager_ratelimit_check_and_queue(Unit *u) {
         r = sd_event_add_time(
                         u->manager->event,
                         &u->auto_start_stop_event_source,
-                        CLOCK_MONOTONIC,
+                        CLOCK_BOOTTIME,
                         ratelimit_end(&u->auto_start_stop_ratelimit),
                         0,
                         manager_ratelimit_requeue,
@@ -1507,7 +1554,7 @@ static unsigned manager_dispatch_stop_when_unneeded_queue(Manager *m) {
                 }
 
                 /* Ok, nobody needs us anymore. Sniff. Then let's commit suicide */
-                r = manager_add_job(u->manager, JOB_STOP, u, JOB_FAIL, &error, /* ret = */ NULL);
+                r = manager_add_job(u->manager, JOB_STOP, u, JOB_FAIL, &error, /* ret= */ NULL);
                 if (r < 0)
                         log_unit_warning_errno(u, r, "Failed to enqueue stop job, ignoring: %s", bus_error_message(&error, r));
         }
@@ -1548,7 +1595,7 @@ static unsigned manager_dispatch_start_when_upheld_queue(Manager *m) {
                         continue;
                 }
 
-                r = manager_add_job(u->manager, JOB_START, u, JOB_FAIL, &error, /* ret = */ NULL);
+                r = manager_add_job(u->manager, JOB_START, u, JOB_FAIL, &error, /* ret= */ NULL);
                 if (r < 0)
                         log_unit_warning_errno(u, r, "Failed to enqueue start job, ignoring: %s", bus_error_message(&error, r));
         }
@@ -1589,7 +1636,7 @@ static unsigned manager_dispatch_stop_when_bound_queue(Manager *m) {
                         continue;
                 }
 
-                r = manager_add_job(u->manager, JOB_STOP, u, JOB_REPLACE, &error, /* ret = */ NULL);
+                r = manager_add_job(u->manager, JOB_STOP, u, JOB_REPLACE, &error, /* ret= */ NULL);
                 if (r < 0)
                         log_unit_warning_errno(u, r, "Failed to enqueue stop job, ignoring: %s", bus_error_message(&error, r));
         }
@@ -1623,10 +1670,35 @@ static unsigned manager_dispatch_stop_notify_queue(Manager *m) {
         return n;
 }
 
+static void manager_clear_unit_dependencies(Manager *m) {
+        Unit *u;
+        const char *name;
+
+        assert(m);
+
+        HASHMAP_FOREACH_KEY(u, name, m->units) {
+
+                /* ignore aliases */
+                if (u->id != name)
+                        continue;
+
+                for (Hashmap *dependencies; (dependencies = hashmap_steal_first(u->dependencies));)
+                        hashmap_free(dependencies);
+
+                u->dependencies = hashmap_free(u->dependencies);
+                u->dependency_generation++;
+        }
+}
+
 static void manager_clear_jobs_and_units(Manager *m) {
         Unit *u;
 
         assert(m);
+
+        /* All units are going away, hence discard the full dependency graph in one pass. Otherwise
+         * unit_free() removes every edge from both endpoints separately, which becomes very costly with
+         * large numbers of synthesized mount units. */
+        manager_clear_unit_dependencies(m);
 
         while ((u = hashmap_first(m->units)))
                 unit_free(u);
@@ -1648,6 +1720,7 @@ static void manager_clear_jobs_and_units(Manager *m) {
         assert(!m->start_when_upheld_queue);
         assert(!m->stop_when_bound_queue);
         assert(!m->release_resources_queue);
+        assert(!m->stop_notify_queue);
 
         assert(hashmap_isempty(m->jobs));
         assert(hashmap_isempty(m->units));
@@ -1657,6 +1730,8 @@ static void manager_clear_jobs_and_units(Manager *m) {
         m->n_running_jobs = 0;
         m->n_installed_jobs = 0;
         m->n_failed_jobs = 0;
+
+        m->transactions_with_cycle = set_free(m->transactions_with_cycle);
 }
 
 Manager* manager_free(Manager *m) {
@@ -1705,7 +1780,8 @@ Manager* manager_free(Manager *m) {
         sd_event_source_unref(m->user_lookup_event_source);
         sd_event_source_unref(m->handoff_timestamp_event_source);
         sd_event_source_unref(m->pidref_event_source);
-        sd_event_source_unref(m->memory_pressure_event_source);
+        FOREACH_ARRAY(pressure_event_source, m->pressure_event_source, _PRESSURE_RESOURCE_MAX)
+                sd_event_source_unref(*pressure_event_source);
 
         safe_close(m->signal_fd);
         safe_close(m->notify_fd);
@@ -1753,14 +1829,15 @@ Manager* manager_free(Manager *m) {
         free(m->watchdog_pretimeout_governor);
         free(m->watchdog_pretimeout_governor_overridden);
 
-        fw_ctx_free(m->fw_ctx);
+        sd_netlink_unref(m->nfnl);
 
 #if BPF_FRAMEWORK
         bpf_restrict_fs_destroy(m->restrict_fs);
 #endif
+        close_many(m->restrict_fsaccess_link_fds, ELEMENTSOF(m->restrict_fsaccess_link_fds));
+        safe_close(m->restrict_fsaccess_bss_map_fd);
 
         safe_close(m->executor_fd);
-        free(m->executor_path);
 
         return mfree(m);
 }
@@ -1844,6 +1921,93 @@ static void manager_catchup(Manager *m) {
         }
 }
 
+ListenFDsTag* listen_fds_tag_free(ListenFDsTag *t) {
+        if (!t)
+                return NULL;
+
+        free(t->unit_id);
+        free(t->fdname);
+        return mfree(t);
+}
+
+DEFINE_HASH_OPS_FULL(
+                fd_to_listen_fds_tag_hash_ops,
+                void, trivial_hash_func, trivial_compare_func, close_fd_ptr,
+                ListenFDsTag, listen_fds_tag_free);
+
+int manager_dispatch_external_fd_to_unit(
+                Manager *m,
+                const char *unit_id,
+                const char *fdname,
+                uint64_t index,
+                int fd_in,
+                const char *log_context) {
+
+        _cleanup_close_ int fd = ASSERT_FD(fd_in);
+        Unit *u = NULL;
+        int r;
+
+        assert(m);
+        assert(unit_id);
+        assert(fdname);
+        assert(log_context);
+
+        /* Load the unit eagerly: if the unit file exists this brings it into UNIT_LOADED, otherwise it
+         * lands in UNIT_NOT_FOUND. In both cases we want to attach the fd so it's preserved until the
+         * unit is fully stopped (or its file appears via daemon-reload). */
+        r = manager_load_unit(m, unit_id, /* path= */ NULL, /* e= */ NULL, &u);
+        if (r < 0)
+                return log_warning_errno(r, "%s: failed to load unit '%s', closing fd '%s': %m",
+                                         log_context, unit_id, fdname);
+
+        if (!UNIT_VTABLE(u)->attach_external_fd_to_fdstore)
+                return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
+                                         "%s: unit '%s' does not support fd restoration, closing fd '%s'.",
+                                         log_context, unit_id, fdname);
+
+        r = UNIT_VTABLE(u)->attach_external_fd_to_fdstore(u, TAKE_FD(fd), fdname, index);
+        if (r < 0)
+                return log_unit_warning_errno(u, r, "%s: failed to attach fd '%s' to fd store: %m",
+                                              log_context, fdname);
+
+        return 1; /* fd consumed */
+}
+
+static int manager_distribute_listen_fds_named(Manager *m, Hashmap *named_listen_fds) {
+        assert(m);
+
+        /* Route fds whose LISTEN_FDNAMES name was a numeric index into the matching unit's fd store.
+         * The hashmap is built and owned by main.c's collect_fds(), keyed by fd, with ListenFDsTag* values
+         * that already carry the parsed unit-id, original fdname and index (resolved against the
+         * upstream-pushed fdstore-mapping memfd). We steal entries here so any leftover (skipped) entries
+         * are still cleaned up by the hashmap's destructor on the caller side. */
+
+        if (MANAGER_IS_TEST_RUN(m))
+                return 0;
+
+        for (;;) {
+                _cleanup_(listen_fds_tag_freep) ListenFDsTag *t = NULL;
+                _cleanup_close_ int fd = -EBADF;
+                void *key;
+
+                t = hashmap_steal_first_key_and_value(named_listen_fds, &key);
+                if (!t)
+                        break;
+
+                fd = PTR_TO_FD(key);
+
+                if (!t->unit_id || !t->fdname)
+                        continue;
+
+                if (!unit_name_is_valid(t->unit_id, UNIT_NAME_ANY))
+                        continue;
+
+                (void) manager_dispatch_external_fd_to_unit(m, t->unit_id, t->fdname, t->index, TAKE_FD(fd), "LISTEN_FDS");
+        }
+
+        return 0;
+}
+
 static void manager_distribute_fds(Manager *m, FDSet *fds) {
         Unit *u;
 
@@ -1882,13 +2046,16 @@ static bool manager_dbus_is_running(Manager *m, bool deserialized) {
         u = manager_get_unit(m, SPECIAL_DBUS_SERVICE);
         if (!u)
                 return false;
-        if (!IN_SET((deserialized ? SERVICE(u)->deserialized_state : SERVICE(u)->state),
+        if (!IN_SET(deserialized ? SERVICE(u)->deserialized_state : SERVICE(u)->state,
                     SERVICE_RUNNING,
-                    SERVICE_MOUNTING,
-                    SERVICE_RELOAD,
-                    SERVICE_RELOAD_NOTIFY,
+                    SERVICE_RUNNING_REVALIDATING,
                     SERVICE_REFRESH_EXTENSIONS,
-                    SERVICE_RELOAD_SIGNAL))
+                    SERVICE_REFRESH_CREDENTIALS,
+                    SERVICE_RELOAD,
+                    SERVICE_RELOAD_SIGNAL,
+                    SERVICE_RELOAD_NOTIFY,
+                    SERVICE_RELOAD_POST,
+                    SERVICE_MOUNTING))
                 return false;
 
         return true;
@@ -1939,13 +2106,10 @@ static void manager_preset_all(Manager *m) {
         CLEANUP_ARRAY(changes, n_changes, install_changes_free);
 
         log_info("Applying preset policy.");
-        r = unit_file_preset_all(RUNTIME_SCOPE_SYSTEM, /* file_flags = */ 0,
-                                 /* root_dir = */ NULL, mode, &changes, &n_changes);
-        install_changes_dump(r, "preset", changes, n_changes, /* quiet = */ false);
-        if (r < 0)
-                log_full_errno(r == -EEXIST ? LOG_NOTICE : LOG_WARNING, r,
-                               "Failed to populate /etc with preset unit settings, ignoring: %m");
-        else
+        r = unit_file_preset_all(RUNTIME_SCOPE_SYSTEM, /* file_flags= */ 0,
+                                 /* root_dir= */ NULL, mode, &changes, &n_changes);
+        r = install_changes_dump(r, "preset all", changes, n_changes, /* quiet= */ false);
+        if (r >= 0)
                 log_info("Populated /etc with preset unit settings.");
 }
 
@@ -1977,6 +2141,8 @@ Manager* manager_reloading_start(Manager *m) {
 }
 
 void manager_reloading_stopp(Manager **m) {
+        assert(m);
+
         if (*m) {
                 assert((*m)->n_reloading > 0);
                 (*m)->n_reloading--;
@@ -1999,7 +2165,7 @@ static int manager_make_runtime_dir(Manager *m) {
         return 0;
 }
 
-int manager_startup(Manager *m, FILE *serialization, FDSet *fds, const char *root) {
+int manager_startup(Manager *m, FILE *serialization, FDSet *fds, Hashmap *named_listen_fds, const char *root) {
         int r;
 
         assert(m);
@@ -2068,6 +2234,17 @@ int manager_startup(Manager *m, FILE *serialization, FDSet *fds, const char *roo
                 if (m->previous_objective == MANAGER_SOFT_REBOOT)
                         m->soft_reboots_count++;
 
+                /* If a LUO (Live Update Orchestrator) session from a previous kexec is available, restore
+                 * preserved file descriptors into the appropriate service fd stores now, before coldplug.
+                 * Only do this when booting up (i.e., skip on reexec/soft reboot/etc.) */
+                if (m->previous_objective < 0)
+                        (void) manager_luo_restore_fd_stores(m);
+
+                /* Pick up fds passed via the LISTEN_FDS=/LISTEN_FDNAMES= protocol that are tagged with a
+                 * unit id ("unit-id|fdname"), and route them into the matching unit's fd store. Untagged
+                 * fds remain in 'fds' and are handed to socket units below as before. */
+                (void) manager_distribute_listen_fds_named(m, named_listen_fds);
+
                 /* Any fds left? Find some unit which wants them. This is useful to allow container managers to pass
                  * some file descriptors to us pre-initialized. This enables socket-based activation of entire
                  * containers. */
@@ -2107,16 +2284,149 @@ int manager_startup(Manager *m, FILE *serialization, FDSet *fds, const char *roo
                 /* Clean up runtime objects */
                 manager_vacuum(m);
 
+                /* After deserialization, refresh the upstream JSON mapping memfd so the supervisor's
+                 * view of our fd store stays consistent with the indices we just restored. */
+                (void) service_propagate_fd_store_mapping_upstream(m);
+
                 if (serialization)
                         /* Let's wait for the UnitNew/JobNew messages being sent, before we notify that the
                          * reload is finished */
                         m->send_reloading_done = true;
         }
 
+        /* Set up RestrictFileSystemAccess= BPF LSM after deserialization (so we can detect deserialized link FDs)
+         * and before clearing switching_root (so we can close the initramfs trust window). This must
+         * run after set_manager_settings() has set m->restrict_filesystem_access. */
+        r = bpf_restrict_fsaccess_setup(m);
+        if (r < 0)
+                return r;
+
         manager_ready(m);
 
         manager_set_switching_root(m, false);
 
+        return 0;
+}
+
+int manager_add_jobs(
+                Manager *m,
+                JobType type,
+                char * const *names,
+                bool reload_if_possible,
+                JobMode mode,
+                TransactionAddFlags extra_flags,
+                Set *affected_jobs,
+                sd_bus_error *reterr_error,
+                Set *ret_jobs) {
+
+        _cleanup_(transaction_abort_and_freep) Transaction *tr = NULL;
+        Job *j;
+        int r;
+
+        assert(m);
+        assert(type >= 0 && type < _JOB_TYPE_MAX);
+        assert(!strv_isempty(names));
+        assert(mode >= 0 && mode < _JOB_MODE_MAX);
+        assert((extra_flags & ~_TRANSACTION_FLAGS_MASK_PUBLIC) == 0);
+
+        if (mode == JOB_ISOLATE && type != JOB_START)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Isolate is only valid for start.");
+
+        if (mode == JOB_TRIGGERING && type != JOB_STOP)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                        "--job-mode=triggering is only valid for stop.");
+
+        if (mode == JOB_RESTART_DEPENDENCIES && type != JOB_START)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                        "--job-mode=restart-dependencies is only valid for start.");
+
+        if (mode == JOB_ISOLATE && strv_length(names) > 1)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED,
+                                        "Isolating more than one unit is not supported.");
+
+        tr = transaction_new(mode == JOB_REPLACE_IRREVERSIBLY, ++m->last_transaction_id);
+        if (!tr)
+                return -ENOMEM;
+
+        LOG_CONTEXT_PUSHF("TRANSACTION_ID=%" PRIu64, tr->id);
+
+        STRV_FOREACH(name, names) {
+                Unit *u;
+                JobType t = type;
+                JobType merged_type;
+
+                r = manager_load_unit(m, *name, NULL, reterr_error, &u);
+                if (r < 0)
+                        return r;
+
+                if (mode == JOB_ISOLATE && !u->allow_isolate)
+                        return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_ISOLATION,
+                                                 "Operation refused, unit %s may not be isolated.", u->id);
+
+                /* Per-unit validation and reload-if-possible mangling: units that can reload turn
+                 * JOB_RESTART into JOB_RELOAD_OR_START and JOB_TRY_RESTART into JOB_TRY_RELOAD; others
+                 * keep the original restart type. Also rejects manual start/stop on units that refuse
+                 * it, etc. */
+                r = unit_queue_job_check_and_mangle_type(u, &t, reload_if_possible, reterr_error);
+                if (r < 0)
+                        return r;
+
+                merged_type = job_type_collapse(t, u);
+
+                log_unit_debug(u, "Trying to enqueue job %s/%s/%s",
+                               u->id, job_type_to_string(merged_type), job_mode_to_string(mode));
+
+                r = transaction_add_job_and_dependencies(
+                                tr,
+                                merged_type,
+                                u,
+                                /* by= */ NULL,
+                                TRANSACTION_MATTERS |
+                                (IN_SET(mode, JOB_IGNORE_DEPENDENCIES, JOB_IGNORE_REQUIREMENTS) ? TRANSACTION_IGNORE_REQUIREMENTS : 0) |
+                                (mode == JOB_IGNORE_DEPENDENCIES ? TRANSACTION_IGNORE_ORDER : 0) |
+                                (mode == JOB_RESTART_DEPENDENCIES ? TRANSACTION_PROPAGATE_START_AS_RESTART : 0) |
+                                extra_flags,
+                                reterr_error);
+                if (r < 0)
+                        return r;
+
+                if (mode == JOB_TRIGGERING) {
+                        r = transaction_add_triggering_jobs(tr, u);
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        if (mode == JOB_ISOLATE) {
+                r = transaction_add_isolate_jobs(tr, m);
+                if (r < 0)
+                        return r;
+        }
+
+        r = transaction_activate(tr, m, mode, affected_jobs, reterr_error);
+        if (r < 0)
+                return r;
+
+        SET_FOREACH(j, tr->anchor_jobs)
+                log_unit_debug(j->unit,
+                               "Enqueued job %s/%s as %u",
+                               j->unit->id, job_type_to_string(j->type), (unsigned) j->id);
+
+        if (ret_jobs) {
+                /* The anchor_jobs set would be destroyed anyway, so steal the contents. */
+                r = set_move(ret_jobs, tr->anchor_jobs);
+                if (r < 0) {
+                        /* On failure, still clear anchor_jobs so the cleanup handler doesn't trip the
+                         * empty-set assertion in transaction_free(). */
+                        set_clear(tr->anchor_jobs);
+                        return r;
+                }
+        } else
+                /* tr->anchor_jobs tracks pointers to jobs that are now installed in the manager; clear
+                 * it so transaction_free() doesn't trip its empty-set assertion. */
+                set_clear(tr->anchor_jobs);
+
+        tr = transaction_free(tr);
         return 0;
 }
 
@@ -2127,7 +2437,7 @@ int manager_add_job_full(
                 JobMode mode,
                 TransactionAddFlags extra_flags,
                 Set *affected_jobs,
-                sd_bus_error *error,
+                sd_bus_error *reterr_error,
                 Job **ret) {
 
         _cleanup_(transaction_abort_and_freep) Transaction *tr = NULL;
@@ -2140,24 +2450,26 @@ int manager_add_job_full(
         assert((extra_flags & ~_TRANSACTION_FLAGS_MASK_PUBLIC) == 0);
 
         if (mode == JOB_ISOLATE && type != JOB_START)
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Isolate is only valid for start.");
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Isolate is only valid for start.");
 
         if (mode == JOB_ISOLATE && !unit->allow_isolate)
-                return sd_bus_error_set(error, BUS_ERROR_NO_ISOLATION, "Operation refused, unit may not be isolated.");
+                return sd_bus_error_set(reterr_error, BUS_ERROR_NO_ISOLATION, "Operation refused, unit may not be isolated.");
 
         if (mode == JOB_TRIGGERING && type != JOB_STOP)
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "--job-mode=triggering is only valid for stop.");
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "--job-mode=triggering is only valid for stop.");
 
         if (mode == JOB_RESTART_DEPENDENCIES && type != JOB_START)
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "--job-mode=restart-dependencies is only valid for start.");
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "--job-mode=restart-dependencies is only valid for start.");
+
+        tr = transaction_new(mode == JOB_REPLACE_IRREVERSIBLY, ++m->last_transaction_id);
+        if (!tr)
+                return -ENOMEM;
+
+        LOG_CONTEXT_PUSHF("TRANSACTION_ID=%" PRIu64, tr->id);
 
         log_unit_debug(unit, "Trying to enqueue job %s/%s/%s", unit->id, job_type_to_string(type), job_mode_to_string(mode));
 
         type = job_type_collapse(type, unit);
-
-        tr = transaction_new(mode == JOB_REPLACE_IRREVERSIBLY);
-        if (!tr)
-                return -ENOMEM;
 
         r = transaction_add_job_and_dependencies(
                         tr,
@@ -2169,7 +2481,7 @@ int manager_add_job_full(
                         (mode == JOB_IGNORE_DEPENDENCIES ? TRANSACTION_IGNORE_ORDER : 0) |
                         (mode == JOB_RESTART_DEPENDENCIES ? TRANSACTION_PROPAGATE_START_AS_RESTART : 0) |
                         extra_flags,
-                        error);
+                        reterr_error);
         if (r < 0)
                 return r;
 
@@ -2185,16 +2497,23 @@ int manager_add_job_full(
                         return r;
         }
 
-        r = transaction_activate(tr, m, mode, affected_jobs, error);
+        r = transaction_activate(tr, m, mode, affected_jobs, reterr_error);
         if (r < 0)
                 return r;
 
+        Job *anchor = ASSERT_PTR(set_first(tr->anchor_jobs));
+        assert(set_size(tr->anchor_jobs) == 1);
+
         log_unit_debug(unit,
                        "Enqueued job %s/%s as %u", unit->id,
-                       job_type_to_string(type), (unsigned) tr->anchor_job->id);
+                       job_type_to_string(type), (unsigned) anchor->id);
 
         if (ret)
-                *ret = tr->anchor_job;
+                *ret = anchor;
+
+        /* anchor_jobs tracks pointers to jobs that are now installed in the manager; clear it so
+         * transaction_free() doesn't trip its empty-set assertion. */
+        set_clear(tr->anchor_jobs);
 
         tr = transaction_free(tr);
         return 0;
@@ -2205,10 +2524,10 @@ int manager_add_job(
         JobType type,
         Unit *unit,
         JobMode mode,
-        sd_bus_error *error,
+        sd_bus_error *reterr_error,
         Job **ret) {
 
-        return manager_add_job_full(m, type, unit, mode, 0, NULL, error, ret);
+        return manager_add_job_full(m, type, unit, mode, 0, NULL, reterr_error, ret);
 }
 
 int manager_add_job_by_name(Manager *m, JobType type, const char *name, JobMode mode, Set *affected_jobs, sd_bus_error *e, Job **ret) {
@@ -2225,37 +2544,53 @@ int manager_add_job_by_name(Manager *m, JobType type, const char *name, JobMode 
                 return r;
         assert(unit);
 
-        return manager_add_job_full(m, type, unit, mode, /* extra_flags = */ 0, affected_jobs, e, ret);
+        return manager_add_job_full(m, type, unit, mode, /* extra_flags= */ 0, affected_jobs, e, ret);
 }
 
-int manager_add_job_by_name_and_warn(Manager *m, JobType type, const char *name, JobMode mode, Set *affected_jobs, Job **ret) {
+static int manager_add_job_by_name_or_warn_with_fallback(
+                Manager *m,
+                JobType type,
+                const char *name,
+                const char *fallback,
+                JobMode mode,
+                Set *affected_jobs,
+                Job **ret) {
+
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int r;
 
-        assert(m);
-        assert(type < _JOB_TYPE_MAX);
-        assert(name);
-        assert(mode < _JOB_MODE_MAX);
-
         r = manager_add_job_by_name(m, type, name, mode, affected_jobs, &error, ret);
+        if (r == -ENOENT && fallback) {
+                log_debug_errno(r, "Failed to enqueue job %s/%s, fallback to %s: %s",
+                                name, job_mode_to_string(mode), fallback, bus_error_message(&error, r));
+                sd_bus_error_free(&error);
+                name = fallback;
+                r = manager_add_job_by_name(m, type, name, mode, affected_jobs, &error, ret);
+        }
         if (r < 0)
-                return log_warning_errno(r, "Failed to enqueue %s job for %s: %s", job_mode_to_string(mode), name, bus_error_message(&error, r));
-
+                return log_warning_errno(r, "Failed to enqueue job %s/%s: %s",
+                                         name, job_mode_to_string(mode), bus_error_message(&error, r));
         return r;
 }
 
+int manager_add_job_by_name_or_warn(Manager *m, JobType type, const char *name, JobMode mode, Set *affected_jobs, Job **ret) {
+        return manager_add_job_by_name_or_warn_with_fallback(m, type, name, /* fallback= */ NULL, mode, affected_jobs, ret);
+}
+
 int manager_propagate_reload(Manager *m, Unit *unit, JobMode mode, sd_bus_error *e) {
-        int r;
         _cleanup_(transaction_abort_and_freep) Transaction *tr = NULL;
+        int r;
 
         assert(m);
         assert(unit);
         assert(mode < _JOB_MODE_MAX);
         assert(mode != JOB_ISOLATE); /* Isolate is only valid for start */
 
-        tr = transaction_new(mode == JOB_REPLACE_IRREVERSIBLY);
+        tr = transaction_new(mode == JOB_REPLACE_IRREVERSIBLY, ++m->last_transaction_id);
         if (!tr)
                 return -ENOMEM;
+
+        LOG_CONTEXT_PUSHF("TRANSACTION_ID=%" PRIu64, tr->id);
 
         /* We need an anchor job */
         r = transaction_add_job_and_dependencies(tr, JOB_NOP, unit, NULL, TRANSACTION_IGNORE_REQUIREMENTS|TRANSACTION_IGNORE_ORDER, e);
@@ -2266,12 +2601,20 @@ int manager_propagate_reload(Manager *m, Unit *unit, JobMode mode, sd_bus_error 
         transaction_add_propagate_reload_jobs(
                         tr,
                         unit,
-                        tr->anchor_job,
+                        set_first(tr->anchor_jobs),
                         mode == JOB_IGNORE_DEPENDENCIES ? TRANSACTION_IGNORE_ORDER : 0);
+
+        /* Only activate the transaction if it contains jobs other than NOP anchor.
+         * Short-circuiting here avoids unnecessary processing, such as emitting D-Bus signals. */
+        if (hashmap_size(tr->jobs) <= 1)
+                return 0;
 
         r = transaction_activate(tr, m, mode, NULL, e);
         if (r < 0)
                 return r;
+
+        /* tr->anchor_jobs tracks pointers to jobs that are now installed in the manager, clear it */
+        set_clear(tr->anchor_jobs);
 
         tr = transaction_free(tr);
         return 0;
@@ -2479,6 +2822,7 @@ int manager_load_startable_unit_or_warn(
                 Manager *m,
                 const char *name,
                 const char *path,
+                int log_level,
                 Unit **ret) {
 
         /* Load a unit, make sure it loaded fully and is not masked. */
@@ -2487,15 +2831,17 @@ int manager_load_startable_unit_or_warn(
         Unit *unit;
         int r;
 
+        assert(ret);
+
         r = manager_load_unit(m, name, path, &error, &unit);
         if (r < 0)
-                return log_error_errno(r, "Failed to load %s %s: %s",
-                                       name ? "unit" : "unit file", name ?: path,
-                                       bus_error_message(&error, r));
+                return log_full_errno(log_level, r, "Failed to load %s %s: %s",
+                                      name ? "unit" : "unit file", name ?: path,
+                                      bus_error_message(&error, r));
 
         r = bus_unit_validate_load_state(unit, &error);
         if (r < 0)
-                return log_error_errno(r, "%s", bus_error_message(&error, r));
+                return log_full_errno(log_level, r, "%s", bus_error_message(&error, r));
 
         *ret = unit;
         return 0;
@@ -2559,6 +2905,24 @@ void manager_trigger_run_queue(Manager *m) {
                 log_warning_errno(r, "Failed to enable job run queue event source, ignoring: %m");
 }
 
+static unsigned manager_send_pending_reload_replies(Manager *m) {
+        unsigned n = 0;
+
+        assert(m);
+
+        if (m->pending_reload_message_dbus) {
+                bus_send_pending_reload_message(m);
+                n++;
+        }
+
+        if (m->pending_reload_message_vl) {
+                manager_varlink_send_pending_reload_message(m);
+                n++;
+        }
+
+        return n;
+}
+
 static unsigned manager_dispatch_dbus_queue(Manager *m) {
         unsigned n = 0, budget;
         Unit *u;
@@ -2566,9 +2930,20 @@ static unsigned manager_dispatch_dbus_queue(Manager *m) {
 
         assert(m);
 
+        /* If the API bus is connected but not fully set up yet (see bus_init_api()), postpone
+         * dispatching the queue, otherwise subscribers restored from a previous reexec would miss
+         * messages. Reload replies are sent anyway: method_reload()/vl_method_reload_manager() rely on
+         * them being sent before the next request is dispatched, and holding them back until the bus
+         * is set up (which can take a long time while the bus daemon is still starting) lets a second
+         * Reload() arrive while the first reply is still pending. Hence in this window a reply goes
+         * out before the signals queued by its reload, also on private connections, which get those
+         * signals once the bus is set up. */
+        if (m->api_bus && !m->api_bus_ready)
+                return manager_send_pending_reload_replies(m);
+
         /* When we are reloading, let's not wait with generating signals, since we need to exit the manager as quickly
          * as we can. There's no point in throttling generation of signals in that case. */
-        if (MANAGER_IS_RELOADING(m) || m->send_reloading_done || m->pending_reload_message)
+        if (MANAGER_IS_RELOADING(m) || m->send_reloading_done || m->pending_reload_message_dbus || m->pending_reload_message_vl)
                 budget = UINT_MAX; /* infinite budget in this case */
         else {
                 /* Anything to do at all? */
@@ -2599,6 +2974,7 @@ static unsigned manager_dispatch_dbus_queue(Manager *m) {
                 assert(u->in_dbus_queue);
 
                 bus_unit_send_change_signal(u);
+                varlink_unit_send_change_signal(u);
                 n++;
 
                 if (budget != UINT_MAX)
@@ -2609,6 +2985,7 @@ static unsigned manager_dispatch_dbus_queue(Manager *m) {
                 assert(j->in_dbus_queue);
 
                 bus_job_send_change_signal(j);
+                varlink_job_send_change_signal(j);
                 n++;
 
                 if (budget != UINT_MAX)
@@ -2621,12 +2998,7 @@ static unsigned manager_dispatch_dbus_queue(Manager *m) {
                 n++;
         }
 
-        if (m->pending_reload_message) {
-                bus_send_pending_reload_message(m);
-                n++;
-        }
-
-        return n;
+        return n + manager_send_pending_reload_replies(m);
 }
 
 static bool manager_process_barrier_fd(char * const *tags, FDSet *fds) {
@@ -2887,10 +3259,10 @@ turn_off:
         return 0;
 }
 
-static void manager_start_special(Manager *m, const char *name, JobMode mode) {
+static void manager_start_special_with_fallback(Manager *m, const char *name, const char *fallback, JobMode mode) {
         Job *job;
 
-        if (manager_add_job_by_name_and_warn(m, JOB_START, name, mode, NULL, &job) < 0)
+        if (manager_add_job_by_name_or_warn_with_fallback(m, JOB_START, name, fallback, mode, /* affected_jobs= */ NULL, &job) < 0)
                 return;
 
         const char *s = unit_status_string(job->unit, NULL);
@@ -2902,6 +3274,10 @@ static void manager_start_special(Manager *m, const char *name, JobMode mode) {
         m->status_ready = false;
 }
 
+static void manager_start_special(Manager *m, const char *name, JobMode mode) {
+        manager_start_special_with_fallback(m, name, /* fallback= */ NULL, mode);
+}
+
 static void manager_handle_ctrl_alt_del(Manager *m) {
         assert(m);
 
@@ -2909,7 +3285,11 @@ static void manager_handle_ctrl_alt_del(Manager *m) {
          * unless it was disabled in system.conf. */
 
         if (ratelimit_below(&m->ctrl_alt_del_ratelimit) || m->cad_burst_action == EMERGENCY_ACTION_NONE)
-                manager_start_special(m, SPECIAL_CTRL_ALT_DEL_TARGET, JOB_REPLACE_IRREVERSIBLY);
+                manager_start_special_with_fallback(
+                                m,
+                                SPECIAL_CTRL_ALT_DEL_TARGET,
+                                FALLBACK_CTRL_ALT_DEL_TARGET,
+                                JOB_REPLACE_IRREVERSIBLY);
         else
                 emergency_action(
                                 m,
@@ -3206,7 +3586,7 @@ static int manager_dispatch_timezone_change(
         /* Read the new timezone */
         tzset();
 
-        log_debug("Timezone has been changed (now: %s).", tzname[daylight]);
+        log_debug("Timezone has been changed (now: %s).", get_tzname(daylight));
 
         HASHMAP_FOREACH(u, m->units)
                 if (UNIT_VTABLE(u)->timezone_change)
@@ -3250,7 +3630,6 @@ static int manager_dispatch_jobs_in_progress(sd_event_source *source, usec_t use
 }
 
 int manager_loop(Manager *m) {
-        RateLimit rl = { .interval = 1*USEC_PER_SEC, .burst = 50000 };
         int r;
 
         assert(m);
@@ -3265,7 +3644,7 @@ int manager_loop(Manager *m) {
 
         while (m->objective == MANAGER_OK) {
 
-                if (!ratelimit_below(&rl)) {
+                if (!ratelimit_below(&m->event_loop_ratelimit)) {
                         /* Yay, something is going seriously wrong, pause a little */
                         log_warning("Looping too fast. Throttling execution a little.");
                         sleep(1);
@@ -3416,7 +3795,7 @@ void manager_send_unit_audit(Manager *m, Unit *u, int type, bool success) {
         }
 
         msg = strjoina("unit=", p);
-        if (audit_log_user_comm_message(audit_fd, type, msg, "systemd", NULL, NULL, NULL, success) < 0) {
+        if (sym_audit_log_user_comm_message(audit_fd, type, msg, "systemd", NULL, NULL, NULL, success) < 0) {
                 if (ERRNO_IS_PRIVILEGE(errno)) {
                         /* We aren't allowed to send audit messages?  Then let's not retry again. */
                         log_debug_errno(errno, "Failed to send audit message, closing audit socket: %m");
@@ -3534,12 +3913,14 @@ int manager_set_watchdog_pretimeout_governor(Manager *m, const char *governor) {
         if (MANAGER_IS_USER(m))
                 return 0;
 
+        governor = empty_to_null(governor);
+
         if (streq_ptr(m->watchdog_pretimeout_governor, governor))
                 return 0;
 
-        p = strdup(governor);
-        if (!p)
-                return -ENOMEM;
+        r = strdup_to(&p, governor);
+        if (r < 0)
+                return r;
 
         r = watchdog_setup_pretimeout_governor(governor);
         if (r < 0)
@@ -3557,12 +3938,14 @@ int manager_override_watchdog_pretimeout_governor(Manager *m, const char *govern
         if (MANAGER_IS_USER(m))
                 return 0;
 
+        governor = empty_to_null(governor);
+
         if (streq_ptr(m->watchdog_pretimeout_governor_overridden, governor))
                 return 0;
 
-        p = strdup(governor);
-        if (!p)
-                return -ENOMEM;
+        r = strdup_to(&p, governor);
+        if (r < 0)
+                return r;
 
         r = watchdog_setup_pretimeout_governor(governor);
         if (r < 0)
@@ -3573,8 +3956,10 @@ int manager_override_watchdog_pretimeout_governor(Manager *m, const char *govern
 
 int manager_reload(Manager *m) {
         _unused_ _cleanup_(manager_reloading_stopp) Manager *reloading = NULL;
+        _cleanup_strv_free_ char **saved_subscribed_as_strv = NULL;
         _cleanup_fdset_free_ FDSet *fds = NULL;
         _cleanup_fclose_ FILE *f = NULL;
+        sd_id128_t saved_deserialized_bus_id;
         int r;
 
         assert(m);
@@ -3601,6 +3986,10 @@ int manager_reload(Manager *m) {
         /* 💀 This is the point of no return, from here on there is no way back. 💀 */
         reloading = NULL;
 
+        /* Bump before sending the Reloading signal, so any client that reads
+         * ReloadCount in response to that signal observes the new value. */
+        m->reload_count = saturate_add(m->reload_count, 1, UINT64_MAX);
+
         bus_manager_send_reloading(m, true);
 
         /* Start by flushing out all jobs and units, all generated units, all runtime environments, all dynamic users
@@ -3626,6 +4015,10 @@ int manager_reload(Manager *m) {
         manager_enumerate(m);
 
         /* Second, deserialize our stored data */
+        saved_subscribed_as_strv = TAKE_PTR(m->subscribed_as_strv);
+        saved_deserialized_bus_id = m->deserialized_bus_id;
+        m->deserialized_bus_id = SD_ID128_NULL;
+
         r = manager_deserialize(m, f, fds);
         if (r < 0)
                 log_warning_errno(r, "Deserialization failed, proceeding anyway: %m");
@@ -3639,10 +4032,12 @@ int manager_reload(Manager *m) {
         (void) manager_setup_handoff_timestamp_fd(m);
         (void) manager_setup_pidref_transport_fd(m);
 
-        /* Clean up deserialized bus track information. They're never consumed during reload (as opposed to
-         * reexec) since we do not disconnect from the bus. */
+        /* Discard the bus track information produced by this reload, since the bus stays connected. Preserve
+         * any validation state that was already pending before the reload, so its asynchronous GetId reply can
+         * still consume it when we return to the event loop. */
         m->subscribed_as_strv = strv_free(m->subscribed_as_strv);
-        m->deserialized_bus_id = SD_ID128_NULL;
+        m->subscribed_as_strv = TAKE_PTR(saved_subscribed_as_strv);
+        m->deserialized_bus_id = saved_deserialized_bus_id;
 
         /* Third, fire things up! */
         manager_coldplug(m);
@@ -3667,6 +4062,8 @@ void manager_reset_failed(Manager *m) {
 
         HASHMAP_FOREACH(u, m->units)
                 unit_reset_failed(u);
+
+        m->transactions_with_cycle = set_free(m->transactions_with_cycle);
 }
 
 bool manager_unit_inactive_or_pending(Manager *m, const char *name) {
@@ -3711,7 +4108,7 @@ static void manager_notify_finished(Manager *m) {
                 /* The soft-reboot case, where we only report data for the last reboot */
                 firmware_usec = loader_usec = initrd_usec = kernel_usec = 0;
                 total_usec = userspace_usec = usec_sub_unsigned(m->timestamps[MANAGER_TIMESTAMP_FINISH].monotonic,
-                                                                m->timestamps[MANAGER_TIMESTAMP_SHUTDOWN_START].monotonic);
+                                                                m->timestamps[MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_START].monotonic);
 
                 log_struct(LOG_INFO,
                            LOG_MESSAGE_ID(SD_MESSAGE_STARTUP_FINISHED_STR),
@@ -3908,7 +4305,7 @@ void manager_send_reloading(Manager *m) {
         assert(m);
 
         /* Let whoever invoked us know that we are now reloading */
-        (void) notify_reloading_full(/* status = */ NULL);
+        (void) notify_reloading_full(/* status= */ NULL);
 
         /* And ensure that we'll send READY=1 again as soon as we are ready again */
         m->ready_sent = false;
@@ -3937,9 +4334,9 @@ static int manager_run_environment_generators(Manager *m) {
         if (MANAGER_IS_TEST_RUN(m) && !(m->test_run_flags & MANAGER_TEST_RUN_ENV_GENERATORS))
                 return 0;
 
-        paths = env_generator_binary_paths(m->runtime_scope);
-        if (!paths)
-                return log_oom();
+        r = env_generator_binary_paths(m->runtime_scope, &paths);
+        if (r < 0)
+                return log_error_errno(r, "Failed to initialize environment generator search paths: %m");
 
         if (!generator_path_any(paths))
                 return 0;
@@ -3953,6 +4350,7 @@ static int manager_run_environment_generators(Manager *m) {
 
         WITH_UMASK(0022)
                 r = execute_directories(
+                                "environment-generators",
                                 (const char* const*) paths,
                                 DEFAULT_TIMEOUT_USEC,
                                 gather_environment,
@@ -4070,6 +4468,7 @@ static int manager_execute_generators(Manager *m, char * const *paths, bool remo
 
         BLOCK_WITH_UMASK(0022);
         return execute_directories(
+                        "generators",
                         (const char* const*) paths,
                         DEFAULT_TIMEOUT_USEC,
                         /* callbacks= */ NULL, /* callback_args= */ NULL,
@@ -4088,9 +4487,9 @@ static int manager_run_generators(Manager *m) {
         if (MANAGER_IS_TEST_RUN(m) && !(m->test_run_flags & MANAGER_TEST_RUN_GENERATORS))
                 return 0;
 
-        paths = generator_binary_paths(m->runtime_scope);
-        if (!paths)
-                return log_oom();
+        r = generator_binary_paths(m->runtime_scope, &paths);
+        if (r < 0)
+                return log_error_errno(r, "Failed to initialize generator search paths: %m");
 
         if (!generator_path_any(paths))
                 return 0;
@@ -4115,7 +4514,7 @@ static int manager_run_generators(Manager *m) {
         if (is_dir("/tmp", /* follow= */ false) > 0 && !MANAGER_IS_TEST_RUN(m))
                 flags |= FORK_PRIVATE_TMP;
 
-        r = safe_fork("(sd-gens)", flags, NULL);
+        r = pidref_safe_fork("(sd-gens)", flags, /* ret= */ NULL);
         if (r == 0) {
                 r = manager_execute_generators(m, paths, /* remount_ro= */ true);
                 _exit(r >= 0 ? EXIT_SUCCESS : EXIT_FAILURE);
@@ -4275,8 +4674,9 @@ int manager_set_unit_defaults(Manager *m, const UnitDefaults *defaults) {
         m->defaults.oom_score_adjust = defaults->oom_score_adjust;
         m->defaults.oom_score_adjust_set = defaults->oom_score_adjust_set;
 
-        m->defaults.memory_pressure_watch = defaults->memory_pressure_watch;
-        m->defaults.memory_pressure_threshold_usec = defaults->memory_pressure_threshold_usec;
+        memcpy(m->defaults.pressure, defaults->pressure, sizeof(m->defaults.pressure));
+
+        m->defaults.memory_zswap_writeback = defaults->memory_zswap_writeback;
 
         free_and_replace(m->defaults.smack_process_label, label);
         rlimit_free_all(m->defaults.rlimit);
@@ -4302,10 +4702,10 @@ void manager_recheck_dbus(Manager *m) {
                 if (MANAGER_IS_SYSTEM(m))
                         (void) bus_init_system(m);
         } else {
-                (void) bus_done_api(m);
+                bus_done_api(m);
 
                 if (MANAGER_IS_SYSTEM(m))
-                        (void) bus_done_system(m);
+                        bus_done_system(m);
         }
 }
 
@@ -4332,7 +4732,7 @@ static bool manager_journal_is_running(Manager *m) {
         u = manager_get_unit(m, SPECIAL_JOURNALD_SERVICE);
         if (!u)
                 return false;
-        if (!IN_SET(SERVICE(u)->state, SERVICE_RELOAD, SERVICE_RUNNING))
+        if (!UNIT_IS_ACTIVE_OR_RELOADING(unit_active_state(u)) || SERVICE(u)->state == SERVICE_EXITED)
                 return false;
 
         return true;
@@ -4474,10 +4874,9 @@ const char* manager_get_confirm_spawn(Manager *m) {
                 goto fail;
         }
 
-        if (!S_ISCHR(st.st_mode)) {
-                r = -ENOTTY;
+        r = stat_verify_char(&st);
+        if (r < 0)
                 goto fail;
-        }
 
         last_errno = 0;
         return m->confirm_spawn;
@@ -4490,19 +4889,30 @@ fail:
 }
 
 void manager_set_first_boot(Manager *m, bool b) {
+        int r;
+
         assert(m);
 
         if (!MANAGER_IS_SYSTEM(m))
                 return;
 
         if (m->first_boot != (int) b) {
-                if (b)
-                        (void) touch("/run/systemd/first-boot");
-                else
-                        (void) unlink("/run/systemd/first-boot");
+                r = update_first_boot_file(b);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to update the first-boot file, ignoring: %m");
         }
 
         m->first_boot = b;
+}
+
+int update_first_boot_file(bool b) {
+        if (b)
+                return touch("/run/systemd/first-boot");
+
+        if (unlink("/run/systemd/first-boot") < 0 && errno != ENOENT)
+                return -errno;
+
+        return 0;
 }
 
 void manager_disable_confirm_spawn(void) {
@@ -4522,10 +4932,10 @@ static bool manager_should_show_status(Manager *m, StatusType type) {
                 return false;
 
         /* If we cannot find out the status properly, just proceed. */
-        if (type != STATUS_TYPE_EMERGENCY && manager_check_ask_password(m) > 0)
+        if (type < STATUS_TYPE_EMERGENCY && manager_check_ask_password(m) > 0)
                 return false;
 
-        if (type == STATUS_TYPE_NOTICE && m->show_status != SHOW_STATUS_NO)
+        if (type >= STATUS_TYPE_NOTICE && manager_get_show_status(m) != SHOW_STATUS_NO)
                 return true;
 
         return manager_get_show_status_on(m);
@@ -4613,8 +5023,8 @@ ManagerState manager_state(Manager *m) {
                         return MANAGER_MAINTENANCE;
         }
 
-        /* Are there any failed units? If so, we are in degraded mode */
-        if (!set_isempty(m->failed_units))
+        /* Are there any failed units or ordering cycles? If so, we are in degraded mode */
+        if (!set_isempty(m->failed_units) || !set_isempty(m->transactions_with_cycle))
                 return MANAGER_DEGRADED;
 
         return MANAGER_RUNNING;
@@ -4946,6 +5356,7 @@ static int manager_dispatch_pidref_transport_fd(sd_event_source *source, int fd,
 
         if (n != sizeof(child_pid)) {
                 log_warning("Got pidref message of unexpected size %zi (expected %zu), ignoring.", n, sizeof(child_pid));
+                cmsg_close_all(&msghdr);
                 return 0;
         }
 
@@ -4964,6 +5375,8 @@ static int manager_dispatch_pidref_transport_fd(sd_event_source *source, int fd,
                         child_pidfd = *CMSG_TYPED_DATA(cmsg, int);
                 }
         }
+
+        /* From this point on, the fds are owned by our local variables. Call cmsg_close_all no more. */
 
         /* Verify and set parent pidref. */
         if (!ucred || !pid_is_valid(ucred->pid)) {
@@ -5168,11 +5581,16 @@ void unit_defaults_init(UnitDefaults *defaults, RuntimeScope scope) {
                 .tasks_max = DEFAULT_TASKS_MAX,
                 .timer_accuracy_usec = 1 * USEC_PER_MINUTE,
 
-                .memory_pressure_watch = CGROUP_PRESSURE_WATCH_AUTO,
-                .memory_pressure_threshold_usec = MEMORY_PRESSURE_DEFAULT_THRESHOLD_USEC,
+                .pressure = {
+                        [PRESSURE_MEMORY] = { .watch = CGROUP_PRESSURE_WATCH_AUTO, .threshold_usec = PRESSURE_DEFAULT_THRESHOLD_USEC },
+                        [PRESSURE_CPU]    = { .watch = CGROUP_PRESSURE_WATCH_AUTO, .threshold_usec = PRESSURE_DEFAULT_THRESHOLD_USEC },
+                        [PRESSURE_IO]     = { .watch = CGROUP_PRESSURE_WATCH_AUTO, .threshold_usec = PRESSURE_DEFAULT_THRESHOLD_USEC },
+                },
 
                 .oom_policy = OOM_STOP,
                 .oom_score_adjust_set = false,
+
+                .memory_zswap_writeback = true,
         };
 }
 
@@ -5191,6 +5609,26 @@ LogTarget manager_get_executor_log_target(Manager *m) {
                 return LOG_TARGET_KMSG;
 
         return log_get_target();
+}
+
+void manager_log_caller(Manager *manager, PidRef *caller, const char *method) {
+        _cleanup_free_ char *comm = NULL;
+
+        assert(manager);
+        assert(method);
+
+        if (!pidref_is_set(caller)) {
+                log_notice("%s requested from unknown client PID...", method);
+                return;
+        }
+
+        (void) pidref_get_comm(caller, &comm);
+        Unit *caller_unit = manager_get_unit_by_pidref(manager, caller);
+
+        log_notice("%s requested from client PID " PID_FMT "%s%s%s%s%s%s...",
+                   method, caller->pid,
+                   comm ? " ('" : "", strempty(comm), comm ? "')" : "",
+                   caller_unit ? " (unit " : "", caller_unit ? caller_unit->id : "", caller_unit ? ")" : "");
 }
 
 static const char* const manager_state_table[_MANAGER_STATE_MAX] = {
@@ -5220,26 +5658,31 @@ static const char* const manager_objective_table[_MANAGER_OBJECTIVE_MAX] = {
 DEFINE_STRING_TABLE_LOOKUP(manager_objective, ManagerObjective);
 
 static const char* const manager_timestamp_table[_MANAGER_TIMESTAMP_MAX] = {
-        [MANAGER_TIMESTAMP_FIRMWARE]                 = "firmware",
-        [MANAGER_TIMESTAMP_LOADER]                   = "loader",
-        [MANAGER_TIMESTAMP_KERNEL]                   = "kernel",
-        [MANAGER_TIMESTAMP_INITRD]                   = "initrd",
-        [MANAGER_TIMESTAMP_USERSPACE]                = "userspace",
-        [MANAGER_TIMESTAMP_FINISH]                   = "finish",
-        [MANAGER_TIMESTAMP_SECURITY_START]           = "security-start",
-        [MANAGER_TIMESTAMP_SECURITY_FINISH]          = "security-finish",
-        [MANAGER_TIMESTAMP_GENERATORS_START]         = "generators-start",
-        [MANAGER_TIMESTAMP_GENERATORS_FINISH]        = "generators-finish",
-        [MANAGER_TIMESTAMP_UNITS_LOAD_START]         = "units-load-start",
-        [MANAGER_TIMESTAMP_UNITS_LOAD_FINISH]        = "units-load-finish",
-        [MANAGER_TIMESTAMP_UNITS_LOAD]               = "units-load",
-        [MANAGER_TIMESTAMP_INITRD_SECURITY_START]    = "initrd-security-start",
-        [MANAGER_TIMESTAMP_INITRD_SECURITY_FINISH]   = "initrd-security-finish",
-        [MANAGER_TIMESTAMP_INITRD_GENERATORS_START]  = "initrd-generators-start",
-        [MANAGER_TIMESTAMP_INITRD_GENERATORS_FINISH] = "initrd-generators-finish",
-        [MANAGER_TIMESTAMP_INITRD_UNITS_LOAD_START]  = "initrd-units-load-start",
-        [MANAGER_TIMESTAMP_INITRD_UNITS_LOAD_FINISH] = "initrd-units-load-finish",
-        [MANAGER_TIMESTAMP_SHUTDOWN_START]           = "shutdown-start",
+        [MANAGER_TIMESTAMP_FIRMWARE]                      = "firmware",
+        [MANAGER_TIMESTAMP_LOADER]                        = "loader",
+        [MANAGER_TIMESTAMP_KERNEL]                        = "kernel",
+        [MANAGER_TIMESTAMP_INITRD]                        = "initrd",
+        [MANAGER_TIMESTAMP_USERSPACE]                     = "userspace",
+        [MANAGER_TIMESTAMP_FINISH]                        = "finish",
+        [MANAGER_TIMESTAMP_SECURITY_START]                = "security-start",
+        [MANAGER_TIMESTAMP_SECURITY_FINISH]               = "security-finish",
+        [MANAGER_TIMESTAMP_GENERATORS_START]              = "generators-start",
+        [MANAGER_TIMESTAMP_GENERATORS_FINISH]             = "generators-finish",
+        [MANAGER_TIMESTAMP_UNITS_LOAD_START]              = "units-load-start",
+        [MANAGER_TIMESTAMP_UNITS_LOAD_FINISH]             = "units-load-finish",
+        [MANAGER_TIMESTAMP_UNITS_LOAD]                    = "units-load",
+        [MANAGER_TIMESTAMP_INITRD_SECURITY_START]         = "initrd-security-start",
+        [MANAGER_TIMESTAMP_INITRD_SECURITY_FINISH]        = "initrd-security-finish",
+        [MANAGER_TIMESTAMP_INITRD_GENERATORS_START]       = "initrd-generators-start",
+        [MANAGER_TIMESTAMP_INITRD_GENERATORS_FINISH]      = "initrd-generators-finish",
+        [MANAGER_TIMESTAMP_INITRD_UNITS_LOAD_START]       = "initrd-units-load-start",
+        [MANAGER_TIMESTAMP_INITRD_UNITS_LOAD_FINISH]      = "initrd-units-load-finish",
+        [MANAGER_TIMESTAMP_SHUTDOWN_START]                = "shutdown-start",
+        [MANAGER_TIMESTAMP_SHUTDOWN_FINISH]               = "shutdown-finish",
+        [MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_START]       = "previous-shutdown-start",
+        [MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_FINISH]      = "previous-shutdown-finish",
+        [MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_LATE_START]  = "previous-shutdown-late-start",
+        [MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_LATE_FINISH] = "previous-shutdown-late-finish",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(manager_timestamp, ManagerTimestamp);

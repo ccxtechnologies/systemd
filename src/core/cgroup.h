@@ -6,6 +6,7 @@
 #include "cpu-set-util.h"
 #include "firewall-util.h"
 #include "list.h"
+#include "psi-util.h"
 
 typedef struct CGroupTasksMax {
         /* If scale == 0, just use value; otherwise, value / scale.
@@ -45,6 +46,14 @@ typedef enum FreezerAction {
         _FREEZER_ACTION_MAX,
         _FREEZER_ACTION_INVALID = -EINVAL,
 } FreezerAction;
+
+typedef enum CPUSetPartition {
+        CPUSET_PARTITION_MEMBER,
+        CPUSET_PARTITION_ROOT,
+        CPUSET_PARTITION_ISOLATED,
+        _CPUSET_PARTITION_MAX,
+        _CPUSET_PARTITION_INVALID = -EINVAL,
+} CPUSetPartition;
 
 typedef enum CGroupDevicePermissions {
         /* We reuse the same bit meanings the kernel's BPF_DEVCG_ACC_xyz definitions use */
@@ -95,13 +104,18 @@ typedef struct CGroupSocketBindItem {
 } CGroupSocketBindItem;
 
 typedef enum CGroupPressureWatch {
-        CGROUP_PRESSURE_WATCH_NO,       /* → tells the service payload explicitly not to watch for memory pressure */
+        CGROUP_PRESSURE_WATCH_NO,       /* → tells the service payload explicitly not to watch for pressure */
         CGROUP_PRESSURE_WATCH_YES,
-        CGROUP_PRESSURE_WATCH_AUTO,     /* → on if memory account is on anyway for the unit, otherwise off */
-        CGROUP_PRESSURE_WATCH_SKIP,     /* → doesn't set up memory pressure watch, but also doesn't explicitly tell payload to avoid it */
+        CGROUP_PRESSURE_WATCH_AUTO,     /* → on if relevant accounting is on anyway for the unit, otherwise off */
+        CGROUP_PRESSURE_WATCH_SKIP,     /* → doesn't set up pressure watch, but also doesn't explicitly tell payload to avoid it */
         _CGROUP_PRESSURE_WATCH_MAX,
         _CGROUP_PRESSURE_WATCH_INVALID = -EINVAL,
 } CGroupPressureWatch;
+
+typedef struct CGroupPressure {
+        CGroupPressureWatch watch;
+        usec_t threshold_usec;
+} CGroupPressure;
 
 /* The user-supplied cgroup-related configuration options. This remains mostly immutable while the service
  * manager is running (except for an occasional SetProperties() configuration change), outside of reload
@@ -130,6 +144,7 @@ typedef struct CGroupContext {
         CPUSet startup_cpuset_cpus;
         CPUSet cpuset_mems;
         CPUSet startup_cpuset_mems;
+        CPUSetPartition cpuset_partition;
 
         uint64_t io_weight;
         uint64_t startup_io_weight;
@@ -137,9 +152,6 @@ typedef struct CGroupContext {
         LIST_HEAD(CGroupIODeviceLimit, io_device_limits);
         LIST_HEAD(CGroupIODeviceLatency, io_device_latencies);
 
-        uint64_t default_memory_min;
-        uint64_t default_memory_low;
-        uint64_t default_startup_memory_low;
         uint64_t memory_min;
         uint64_t memory_low;
         uint64_t startup_memory_low;
@@ -152,11 +164,6 @@ typedef struct CGroupContext {
         uint64_t memory_zswap_max;
         uint64_t startup_memory_zswap_max;
 
-        bool default_memory_min_set:1;
-        bool default_memory_low_set:1;
-        bool default_startup_memory_low_set:1;
-        bool memory_min_set:1;
-        bool memory_low_set:1;
         bool startup_memory_low_set:1;
         bool startup_memory_high_set:1;
         bool startup_memory_max_set:1;
@@ -185,6 +192,8 @@ typedef struct CGroupContext {
         LIST_HEAD(CGroupSocketBindItem, socket_bind_allow);
         LIST_HEAD(CGroupSocketBindItem, socket_bind_deny);
 
+        char *bind_network_interface;
+
         /* Common */
         CGroupTasksMax tasks_max;
 
@@ -194,12 +203,10 @@ typedef struct CGroupContext {
         uint32_t moom_mem_pressure_limit; /* Normalized to 2^32-1 == 100% */
         usec_t moom_mem_pressure_duration_usec;
         ManagedOOMPreference moom_preference;
+        char **moom_rules;
 
-        /* Memory pressure logic */
-        CGroupPressureWatch memory_pressure_watch;
-        usec_t memory_pressure_threshold_usec;
-        /* NB: For now we don't make the period configurable, not the type, nor do we allow multiple
-         * triggers, nor triggers for non-memory pressure. We might add that later. */
+        /* Pressure logic */
+        CGroupPressure pressure[_PRESSURE_RESOURCE_MAX];
 
         NFTSetContext nft_set_context;
 
@@ -323,6 +330,13 @@ typedef struct CGroupRuntime {
         struct bpf_link *restrict_ifaces_egress_bpf_link;
 #endif
 
+#if BPF_FRAMEWORK
+        /* BPF link to BPF programs attached to cgroup/sock_create hooks and
+         * responsible for binding created sockets to a given VRF interface. */
+        struct bpf_link *bpf_bind_network_interface_link;
+#endif
+        int initial_bind_network_interface_link_fd;
+
         bool cgroup_members_mask_valid:1;
 
         /* Reset cgroup accounting next time we fork something off */
@@ -352,11 +366,37 @@ void cgroup_context_free_io_device_latency(CGroupContext *c, CGroupIODeviceLaten
 void cgroup_context_remove_bpf_foreign_program(CGroupContext *c, CGroupBPFForeignProgram *p);
 void cgroup_context_remove_socket_bind(CGroupSocketBindItem **head);
 
-static inline bool cgroup_context_want_memory_pressure(const CGroupContext *c) {
+static inline bool cgroup_context_want_pressure(const CGroupContext *c, PressureResource t) {
         assert(c);
+        assert(t >= 0 && t < _PRESSURE_RESOURCE_MAX);
 
-        return c->memory_pressure_watch == CGROUP_PRESSURE_WATCH_YES ||
-                (c->memory_pressure_watch == CGROUP_PRESSURE_WATCH_AUTO && c->memory_accounting);
+        if (c->pressure[t].watch == CGROUP_PRESSURE_WATCH_YES)
+                return true;
+
+        if (c->pressure[t].watch != CGROUP_PRESSURE_WATCH_AUTO)
+                return false;
+
+        switch (t) {
+
+        case PRESSURE_MEMORY:
+                return c->memory_accounting;
+
+        case PRESSURE_CPU:
+                return c->cpu_weight != CGROUP_WEIGHT_INVALID ||
+                        c->startup_cpu_weight != CGROUP_WEIGHT_INVALID ||
+                        c->cpu_quota_per_sec_usec != USEC_INFINITY;
+
+        case PRESSURE_IO:
+                return c->io_accounting ||
+                        c->io_weight != CGROUP_WEIGHT_INVALID ||
+                        c->startup_io_weight != CGROUP_WEIGHT_INVALID ||
+                        c->io_device_weights ||
+                        c->io_device_latencies ||
+                        c->io_device_limits;
+
+        default:
+                assert_not_reached();
+        }
 }
 
 static inline bool cgroup_context_has_device_policy(const CGroupContext *c) {
@@ -369,8 +409,6 @@ static inline bool cgroup_context_has_device_policy(const CGroupContext *c) {
 int cgroup_context_add_device_allow(CGroupContext *c, const char *dev, CGroupDevicePermissions p);
 int cgroup_context_add_or_update_device_allow(CGroupContext *c, const char *dev, CGroupDevicePermissions p);
 int cgroup_context_add_bpf_foreign_program(CGroupContext *c, uint32_t attach_type, const char *path);
-
-void unit_modify_nft_set(Unit *u, bool add);
 
 CGroupMask unit_get_own_mask(Unit *u);
 CGroupMask unit_get_delegate_mask(Unit *u);
@@ -409,10 +447,6 @@ Unit* manager_get_unit_by_pidref_cgroup(Manager *m, const PidRef *pid);
 Unit* manager_get_unit_by_pidref_watching(Manager *m, const PidRef *pid);
 Unit* manager_get_unit_by_pidref(Manager *m, PidRef *pid);
 
-uint64_t unit_get_ancestor_memory_min(Unit *u);
-uint64_t unit_get_ancestor_memory_low(Unit *u);
-uint64_t unit_get_ancestor_startup_memory_low(Unit *u);
-
 int unit_search_main_pid(Unit *u, PidRef *ret);
 
 int unit_get_memory_available(Unit *u, uint64_t *ret);
@@ -441,19 +475,20 @@ void unit_invalidate_cgroup_bpf_firewall(Unit *u);
 
 void manager_invalidate_startup_units(Manager *m);
 
-const char* cgroup_device_policy_to_string(CGroupDevicePolicy i) _const_;
-CGroupDevicePolicy cgroup_device_policy_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(cgroup_device_policy, CGroupDevicePolicy);
 
 void unit_cgroup_catchup(Unit *u);
 
 bool unit_cgroup_delegate(Unit *u);
 
+void unit_cgroup_disable_all_controllers(Unit *u);
+
 int unit_get_cpuset(Unit *u, CPUSet *cpus, const char *name);
 
 int unit_cgroup_freezer_action(Unit *u, FreezerAction action);
 
-const char* freezer_action_to_string(FreezerAction a) _const_;
-FreezerAction freezer_action_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(freezer_action, FreezerAction);
+DECLARE_STRING_TABLE_LOOKUP(cpuset_partition, CPUSetPartition);
 
 CGroupRuntime* cgroup_runtime_new(void);
 CGroupRuntime* cgroup_runtime_free(CGroupRuntime *crt);
@@ -462,20 +497,14 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(CGroupRuntime*, cgroup_runtime_free);
 int cgroup_runtime_serialize(Unit *u, FILE *f, FDSet *fds);
 int cgroup_runtime_deserialize_one(Unit *u, const char *key, const char *value, FDSet *fds);
 
-const char* cgroup_pressure_watch_to_string(CGroupPressureWatch a) _const_;
-CGroupPressureWatch cgroup_pressure_watch_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(cgroup_pressure_watch, CGroupPressureWatch);
 
-const char* cgroup_device_permissions_to_string(CGroupDevicePermissions p) _const_;
-CGroupDevicePermissions cgroup_device_permissions_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(cgroup_device_permissions, CGroupDevicePermissions);
 
-const char* cgroup_ip_accounting_metric_to_string(CGroupIPAccountingMetric m) _const_;
-CGroupIPAccountingMetric cgroup_ip_accounting_metric_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(cgroup_ip_accounting_metric, CGroupIPAccountingMetric);
 
-const char* cgroup_io_accounting_metric_to_string(CGroupIOAccountingMetric m) _const_;
-CGroupIOAccountingMetric cgroup_io_accounting_metric_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(cgroup_io_accounting_metric, CGroupIOAccountingMetric);
 
-const char* cgroup_effective_limit_type_to_string(CGroupLimitType m) _const_;
-CGroupLimitType cgroup_effective_limit_type_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(cgroup_effective_limit_type, CGroupLimitType);
 
-const char* cgroup_memory_accounting_metric_to_string(CGroupMemoryAccountingMetric m) _const_;
-CGroupMemoryAccountingMetric cgroup_memory_accounting_metric_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(cgroup_memory_accounting_metric, CGroupMemoryAccountingMetric);

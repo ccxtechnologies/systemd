@@ -1,4 +1,4 @@
----
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # syntax - https://github.com/redhat-plumbers-in-action/advanced-issue-labeler#policy
 
 policy:
@@ -53,7 +53,7 @@ policy:
             keys: ['systemd-hwdb', 'hardware database files']
 
           - name: import
-            keys: ['systemd-import']
+            keys: ['systemd-importd', 'importctl']
 
           - name: journal
             keys: ['systemd-journald', 'journalctl']
@@ -120,9 +120,6 @@ policy:
 
           - name: sysusers
             keys: ['systemd-sysusers']
-
-          - name: sysv
-            keys: ['systemd-sysv-generator']
 
           - name: tests
             keys: ['tests']

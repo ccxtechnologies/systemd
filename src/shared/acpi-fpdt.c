@@ -56,7 +56,7 @@ struct acpi_fpdt_boot {
         uint64_t startup_start;
         uint64_t exit_services_entry;
         uint64_t exit_services_exit;
-} _packed;
+} _packed_;
 
 /* /dev/mem is deprecated on many systems, try using /sys/firmware/acpi/fpdt parsing instead.
  * This code requires kernel version 5.12 on x86 based machines or 6.2 for arm64 */
@@ -127,7 +127,8 @@ int acpi_get_boot_usec(usec_t *ret_loader_start, usec_t *ret_loader_exit) {
                         break;
                 if (rec->type != ACPI_FPDT_TYPE_BOOT)
                         continue;
-                if (rec->length != sizeof(struct acpi_fpdt_header))
+                if (rec->length != sizeof(struct acpi_fpdt_header) ||
+                    (char *)rec + rec->length > buf + l)
                         continue;
 
                 ptr = rec->ptr;

@@ -9,11 +9,13 @@
 #include "chattr-util.h"
 #include "fd-util.h"
 #include "iovec-util.h"
+#include "journal-authenticate.h"
 #include "journal-file-util.h"
 #include "journal-verify.h"
 #include "log.h"
 #include "mmap-cache.h"
 #include "rm-rf.h"
+#include "stdio-util.h"
 #include "tests.h"
 #include "time-util.h"
 
@@ -22,19 +24,15 @@
 
 static void bit_toggle(const char *fn, uint64_t p) {
         uint8_t b;
-        ssize_t r;
         int fd;
 
-        fd = open(fn, O_RDWR|O_CLOEXEC);
-        assert_se(fd >= 0);
+        ASSERT_OK_ERRNO(fd = open(fn, O_RDWR|O_CLOEXEC));
 
-        r = pread(fd, &b, 1, p/8);
-        assert_se(r == 1);
+        ASSERT_EQ(pread(fd, &b, 1, p/8), 1);
 
         b ^= 1 << (p % 8);
 
-        r = pwrite(fd, &b, 1, p/8);
-        assert_se(r == 1);
+        ASSERT_EQ(pwrite(fd, &b, 1, p/8), 1);
 
         safe_close(fd);
 }
@@ -44,8 +42,7 @@ static int raw_verify(const char *fn, const char *verification_key) {
         JournalFile *f;
         int r;
 
-        m = mmap_cache_new();
-        assert_se(m != NULL);
+        ASSERT_NOT_NULL(m = mmap_cache_new());
 
         r = journal_file_open(
                         /* fd= */ -EBADF,
@@ -77,8 +74,7 @@ static int run_test(const char *verification_key, ssize_t max_iterations) {
         uint64_t start, end;
         int r;
 
-        m = mmap_cache_new();
-        assert_se(m != NULL);
+        ASSERT_NOT_NULL(m = mmap_cache_new());
 
         /* journal_file_open() requires a valid machine id */
         if (sd_id128_get_machine(NULL) < 0)
@@ -86,13 +82,13 @@ static int run_test(const char *verification_key, ssize_t max_iterations) {
 
         test_setup_logging(LOG_DEBUG);
 
-        assert_se(mkdtemp(t));
-        assert_se(chdir(t) >= 0);
+        ASSERT_NOT_NULL(mkdtemp(t));
+        ASSERT_OK_ERRNO(chdir(t));
         (void) chattr_path(t, FS_NOCOW_FL, FS_NOCOW_FL);
 
         log_info("Generating a test journal");
 
-        assert_se(journal_file_open(
+        ASSERT_OK_ZERO(journal_file_open(
                                 /* fd= */ -EBADF,
                                 "test.journal",
                                 O_RDWR|O_CREAT,
@@ -102,7 +98,7 @@ static int run_test(const char *verification_key, ssize_t max_iterations) {
                                 /* metrics= */ NULL,
                                 m,
                                 /* template= */ NULL,
-                                &df) == 0);
+                                &df));
 
         for (size_t n = 0; n < N_ENTRIES; n++) {
                 _cleanup_free_ char *test = NULL;
@@ -110,9 +106,9 @@ static int run_test(const char *verification_key, ssize_t max_iterations) {
                 struct dual_timestamp ts;
 
                 dual_timestamp_now(&ts);
-                assert_se(asprintf(&test, "RANDOM=%li", random() % RANDOM_RANGE));
+                ASSERT_OK_ERRNO(asprintf(&test, "RANDOM=%li", random() % RANDOM_RANGE));
                 iovec = IOVEC_MAKE_STRING(test);
-                assert_se(journal_file_append_entry(
+                ASSERT_OK_ZERO(journal_file_append_entry(
                                         df,
                                         &ts,
                                         /* boot_id= */ NULL,
@@ -121,14 +117,14 @@ static int run_test(const char *verification_key, ssize_t max_iterations) {
                                         /* seqnum= */ NULL,
                                         /* seqnum_id= */ NULL,
                                         /* ret_object= */ NULL,
-                                        /* ret_offset= */ NULL) == 0);
+                                        /* ret_offset= */ NULL));
         }
 
         (void) journal_file_offline_close(df);
 
         log_info("Verifying with key: %s", strna(verification_key));
 
-        assert_se(journal_file_open(
+        ASSERT_OK_ZERO(journal_file_open(
                                 /* fd= */ -EBADF,
                                 "test.journal",
                                 O_RDONLY,
@@ -138,11 +134,11 @@ static int run_test(const char *verification_key, ssize_t max_iterations) {
                                 /* metrics= */ NULL,
                                 m,
                                 /* template= */ NULL,
-                                &f) == 0);
+                                &f));
         journal_file_print_header(f);
         journal_file_dump(f);
 
-        assert_se(journal_file_verify(f, verification_key, &from, &to, &total, true) >= 0);
+        ASSERT_OK(journal_file_verify(f, verification_key, &from, &to, &total, true));
 
         if (verification_key && JOURNAL_HEADER_SEALED(f->header))
                 log_info("=> Validated from %s to %s, %s missing",
@@ -151,7 +147,7 @@ static int run_test(const char *verification_key, ssize_t max_iterations) {
                          FORMAT_TIMESPAN(total > to ? total - to : 0, 0));
 
         (void) journal_file_close(f);
-        assert_se(stat("test.journal", &st) >= 0);
+        ASSERT_OK_ERRNO(stat("test.journal", &st));
 
         start = 38448 * 8 + 0;
         end = max_iterations < 0 ? (uint64_t)st.st_size * 8 : start + max_iterations;
@@ -171,14 +167,100 @@ static int run_test(const char *verification_key, ssize_t max_iterations) {
                 bit_toggle("test.journal", p);
         }
 
-        assert_se(rm_rf(t, REMOVE_ROOT|REMOVE_PHYSICAL) >= 0);
+        ASSERT_OK(rm_rf(t, REMOVE_ROOT|REMOVE_PHYSICAL));
 
         return 0;
+}
+
+static void test_hash_chain_cycle(void) {
+        _cleanup_(mmap_cache_unrefp) MMapCache *m = NULL;
+        char t[] = "/var/tmp/journal-XXXXXX", second[64];
+        const char *first = "CYCLE=first";
+        uint64_t buckets, bucket, head, tail;
+        struct dual_timestamp ts;
+        JournalFile *f;
+        le64_t back;
+        int fd;
+
+        if (sd_id128_get_machine(NULL) < 0)
+                return (void) log_tests_skipped("No valid machine ID found");
+
+        test_setup_logging(LOG_DEBUG);
+
+        ASSERT_NOT_NULL(m = mmap_cache_new());
+
+        ASSERT_NOT_NULL(mkdtemp(t));
+        ASSERT_OK_ERRNO(chdir(t));
+
+        ASSERT_OK_ZERO(journal_file_open(
+                                /* fd= */ -EBADF,
+                                "test.journal",
+                                O_RDWR|O_CREAT,
+                                /* file_flags= */ 0,
+                                0666,
+                                /* compress_threshold_bytes= */ UINT64_MAX,
+                                /* metrics= */ NULL,
+                                m,
+                                /* template= */ NULL,
+                                &f));
+        dual_timestamp_now(&ts);
+
+        /* We need two data objects in the same hash chain. journal_file_hash_data() is keyed per-file, so
+         * compute the colliding value against the open file. */
+        buckets = le64toh(f->header->data_hash_table_size) / sizeof(HashItem);
+        bucket = journal_file_hash_data(f, first, strlen(first)) % buckets;
+        for (uint64_t i = 0;; i++) {
+                ASSERT_LT(i, UINT64_C(1000000));
+                xsprintf(second, "CYCLE=%" PRIu64, i);
+                if (journal_file_hash_data(f, second, strlen(second)) % buckets == bucket)
+                        break;
+        }
+
+        const char *v;
+        FOREACH_ARGUMENT(v, first, second) {
+                struct iovec iovec = IOVEC_MAKE_STRING(v);
+                ASSERT_OK_ZERO(journal_file_append_entry(
+                                        f,
+                                        &ts,
+                                        /* boot_id= */ NULL,
+                                        &iovec,
+                                        /* n_iovec= */ 1,
+                                        /* seqnum= */ NULL,
+                                        /* seqnum_id= */ NULL,
+                                        /* ret_object= */ NULL,
+                                        /* ret_offset= */ NULL));
+        }
+
+        ASSERT_EQ(journal_file_find_data_object(f, first, strlen(first), NULL, &head), 1);
+        ASSERT_EQ(journal_file_find_data_object(f, second, strlen(second), NULL, &tail), 1);
+        ASSERT_LT(head, tail);
+        (void) journal_file_offline_close(f);
+
+        /* The file has to be fine before we touch it, so that the failure below is really ours */
+        ASSERT_OK(raw_verify("test.journal", /* verification_key= */ NULL));
+
+        /* Point the second data object of the chain back at the head. Looking up the second data object,
+         * which verifying the entry that references it does, would then run into the cycle. */
+        back = htole64(head);
+        ASSERT_OK_ERRNO(fd = open("test.journal", O_RDWR|O_CLOEXEC));
+        ASSERT_EQ(pwrite(fd, &back, sizeof(back), tail + offsetof(Object, data.next_hash_offset)),
+                  (ssize_t) sizeof(back));
+        safe_close(fd);
+
+        /* If the cycle is not detected, verification never returns. Fail quickly and visibly then, instead
+         * of running into the timeout of the whole test. */
+        alarm(60);
+        ASSERT_ERROR(raw_verify("test.journal", /* verification_key= */ NULL), EBADMSG);
+        alarm(0);
+
+        ASSERT_OK(rm_rf(t, REMOVE_ROOT|REMOVE_PHYSICAL));
 }
 
 int main(int argc, char *argv[]) {
         const char *verification_key = NULL;
         int max_iterations = 512;
+
+        journal_auth_init();
 
         if (argc > 1) {
                 /* Don't limit the number of iterations when the verification key
@@ -187,25 +269,25 @@ int main(int argc, char *argv[]) {
                 max_iterations = -1;
         }
 
-        assert_se(setenv("SYSTEMD_JOURNAL_COMPACT", "0", 1) >= 0);
+        ASSERT_OK_ERRNO(setenv("SYSTEMD_JOURNAL_COMPACT", "0", 1));
         run_test(verification_key, max_iterations);
 
-        assert_se(setenv("SYSTEMD_JOURNAL_COMPACT", "1", 1) >= 0);
+        ASSERT_OK_ERRNO(setenv("SYSTEMD_JOURNAL_COMPACT", "1", 1));
         run_test(verification_key, max_iterations);
 
-#if HAVE_GCRYPT
-        /* If we're running without any arguments and we're compiled with gcrypt
+        /* If we're running without any arguments and journal sealing support is enabled,
          * check the journal verification stuff with a valid key as well */
-        if (argc <= 1) {
+        if (argc <= 1 && journal_auth_supported()) {
                 verification_key = "c262bd-85187f-0b1b04-877cc5/1c7af8-35a4e900";
 
-                assert_se(setenv("SYSTEMD_JOURNAL_COMPACT", "0", 1) >= 0);
+                ASSERT_OK_ERRNO(setenv("SYSTEMD_JOURNAL_COMPACT", "0", 1));
                 run_test(verification_key, max_iterations);
 
-                assert_se(setenv("SYSTEMD_JOURNAL_COMPACT", "1", 1) >= 0);
+                ASSERT_OK_ERRNO(setenv("SYSTEMD_JOURNAL_COMPACT", "1", 1));
                 run_test(verification_key, max_iterations);
         }
-#endif
+
+        test_hash_chain_cycle();
 
         return 0;
 }

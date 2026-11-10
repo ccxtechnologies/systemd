@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include <libintl.h>    /* IWYU pragma: export */
 #include <locale.h>     /* IWYU pragma: export */
 
 #include "forward.h"
@@ -27,7 +28,7 @@ typedef enum LocaleVariable {
         _VARIABLE_LC_INVALID = -EINVAL,
 } LocaleVariable;
 
-int get_locales(char ***l);
+int get_locales(char ***ret);
 bool locale_is_valid(const char *name);
 int locale_is_installed(const char *name);
 
@@ -36,8 +37,7 @@ int locale_is_installed(const char *name);
 
 bool is_locale_utf8(void);
 
-const char* locale_variable_to_string(LocaleVariable i) _const_;
-LocaleVariable locale_variable_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(locale_variable, LocaleVariable);
 
 static inline void freelocalep(locale_t *p) {
         if (*p == (locale_t) 0)

@@ -3,8 +3,8 @@
 
 #include "sd-bus.h" /* IWYU pragma: export */
 
-#include "log.h"
 #include "forward.h"
+#include "log.h"
 
 typedef enum BusTransport {
         BUS_TRANSPORT_LOCAL,
@@ -35,8 +35,8 @@ int bus_connect_user_systemd(sd_bus **ret);
 int bus_connect_capsule_systemd(const char *capsule, sd_bus **ret);
 int bus_connect_capsule_bus(const char *capsule, sd_bus **ret);
 
-int bus_connect_transport(BusTransport transport, const char *host, RuntimeScope runtime_scope, sd_bus **bus);
-int bus_connect_transport_systemd(BusTransport transport, const char *host, RuntimeScope runtime_scope, sd_bus **bus);
+int bus_connect_transport(BusTransport transport, const char *host, RuntimeScope runtime_scope, sd_bus **ret);
+int bus_connect_transport_systemd(BusTransport transport, const char *host, RuntimeScope runtime_scope, sd_bus **ret);
 
 int bus_log_address_error(int r, BusTransport transport);
 int bus_log_connect_full(int log_level, int r, BusTransport transport, RuntimeScope scope);
@@ -70,6 +70,4 @@ int bus_register_malloc_status(sd_bus *bus, const char *destination);
 int bus_creds_get_pidref(sd_bus_creds *c, PidRef *ret);
 int bus_query_sender_pidref(sd_bus_message *m, PidRef *ret);
 
-int bus_get_instance_id(sd_bus *bus, sd_id128_t *ret);
-
-const char* bus_transport_to_string(BusTransport transport) _const_;
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(bus_transport, BusTransport);

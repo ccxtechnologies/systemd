@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-if conf.get('HAVE_LIBCRYPTSETUP') != 1
+if conf.get('HAVE_LIBCRYPTSETUP') != 1 or conf.get('HAVE_LIBMOUNT') != 1
         subdir_done()
 endif
 
@@ -18,14 +18,20 @@ executables += [
                 'public' : true,
                 'sources' : systemd_cryptsetup_sources,
                 'dependencies' : [
-                        libcryptsetup,
-                        libopenssl,
+                        libcryptsetup_cflags,
+                        libfido2_cflags,
+                        libmount_cflags,
+                        libopenssl_cflags,
                         libp11kit_cflags,
+                        tpm2_cflags,
                 ],
         },
         generator_template + {
                 'name' : 'systemd-cryptsetup-generator',
                 'sources' : files('cryptsetup-generator.c'),
+                'dependencies' : [
+                        libcryptsetup_cflags,
+                ],
         },
 ]
 

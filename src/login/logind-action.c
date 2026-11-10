@@ -222,10 +222,6 @@ static int handle_action_execute(
         assert(m);
         assert(!IN_SET(handle, HANDLE_IGNORE, HANDLE_LOCK, HANDLE_SLEEP));
 
-        if (handle == HANDLE_KEXEC && access(KEXEC, X_OK) < 0)
-                return log_warning_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                         "Requested %s operation not supported, ignoring.", handle_action_to_string(handle));
-
         if (m->delayed_action)
                 return log_debug_errno(SYNTHETIC_ERRNO(EALREADY),
                                        "Action %s already in progress, ignoring requested %s operation.",
@@ -348,16 +344,16 @@ static int manager_handle_action_secure_attention_key(
 int manager_handle_action(
                 Manager *m,
                 InhibitWhat inhibit_key,
-                HandleAction handle,
+                HandleAction action,
                 bool ignore_inhibited,
                 bool is_edge,
                 const char *action_seat) {
 
         assert(m);
-        assert(handle_action_valid(handle));
+        assert(handle_action_valid(action));
 
         /* If the key handling is turned off, don't do anything */
-        if (handle == HANDLE_IGNORE) {
+        if (action == HANDLE_IGNORE) {
                 log_debug("Handling of %s (%s) is disabled, taking no action.",
                           inhibit_key == 0 ? "idle timeout" : inhibit_what_to_string(inhibit_key),
                           is_edge ? "edge" : "level");
@@ -377,14 +373,14 @@ int manager_handle_action(
         if (inhibit_key > 0) {
                 if (manager_is_inhibited(m, inhibit_key, NULL, MANAGER_IS_INHIBITED_IGNORE_INACTIVE, UID_INVALID, NULL)) {
                         log_debug("Refusing %s operation, %s is inhibited.",
-                                  handle_action_to_string(handle),
+                                  handle_action_to_string(action),
                                   inhibit_what_to_string(inhibit_key));
                         return 0;
                 }
         }
 
         /* Locking and greeter activation is handled differently from the rest. */
-        if (handle == HANDLE_LOCK) {
+        if (action == HANDLE_LOCK) {
                 if (!is_edge)
                         return 0;
 
@@ -393,13 +389,13 @@ int manager_handle_action(
                 return 1;
         }
 
-        if (handle == HANDLE_SECURE_ATTENTION_KEY)
+        if (action == HANDLE_SECURE_ATTENTION_KEY)
                 return manager_handle_action_secure_attention_key(m, is_edge, action_seat);
 
-        if (HANDLE_ACTION_IS_SLEEP(handle))
-                return handle_action_sleep_execute(m, handle, ignore_inhibited, is_edge);
+        if (HANDLE_ACTION_IS_SLEEP(action))
+                return handle_action_sleep_execute(m, action, ignore_inhibited, is_edge);
 
-        return handle_action_execute(m, handle, ignore_inhibited, is_edge);
+        return handle_action_execute(m, action, ignore_inhibited, is_edge);
 }
 
 static const char* const handle_action_verb_table[_HANDLE_ACTION_MAX] = {

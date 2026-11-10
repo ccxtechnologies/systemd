@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <stdlib.h>
 #include <sys/file.h>
 #include <unistd.h>
 
 #include "sd-event.h"
+#include "sd-json.h"
 #include "sd-netlink.h"
 
 #include "af-list.h"
@@ -18,6 +18,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
+#include "glyph-util.h"
 #include "hashmap.h"
 #include "id128-util.h"
 #include "local-addresses.h"
@@ -26,7 +27,6 @@
 #include "os-util.h"
 #include "path-util.h"
 #include "plymouth-util.h"
-#include "pretty-print.h"
 #include "random-util.h"
 #include "recurse-dir.h"
 #include "siphash24.h"
@@ -37,6 +37,7 @@
 #include "terminal-util.h"
 #include "time-util.h"
 #include "udev-util.h"
+#include "verbs.h"
 
 static char **arg_devices = NULL;
 static char *arg_nqn = NULL;
@@ -45,101 +46,74 @@ static int arg_all = 0;
 STATIC_DESTRUCTOR_REGISTER(arg_devices, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_nqn, freep);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-storagetm", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...] [DEVICE...]\n"
-               "\n%sExpose a block device or regular file as NVMe-TCP volume.%s\n\n"
-               "  -h --help            Show this help\n"
-               "     --version         Show package version\n"
-               "     --nqn=STRING      Select NQN (NVMe Qualified Name)\n"
-               "  -a --all             Expose all devices\n"
-               "     --list-devices    List candidate block devices to operate on\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               link);
-
-        return 0;
-}
+COMMAND(
+        "systemd-storagetm\0",
+        "Expose a block device or regular file as NVMe-TCP volume.",
+        .argspec =
+                "DEVICE…\0"
+                "--all\0"
+                "--list-devices\0",
+        .man_pages = "systemd-storagetm(8)\0",
+);
 
 static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_NQN = 0x100,
-                ARG_VERSION,
-                ARG_LIST_DEVICES,
-        };
-
-        static const struct option options[] = {
-                { "help",         no_argument,       NULL, 'h'              },
-                { "version",      no_argument,       NULL, ARG_VERSION      },
-                { "nqn",          required_argument, NULL, ARG_NQN          },
-                { "all",          no_argument,       NULL, 'a'              },
-                { "list-devices", no_argument,       NULL, ARG_LIST_DEVICES },
-                {}
-        };
-
-        int r, c;
-
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "ha", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_NQN:
-                        if (!filename_is_valid(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "NQN invalid: %s", optarg);
+                OPTION_LONG("nqn", "STRING",
+                            "Select NQN (NVMe Qualified Name)"):
+                        if (!filename_is_valid(opts.arg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "NQN invalid: %s", opts.arg);
 
-                        if (free_and_strdup(&arg_nqn, optarg) < 0)
+                        if (free_and_strdup(&arg_nqn, opts.arg) < 0)
                                 return log_oom();
 
                         break;
 
-                case 'a':
+                OPTION('a', "all", NULL, "Expose all devices"):
                         arg_all++;
                         break;
 
-                case ARG_LIST_DEVICES:
-                        r = blockdev_list(BLOCKDEV_LIST_SHOW_SYMLINKS|BLOCKDEV_LIST_IGNORE_ZRAM);
+                OPTION_LONG("list-devices", NULL,
+                            "List candidate block devices to operate on"):
+                        r = blockdev_list(BLOCKDEV_LIST_SHOW_SYMLINKS|BLOCKDEV_LIST_IGNORE_RAMDISK,
+                                          /* ret_devices= */ NULL, /* ret_n_devices= */ NULL);
                         if (r < 0)
                                 return r;
 
                         return 0;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
+        char **args = option_parser_get_args(&opts);
         if (arg_all > 0) {
-                if (argc > optind)
+                if (!strv_isempty(args))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Expects no further arguments if --all/-a is specified.");
         } else {
-                if (optind >= argc)
+                if (strv_isempty(args))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Expecting device name or --all/-a.");
 
-                for (int i = optind; i < argc; i++)
-                        if (!path_is_valid(argv[i]))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid path: %s", argv[i]);
+                STRV_FOREACH(a, args)
+                        if (!path_is_valid(*a))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid path: %s", *a);
 
-                arg_devices = strv_copy(argv + optind);
+                arg_devices = strv_copy(args);
+                if (!arg_devices)
+                        return log_oom();
         }
 
         if (!arg_nqn) {
@@ -271,6 +245,8 @@ static int nvme_subsystem_write_metadata(int subsystem_fd, sd_device *device) {
         }
         if (w) {
                 _cleanup_free_ char *truncated = strndup(w, 40); /* kernel refuses more than 40 chars (as per nvme spec) */
+                if (!truncated)
+                        return log_oom();
 
                 /* The default string stored in 'attr_model' is "Linux" btw. */
                 r = write_string_file_at(subsystem_fd, "attr_model", truncated, WRITE_STRING_FILE_DISABLE_BUFFER);
@@ -390,7 +366,7 @@ static int nvme_subsystem_add(const char *node, int consumed_fd, sd_device *devi
                 return log_oom();
 
         if (fd < 0) {
-                fd = RET_NERRNO(open(node, O_RDONLY|O_CLOEXEC|O_NONBLOCK));
+                fd = RET_NERRNO(open(node, O_RDWR|O_CLOEXEC|O_NONBLOCK));
                 if (fd < 0)
                         return log_error_errno(fd, "Failed to open '%s': %m", node);
         }
@@ -746,6 +722,8 @@ static int plymouth_notify_port(NvmePort *port, struct local_address *a) {
 }
 
 static int nvme_port_report(NvmePort *port, bool *plymouth_done) {
+        POINTER_MAY_BE_NULL(plymouth_done);
+
         if (!port)
                 return 0;
 
@@ -848,7 +826,7 @@ static void device_track_back(sd_device *d, sd_device **ret) {
         (void) sd_device_get_devname(d, &devname);
 
         _cleanup_(sd_device_unrefp) sd_device *d_originating = NULL;
-        r = block_device_get_originating(d, &d_originating);
+        r = block_device_get_originating(d, &d_originating, /* recursive= */ true);
         if (r < 0 && r != -ENOENT)
                 log_device_debug_errno(d, r, "Failed to get originating device for '%s', ignoring: %m", strna(devname));
 
@@ -923,7 +901,6 @@ static bool device_is_allowed(sd_device *d) {
 }
 
 static int device_added(Context *c, sd_device *device) {
-        _cleanup_close_ int fd = -EBADF;
         int r;
 
         assert(c);
@@ -936,7 +913,7 @@ static int device_added(Context *c, sd_device *device) {
 
         log_device_debug(device, "new block device '%s'", sysname);
 
-        if (STARTSWITH_SET(sysname, "loop", "zram")) /* Ignore some devices */
+        if (STARTSWITH_SET(sysname, "loop", "ram", "zram")) /* Ignore some devices */
                 return 0;
 
         const char *devname;
@@ -967,7 +944,7 @@ static int device_added(Context *c, sd_device *device) {
                 return 0;
         }
 
-        fd = sd_device_open(device, O_RDONLY|O_CLOEXEC|O_NONBLOCK);
+        int fd = sd_device_open(device, O_RDWR|O_CLOEXEC|O_NONBLOCK);
         if (fd < 0) {
                 log_device_warning_errno(device, fd, "Failed to open newly acquired device '%s', ignoring device: %m", devname);
                 return 0;

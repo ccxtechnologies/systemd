@@ -129,7 +129,7 @@ void sd_json_variant_sensitive(sd_json_variant *v);
 int sd_json_variant_is_sensitive(sd_json_variant *v);
 int sd_json_variant_is_sensitive_recursive(sd_json_variant *v);
 
-int sd_json_variant_get_source(sd_json_variant *v, const char **ret_source, unsigned *ret_line, unsigned *reterr_column);
+int sd_json_variant_get_source(sd_json_variant *v, const char **ret_source, unsigned *ret_line, unsigned *ret_column);
 
 __extension__ typedef enum _SD_ENUM_TYPE_S64(sd_json_format_flags_t) {
         SD_JSON_FORMAT_OFF              = 1 << 0,  /* disable json output, make json_variant_format() fail with -ENOEXEC */
@@ -144,6 +144,7 @@ __extension__ typedef enum _SD_ENUM_TYPE_S64(sd_json_format_flags_t) {
         SD_JSON_FORMAT_FLUSH            = 1 << 9,  /* call fflush() after dumping JSON */
         SD_JSON_FORMAT_EMPTY_ARRAY      = 1 << 10, /* output "[]" for empty input */
         SD_JSON_FORMAT_CENSOR_SENSITIVE = 1 << 11, /* replace all sensitive elements with the string "<sensitive data>" */
+        SD_JSON_FORMAT_EMPTY_OBJECT     = 1 << 12, /* output "{}" for empty input */
         _SD_ENUM_FORCE_S64(JSON_FORMAT_FLAGS)
 } sd_json_format_flags_t;
 
@@ -181,7 +182,12 @@ int sd_json_variant_sort(sd_json_variant **v);
 int sd_json_variant_normalize(sd_json_variant **v);
 
 __extension__ typedef enum _SD_ENUM_TYPE_S64(sd_json_parse_flags_t) {
-        SD_JSON_PARSE_SENSITIVE = 1 << 0, /* mark variant as "sensitive", i.e. something containing secret key material or such */
+        SD_JSON_PARSE_SENSITIVE      = 1 << 0, /* mark variant as "sensitive", i.e. something containing secret key material or such */
+        SD_JSON_PARSE_MUST_BE_OBJECT = 1 << 1, /* refuse parsing if top-level is not an object */
+        SD_JSON_PARSE_MUST_BE_ARRAY  = 1 << 2, /* refuse parsing if top-level is not an array */
+        SD_JSON_PARSE_SEEK0          = 1 << 3, /* seek to offset 0 before reading */
+        SD_JSON_PARSE_DONATE_FD      = 1 << 4, /* pass ownership of fd to call, incl. on failure */
+        SD_JSON_PARSE_REOPEN_FD      = 1 << 5, /* reopen the specified file descriptor */
         _SD_ENUM_FORCE_S64(JSON_PARSE_FLAGS)
 } sd_json_parse_flags_t;
 
@@ -191,6 +197,7 @@ int sd_json_parse(const char *string, sd_json_parse_flags_t flags, sd_json_varia
 int sd_json_parse_continue(const char **p, sd_json_parse_flags_t flags, sd_json_variant **ret, unsigned *reterr_line, unsigned *reterr_column);
 int sd_json_parse_file_at(FILE *f, int dir_fd, const char *path, sd_json_parse_flags_t flags, sd_json_variant **ret, unsigned *reterr_line, unsigned *reterr_column);
 int sd_json_parse_file(FILE *f, const char *path, sd_json_parse_flags_t flags, sd_json_variant **ret, unsigned *reterr_line, unsigned *reterr_column);
+int sd_json_parse_fd(const char *path, int fd, sd_json_parse_flags_t flags, sd_json_variant **ret, unsigned *reterr_line, unsigned *reterr_column);
 
 enum {
         /* Do not use these directly, use the SD_JSON_BUILD_*() macros below */
@@ -335,10 +342,10 @@ int sd_json_variant_strv(sd_json_variant *v, char ***ret);
 int sd_json_variant_unbase64(sd_json_variant *v, void **ret, size_t *ret_size);
 int sd_json_variant_unhex(sd_json_variant *v, void **ret, size_t *ret_size);
 
-const char* sd_json_variant_type_to_string(sd_json_variant_type_t t);
+const char* sd_json_variant_type_to_string(sd_json_variant_type_t i);
 sd_json_variant_type_t sd_json_variant_type_from_string(const char *s);
 
-_sd_const_ static __inline__ int sd_json_format_enabled(sd_json_format_flags_t flags) {
+static __inline__ int sd_json_format_enabled(sd_json_format_flags_t flags) {
         return !(flags & SD_JSON_FORMAT_OFF);
 }
 

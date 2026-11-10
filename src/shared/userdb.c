@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <fnmatch.h>
 #include <gshadow.h>
 #include <stdlib.h>
 
@@ -18,6 +19,7 @@
 #include "log.h"
 #include "parse-util.h"
 #include "set.h"
+#include "socket-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "uid-classification.h"
@@ -25,6 +27,7 @@
 #include "user-util.h"
 #include "userdb.h"
 #include "userdb-dropin.h"
+#include "xattr-util.h"
 
 DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(link_hash_ops, void, trivial_hash_func, trivial_compare_func, sd_varlink, sd_varlink_unref);
 
@@ -34,6 +37,14 @@ typedef enum LookupWhat {
         LOOKUP_MEMBERSHIP,
         _LOOKUP_WHAT_MAX,
 } LookupWhat;
+
+typedef struct SocketFilter {
+        /* Restricts the sockets to connect to */
+        uid_t uid;
+        gid_t gid;
+        const char *username;
+        const char *groupname;
+} SocketFilter;
 
 struct UserDBIterator {
         LookupWhat what;
@@ -192,6 +203,7 @@ static int userdb_maybe_restart_query(
         static const char *const fields[] = {
                 "fuzzyNames",
                 "dispositionMask",
+                "uuid",
                 "uidMin",
                 "uidMax",
                 "gidMin",
@@ -505,11 +517,138 @@ static int userdb_connect(
         return r;
 }
 
+static int socket_filter_id_test(
+                id_t id,
+                const char *xattr,
+                int dir_fd,
+                const char *fname,
+                const char *full_path /* for logging only */) {
+
+        int r;
+
+        assert(xattr);
+        assert(dir_fd >= 0);
+        assert(fname);
+        assert(full_path);
+
+        /* Generic implementation for both UIDs and GIDs */
+
+        if (!uid_is_valid(id))
+                return true;
+
+        /* Looks for an xattr of the specified name on the referenced socket entrypoint inode. Parses this
+         * as a pair of start UID/end UID. Matches the specified UID against it. If it matches yay. If it
+         * doesn't nay. If no UID is specified or no xattr set, also yay. */
+
+        _cleanup_free_ char *t = NULL;
+        r = getxattr_at_malloc(dir_fd, fname, xattr, AT_SYMLINK_FOLLOW, &t, /* ret_size= */ NULL);
+        if (r == -ENODATA)
+                return true; /* no such xattr? match! */
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r)) {
+                log_debug_errno(r, "Extended attributes on sockets not supported after all, ignoring: %m");
+                return true; /* if sockets don't support xattrs here, then this is a match */
+        }
+        if (r < 0)
+                return log_debug_errno(r, "Unexpected error while reading extended attribute '%s' of '%s', ignoring: %m", xattr, full_path);
+
+        _cleanup_strv_free_ char **l = strv_split(t, ",");
+        if (!l)
+                return log_oom_debug();
+
+        STRV_FOREACH(i, l) {
+                /* Single UID or UID range */
+                uid_t x, y;
+                r = parse_uid_range(*i, &x, &y);
+                if (r < 0)
+                        return log_debug_errno(r, "Malformed extended attribute '%s' on '%s', ignoring.", xattr, full_path);
+
+                if (id >= x && id <= y)
+                        return true;
+        }
+
+        return false;
+}
+
+static int socket_filter_name_test(
+                const char *name,
+                const char *xattr,
+                int dir_fd,
+                const char *fname,
+                const char *full_path /* for logging only */) {
+
+        int r;
+
+        assert(xattr);
+        assert(dir_fd >= 0);
+        assert(fname);
+        assert(full_path);
+
+        /* Looks for an xattr of the specified name on the referenced socket entrypoint inode. Parses this
+         * as a NUL terminated string list. Matches the specified name against it via fnmatch(). If it matches
+         * yay. If it doesn't nay. If no name is specified or no xattr set, also yay. */
+
+        if (!name)
+                return true;
+
+        _cleanup_strv_free_ char **l = NULL;
+        r = getxattr_at_strv(dir_fd, fname, xattr, AT_SYMLINK_FOLLOW, &l);
+        if (r == -ENODATA)
+                return true; /* no such xattr? match! */
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r)) {
+                log_debug_errno(r, "Extended attributes on sockets not supported after all, ignoring: %m");
+                return true; /* if sockets don't support xattrs here, then this is a match */
+        }
+        if (r < 0)
+                return log_debug_errno(r, "Unexpected error while reading extended attribute '%s' of '%s', ignoring: %m", xattr, full_path);
+
+        return strv_fnmatch_full(l, name, FNM_NOESCAPE, /* ret_matched_pos= */ NULL);
+}
+
+static int socket_filter_test(
+                const SocketFilter *sfilter,
+                int dir_fd,
+                const char *fname,
+                const char *full_path /* for logging only */) {
+
+        assert(dir_fd >= 0);
+        assert(fname);
+        assert(full_path);
+
+        /* Before we contact a Varlink service, let's see if there's any chance it might answer our questions
+         * at all. For such pre-filtering a userdb backend can install xattrs on their entrypoint inode to
+         * indicate that it's never going to answer outside of a certain UID/GID range or username/groupname
+         * pattern */
+
+        /* No filter means all sockets match */
+        if (!sfilter)
+                return 1;
+
+        /* No xattr support? then all sockets match. This check mostly exists to take benefit of the internal caching
+         * of the test. Either way we'll check below again. */
+        if (socket_xattr_supported() == 0)
+                return 1;
+
+        if (socket_filter_id_test(sfilter->uid, "user.userdb.uid", dir_fd, fname, full_path) == 0)
+                return 0;
+
+        if (socket_filter_id_test(sfilter->gid, "user.userdb.gid", dir_fd, fname, full_path) == 0)
+                return 0;
+
+        if (socket_filter_name_test(sfilter->username, "user.userdb.username", dir_fd, fname, full_path) == 0)
+                return 0;
+
+        if (socket_filter_name_test(sfilter->groupname, "user.userdb.groupname", dir_fd, fname, full_path) == 0)
+                return 0;
+
+        return 1;
+}
+
 static int userdb_start_query(
                 UserDBIterator *iterator,
                 const char *method, /* must be a static string, we are not going to copy this here! */
                 bool more,
                 sd_json_variant *query,
+                const SocketFilter *sfilter,
                 UserDBFlags flags) {
 
         _cleanup_strv_free_ char **except = NULL, **only = NULL;
@@ -600,6 +739,12 @@ static int userdb_start_query(
                 p = path_join("/run/systemd/userdb/", de->d_name);
                 if (!p)
                         return -ENOMEM;
+
+                r = socket_filter_test(sfilter, dirfd(d), de->d_name, p);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to filter sockets, ignoring: %m");
+                else if (r == 0)
+                        continue;
 
                 r = userdb_connect(iterator, p, method, more, query);
                 if (is_nss && r >= 0) /* Turn off fallback NSS + dropin if we found the NSS/dropin service
@@ -701,8 +846,8 @@ static int synthetic_root_user_build(UserRecord **ret) {
         return user_record_buildo(
                         ret,
                         SD_JSON_BUILD_PAIR("userName", JSON_BUILD_CONST_STRING("root")),
-                        SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(0)),
-                        SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(0)),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("uid", 0),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("gid", 0),
                         SD_JSON_BUILD_PAIR("homeDirectory", JSON_BUILD_CONST_STRING("/root")),
                         SD_JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("intrinsic")));
 }
@@ -711,10 +856,10 @@ static int synthetic_nobody_user_build(UserRecord **ret) {
         return user_record_buildo(
                         ret,
                         SD_JSON_BUILD_PAIR("userName", JSON_BUILD_CONST_STRING(NOBODY_USER_NAME)),
-                        SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(UID_NOBODY)),
-                        SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(GID_NOBODY)),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("uid", UID_NOBODY),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("gid", GID_NOBODY),
                         SD_JSON_BUILD_PAIR("shell", JSON_BUILD_CONST_STRING(NOLOGIN)),
-                        SD_JSON_BUILD_PAIR("locked", SD_JSON_BUILD_BOOLEAN(true)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("locked", true),
                         SD_JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("intrinsic")));
 }
 
@@ -736,12 +881,12 @@ static int synthetic_foreign_user_build(uid_t foreign_uid, UserRecord **ret) {
 
         return user_record_buildo(
                         ret,
-                        SD_JSON_BUILD_PAIR("userName", SD_JSON_BUILD_STRING(un)),
-                        SD_JSON_BUILD_PAIR("realName", SD_JSON_BUILD_STRING(rn)),
-                        SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(FOREIGN_UID_BASE + foreign_uid)),
-                        SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(FOREIGN_UID_BASE + foreign_uid)),
+                        SD_JSON_BUILD_PAIR_STRING("userName", un),
+                        SD_JSON_BUILD_PAIR_STRING("realName", rn),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("uid", FOREIGN_UID_BASE + foreign_uid),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("gid", FOREIGN_UID_BASE + foreign_uid),
                         SD_JSON_BUILD_PAIR("shell", JSON_BUILD_CONST_STRING(NOLOGIN)),
-                        SD_JSON_BUILD_PAIR("locked", SD_JSON_BUILD_BOOLEAN(true)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("locked", true),
                         SD_JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("foreign")));
 }
 
@@ -799,27 +944,29 @@ nomatch:
         return 0;
 }
 
-static int query_append_disposition_mask(sd_json_variant **query, uint64_t mask) {
+static int query_append_common(sd_json_variant **query, const UserDBMatch *match) {
         int r;
+        _cleanup_strv_free_ char **dispositions = NULL;
 
         assert(query);
 
-        if (FLAGS_SET(mask, USER_DISPOSITION_MASK_ALL))
-                return 0;
+        uint64_t mask = match->disposition_mask;
+        if (FLAGS_SET(mask, USER_DISPOSITION_MASK_ALL)) {
+                for (UserDisposition d = 0; d < _USER_DISPOSITION_MAX; d++) {
+                        if (!BIT_SET(mask, d))
+                                continue;
 
-        _cleanup_strv_free_ char **dispositions = NULL;
-        for (UserDisposition d = 0; d < _USER_DISPOSITION_MAX; d++) {
-                if (!BITS_SET(mask, d))
-                        continue;
-
-                r = strv_extend(&dispositions, user_disposition_to_string(d));
-                if (r < 0)
-                        return r;
+                        r = strv_extend(&dispositions, user_disposition_to_string(d));
+                        if (r < 0)
+                                return r;
+                }
         }
 
         return sd_json_variant_merge_objectbo(
                         query,
-                        SD_JSON_BUILD_PAIR_STRV("dispositionMask", dispositions));
+                        SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(match->fuzzy_names), "fuzzyNames", SD_JSON_BUILD_STRV(match->fuzzy_names)),
+                        SD_JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(match->uuid), "uuid", SD_JSON_BUILD_UUID(match->uuid)),
+                        SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(dispositions), "dispositionMask", SD_JSON_BUILD_STRV(dispositions)));
 }
 
 static int query_append_uid_match(sd_json_variant **query, const UserDBMatch *match) {
@@ -832,13 +979,12 @@ static int query_append_uid_match(sd_json_variant **query, const UserDBMatch *ma
 
         r = sd_json_variant_merge_objectbo(
                         query,
-                        SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(match->fuzzy_names), "fuzzyNames", SD_JSON_BUILD_STRV(match->fuzzy_names)),
                         SD_JSON_BUILD_PAIR_CONDITION(match->uid_min > 0, "uidMin", SD_JSON_BUILD_UNSIGNED(match->uid_min)),
                         SD_JSON_BUILD_PAIR_CONDITION(match->uid_max < UID_INVALID-1, "uidMax", SD_JSON_BUILD_UNSIGNED(match->uid_max)));
         if (r < 0)
                 return r;
 
-        return query_append_disposition_mask(query, match->disposition_mask);
+        return query_append_common(query, match);
 }
 
 static int userdb_by_name_fallbacks(
@@ -915,7 +1061,7 @@ int userdb_by_name(const char *name, const UserDBMatch *match, UserDBFlags flags
         if (!valid_user_group_name(name, VALID_USER_RELAX))
                 return -EINVAL;
 
-        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR("userName", SD_JSON_BUILD_STRING(name)));
+        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR_STRING("userName", name));
         if (r < 0)
                 return r;
 
@@ -927,11 +1073,23 @@ int userdb_by_name(const char *name, const UserDBMatch *match, UserDBFlags flags
         if (!iterator)
                 return -ENOMEM;
 
+        SocketFilter sfilter = {
+                .uid = UID_INVALID,
+                .gid = GID_INVALID,
+                .username = name,
+        };
+
         _cleanup_(user_record_unrefp) UserRecord *ur = NULL;
-        r = userdb_start_query(iterator, "io.systemd.UserDatabase.GetUserRecord", /* more= */ false, query, flags);
+        r = userdb_start_query(
+                        iterator,
+                        "io.systemd.UserDatabase.GetUserRecord",
+                        /* more= */ false,
+                        query,
+                        &sfilter,
+                        flags);
         if (r >= 0) {
                 r = userdb_process(iterator, &ur, /* ret_group_record= */ NULL, /* ret_user_name= */ NULL, /* ret_group_name= */ NULL);
-                if (r == -ENOEXEC) /* found a user matching UID or name, but not filter. In this case the
+                if (r == -ENOEXEC) /* Found a user matching UID or name, but not filter. In this case the
                                     * fallback paths below are pointless */
                         return r;
         }
@@ -1005,7 +1163,7 @@ int userdb_by_uid(uid_t uid, const UserDBMatch *match, UserDBFlags flags, UserRe
         if (!uid_is_valid(uid))
                 return -EINVAL;
 
-        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(uid)));
+        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR_UNSIGNED("uid", uid));
         if (r < 0)
                 return r;
 
@@ -1017,8 +1175,19 @@ int userdb_by_uid(uid_t uid, const UserDBMatch *match, UserDBFlags flags, UserRe
         if (!iterator)
                 return -ENOMEM;
 
+        SocketFilter sfilter = {
+                .uid = uid,
+                .gid = GID_INVALID,
+        };
+
         _cleanup_(user_record_unrefp) UserRecord *ur = NULL;
-        r = userdb_start_query(iterator, "io.systemd.UserDatabase.GetUserRecord", /* more= */ false, query, flags);
+        r = userdb_start_query(
+                        iterator,
+                        "io.systemd.UserDatabase.GetUserRecord",
+                        /* more= */ false,
+                        query,
+                        &sfilter,
+                        flags);
         if (r >= 0) {
                 r = userdb_process(iterator, &ur, /* ret_group_record= */ NULL, /* ret_user_name= */ NULL, /* ret_group_name= */ NULL);
                 if (r == -ENOEXEC)
@@ -1054,7 +1223,13 @@ int userdb_all(const UserDBMatch *match, UserDBFlags flags, UserDBIterator **ret
         if (!iterator)
                 return -ENOMEM;
 
-        qr = userdb_start_query(iterator, "io.systemd.UserDatabase.GetUserRecord", /* more= */ true, query, flags);
+        qr = userdb_start_query(
+                        iterator,
+                        "io.systemd.UserDatabase.GetUserRecord",
+                        /* more= */ true,
+                        query,
+                        /* sfilter= */ NULL,
+                        flags);
 
         if (!FLAGS_SET(flags, USERDB_EXCLUDE_NSS) && (qr < 0 || !iterator->nss_covered)) {
                 r = userdb_iterator_block_nss_systemd(iterator);
@@ -1123,7 +1298,7 @@ static int userdb_iterator_get_one(UserDBIterator *iterator, UserRecord **ret) {
                                 incomplete = true;
                         }
 
-                        r = nss_passwd_to_user_record(pw, r >= 0 ? &spwd : NULL, ret);
+                        r = nss_passwd_to_user_record(pw, r >= 0 ? &spwd : NULL, /* alias_name= */ NULL, ret);
                         if (r < 0)
                                 return r;
 
@@ -1227,7 +1402,7 @@ static int synthetic_root_group_build(GroupRecord **ret) {
         return group_record_buildo(
                         ret,
                         SD_JSON_BUILD_PAIR("groupName", JSON_BUILD_CONST_STRING("root")),
-                        SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(0)),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("gid", 0),
                         SD_JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("intrinsic")));
 }
 
@@ -1235,7 +1410,7 @@ static int synthetic_nobody_group_build(GroupRecord **ret) {
         return group_record_buildo(
                         ret,
                         SD_JSON_BUILD_PAIR("groupName", JSON_BUILD_CONST_STRING(NOBODY_GROUP_NAME)),
-                        SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(GID_NOBODY)),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("gid", GID_NOBODY),
                         SD_JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("intrinsic")));
 }
 
@@ -1257,9 +1432,9 @@ static int synthetic_foreign_group_build(gid_t foreign_gid, GroupRecord **ret) {
 
         return group_record_buildo(
                         ret,
-                        SD_JSON_BUILD_PAIR("groupName", SD_JSON_BUILD_STRING(gn)),
-                        SD_JSON_BUILD_PAIR("description", SD_JSON_BUILD_STRING(d)),
-                        SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(FOREIGN_UID_BASE + foreign_gid)),
+                        SD_JSON_BUILD_PAIR_STRING("groupName", gn),
+                        SD_JSON_BUILD_PAIR_STRING("description", d),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("gid", FOREIGN_UID_BASE + foreign_gid),
                         SD_JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("foreign")));
 }
 
@@ -1298,13 +1473,13 @@ static int query_append_gid_match(sd_json_variant **query, const UserDBMatch *ma
 
         r = sd_json_variant_merge_objectbo(
                         query,
-                        SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(match->fuzzy_names), "fuzzyNames", SD_JSON_BUILD_STRV(match->fuzzy_names)),
                         SD_JSON_BUILD_PAIR_CONDITION(match->gid_min > 0, "gidMin", SD_JSON_BUILD_UNSIGNED(match->gid_min)),
                         SD_JSON_BUILD_PAIR_CONDITION(match->gid_max < GID_INVALID-1, "gidMax", SD_JSON_BUILD_UNSIGNED(match->gid_max)));
+
         if (r < 0)
                 return r;
 
-        return query_append_disposition_mask(query, match->disposition_mask);
+        return query_append_common(query, match);
 }
 
 static int groupdb_by_name_fallbacks(
@@ -1371,7 +1546,7 @@ int groupdb_by_name(const char *name, const UserDBMatch *match, UserDBFlags flag
         if (!valid_user_group_name(name, VALID_USER_RELAX))
                 return -EINVAL;
 
-        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR("groupName", SD_JSON_BUILD_STRING(name)));
+        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR_STRING("groupName", name));
         if (r < 0)
                 return r;
 
@@ -1383,8 +1558,20 @@ int groupdb_by_name(const char *name, const UserDBMatch *match, UserDBFlags flag
         if (!iterator)
                 return -ENOMEM;
 
+        SocketFilter sfilter = {
+                .uid = UID_INVALID,
+                .gid = GID_INVALID,
+                .groupname = name,
+        };
+
         _cleanup_(group_record_unrefp) GroupRecord *gr = NULL;
-        r = userdb_start_query(iterator, "io.systemd.UserDatabase.GetGroupRecord", /* more= */ false, query, flags);
+        r = userdb_start_query(
+                        iterator,
+                        "io.systemd.UserDatabase.GetGroupRecord",
+                        /* more= */ false,
+                        query,
+                        &sfilter,
+                        flags);
         if (r >= 0) {
                 r = userdb_process(iterator, /* ret_user_record= */ NULL, &gr, /* ret_user_name= */ NULL, /* ret_group_name= */ NULL);
                 if (r == -ENOEXEC)
@@ -1417,13 +1604,13 @@ static int groupdb_by_gid_fallbacks(
         assert(iterator);
         assert(ret);
 
-        if (!FLAGS_SET(flags, USERDB_EXCLUDE_DROPIN) && !(iterator && iterator->dropin_covered)) {
+        if (!FLAGS_SET(flags, USERDB_EXCLUDE_DROPIN) && !iterator->dropin_covered) {
                 r = dropin_group_record_by_gid(gid, NULL, flags, ret);
                 if (r >= 0)
                         return r;
         }
 
-        if (!FLAGS_SET(flags, USERDB_EXCLUDE_NSS) && !(iterator && iterator->nss_covered)) {
+        if (!FLAGS_SET(flags, USERDB_EXCLUDE_NSS) && !iterator->nss_covered) {
                 r = userdb_iterator_block_nss_systemd(iterator);
                 if (r >= 0) {
                         r = nss_group_record_by_gid(gid, !FLAGS_SET(flags, USERDB_SUPPRESS_SHADOW), ret);
@@ -1457,7 +1644,7 @@ int groupdb_by_gid(gid_t gid, const UserDBMatch *match, UserDBFlags flags, Group
         if (!gid_is_valid(gid))
                 return -EINVAL;
 
-        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(gid)));
+        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR_UNSIGNED("gid", gid));
         if (r < 0)
                 return r;
 
@@ -1469,8 +1656,19 @@ int groupdb_by_gid(gid_t gid, const UserDBMatch *match, UserDBFlags flags, Group
         if (!iterator)
                 return -ENOMEM;
 
+        SocketFilter sfilter = {
+                .uid = UID_INVALID,
+                .gid = gid,
+        };
+
         _cleanup_(group_record_unrefp) GroupRecord *gr = NULL;
-        r = userdb_start_query(iterator, "io.systemd.UserDatabase.GetGroupRecord", /* more= */ false, query, flags);
+        r = userdb_start_query(
+                        iterator,
+                        "io.systemd.UserDatabase.GetGroupRecord",
+                        /* more= */ false,
+                        query,
+                        &sfilter,
+                        flags);
         if (r >= 0) {
                 r = userdb_process(iterator, /* ret_user_record= */ NULL, &gr, /* ret_user_name= */ NULL, /* ret_group_name= */ NULL);
                 if (r == -ENOEXEC)
@@ -1506,7 +1704,13 @@ int groupdb_all(const UserDBMatch *match, UserDBFlags flags, UserDBIterator **re
         if (!iterator)
                 return -ENOMEM;
 
-        qr = userdb_start_query(iterator, "io.systemd.UserDatabase.GetGroupRecord", /* more= */ true, query, flags);
+        qr = userdb_start_query(
+                        iterator,
+                        "io.systemd.UserDatabase.GetGroupRecord",
+                        /* more= */ true,
+                        query,
+                        /* sfilter= */ NULL,
+                        flags);
 
         if (!FLAGS_SET(flags, USERDB_EXCLUDE_NSS) && (qr < 0 || !iterator->nss_covered)) {
                 r = userdb_iterator_block_nss_systemd(iterator);
@@ -1569,7 +1773,7 @@ static int groupdb_iterator_get_one(UserDBIterator *iterator, GroupRecord **ret)
                                 incomplete = true;
                         }
 
-                        r = nss_group_to_group_record(gr, r >= 0 ? &sgrp : NULL, ret);
+                        r = nss_group_to_group_record(gr, r >= 0 ? &sgrp : NULL, /* alias_name= */ NULL, ret);
                         if (r < 0)
                                 return r;
 
@@ -1685,7 +1889,7 @@ int membershipdb_by_user(const char *name, UserDBFlags flags, UserDBIterator **r
         if (!valid_user_group_name(name, VALID_USER_RELAX))
                 return -EINVAL;
 
-        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR("userName", SD_JSON_BUILD_STRING(name)));
+        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR_STRING("userName", name));
         if (r < 0)
                 return r;
 
@@ -1697,7 +1901,13 @@ int membershipdb_by_user(const char *name, UserDBFlags flags, UserDBIterator **r
         if (!iterator->filter_user_name)
                 return -ENOMEM;
 
-        qr = userdb_start_query(iterator, "io.systemd.UserDatabase.GetMemberships", true, query, flags);
+        qr = userdb_start_query(
+                        iterator,
+                        "io.systemd.UserDatabase.GetMemberships",
+                        /* more= */ true,
+                        query,
+                        /* sfilter= */ NULL,
+                        flags);
 
         if (!FLAGS_SET(flags, USERDB_EXCLUDE_NSS) && (qr < 0 || !iterator->nss_covered)) {
                 r = userdb_iterator_block_nss_systemd(iterator);
@@ -1730,7 +1940,7 @@ int membershipdb_by_group(const char *name, UserDBFlags flags, UserDBIterator **
         if (!valid_user_group_name(name, VALID_USER_RELAX))
                 return -EINVAL;
 
-        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR("groupName", SD_JSON_BUILD_STRING(name)));
+        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR_STRING("groupName", name));
         if (r < 0)
                 return r;
 
@@ -1742,7 +1952,13 @@ int membershipdb_by_group(const char *name, UserDBFlags flags, UserDBIterator **
         if (!iterator->filter_group_name)
                 return -ENOMEM;
 
-        qr = userdb_start_query(iterator, "io.systemd.UserDatabase.GetMemberships", true, query, flags);
+        qr = userdb_start_query(
+                        iterator,
+                        "io.systemd.UserDatabase.GetMemberships",
+                        /* more= */ true,
+                        query,
+                        /* sfilter= */ NULL,
+                        flags);
 
         if (!FLAGS_SET(flags, USERDB_EXCLUDE_NSS) && (qr < 0 || !iterator->nss_covered)) {
                 _cleanup_(group_record_unrefp) GroupRecord *gr = NULL;
@@ -1788,7 +2004,13 @@ int membershipdb_all(UserDBFlags flags, UserDBIterator **ret) {
         if (!iterator)
                 return -ENOMEM;
 
-        qr = userdb_start_query(iterator, "io.systemd.UserDatabase.GetMemberships", true, NULL, flags);
+        qr = userdb_start_query(
+                        iterator,
+                        "io.systemd.UserDatabase.GetMemberships",
+                        /* more= */ true,
+                        /* query= */ NULL,
+                        /* sfilter= */ NULL,
+                        flags);
 
         if (!FLAGS_SET(flags, USERDB_EXCLUDE_NSS) && (qr < 0 || !iterator->nss_covered)) {
                 r = userdb_iterator_block_nss_systemd(iterator);
@@ -1976,21 +2198,22 @@ int membershipdb_by_group_strv(const char *name, UserDBFlags flags, char ***ret)
 }
 
 int userdb_block_nss_systemd(int b) {
-        _cleanup_(dlclosep) void *dl = NULL;
-        int (*call)(bool b);
+        int r;
 
         /* Note that we might be called from libnss_systemd.so.2 itself, but that should be fine, really. */
 
-        dl = dlopen(LIBDIR "/libnss_systemd.so.2", RTLD_NOW|RTLD_NODELETE);
-        if (!dl) {
+        _cleanup_(dlclosep) void *dl = NULL;
+        const char *dle;
+        r = dlopen_safe(LIBDIR "/libnss_systemd.so.2", &dl, &dle);
+        if (r < 0) {
                 /* If the file isn't installed, don't complain loudly */
-                log_debug("Failed to dlopen(libnss_systemd.so.2), ignoring: %s", dlerror());
+                log_debug_errno(r, "Failed to dlopen(libnss_systemd.so.2), ignoring: %s", dle ?: STRERROR(r));
                 return 0;
         }
 
         log_debug("Loaded '%s' via dlopen()", LIBDIR "/libnss_systemd.so.2");
 
-        call = dlsym(dl, "_nss_systemd_block");
+        int (*call)(bool b) = dlsym(dl, "_nss_systemd_block");
         if (!call)
                 /* If the file is installed but lacks the symbol we expect, things are weird, let's complain */
                 return log_debug_errno(SYNTHETIC_ERRNO(ELIBBAD),

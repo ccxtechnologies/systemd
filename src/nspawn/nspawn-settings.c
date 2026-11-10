@@ -12,10 +12,11 @@
 #include "nspawn-mount.h"
 #include "nspawn-network.h"
 #include "nspawn-settings.h"
+#include "parse-helpers.h"
 #include "parse-util.h"
-#include "path-util.h"
 #include "process-util.h"
 #include "rlimit-util.h"
+#include "set.h"
 #include "socket-util.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -94,7 +95,9 @@ int settings_load(FILE *f, const char *path, Settings **ret) {
         /* Make sure that if userns_mode is set, userns_chown is set to something appropriate, and vice versa. Either
          * both fields shall be initialized or neither. */
         if (s->userns_mode >= 0 && s->userns_ownership < 0)
-                s->userns_ownership = s->userns_mode == USER_NAMESPACE_PICK ? USER_NAMESPACE_OWNERSHIP_CHOWN : USER_NAMESPACE_OWNERSHIP_OFF;
+                s->userns_ownership = IN_SET(s->userns_mode, USER_NAMESPACE_PICK, USER_NAMESPACE_MANAGED)
+                        ? USER_NAMESPACE_OWNERSHIP_AUTO
+                        : USER_NAMESPACE_OWNERSHIP_OFF;
         if (s->userns_ownership >= 0 && s->userns_mode < 0)
                 s->userns_mode = USER_NAMESPACE_NO;
 
@@ -138,6 +141,7 @@ Settings* settings_free(Settings *s) {
         rlimit_free_all(s->rlimit);
         free(s->hostname);
         cpu_set_done(&s->cpu_set);
+        set_free(s->restrict_address_families);
         strv_free(s->bind_user);
         free(s->bind_user_shell);
 
@@ -168,7 +172,8 @@ Settings* settings_free(Settings *s) {
         strv_free(s->sysctl);
 
 #if HAVE_SECCOMP
-        seccomp_release(s->seccomp);
+        if (s->seccomp)
+                sym_seccomp_release(s->seccomp);
 #endif
 
         return mfree(s);
@@ -694,6 +699,11 @@ int config_parse_private_users(
                 settings->userns_mode = USER_NAMESPACE_FIXED;
                 settings->uid_shift = 0;
                 settings->uid_range = UINT32_C(0x10000);
+        } else if (streq(rvalue, "managed")) {
+                /* managed: User namespace on, and acquire it from systemd-nsresourced */
+                settings->userns_mode = USER_NAMESPACE_MANAGED;
+                settings->uid_shift = UID_INVALID;
+                settings->uid_range = UINT32_C(0x10000);
         } else {
                 const char *range, *shift;
                 uid_t sh, rn;
@@ -717,12 +727,12 @@ int config_parse_private_users(
 
                 r = parse_uid(shift, &sh);
                 if (r < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, r, "UID/GID shift invalid, ignoring: %s", range);
+                        log_syntax(unit, LOG_WARNING, filename, line, r, "UID/GID shift invalid, ignoring: %s", rvalue);
                         return 0;
                 }
 
                 if (!userns_shift_range_valid(sh, rn)) {
-                        log_syntax(unit, LOG_WARNING, filename, line, 0, "UID/GID shift and range combination invalid, ignoring: %s", range);
+                        log_syntax(unit, LOG_WARNING, filename, line, 0, "UID/GID shift and range combination invalid, ignoring: %s", rvalue);
                         return 0;
                 }
 
@@ -914,6 +924,16 @@ static const char *const timezone_mode_table[_TIMEZONE_MODE_MAX] = {
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(timezone_mode, TimezoneMode, TIMEZONE_AUTO);
 
+static const char *const console_mode_table[_CONSOLE_MODE_MAX] = {
+        [CONSOLE_AUTOPIPE]    = "autopipe",
+        [CONSOLE_INTERACTIVE] = "interactive",
+        [CONSOLE_READ_ONLY]   = "read-only",
+        [CONSOLE_PASSIVE]     = "passive",
+        [CONSOLE_PIPE]        = "pipe",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(console_mode, ConsoleMode);
+
 DEFINE_CONFIG_PARSE_ENUM(config_parse_userns_ownership, user_namespace_ownership, UserNamespaceOwnership);
 
 static const char *const user_namespace_ownership_table[_USER_NAMESPACE_OWNERSHIP_MAX] = {
@@ -1041,6 +1061,35 @@ int config_parse_bind_user_shell(
         free_and_replace(settings->bind_user_shell, sh);
         settings->bind_user_shell_copy = copy;
         settings->bind_user_shell_set = true;
+
+        return 0;
+}
+
+int config_parse_restrict_address_families(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        Settings *settings = ASSERT_PTR(data);
+        int r;
+
+        assert(rvalue);
+
+        r = parse_address_families(rvalue, &settings->restrict_address_families, &settings->restrict_address_families_is_allowlist);
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to parse address family, ignoring: %s", rvalue);
+                return 0;
+        }
 
         return 0;
 }

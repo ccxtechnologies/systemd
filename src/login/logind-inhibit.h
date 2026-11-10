@@ -80,12 +80,13 @@ bool manager_is_inhibited(
                 uid_t uid_to_ignore,
                 Inhibitor **ret_offending);
 
+int inhibitor_build_json(Inhibitor *i, sd_json_variant **ret);
+
 static inline bool inhibit_what_is_valid(InhibitWhat w) {
         return w > 0 && w < _INHIBIT_WHAT_MAX;
 }
 
-const char* inhibit_what_to_string(InhibitWhat k);
+const char* inhibit_what_to_string(InhibitWhat w);
 int inhibit_what_from_string(const char *s);
 
-const char* inhibit_mode_to_string(InhibitMode k);
-InhibitMode inhibit_mode_from_string(const char *s);
+DECLARE_STRING_TABLE_LOOKUP(inhibit_mode, InhibitMode);

@@ -112,7 +112,7 @@ config_container_service() {
     mkdir -p "$container_systemd_dir"
 
     # Generate a phony random machine-id for the container
-    uuidgen -r | tr -d '-' | tr '[:upper:]' '[:lower:]' > "${CONTAINER_ROOT_FS}/etc/machine-id"
+    uuidgen -r | tr -d '-' | tr '[:upper:]' '[:lower:]' >"${CONTAINER_ROOT_FS}/etc/machine-id"
 
     cat <<EOF >"$internal_test_service"
 [Unit]
@@ -121,8 +121,8 @@ After=basic.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'echo "$EXPECTED_OUTPUT"  > "$guest_output"'
-ExecStartPost=/usr/bin/systemctl --no-block exit 0
+ExecStart=bash -c 'echo "$EXPECTED_OUTPUT"  >"$guest_output"'
+ExecStartPost=systemctl --no-block exit 0
 TimeoutStopSec=15s
 
 [Install]
@@ -188,7 +188,9 @@ file_write_cleanup() {
     # Remove all the mounts and directories we created
     # These variables reset to empty arrays when the subprocess concludes.
     umount "${CLEANUP_MOUNTS[@]}"
-    rm -rf "${CLEANUP_PATHS[@]}"
+    rm -rf --one-file-system "${CLEANUP_PATHS[@]}"
+
+    set -e
 }
 
 run_testcases

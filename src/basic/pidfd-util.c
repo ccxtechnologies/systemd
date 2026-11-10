@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <linux/fs.h>
 #include <linux/magic.h>
 #include <sys/ioctl.h>
 #include <threads.h>
@@ -16,7 +15,6 @@
 #include "stat-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
-#include "unaligned.h"
 
 static thread_local int have_pidfs = -1;
 
@@ -29,7 +27,7 @@ int pidfd_check_pidfs(int pid_fd) {
 
         _cleanup_close_ int our_fd = -EBADF;
         if (pid_fd < 0) {
-                our_fd = pidfd_open(getpid_cached(), /* flags = */ 0);
+                our_fd = pidfd_open(getpid_cached(), /* flags= */ 0);
                 if (our_fd < 0)
                         return -errno;
 
@@ -56,7 +54,7 @@ int pidfd_get_namespace(int fd, unsigned long ns_type_cmd) {
         if (have_pidfs == 0 || !cached_supported)
                 return -EOPNOTSUPP;
 
-        int nsfd = ioctl(fd, ns_type_cmd);
+        int nsfd = ioctl(fd, ns_type_cmd, 0);
         if (nsfd < 0) {
                 /* Kernel returns EOPNOTSUPP if the ns type in question is disabled. Hence we need to look
                  * at precise errno instead of generic ERRNO_IS_(IOCTL_)NOT_SUPPORTED. */
@@ -73,7 +71,7 @@ int pidfd_get_namespace(int fd, unsigned long ns_type_cmd) {
         return nsfd;
 }
 
-static int pidfd_get_info(int fd, struct pidfd_info *info) {
+int pidfd_get_info(int fd, struct pidfd_info *info) {
         static bool cached_supported = true;
 
         assert(fd >= 0);
@@ -92,6 +90,48 @@ static int pidfd_get_info(int fd, struct pidfd_info *info) {
         }
 
         return 0;
+}
+
+int pidfd_info_mask_is_supported(uint64_t mask) {
+        static thread_local uint64_t cached_mask = 0;
+        static thread_local int cached = 0; /* 0 when not cached, 1 when cached, negative errno on failure. */
+        int r;
+
+        if (cached < 0)
+                return cached;
+
+        if (cached == 0) {
+                _cleanup_close_ int pidfd = r = RET_NERRNO(pidfd_open(getpid_cached(), /* flags= */ 0));
+                if (r < 0)
+                        return r;
+
+                struct pidfd_info info = {
+                        .mask = PIDFD_INFO_SUPPORTED_MASK, /* Since dfd78546c95330db2252e0d7e937a15ab5eddb4e (v6.19). */
+                };
+
+                r = pidfd_get_info(pidfd, &info);
+                if (r == -EOPNOTSUPP)
+                        return (cached = -EOPNOTSUPP);
+                if (r < 0)
+                        return r;
+
+                if (FLAGS_SET(info.mask, PIDFD_INFO_SUPPORTED_MASK) &&
+                    FLAGS_SET(info.supported_mask, PIDFD_INFO_SUPPORTED_MASK))
+                        /* The kernel is v6.19 or newer. Let's use the provided supported_mask. */
+                        cached_mask = info.supported_mask;
+                else
+                        /* The kernel is older than v6.19. These three flags have been supported since
+                         * ioctl(PIDFD_GET_INFO) was introduced, so a successful pidfd_get_info() call
+                         * guarantees they are supported. However, there is no reliable way to
+                         * determine whether PIDFD_INFO_EXIT and PIDFD_INFO_COREDUMP are supported, as
+                         * they predate PIDFD_INFO_SUPPORTED_MASK, so assume they are not. */
+                        cached_mask = PIDFD_INFO_PID | PIDFD_INFO_CREDS | PIDFD_INFO_CGROUPID;
+
+                cached = true;
+        }
+
+        /* Return true when all requested features are supported. */
+        return FLAGS_SET(cached_mask, mask);
 }
 
 static int pidfd_get_pid_fdinfo(int fd, pid_t *ret) {
@@ -236,25 +276,10 @@ int pidfd_get_inode_id_impl(int fd, uint64_t *ret) {
 
         assert(fd >= 0);
 
+        /* Since kernel 6.14 (b3caba8f7a34a2bbaf45ffc6ff3a49b70afeb192), we can use name_to_handle_at(). */
         if (file_handle_supported) {
-                union {
-                        struct file_handle file_handle;
-                        uint8_t space[offsetof(struct file_handle, f_handle) + sizeof(uint64_t)];
-                } fh = {
-                        .file_handle.handle_bytes = sizeof(uint64_t),
-                        .file_handle.handle_type = FILEID_KERNFS,
-                };
-                int mnt_id;
-
-                r = RET_NERRNO(name_to_handle_at(fd, "", &fh.file_handle, &mnt_id, AT_EMPTY_PATH));
-                if (r >= 0) {
-                        if (ret)
-                                /* Note, "struct file_handle" is 32bit aligned usually, but we need to read a 64bit value from it */
-                                *ret = unaligned_read_ne64(fh.file_handle.f_handle);
-                        return 0;
-                }
-                assert(r != -EOVERFLOW);
-                if (is_name_to_handle_at_fatal_error(r))
+                r = fd_to_handle_u64(fd, ret);
+                if (r >= 0 || is_name_to_handle_at_fatal_error(r))
                         return r;
 
                 file_handle_supported = false;
@@ -294,31 +319,42 @@ int pidfd_get_inode_id(int fd, uint64_t *ret) {
         return pidfd_get_inode_id_impl(fd, ret);
 }
 
+static thread_local uint64_t cached_pidfd_id = 0;
+static thread_local pid_t cached_pidfd_id_initialized = 0; /* < 0: cached error; == 0: invalid; > 0: valid and pid that was current */
+
+void reset_cached_pidfd_id(void) {
+        /* Invoked in the child after a fork()/clone(). */
+        cached_pidfd_id = 0;
+        cached_pidfd_id_initialized = 0;
+}
+
 int pidfd_get_inode_id_self_cached(uint64_t *ret) {
-        static thread_local uint64_t cached = 0;
-        static thread_local pid_t initialized = 0; /* < 0: cached error; == 0: invalid; > 0: valid and pid that was current */
         int r;
 
         assert(ret);
 
-        if (initialized == getpid_cached()) {
-                *ret = cached;
+        /* Note that matching the PID is not sufficient to detect that the cached ID is stale: if we are
+         * PID 1 in a PID namespace and clone off a child into a new PID namespace, it will be PID 1 too,
+         * but of course it's a different process with a different pidfd ID. Hence the cache is also
+         * explicitly flushed via reset_cached_pidfd_id() in the child after fork()/clone(). */
+        if (getpid_cached() == cached_pidfd_id_initialized) {
+                *ret = cached_pidfd_id;
                 return 0;
         }
-        if (initialized < 0)
-                return initialized;
+        if (cached_pidfd_id_initialized < 0)
+                return cached_pidfd_id_initialized;
 
         _cleanup_close_ int fd = pidfd_open(getpid_cached(), 0);
         if (fd < 0)
                 return -errno;
 
-        r = pidfd_get_inode_id(fd, &cached);
+        r = pidfd_get_inode_id(fd, &cached_pidfd_id);
         if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                return (initialized = -EOPNOTSUPP);
+                return (cached_pidfd_id_initialized = -EOPNOTSUPP);
         if (r < 0)
                 return r;
 
-        *ret = cached;
-        initialized = getpid_cached();
+        *ret = cached_pidfd_id;
+        cached_pidfd_id_initialized = getpid_cached();
         return 0;
 }

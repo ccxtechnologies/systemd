@@ -7,16 +7,14 @@ endif
 executables += [
         libexec_template + {
                 'name' : 'systemd-integritysetup',
-                'sources' : files(
-                        'integrity-util.c',
-                        'integritysetup.c',
-                ),
-                'extract' : files('integrity-util.c'),
-                'dependencies' : libcryptsetup,
+                'public' : true,
+                'sources' : files('integritysetup.c'),
+                'export' : files('integrity-util.c'),
+                'dependencies' : libcryptsetup_cflags,
         },
         generator_template + {
                 'name' : 'systemd-integritysetup-generator',
                 'sources' : files('integritysetup-generator.c'),
-                'objects' : ['systemd-integritysetup'],
+                'import' : ['systemd-integritysetup'],
         },
 ]

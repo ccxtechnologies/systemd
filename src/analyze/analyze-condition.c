@@ -17,7 +17,7 @@ static int parse_condition(Unit *u, const char *line) {
         assert(u);
         assert(line);
 
-        line = skip_leading_chars(line, /* bad = */ NULL);
+        line = skip_leading_chars(line, /* bad= */ NULL);
 
         const char *eq = strchr(line, '=');
         if (!eq)
@@ -27,7 +27,7 @@ static int parse_condition(Unit *u, const char *line) {
         if (!type_string)
                 return log_oom();
 
-        delete_trailing_chars(type_string, /* bad = */ NULL);
+        delete_trailing_chars(type_string, /* bad= */ NULL);
 
         Condition **target;
         ConditionType type;
@@ -41,7 +41,7 @@ static int parse_condition(Unit *u, const char *line) {
         if (type < 0)
                 return log_error_errno(type, "Cannot parse \"%s\".", line);
 
-        const char *val = skip_leading_chars(eq + 1, /* bad = */ NULL);
+        const char *val = skip_leading_chars(eq + 1, /* bad= */ NULL);
 
         ConfigParserCallback callback;
         if (condition_takes_path(type))
@@ -49,16 +49,16 @@ static int parse_condition(Unit *u, const char *line) {
         else
                 callback = config_parse_unit_condition_string;
 
-        return callback(/* unit = */ NULL,
-                        /* filename = */ "(cmdline)",
-                        /* line = */ 0,
-                        /* section = */ NULL,
-                        /* section_line = */ 0,
-                        /* lvalue = */ type_string,
-                        /* ltype = */ type,
-                        /* rvalue = */ val,
-                        /* data = */ target,
-                        /* userdata = */ u);
+        return callback(/* unit= */ NULL,
+                        /* filename= */ "(cmdline)",
+                        /* line= */ 0,
+                        /* section= */ NULL,
+                        /* section_line= */ 0,
+                        /* lvalue= */ type_string,
+                        /* ltype= */ type,
+                        /* rvalue= */ val,
+                        /* data= */ target,
+                        /* userdata= */ u);
 }
 
 _printf_(7, 8)
@@ -72,10 +72,10 @@ static int log_helper(void *userdata, int level, int error, const char *file, in
 
         va_start(ap, format);
         r = log_object_internalv(level, error, file, line, func,
-                                 /* object_field = */ unit_log_field(u),
-                                 /* object = */ u->id,
-                                 /* extra_field = */ NULL,
-                                 /* extra = */ NULL,
+                                 /* object_field= */ unit_log_field(u),
+                                 /* object= */ u->id,
+                                 /* extra_field= */ NULL,
+                                 /* extra= */ NULL,
                                  format, ap);
         va_end(ap);
 
@@ -98,7 +98,7 @@ static int verify_conditions(char **lines, RuntimeScope scope, const char *unit,
                 return log_error_errno(r, "Failed to initialize manager: %m");
 
         log_debug("Starting manager...");
-        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, root);
+        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, /* named_listen_fds= */ NULL, root);
         if (r < 0)
                 return r;
 
@@ -109,7 +109,7 @@ static int verify_conditions(char **lines, RuntimeScope scope, const char *unit,
                 if (r < 0)
                         return log_error_errno(r, "Failed to prepare filename %s: %m", unit);
 
-                r = manager_load_startable_unit_or_warn(m, NULL, prepared, &u);
+                r = manager_load_startable_unit_or_warn(m, /* name= */ NULL, prepared, LOG_ERR, &u);
                 if (r < 0)
                         return r;
         } else {
@@ -125,18 +125,18 @@ static int verify_conditions(char **lines, RuntimeScope scope, const char *unit,
         }
 
         condition_test_logger_t logger = arg_quiet ? NULL : log_helper;
-        r = condition_test_list(u->asserts, environ, assert_type_to_string, logger, u);
+        r = condition_test_list(u->asserts, environ, assert_type_to_string, logger, u) > 0;
         if (u->asserts)
                 log_full(arg_quiet ? LOG_DEBUG : LOG_NOTICE, "Asserts %s.", r > 0 ? "succeeded" : "failed");
 
-        q = condition_test_list(u->conditions, environ, condition_type_to_string, logger, u);
+        q = condition_test_list(u->conditions, environ, condition_type_to_string, logger, u) > 0;
         if (u->conditions)
                 log_full(arg_quiet ? LOG_DEBUG : LOG_NOTICE, "Conditions %s.", q > 0 ? "succeeded" : "failed");
 
         return r > 0 && q > 0 ? 0 : -EIO;
 }
 
-int verb_condition(int argc, char *argv[], void *userdata) {
+int verb_condition(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
         r = verify_conditions(strv_skip(argv, 1), arg_runtime_scope, arg_unit, arg_root);

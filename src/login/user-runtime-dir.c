@@ -8,6 +8,7 @@
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "devnum-util.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "format-util.h"
@@ -16,7 +17,7 @@
 #include "limits-util.h"
 #include "log.h"
 #include "main-func.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "path-util.h"
@@ -183,7 +184,7 @@ static int do_umount(const char *user) {
         /* The user may be already removed. So, first try to parse the string by parse_uid(),
          * and if it fails, fall back to get_user_creds(). */
         if (parse_uid(user, &uid) < 0) {
-                r = get_user_creds(&user, &uid, NULL, NULL, NULL, 0);
+                r = get_user_creds(user, /* flags= */ 0, NULL, &uid, NULL, NULL, NULL);
                 if (r < 0)
                         return log_error_errno(r,
                                                r == -ESRCH ? "No such user \"%s\"" :
@@ -327,6 +328,9 @@ static int do_tmpfs_quota(UserRecord *ur) {
 static int run(int argc, char *argv[]) {
         int r;
 
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+
         log_setup();
 
         if (argc != 3)
@@ -348,10 +352,8 @@ static int run(int argc, char *argv[]) {
         if (streq(verb, "start")) {
                 _cleanup_(user_record_unrefp) UserRecord *ur = NULL;
                 r = userdb_by_name(user, /* match= */ NULL, USERDB_PARSE_NUMERIC|USERDB_SUPPRESS_SHADOW, &ur);
-                if (r == -ESRCH)
-                        return log_error_errno(r, "User '%s' does not exist: %m", user);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to resolve user '%s': %m", user);
+                        return log_error_errno(r, "Failed to resolve user '%s': %s", user, STRERROR_USER(r));
 
                 /* We do two things here: mount the per-user XDG_RUNTIME_DIR, and set up tmpfs quota on /tmp/
                  * and /dev/shm/. */

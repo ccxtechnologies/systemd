@@ -5,12 +5,10 @@
 #include "errno-util.h"
 #include "kbd-util.h"
 #include "log.h"
-#include "path-util.h"
 #include "recurse-dir.h"
 #include "set.h"
 #include "string-util.h"
 #include "strv.h"
-#include "utf8.h"
 
 #define KBD_KEYMAP_DIRS                         \
         "/usr/share/keymaps/",                  \
@@ -60,7 +58,7 @@ static int keymap_recurse_dir_callback(
         if (!IN_SET(de->d_type, DT_REG, DT_LNK))
                 return RECURSE_DIR_CONTINUE;
 
-        const char *e = endswith(de->d_name, ".map") ?: endswith(de->d_name, ".map.gz");
+        const char *e = ENDSWITH_SET(de->d_name, ".map", ".map.gz", ".kmap", ".kmap.gz");
         if (!e)
                 return RECURSE_DIR_CONTINUE;
 
@@ -87,6 +85,8 @@ int get_keymaps(char ***ret) {
         _cleanup_set_free_ Set *keymaps = NULL;
         _cleanup_strv_free_ char **keymap_dirs = NULL;
         int r;
+
+        assert(ret);
 
         r = keymap_directories(&keymap_dirs);
         if (r < 0)
@@ -129,19 +129,10 @@ int get_keymaps(char ***ret) {
 }
 
 bool keymap_is_valid(const char *name) {
-        if (isempty(name))
+        if (!string_is_safe(name, STRING_FILENAME))
                 return false;
 
         if (strlen(name) >= 128)
-                return false;
-
-        if (!utf8_is_valid(name))
-                return false;
-
-        if (!filename_is_valid(name))
-                return false;
-
-        if (!string_is_safe(name))
                 return false;
 
         return true;

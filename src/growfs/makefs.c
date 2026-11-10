@@ -7,6 +7,7 @@
 #include "alloc-util.h"
 #include "blockdev-util.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "fd-util.h"
 #include "log.h"
 #include "main-func.h"
@@ -19,6 +20,9 @@ static int run(int argc, char *argv[]) {
         sd_id128_t uuid;
         struct stat st;
         int r;
+
+        LIBBLKID_NOTE(recommended);
+        LIBMOUNT_NOTE(recommended);
 
         log_setup();
 
@@ -41,7 +45,7 @@ static int run(int argc, char *argv[]) {
         if (S_ISBLK(st.st_mode)) {
                 /* Lock the device so that udev doesn't interfere with our work */
 
-                lock_fd = lock_whole_block_device(st.st_rdev, LOCK_EX);
+                lock_fd = lock_whole_block_device(st.st_rdev, O_WRONLY, LOCK_EX);
                 if (lock_fd < 0)
                         return log_error_errno(lock_fd, "Failed to lock whole block device of \"%s\": %m", device);
         } else
@@ -68,13 +72,13 @@ static int run(int argc, char *argv[]) {
         return make_filesystem(device,
                                fstype,
                                label,
-                               /* root = */ NULL,
+                               /* root= */ NULL,
                                uuid,
                                MKFS_DISCARD | MKFS_QUIET,
-                               /* sector_size = */ 0,
-                               /* compression = */ NULL,
-                               /* compression_level = */ NULL,
-                               /* extra_mkfs_options = */ NULL);
+                               /* sector_size= */ 0,
+                               /* compression= */ NULL,
+                               /* compression_level= */ NULL,
+                               /* extra_mkfs_options= */ NULL);
 }
 
 DEFINE_MAIN_FUNCTION(run);

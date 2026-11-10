@@ -6,6 +6,7 @@
 #include "sd-event.h"
 #include "sd-messages.h"
 
+#include "dlopen-note.h"
 #include "format-util.h"
 #include "journal-authenticate.h"
 #include "journald-kmsg.h"
@@ -24,6 +25,12 @@ static int run(int argc, char *argv[]) {
         const char *namespace;
         LogTarget log_target;
         int r;
+
+        COMPRESS_JOURNAL_NOTE;
+        LIBACL_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBPCRE2_NOTE(suggested);
+        LIBSELINUX_NOTE(recommended);
 
         if (argc > 2)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes one or no arguments.");
@@ -52,6 +59,8 @@ static int run(int argc, char *argv[]) {
 
         sigbus_install();
 
+        journal_auth_init();
+
         r = manager_new(&m);
         if (r < 0)
                 return log_oom();
@@ -66,8 +75,8 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return r;
 
-        manager_vacuum(m, /* verbose = */ false);
-        manager_flush_to_var(m, /* require_flag_file = */ true);
+        manager_vacuum(m, /* verbose= */ false);
+        manager_flush_to_var(m, /* require_flag_file= */ true);
         manager_flush_dev_kmsg(m);
 
         if (m->namespace)
@@ -104,20 +113,18 @@ static int run(int argc, char *argv[]) {
                         /* The retention time is reached, so let's vacuum! */
                         if (t <= 0) {
                                 log_info("Retention time reached, vacuuming.");
-                                manager_vacuum(m, /* verbose = */ false);
+                                manager_vacuum(m, /* verbose= */ false);
                                 continue;
                         }
                 } else
                         t = USEC_INFINITY;
 
-#if HAVE_GCRYPT
                 if (m->system_journal) {
                         usec_t u;
 
-                        if (journal_file_next_evolve_usec(m->system_journal, &u))
+                        if (journal_file_auth_next_evolve_usec(m->system_journal, &u) >= 0)
                                 t = MIN(t, usec_sub_unsigned(u, n));
                 }
-#endif
 
                 r = sd_event_run(m->event, t);
                 if (r < 0)

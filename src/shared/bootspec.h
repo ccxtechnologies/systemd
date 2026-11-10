@@ -4,6 +4,8 @@
 
 #include "forward.h"
 
+#include "../fundamental/bootspec.h"   /* IWYU pragma: export */
+
 typedef enum BootEntryType {
         BOOT_ENTRY_TYPE1,     /* Boot Loader Specification Type #1 entries: *.conf files */
         BOOT_ENTRY_TYPE2,     /* Boot Loader Specification Type #2 entries: *.efi files (UKIs) */
@@ -20,36 +22,49 @@ typedef enum BootEntrySource {
         _BOOT_ENTRY_SOURCE_INVALID = -EINVAL,
 } BootEntrySource;
 
-typedef struct BootEntryAddon {
-        char *location;
-        char *cmdline;
-} BootEntryAddon;
+typedef enum BootEntryExtraType {
+        BOOT_ENTRY_ADDON,
+        BOOT_ENTRY_CONFEXT,
+        BOOT_ENTRY_SYSEXT,
+        BOOT_ENTRY_CREDENTIAL,
+        _BOOT_ENTRY_EXTRA_TYPE_MAX,
+        _BOOT_ENTRY_EXTRA_TYPE_INVALID = -EINVAL,
+} BootEntryExtraType;
 
-typedef struct BootEntryAddons {
-        BootEntryAddon *items;
+typedef struct BootEntryExtra {
+        BootEntryExtraType type;
+        char *location;
+        char *cmdline; /* only for BOOT_ENTRY_ADDON */
+} BootEntryExtra;
+
+typedef struct BootEntryExtras {
+        BootEntryExtra *items;
         size_t n_items;
-} BootEntryAddons;
+} BootEntryExtras;
 
 typedef struct BootEntry {
         BootEntryType type;
         BootEntrySource source;
         bool reported_by_loader;
-        char *id;       /* This is the file basename (including extension!) */
-        char *id_old;   /* Old-style ID, for deduplication purposes. */
-        char *id_without_profile; /* id without profile suffixed */
-        char *path;     /* This is the full path to the drop-in file */
-        char *root;     /* The root path in which the drop-in was found, i.e. to which 'kernel', 'efi' and 'initrd' are relative */
+        char *id;                 /* This is the file basename (including extension, but with tries counters stripped) */
+        char *id_old;             /* Old-style ID, for deduplication purposes (for type1: same as the regular id, but with extension stripped too). */
+        char *id_without_profile; /* ID without profile suffixed */
+        char *path;               /* This is the full path to the drop-in file (i.e. prefixed with 'root' field below) */
+        char *root;               /* The root path in which the drop-in was found, i.e. to which 'kernel', 'efi' and 'initrd' are relative */
         char *title;
         char *show_title;
         char *sort_key;
         char *version;
+        char *uname;
         char *machine_id;
         char *architecture;
         char **options;
-        BootEntryAddons local_addons;
-        const BootEntryAddons *global_addons; /* Backpointer into the BootConfig; we don't own this here */
+        BootEntryExtras local_extras;
+        const BootEntryExtras *global_extras; /* Backpointer into the BootConfig; we don't own this here */
         char *kernel;        /* linux is #defined to 1, yikes! */
         char *efi;
+        char *uki;
+        char *uki_url;
         char **initrd;
         char *device_tree;
         char **device_tree_overlay;
@@ -64,14 +79,17 @@ typedef struct BootEntry {
                 .source = (s),                  \
                 .tries_left = UINT_MAX,         \
                 .tries_done = UINT_MAX,         \
+                .profile = UINT_MAX,            \
         }
 
 typedef struct BootConfig {
         int loader_conf_status;  /* 0 → before loading, 1 → loaded, negative → error. */
 
         char *default_pattern;
+        char *preferred_pattern;
 
         char *entry_oneshot;
+        char *entry_preferred;
         char *entry_default;
         char *entry_selected;
         char *entry_sysfail;
@@ -79,7 +97,7 @@ typedef struct BootConfig {
         BootEntry *entries;
         size_t n_entries;
 
-        BootEntryAddons global_addons[_BOOT_ENTRY_SOURCE_MAX];
+        BootEntryExtras global_extras[_BOOT_ENTRY_SOURCE_MAX];
 
         ssize_t default_entry;
         ssize_t selected_entry;
@@ -93,12 +111,11 @@ typedef struct BootConfig {
                 .selected_entry = -1, \
         }
 
-const char* boot_entry_type_description_to_string(BootEntryType) _const_;
-const char* boot_entry_type_to_string(BootEntryType) _const_;
-BootEntryType boot_entry_type_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(boot_entry_type_description, BootEntryType);
+DECLARE_STRING_TABLE_LOOKUP(boot_entry_type, BootEntryType);
 
-const char* boot_entry_source_description_to_string(BootEntrySource) _const_;
-const char* boot_entry_source_to_string(BootEntrySource) _const_;
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(boot_entry_source_description, BootEntrySource);
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(boot_entry_source, BootEntrySource);
 
 BootEntry* boot_config_find_entry(BootConfig *config, const char *id);
 
@@ -112,6 +129,16 @@ static inline const BootEntry* boot_config_default_entry(const BootConfig *confi
         return config->entries + config->default_entry;
 }
 
+static inline const BootEntry* boot_config_selected_entry(const BootConfig *config) {
+        assert(config);
+
+        if (config->selected_entry < 0)
+                return NULL;
+
+        assert((size_t) config->selected_entry < config->n_entries);
+        return config->entries + config->selected_entry;
+}
+
 void boot_config_free(BootConfig *config);
 
 int boot_loader_read_conf(BootConfig *config, FILE *file, const char *path);
@@ -120,14 +147,14 @@ int boot_config_load_type1(
                 BootConfig *config,
                 FILE *f,
                 const char *root,
-                const BootEntrySource source,
+                BootEntrySource source,
                 const char *dir,
-                const char *id);
+                const char *filename);
 
 int boot_config_finalize(BootConfig *config);
 int boot_config_load(BootConfig *config, const char *esp_path, const char *xbootldr_path);
 int boot_config_load_auto(BootConfig *config, const char *override_esp_path, const char *override_xbootldr_path);
-int boot_config_augment_from_loader(BootConfig *config, char **list, bool auto_only);
+int boot_config_augment_from_loader(BootConfig *config, char **found_by_loader, bool auto_only);
 
 int boot_config_select_special_entries(BootConfig *config, bool skip_efivars);
 
@@ -148,3 +175,7 @@ int show_boot_entries(
 int boot_filename_extract_tries(const char *fname, char **ret_stripped, unsigned *ret_tries_left, unsigned *ret_tries_done);
 
 int boot_entry_to_json(const BootConfig *c, size_t i, sd_json_variant **ret);
+
+int pe_find_uki_sections(int fd, const char *path, unsigned profile, char **ret_osrelease, char **ret_profile, char **ret_cmdline, char **ret_uname);
+
+int bootspec_extract_osrelease(const char *text, char **ret_good_name, char **ret_good_version, char **ret_good_sort_key, char **ret_os_id, char **ret_os_version_id, char **ret_image_id, char **ret_image_version);

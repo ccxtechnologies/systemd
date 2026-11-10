@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "crypto-util.h"
 #include "hexdecoct.h"
 #include "log.h"
 #include "pe-binary.h"
@@ -11,6 +12,13 @@
 #include "stat-util.h"
 #include "string-table.h"
 #include "string-util.h"
+
+/* Cap on the (VirtualSize - SizeOfRawData) zero-padding the UKI hasher
+ * will produce for a single section.  Any value beyond this is treated as
+ * a malformed PE — bounds the hash work an attacker can drive (#42344). */
+#define UKI_HASH_VIRTUAL_SIZE_PADDING_MAX (64U * 1024U * 1024U)
+
+/* Note: none of these function change the file position of the provided fd, as they use pread() */
 
 bool pe_header_is_64bit(const PeHeader *h) {
         assert(h);
@@ -137,6 +145,12 @@ int pe_load_headers(
         if (!IN_SET(le16toh(pe_header->optional.Magic), UINT16_C(0x010B), UINT16_C(0x020B)))
                 return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Optional header magic invalid.");
 
+        /* The optional header must be at least large enough to cover everything
+         * up to and including NumberOfRvaAndSizes — otherwise the equality
+         * check below would read uninitialised memory for that field. */
+        if (pe_header_size(pe_header) < PE_HEADER_OPTIONAL_FIELD_OFFSET(pe_header, DataDirectory))
+                return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Optional header too small.");
+
         if (pe_header_size(pe_header) !=
             PE_HEADER_OPTIONAL_FIELD_OFFSET(pe_header, DataDirectory) +
             sizeof(IMAGE_DATA_DIRECTORY) * (uint64_t) le32toh(PE_HEADER_OPTIONAL_FIELD(pe_header, NumberOfRvaAndSizes)))
@@ -157,6 +171,7 @@ int pe_load_sections(
                 IMAGE_SECTION_HEADER **ret_sections) {
 
         _cleanup_free_ IMAGE_SECTION_HEADER *sections = NULL;
+        struct stat st;
         size_t nos;
         ssize_t n;
 
@@ -179,8 +194,49 @@ int pe_load_sections(
         if ((size_t) n != sizeof(IMAGE_SECTION_HEADER) * nos)
                 return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Short read while reading section table.");
 
+        /* The section's raw bytes must fit inside the file.  This is the
+         * fundamental invariant the parser relies on later (pe_hash, uki_hash,
+         * pe_read_section_data, ...); reject obvious malformations early so
+         * downstream loops don't get driven by attacker-controlled sizes. */
+        if (fstat(fd, &st) < 0)
+                return log_debug_errno(errno, "Failed to stat PE file: %m");
+
+        FOREACH_ARRAY(section, sections, nos) {
+                uint64_t prd = le32toh(section->PointerToRawData), srd = le32toh(section->SizeOfRawData), end;
+
+                /* SizeOfRawData == 0 is legitimate (BSS-like, uninitialised) —
+                 * PointerToRawData is then meaningless and not used as an offset. */
+                if (srd == 0)
+                        continue;
+
+                if (!ADD_SAFE(&end, prd, srd) || end > (uint64_t) st.st_size)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                               "PE section raw data exceeds file size.");
+        }
+
         if (ret_sections)
                 *ret_sections = TAKE_PTR(sections);
+
+        return 0;
+}
+
+int pe_load_headers_and_sections(int fd, PeHeader **ret_pe_header, IMAGE_SECTION_HEADER **ret_sections) {
+        _cleanup_free_ IMAGE_DOS_HEADER *dos_header = NULL;
+        _cleanup_free_ PeHeader *pe_header = NULL;
+        int r;
+
+        assert(fd >= 0);
+
+        r = pe_load_headers(fd, &dos_header, &pe_header);
+        if (r < 0)
+                return r;
+
+        r = pe_load_sections(fd, dos_header, pe_header, ret_sections);
+        if (r < 0)
+                return r;
+
+        if (ret_pe_header)
+                *ret_pe_header = TAKE_PTR(pe_header);
 
         return 0;
 }
@@ -195,9 +251,12 @@ int pe_read_section_data(
         assert(fd >= 0);
         assert(section);
 
-        size_t n = le32toh(section->VirtualSize);
+        /* SizeOfRawData includes padding up to the file alignment. VirtualSize is larger than
+         * SizeOfRawData when the section ends with zero-initialized data. The file does not contain
+         * that data. Reading VirtualSize bytes would return bytes of the next section instead. */
+        size_t n = MIN(le32toh(section->VirtualSize), le32toh(section->SizeOfRawData));
         if (n > MIN(max_size, (size_t) SSIZE_MAX))
-                return -E2BIG;
+                return -EBADMSG;
 
         _cleanup_free_ void *data = malloc(n+1);
         if (!data)
@@ -207,7 +266,7 @@ int pe_read_section_data(
         if (ss < 0)
                 return -errno;
         if ((size_t) ss != n)
-                return -EIO;
+                return -EBADMSG;
 
         if (ret_size)
                 *ret_size = n;
@@ -241,7 +300,7 @@ int pe_read_section_data_by_name(
 
         assert(fd >= 0);
         assert(pe_header);
-        assert(sections || pe_header->pe.NumberOfSections == 0);
+        assert(sections || le16toh(pe_header->pe.NumberOfSections) == 0);
         assert(name);
 
         section = pe_header_find_section(pe_header, sections, name);
@@ -323,7 +382,7 @@ static int hash_file(int fd, EVP_MD_CTX *md_ctx, uint64_t offset, uint64_t size)
                 if ((size_t) n != m)
                         return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Short read while hashing.");
 
-                if (EVP_DigestUpdate(md_ctx, buffer, m) != 1)
+                if (sym_EVP_DigestUpdate(md_ctx, buffer, m) != 1)
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Unable to hash data.");
 
                 offset += m;
@@ -334,15 +393,14 @@ static int hash_file(int fd, EVP_MD_CTX *md_ctx, uint64_t offset, uint64_t size)
 }
 
 static int section_offset_cmp(const IMAGE_SECTION_HEADER *a, const IMAGE_SECTION_HEADER *b) {
-        return CMP(ASSERT_PTR(a)->PointerToRawData, ASSERT_PTR(b)->PointerToRawData);
+        return CMP(le32toh(ASSERT_PTR(a)->PointerToRawData), le32toh(ASSERT_PTR(b)->PointerToRawData));
 }
-#endif
 
 int pe_hash(int fd,
             const EVP_MD *md,
             void **ret_hash,
             size_t *ret_hash_size) {
-#if HAVE_OPENSSL
+
         _cleanup_(EVP_MD_CTX_freep) EVP_MD_CTX *mdctx = NULL;
         _cleanup_free_ IMAGE_SECTION_HEADER *sections = NULL;
         _cleanup_free_ IMAGE_DOS_HEADER *dos_header = NULL;
@@ -356,6 +414,10 @@ int pe_hash(int fd,
         assert(md);
         assert(ret_hash_size);
         assert(ret_hash);
+
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
 
         if (fstat(fd, &st) < 0)
                 return log_debug_errno(errno, "Failed to stat file: %m");
@@ -375,15 +437,15 @@ int pe_hash(int fd,
         if (!certificate_table)
                 return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "File lacks certificate table.");
 
-        mdctx = EVP_MD_CTX_new();
+        mdctx = sym_EVP_MD_CTX_new();
         if (!mdctx)
                 return log_oom_debug();
 
-        if (EVP_DigestInit_ex(mdctx, md, NULL) != 1)
+        if (sym_EVP_DigestInit_ex(mdctx, md, NULL) != 1)
                 return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to allocate message digest.");
 
         /* Everything from beginning of file to CheckSum field in PE header */
-        p = (uint64_t) dos_header->e_lfanew +
+        p = (uint64_t) le32toh(dos_header->e_lfanew) +
                 offsetof(PeHeader, optional.CheckSum);
         r = hash_file(fd, mdctx, 0, p);
         if (r < 0)
@@ -391,7 +453,7 @@ int pe_hash(int fd,
         p += sizeof(le32_t);
 
         /* Everything between the CheckSum field and the Image Data Directory Entry for the Certification Table */
-        q = (uint64_t) dos_header->e_lfanew +
+        q = (uint64_t) le32toh(dos_header->e_lfanew) +
                 PE_HEADER_OPTIONAL_FIELD_OFFSET(pe_header, DataDirectory[IMAGE_DATA_DIRECTORY_INDEX_CERTIFICATION_TABLE]);
         r = hash_file(fd, mdctx, p, q - p);
         if (r < 0)
@@ -399,7 +461,7 @@ int pe_hash(int fd,
         q += sizeof(IMAGE_DATA_DIRECTORY);
 
         /* The rest of the header + the section table */
-        p = pe_header->optional.SizeOfHeaders;
+        p = le32toh(pe_header->optional.SizeOfHeaders);
         if (p < q)
                 return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "SizeOfHeaders too short.");
         r = hash_file(fd, mdctx, q, p - q);
@@ -407,31 +469,31 @@ int pe_hash(int fd,
                 return r;
 
         /* Sort by location in file */
-        typesafe_qsort(sections, pe_header->pe.NumberOfSections, section_offset_cmp);
+        typesafe_qsort(sections, le16toh(pe_header->pe.NumberOfSections), section_offset_cmp);
 
-        FOREACH_ARRAY(section, sections, pe_header->pe.NumberOfSections) {
-                r = hash_file(fd, mdctx, section->PointerToRawData, section->SizeOfRawData);
+        FOREACH_ARRAY(section, sections, le16toh(pe_header->pe.NumberOfSections)) {
+                r = hash_file(fd, mdctx, le32toh(section->PointerToRawData), le32toh(section->SizeOfRawData));
                 if (r < 0)
                         return r;
 
-                p += section->SizeOfRawData;
+                p += le32toh(section->SizeOfRawData);
         }
 
         if ((uint64_t) st.st_size > p) {
 
-                if (st.st_size - p < certificate_table->Size)
-                        return log_debug_errno(errno, "No space for certificate table, refusing.");
+                if ((uint64_t) st.st_size - p < le32toh(certificate_table->Size))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "No space for certificate table, refusing.");
 
-                r = hash_file(fd, mdctx, p, st.st_size - p - certificate_table->Size);
+                r = hash_file(fd, mdctx, p, (uint64_t) st.st_size - p - le32toh(certificate_table->Size));
                 if (r < 0)
                         return r;
 
                 /* If the file size is not a multiple of 8 bytes, pad the hash with zero bytes. */
-                if (st.st_size % 8 != 0 && EVP_DigestUpdate(mdctx, (const uint8_t[8]) {}, 8 - (st.st_size % 8)) != 1)
+                if (st.st_size % 8 != 0 && sym_EVP_DigestUpdate(mdctx, (const uint8_t[8]) {}, 8 - (st.st_size % 8)) != 1)
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Unable to hash data.");
         }
 
-        int hsz = EVP_MD_CTX_size(mdctx);
+        int hsz = sym_EVP_MD_CTX_get_size(mdctx);
         if (hsz < 0)
                 return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to get hash size.");
 
@@ -440,7 +502,7 @@ int pe_hash(int fd,
         if (!hash)
                 return log_oom_debug();
 
-        if (EVP_DigestFinal_ex(mdctx, hash, &hash_size) != 1)
+        if (sym_EVP_DigestFinal_ex(mdctx, hash, &hash_size) != 1)
                 return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to finalize hash function.");
 
         assert(hash_size == (unsigned) hsz);
@@ -449,9 +511,6 @@ int pe_hash(int fd,
         *ret_hash_size = hash_size;
 
         return 0;
-#else
-        return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "OpenSSL is not supported, cannot calculate PE hash.");
-#endif
 }
 
 int pe_checksum(int fd, uint32_t *ret) {
@@ -484,7 +543,8 @@ int pe_checksum(int fd, uint32_t *ret) {
                         return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Short read from PE file");
 
                 for (size_t i = 0; i < (size_t) n / 2; i++) {
-                        if (off + i >= checksum_offset && off + i < checksum_offset + sizeof(pe_header->optional.CheckSum))
+                        size_t pos = off + i * sizeof(uint16_t);
+                        if (pos >= checksum_offset && pos < checksum_offset + sizeof(pe_header->optional.CheckSum))
                                 continue;
 
                         uint16_t val = le16toh(buf[i]);
@@ -503,7 +563,6 @@ int pe_checksum(int fd, uint32_t *ret) {
         return 0;
 }
 
-#if HAVE_OPENSSL
 typedef void* SectionHashArray[_UNIFIED_SECTION_MAX];
 
 static void section_hash_array_done(SectionHashArray *array) {
@@ -512,13 +571,12 @@ static void section_hash_array_done(SectionHashArray *array) {
         for (size_t i = 0; i < _UNIFIED_SECTION_MAX; i++)
                 free((*array)[i]);
 }
-#endif
 
 int uki_hash(int fd,
              const EVP_MD *md,
              void* ret_hashes[static _UNIFIED_SECTION_MAX],
              size_t *ret_hash_size) {
-#if HAVE_OPENSSL
+
         _cleanup_(section_hash_array_done) SectionHashArray hashes = {};
         _cleanup_free_ IMAGE_SECTION_HEADER *sections = NULL;
         _cleanup_free_ IMAGE_DOS_HEADER *dos_header = NULL;
@@ -529,6 +587,10 @@ int uki_hash(int fd,
         assert(ret_hashes);
         assert(ret_hash_size);
 
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
         r = pe_load_headers(fd, &dos_header, &pe_header);
         if (r < 0)
                 return r;
@@ -537,11 +599,11 @@ int uki_hash(int fd,
         if (r < 0)
                 return r;
 
-        int hsz = EVP_MD_size(md);
+        int hsz = sym_EVP_MD_get_size(md);
         if (hsz < 0)
                 return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to get hash size.");
 
-        FOREACH_ARRAY(section, sections, pe_header->pe.NumberOfSections) {
+        FOREACH_ARRAY(section, sections, le16toh(pe_header->pe.NumberOfSections)) {
                 _cleanup_(EVP_MD_CTX_freep) EVP_MD_CTX *mdctx = NULL;
                 _cleanup_free_ char *n = NULL;
                 ssize_t i;
@@ -557,25 +619,35 @@ int uki_hash(int fd,
                 if (hashes[i])
                         return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Duplicate section");
 
-                mdctx = EVP_MD_CTX_new();
+                mdctx = sym_EVP_MD_CTX_new();
                 if (!mdctx)
                         return log_oom_debug();
 
-                if (EVP_DigestInit_ex(mdctx, md, NULL) != 1)
+                if (sym_EVP_DigestInit_ex(mdctx, md, NULL) != 1)
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to allocate message digest.");
 
-                r = hash_file(fd, mdctx, section->PointerToRawData, MIN(section->VirtualSize, section->SizeOfRawData));
+                r = hash_file(fd, mdctx, le32toh(section->PointerToRawData), MIN(le32toh(section->VirtualSize), le32toh(section->SizeOfRawData)));
                 if (r < 0)
                         return r;
 
-                if (section->SizeOfRawData < section->VirtualSize) {
+                if (le32toh(section->SizeOfRawData) < le32toh(section->VirtualSize)) {
                         uint8_t zeroes[1024] = {};
-                        size_t remaining = section->VirtualSize - section->SizeOfRawData;
+                        size_t remaining = le32toh(section->VirtualSize) - le32toh(section->SizeOfRawData);
+
+                        /* Bound the zero-padding hash work.  An attacker can otherwise
+                         * set VirtualSize close to UINT32_MAX with SizeOfRawData = 0,
+                         * driving ~4 GiB of SHA-256 work per section on a tiny file
+                         * (issue #42344 — wedges the parser for >10 s on 382 B). */
+                        if (remaining > UKI_HASH_VIRTUAL_SIZE_PADDING_MAX)
+                                return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                                       "Section VirtualSize exceeds SizeOfRawData by %zu bytes (cap %zu); refusing to hash.",
+                                                       remaining,
+                                                       (size_t) UKI_HASH_VIRTUAL_SIZE_PADDING_MAX);
 
                         while (remaining > 0) {
                                 size_t sz = MIN(sizeof(zeroes), remaining);
 
-                                if (EVP_DigestUpdate(mdctx, zeroes, sz) != 1)
+                                if (sym_EVP_DigestUpdate(mdctx, zeroes, sz) != 1)
                                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Unable to hash data.");
 
                                 remaining -= sz;
@@ -587,7 +659,7 @@ int uki_hash(int fd,
                         return log_oom_debug();
 
                 unsigned hash_size = (unsigned) hsz;
-                if (EVP_DigestFinal_ex(mdctx, hashes[i], &hash_size) != 1)
+                if (sym_EVP_DigestFinal_ex(mdctx, hashes[i], &hash_size) != 1)
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to finalize hash function.");
 
                 assert(hash_size == (unsigned) hsz);
@@ -596,7 +668,7 @@ int uki_hash(int fd,
                         _cleanup_free_ char *hs = NULL;
 
                         hs = hexmem(hashes[i], hsz);
-                        log_debug("Section %s with %s is %s.", n, EVP_MD_name(md), strna(hs));
+                        log_debug("Section %s with %s is %s.", n, sym_EVP_MD_get0_name(md), strna(hs));
                 }
         }
 
@@ -605,7 +677,5 @@ int uki_hash(int fd,
         *ret_hash_size = (unsigned) hsz;
 
         return 0;
-#else
-        return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "OpenSSL is not supported, cannot calculate UKI hash.");
-#endif
 }
+#endif

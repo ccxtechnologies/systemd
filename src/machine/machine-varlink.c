@@ -126,6 +126,8 @@ static int machine_cid(const char *name, sd_json_variant *variant, sd_json_dispa
 int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         Manager *manager = ASSERT_PTR(userdata);
         _cleanup_(machine_freep) Machine *machine = NULL;
+        const char *bad_field = NULL;
+        bool sender_is_admin = false;
         int r;
 
         static const sd_json_dispatch_field dispatch_table[] = {
@@ -135,13 +137,12 @@ int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink
                 { "class",               SD_JSON_VARIANT_STRING,        dispatch_machine_class,   offsetof(Machine, class),                SD_JSON_MANDATORY },
                 { "leader",              _SD_JSON_VARIANT_TYPE_INVALID, machine_pidref,           offsetof(Machine, leader),               SD_JSON_STRICT    },
                 { "leaderProcessId",     SD_JSON_VARIANT_OBJECT,        machine_pidref,           offsetof(Machine, leader),               SD_JSON_STRICT    },
-                { "supervisor",          _SD_JSON_VARIANT_TYPE_INVALID, machine_pidref,           offsetof(Machine, supervisor),           SD_JSON_STRICT    },
-                { "supervisorProcessId", SD_JSON_VARIANT_OBJECT,        machine_pidref,           offsetof(Machine, supervisor),           SD_JSON_STRICT    },
                 { "rootDirectory",       SD_JSON_VARIANT_STRING,        json_dispatch_path,       offsetof(Machine, root_directory),       SD_JSON_STRICT    },
                 { "ifIndices",           SD_JSON_VARIANT_ARRAY,         machine_ifindices,        0,                                       0                 },
                 { "vSockCid",            _SD_JSON_VARIANT_TYPE_INVALID, machine_cid,              offsetof(Machine, vsock_cid),            0                 },
                 { "sshAddress",          SD_JSON_VARIANT_STRING,        sd_json_dispatch_string,  offsetof(Machine, ssh_address),          SD_JSON_STRICT    },
                 { "sshPrivateKeyPath",   SD_JSON_VARIANT_STRING,        json_dispatch_path,       offsetof(Machine, ssh_private_key_path), 0                 },
+                { "controlAddress",      SD_JSON_VARIANT_STRING,        json_dispatch_path,       offsetof(Machine, control_address),      SD_JSON_STRICT    },
                 { "allocateUnit",        SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool, offsetof(Machine, allocate_unit),        0                 },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
@@ -151,27 +152,36 @@ int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink
         if (r < 0)
                 return r;
 
-        r = sd_varlink_dispatch(link, parameters, dispatch_table, machine);
-        if (r != 0)
+        r = sd_json_dispatch_full(parameters, dispatch_table, /* bad= */ NULL, SD_JSON_ALLOW_EXTENSIONS, machine, &bad_field);
+        if (r < 0) {
+                if (bad_field)
+                        return sd_varlink_error_invalid_parameter_name(link, bad_field);
                 return r;
+        }
 
-        r = varlink_verify_polkit_async(
-                        link,
-                        manager->bus,
-                        machine->allocate_unit ? "org.freedesktop.machine1.create-machine" : "org.freedesktop.machine1.register-machine",
-                        (const char**) STRV_MAKE("name", machine->name,
-                                                 "class", machine_class_to_string(machine->class)),
-                        &manager->polkit_registry);
-        if (r <= 0)
-                return r;
+        if (!MACHINE_CLASS_CAN_REGISTER(machine->class))
+                return sd_varlink_error_invalid_parameter_name(link, "class");
+
+        if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                r = varlink_verify_polkit_async_full(
+                                link,
+                                manager->system_bus,
+                                machine->allocate_unit ? "org.freedesktop.machine1.create-machine" : "org.freedesktop.machine1.register-machine",
+                                (const char**) STRV_MAKE("name", machine->name,
+                                                         "class", machine_class_to_string(machine->class)),
+                                /* good_user= */ UID_INVALID,
+                                /* flags= */ 0,
+                                &manager->polkit_registry,
+                                &sender_is_admin);
+                if (r <= 0)
+                        return r;
+        }
 
         if (!pidref_is_set(&machine->leader)) {
                 r = varlink_get_peer_pidref(link, &machine->leader);
                 if (r < 0)
                         return r;
-        }
-
-        if (!pidref_is_set(&machine->supervisor)) {
+        } else {
                 _cleanup_(pidref_done) PidRef client_pidref = PIDREF_NULL;
 
                 r = varlink_get_peer_pidref(link, &client_pidref);
@@ -187,8 +197,10 @@ int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink
         if (r < 0)
                 return r;
 
-        /* Ensure an unprivileged user cannot claim any process they don't control as their own machine */
-        if (machine->uid != 0) {
+        /* In system scope, ensure an unprivileged user cannot claim any process they don't
+         * control as their own machine. In user scope the varlink socket is already
+         * protected by $XDG_RUNTIME_DIR permissions. */
+        if (manager->runtime_scope != RUNTIME_SCOPE_USER && machine->uid != 0 && !sender_is_admin) {
                 r = process_is_owned_by_uid(&machine->leader, machine->uid);
                 if (r < 0)
                         return r;
@@ -203,7 +215,7 @@ int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink
                 return r;
 
         if (!machine->allocate_unit) {
-                r = cg_pidref_get_unit_full(&machine->leader, &machine->unit, &machine->subgroup);
+                r = machine_determine_unit(machine);
                 if (r < 0)
                         return r;
         }
@@ -306,17 +318,20 @@ int vl_method_unregister_internal(sd_varlink *link, sd_json_variant *parameters,
         Manager *manager = ASSERT_PTR(machine->manager);
         int r;
 
-        r = varlink_verify_polkit_async_full(
-                        link,
-                        manager->bus,
-                        "org.freedesktop.machine1.manage-machines",
-                        (const char**) STRV_MAKE("name", machine->name,
-                                                 "verb", "unregister"),
-                        machine->uid,
-                        /* flags= */ 0,
-                        &manager->polkit_registry);
-        if (r <= 0)
-                return r;
+        if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                r = varlink_verify_polkit_async_full(
+                                link,
+                                manager->system_bus,
+                                "org.freedesktop.machine1.manage-machines",
+                                (const char**) STRV_MAKE("name", machine->name,
+                                                         "verb", "unregister"),
+                                machine->uid,
+                                /* flags= */ 0,
+                                &manager->polkit_registry,
+                                /* ret_admin= */ NULL);
+                if (r <= 0)
+                        return r;
+        }
 
         r = machine_finalize(machine);
         if (r < 0)
@@ -330,17 +345,20 @@ int vl_method_terminate_internal(sd_varlink *link, sd_json_variant *parameters, 
         Manager *manager = ASSERT_PTR(machine->manager);
         int r;
 
-        r = varlink_verify_polkit_async_full(
-                        link,
-                        manager->bus,
-                        "org.freedesktop.machine1.manage-machines",
-                        (const char**) STRV_MAKE("name", machine->name,
-                                                 "verb", "terminate"),
-                        machine->uid,
-                        /* flags= */ 0,
-                        &manager->polkit_registry);
-        if (r <= 0)
-                return r;
+        if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                r = varlink_verify_polkit_async_full(
+                                link,
+                                manager->system_bus,
+                                "org.freedesktop.machine1.manage-machines",
+                                (const char**) STRV_MAKE("name", machine->name,
+                                                         "verb", "terminate"),
+                                machine->uid,
+                                /* flags= */ 0,
+                                &manager->polkit_registry,
+                                /* ret_admin= */ NULL);
+                if (r <= 0)
+                        return r;
+        }
 
         r = machine_stop(machine);
         if (r < 0)
@@ -349,10 +367,12 @@ int vl_method_terminate_internal(sd_varlink *link, sd_json_variant *parameters, 
         return sd_varlink_reply(link, NULL);
 }
 
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_kill_whom, KillWhom, kill_whom_from_string);
+
 typedef struct MachineKillParameters {
         const char *name;
         PidRef pidref;
-        const char *swhom;
+        KillWhom whom;
         int32_t signo;
 } MachineKillParameters;
 
@@ -365,7 +385,7 @@ static void machine_kill_paramaters_done(MachineKillParameters *p) {
 int vl_method_kill(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         static const sd_json_dispatch_field dispatch_table[] = {
                 VARLINK_DISPATCH_MACHINE_LOOKUP_FIELDS(MachineKillParameters),
-                { "whom",   SD_JSON_VARIANT_STRING,         sd_json_dispatch_const_string, offsetof(MachineKillParameters, swhom), 0                 },
+                { "whom",   SD_JSON_VARIANT_STRING,         dispatch_kill_whom,            offsetof(MachineKillParameters, whom),  0                 },
                 { "signal", _SD_JSON_VARIANT_TYPE_INVALID , sd_json_dispatch_signal,       offsetof(MachineKillParameters, signo), SD_JSON_MANDATORY },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
@@ -374,8 +394,8 @@ int vl_method_kill(sd_varlink *link, sd_json_variant *parameters, sd_varlink_met
         Manager *manager = ASSERT_PTR(userdata);
         _cleanup_(machine_kill_paramaters_done) MachineKillParameters p = {
                 .pidref = PIDREF_NULL,
+                .whom = _KILL_WHOM_INVALID,
         };
-        KillWhom whom;
         int r;
 
         assert(link);
@@ -392,25 +412,22 @@ int vl_method_kill(sd_varlink *link, sd_json_variant *parameters, sd_varlink_met
         if (r < 0)
                 return r;
 
-        if (isempty(p.swhom))
-                whom = KILL_ALL;
-        else {
-                whom = kill_whom_from_string(p.swhom);
-                if (whom < 0)
-                        return sd_varlink_error_invalid_parameter_name(link, "whom");
-        }
+        KillWhom whom = p.whom >= 0 ? p.whom : KILL_ALL;
 
-        r = varlink_verify_polkit_async_full(
-                        link,
-                        manager->bus,
-                        "org.freedesktop.machine1.manage-machines",
-                        (const char**) STRV_MAKE("name", machine->name,
-                                                 "verb", "kill"),
-                        machine->uid,
-                        /* flags= */ 0,
-                        &manager->polkit_registry);
-        if (r <= 0)
-                return r;
+        if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                r = varlink_verify_polkit_async_full(
+                                link,
+                                manager->system_bus,
+                                "org.freedesktop.machine1.manage-machines",
+                                (const char**) STRV_MAKE("name", machine->name,
+                                                         "verb", "kill"),
+                                machine->uid,
+                                /* flags= */ 0,
+                                &manager->polkit_registry,
+                                /* ret_admin= */ NULL);
+                if (r <= 0)
+                        return r;
+        }
 
         r = machine_kill(machine, whom, p.signo);
         if (r < 0)
@@ -509,8 +526,8 @@ int vl_method_open(sd_varlink *link, sd_json_variant *parameters, sd_varlink_met
         };
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         _cleanup_free_ char *ptmx_name = NULL, *command_line = NULL;
-        _cleanup_strv_free_ char **polkit_details = NULL, **args = NULL;
         const char *user = NULL, *path = NULL; /* gcc complains about uninitialized variables */
+        _cleanup_strv_free_ char **args = NULL;
         Machine *machine;
         int r, ptmx_fd_idx;
 
@@ -543,17 +560,41 @@ int vl_method_open(sd_varlink *link, sd_json_variant *parameters, sd_varlink_met
         if (r < 0)
                 return r;
 
-        polkit_details = machine_open_polkit_details(p.mode, machine->name, user, path, command_line);
-        r = varlink_verify_polkit_async_full(
-                        link,
-                        manager->bus,
-                        machine_open_polkit_action(p.mode, machine->class),
-                        (const char**) polkit_details,
-                        machine->uid,
-                        /* flags= */ 0,
-                        &manager->polkit_registry);
-        if (r <= 0)
-                return r;
+        if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                /* Ensure only root can shell into the root namespace. This is to avoid unprivileged users
+                 * registering a process they own in the root user namespace, and then shelling in as root
+                 * or another user. Note that the shell operation is privileged and requires 'auth_admin', so we
+                 * do not need to check the caller's uid, as that will be checked by polkit, and if the machine's
+                 * and the caller's do not match, authorization will be required. It's only the case where the
+                 * caller owns the machine that will be shortcut and needs to be checked here. */
+                if (machine->uid != 0) {
+                        assert(machine->class != MACHINE_HOST);
+
+                        r = pidref_in_same_namespace(&PIDREF_MAKE_FROM_PID(1), &machine->leader, NAMESPACE_USER);
+                        if (r < 0)
+                                return log_debug_errno(
+                                                r,
+                                                "Failed to check if machine '%s' is running in the root user namespace: %m",
+                                                machine->name);
+                        if (r > 0)
+                                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, NULL);
+                }
+
+                _cleanup_strv_free_ char **polkit_details = NULL;
+
+                polkit_details = machine_open_polkit_details(p.mode, machine->name, user, path, command_line);
+                r = varlink_verify_polkit_async_full(
+                                link,
+                                manager->system_bus,
+                                machine_open_polkit_action(p.mode, machine->class),
+                                (const char**) polkit_details,
+                                machine->uid,
+                                /* flags= */ 0,
+                                &manager->polkit_registry,
+                                /* ret_admin= */ NULL);
+                if (r <= 0)
+                        return r;
+        }
 
         ptmx_fd = machine_openpt(machine, O_RDWR|O_NOCTTY|O_CLOEXEC, &ptmx_name);
         if (ERRNO_IS_NEG_NOT_SUPPORTED(ptmx_fd))
@@ -567,7 +608,7 @@ int vl_method_open(sd_varlink *link, sd_json_variant *parameters, sd_varlink_met
                         break;
 
                 case MACHINE_OPEN_MODE_LOGIN:
-                        r = machine_start_getty(machine, ptmx_name, /* error = */ NULL);
+                        r = machine_start_getty(machine, ptmx_name, /* error= */ NULL);
                         if (r == -ENOENT)
                                 return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NO_IPC, NULL);
                         if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
@@ -579,7 +620,7 @@ int vl_method_open(sd_varlink *link, sd_json_variant *parameters, sd_varlink_met
 
                 case MACHINE_OPEN_MODE_SHELL: {
                         assert(user && path && args); /* to avoid gcc complaining about possible uninitialized variables */
-                        r = machine_start_shell(machine, ptmx_fd, ptmx_name, user, path, args, p.env, /* error = */ NULL);
+                        r = machine_start_shell(machine, ptmx_fd, ptmx_name, user, path, args, p.env, /* error= */ NULL);
                         if (r == -ENOENT)
                                 return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NO_IPC, NULL);
                         if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
@@ -626,7 +667,7 @@ static void machine_map_paramaters_done(MachineMapParameters *p) {
 
 int vl_method_map_from(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         static const sd_json_dispatch_field dispatch_table[] = {
-                VARLINK_DISPATCH_MACHINE_LOOKUP_FIELDS(MachineOpenParameters),
+                VARLINK_DISPATCH_MACHINE_LOOKUP_FIELDS(MachineMapParameters),
                 { "uid", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uid_gid, offsetof(MachineMapParameters, uid), 0 },
                 { "gid", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uid_gid, offsetof(MachineMapParameters, gid), 0 },
                 {}
@@ -787,11 +828,11 @@ static void machine_mount_paramaters_done(MachineMountParameters *p) {
 
 int vl_method_bind_mount(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         static const sd_json_dispatch_field dispatch_table[] = {
-                VARLINK_DISPATCH_MACHINE_LOOKUP_FIELDS(MachineOpenParameters),
-                { "source",      SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineMountParameters, src),       SD_JSON_MANDATORY },
-                { "destination", SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineMountParameters, dest),      0                 },
-                { "readOnly",    SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineMountParameters, read_only), 0                 },
-                { "mkdir",       SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineMountParameters, mkdir),     0                 },
+                VARLINK_DISPATCH_MACHINE_LOOKUP_FIELDS(MachineMountParameters),
+                { "source",      SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineMountParameters, src),       SD_JSON_MANDATORY|SD_JSON_STRICT },
+                { "destination", SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineMountParameters, dest),      SD_JSON_STRICT                   },
+                { "readOnly",    SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineMountParameters, read_only), 0                                },
+                { "mkdir",       SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineMountParameters, mkdir),     0                                },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
         };
@@ -811,7 +852,7 @@ int vl_method_bind_mount(sd_varlink *link, sd_json_variant *parameters, sd_varli
         if (r != 0)
                 return r;
 
-        /* There is no need for extra validation since json_dispatch_const_path() does path_is_valid() and path_is_absolute(). */
+        /* There is no need for extra validation since json_dispatch_const_path() with SD_JSON_STRICT does path_is_normalized() and path_is_absolute(). */
         const char *dest = p.dest ?: p.src;
 
         Machine *machine;
@@ -824,18 +865,20 @@ int vl_method_bind_mount(sd_varlink *link, sd_json_variant *parameters, sd_varli
         if (machine->class != MACHINE_CONTAINER)
                 return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NOT_SUPPORTED, NULL);
 
-        /* NB: For now not opened up to owner of machine without auth */
-        r = varlink_verify_polkit_async(
-                        link,
-                        manager->bus,
-                        "org.freedesktop.machine1.manage-machines",
-                        (const char**) STRV_MAKE("name", machine->name,
-                                                 "verb", "bind",
-                                                 "src", p.src,
-                                                 "dest", dest),
-                        &manager->polkit_registry);
-        if (r <= 0)
-                return r;
+        if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                /* NB: For now not opened up to owner of machine without auth */
+                r = varlink_verify_polkit_async(
+                                link,
+                                manager->system_bus,
+                                "org.freedesktop.machine1.manage-machines",
+                                (const char**) STRV_MAKE("name", machine->name,
+                                                         "verb", "bind",
+                                                         "src", p.src,
+                                                         "dest", dest),
+                                &manager->polkit_registry);
+                if (r <= 0)
+                        return r;
+        }
 
         r = machine_get_uid_shift(machine, &uid_shift);
         if (r < 0)
@@ -896,9 +939,9 @@ static int copy_done(Operation *operation, int ret, sd_bus_error *error) {
 int vl_method_copy_internal(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata, bool copy_from) {
         static const sd_json_dispatch_field dispatch_table[] = {
                 VARLINK_DISPATCH_MACHINE_LOOKUP_FIELDS(MachineCopyParameters),
-                { "source",      SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineCopyParameters, src),     SD_JSON_MANDATORY },
-                { "destination", SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineCopyParameters, dest),    0                 },
-                { "replace",     SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineCopyParameters, replace), 0                 },
+                { "source",      SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineCopyParameters, src),     SD_JSON_MANDATORY|SD_JSON_STRICT },
+                { "destination", SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineCopyParameters, dest),    SD_JSON_STRICT                   },
+                { "replace",     SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineCopyParameters, replace), 0                                },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
         };
@@ -919,11 +962,11 @@ int vl_method_copy_internal(sd_varlink *link, sd_json_variant *parameters, sd_va
         if (r != 0)
                 return r;
 
-        /* There is no need for extra validation since json_dispatch_const_path() does path_is_valid() and path_is_absolute(). */
+        /* There is no need for extra validation since json_dispatch_const_path() with SD_JSON_STRICT does path_is_normalized() and path_is_absolute(). */
         const char *dest = p.dest ?: p.src;
         const char *container_path = copy_from ? p.src : dest;
         const char *host_path = copy_from ? dest : p.src;
-        CopyFlags copy_flags = COPY_REFLINK|COPY_MERGE|COPY_HARDLINKS;
+        CopyFlags copy_flags = COPY_MERGE|COPY_HARDLINKS;
         copy_flags |= p.replace ? COPY_REPLACE : 0;
 
         Machine *machine;
@@ -936,18 +979,20 @@ int vl_method_copy_internal(sd_varlink *link, sd_json_variant *parameters, sd_va
         if (machine->class != MACHINE_CONTAINER)
                 return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NOT_SUPPORTED, NULL);
 
-        /* NB: For now not opened up to owner of machine without auth */
-        r = varlink_verify_polkit_async(
-                        link,
-                        manager->bus,
-                        "org.freedesktop.machine1.manage-machines",
-                        (const char**) STRV_MAKE("name", machine->name,
-                                                 "verb", "copy",
-                                                 "src", p.src,
-                                                 "dest", dest),
-                        &manager->polkit_registry);
-        if (r <= 0)
-                return r;
+        if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                /* NB: For now not opened up to owner of machine without auth */
+                r = varlink_verify_polkit_async(
+                                link,
+                                manager->system_bus,
+                                "org.freedesktop.machine1.manage-machines",
+                                (const char**) STRV_MAKE("name", machine->name,
+                                                         "verb", "copy",
+                                                         "src", p.src,
+                                                         "dest", dest),
+                                &manager->polkit_registry);
+                if (r <= 0)
+                        return r;
+        }
 
         Operation *op;
         r = machine_copy_from_to_operation(manager, machine, host_path, container_path, copy_from, copy_flags, &op);
@@ -967,15 +1012,17 @@ int vl_method_open_root_directory_internal(sd_varlink *link, sd_json_variant *pa
         int r;
 
         /* NB: For now not opened up to owner of machine without auth */
-        r = varlink_verify_polkit_async(
-                        link,
-                        manager->bus,
-                        "org.freedesktop.machine1.manage-machines",
-                        (const char**) STRV_MAKE("name", machine->name,
-                                                 "verb", "open_root_directory"),
-                        &manager->polkit_registry);
-        if (r <= 0)
-                return r;
+        if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                r = varlink_verify_polkit_async(
+                                link,
+                                manager->system_bus,
+                                "org.freedesktop.machine1.manage-machines",
+                                (const char**) STRV_MAKE("name", machine->name,
+                                                         "verb", "open_root_directory"),
+                                &manager->polkit_registry);
+                if (r <= 0)
+                        return r;
+        }
 
         fd = machine_open_root_directory(machine);
         if (ERRNO_IS_NEG_NOT_SUPPORTED(fd))

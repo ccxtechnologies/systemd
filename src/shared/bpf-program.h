@@ -30,7 +30,7 @@ int bpf_program_new(uint32_t prog_type, const char *prog_name, BPFProgram **ret)
 int bpf_program_new_from_bpffs_path(const char *path, BPFProgram **ret);
 BPFProgram *bpf_program_free(BPFProgram *p);
 
-int bpf_program_add_instructions(BPFProgram *p, const struct bpf_insn *insn, size_t count);
+int bpf_program_add_instructions(BPFProgram *p, const struct bpf_insn *instructions, size_t count);
 int bpf_program_load_kernel(BPFProgram *p, char *log_buf, size_t log_size);
 int bpf_program_load_from_bpf_fs(BPFProgram *p, const char *path);
 
@@ -52,7 +52,6 @@ int bpf_map_new(const char *name, enum bpf_map_type type, size_t key_size, size_
 int bpf_map_update_element(int fd, const void *key, void *value);
 int bpf_map_lookup_element(int fd, const void *key, void *value);
 
-int bpf_cgroup_attach_type_from_string(const char *str) _pure_;
-const char* bpf_cgroup_attach_type_to_string(int attach_type) _const_;
+DECLARE_STRING_TABLE_LOOKUP(bpf_cgroup_attach_type, int);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(BPFProgram*, bpf_program_free);

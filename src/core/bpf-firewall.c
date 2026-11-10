@@ -547,9 +547,9 @@ int bpf_firewall_compile(Unit *u) {
         if (!cc)
                 return -EINVAL;
 
-        crt = unit_setup_cgroup_runtime(u);
+        crt = unit_get_cgroup_runtime(u);
         if (!crt)
-                return -ENOMEM;
+                return -ESTALE;
 
         if (bpf_program_supported() <= 0)
                 return log_unit_debug_errno(u, SYNTHETIC_ERRNO(EOPNOTSUPP),
@@ -603,6 +603,8 @@ int bpf_firewall_compile(Unit *u) {
 }
 
 static int load_bpf_progs_from_fs_to_set(Unit *u, char **filter_paths, Set **set) {
+        assert(set);
+
         set_clear(*set);
 
         STRV_FOREACH(bpf_fs_path, filter_paths) {
@@ -661,6 +663,8 @@ static int attach_custom_bpf_progs(Unit *u, const char *path, int attach_type, S
         int r;
 
         assert(u);
+        assert(set);
+        assert(set_installed);
 
         set_clear(*set_installed);
         r = set_ensure_allocated(set_installed, &bpf_program_hash_ops);
@@ -696,7 +700,7 @@ int bpf_firewall_install(Unit *u) {
                 return log_unit_debug_errno(u, SYNTHETIC_ERRNO(EOPNOTSUPP),
                                             "bpf-firewall: BPF firewalling not supported, proceeding without.");
 
-        r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, crt->cgroup_path, NULL, &path);
+        r = cg_get_path(crt->cgroup_path, /* suffix= */ NULL, &path);
         if (r < 0)
                 return log_unit_error_errno(u, r, "bpf-firewall: Failed to determine cgroup path: %m");
 

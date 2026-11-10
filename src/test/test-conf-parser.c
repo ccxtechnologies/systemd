@@ -41,6 +41,14 @@ static void test_config_parse_iec_size_one(const char *rvalue, size_t expected) 
         ASSERT_EQ(expected, iec_size);
 }
 
+static void test_config_parse_iec_size_long_one(const char *rvalue, long expected) {
+        long iec_size = 0;
+
+        ASSERT_OK(config_parse_iec_size_long(
+                          "unit", "filename", 1, "section", 1, "lvalue", 0, rvalue, &iec_size, NULL));
+        ASSERT_EQ(expected, iec_size);
+}
+
 static void test_config_parse_si_uint64_one(const char *rvalue, uint64_t expected) {
         uint64_t si_uint64 = 0;
 
@@ -133,6 +141,19 @@ TEST(config_parse_iec_size) {
         test_config_parse_iec_size_one("-982", 0);
         test_config_parse_iec_size_one("49874444198739873000000G", 0);
         test_config_parse_iec_size_one("garbage", 0);
+}
+
+TEST(config_parse_iec_size_long) {
+        test_config_parse_iec_size_long_one("1024", 1024);
+        test_config_parse_iec_size_long_one("2K", 2048);
+        test_config_parse_iec_size_long_one("10M", 10 * 1024 * 1024);
+        test_config_parse_iec_size_long_one("1G", 1L * 1024 * 1024 * 1024);
+        test_config_parse_iec_size_long_one("0G", 0);
+        test_config_parse_iec_size_long_one("0", 0);
+
+        test_config_parse_iec_size_long_one("-982", 0);
+        test_config_parse_iec_size_long_one("49874444198739873000000G", 0);
+        test_config_parse_iec_size_long_one("garbage", 0);
 }
 
 TEST(config_parse_si_uint64) {
@@ -444,7 +465,9 @@ TEST(config_parse_standard_file_with_dropins_full) {
         };
 
         r = config_parse_standard_file_with_dropins_full(
-                        root, "kernel/install.conf",
+                        root,
+                        /* root_fd= */ -EBADF,
+                        "kernel/install.conf",
                         /* sections= */ NULL,
                         config_item_table_lookup, items,
                         CONFIG_PARSE_WARN,
@@ -483,7 +506,9 @@ TEST(config_parse_standard_file_with_dropins_full) {
         assert_se(symlinkat("/etc/kernel/install.conf.d/drop4.conf", rfd, "etc/kernel/install2.conf.d/drop4.conf") == 0);
 
         r = config_parse_standard_file_with_dropins_full(
-                        root, "kernel/install2.conf",
+                        root,
+                        /* root_fd= */ -EBADF,
+                        "kernel/install2.conf",
                         /* sections= */ NULL,
                         config_item_table_lookup, items,
                         CONFIG_PARSE_WARN,

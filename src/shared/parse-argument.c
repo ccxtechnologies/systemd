@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "bus-util.h"
 #include "format-table.h"
 #include "hostname-util.h"
@@ -19,40 +20,38 @@ int parse_boolean_argument(const char *optname, const char *s, bool *ret) {
 
         /* Returns the result through *ret and the return value. */
 
+        assert(optname);
+
         if (s) {
                 r = parse_boolean(s);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to parse boolean argument to %s: %s.", optname, s);
+                        return log_error_errno(r, "Failed to parse boolean argument to '%s': %s", optname, s);
 
                 if (ret)
                         *ret = r;
                 return r;
         } else {
-                /* s may be NULL. This is controlled by getopt_long() parameters. */
+                /* s may be NULL. This is controlled by OPTION flags. */
                 if (ret)
                         *ret = true;
                 return true;
         }
 }
 
-int parse_tristate_argument(const char *optname, const char *s, int *ret) {
+int parse_tristate_argument_with_auto(const char *optname, const char *s, int *ret) {
         int r;
 
-        if (s) {
-                r = parse_boolean(s);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to parse boolean argument to %s: %s.", optname, s);
+        assert(optname);
+        assert(s); /* We refuse NULL arg here, since that would be ambiguous on cmdline: for
+                    * --enable-a[=BOOL], --enable-a is intuitively interpreted as true rather than "auto"
+                    * (parse_boolean_argument() does exactly that). IOW, tristate options should require
+                    * arguments. */
 
-                if (ret)
-                        *ret = r;
+        r = parse_tristate_full(s, "auto", ret);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse tristate argument to '%s': %s", optname, s);
 
-                return r;
-        } else {
-                if (ret)
-                        *ret = -1;
-
-                return 0;
-        }
+        return 0;
 }
 
 int parse_json_argument(const char *s, sd_json_format_flags_t *ret) {
@@ -79,6 +78,8 @@ int parse_json_argument(const char *s, sd_json_format_flags_t *ret) {
 int parse_path_argument(const char *path, bool suppress_root, char **arg) {
         char *p;
         int r;
+
+        assert(arg);
 
         /*
          * This function is intended to be used in command line parsers, to handle paths that are passed
@@ -110,10 +111,8 @@ int parse_signal_argument(const char *s, int *ret) {
         assert(s);
         assert(ret);
 
-        if (streq(s, "help")) {
-                DUMP_STRING_TABLE(signal, int, _NSIG);
-                return 0;
-        }
+        if (streq(s, "help"))
+                return DUMP_STRING_TABLE(signal, int, _NSIG);
 
         if (streq(s, "list")) {
                 _cleanup_(table_unrefp) Table *table = NULL;
@@ -131,11 +130,7 @@ int parse_signal_argument(const char *s, int *ret) {
                                 return table_log_add_error(r);
                 }
 
-                r = table_print(table, NULL);
-                if (r < 0)
-                        return table_log_print_error(r);
-
-                return 0;
+                return table_print_or_warn(table);
         }
 
         r = signal_from_string(s);
@@ -164,4 +159,11 @@ int parse_machine_argument(const char *s, const char **ret_host, BusTransport *r
                 *ret_transport = BUS_TRANSPORT_MACHINE;
 
         return 0;
+}
+
+int parse_background_argument(const char *s, char **arg) {
+        if (!isempty(s) && !looks_like_ansi_color_code(s))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid --background= argument: %s", s);
+
+        return free_and_strdup_warn(arg, s);
 }

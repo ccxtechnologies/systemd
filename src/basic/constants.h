@@ -59,9 +59,17 @@
 #define DEFAULT_RLIMIT_MEMLOCK (1024ULL*1024ULL*8ULL)
 
 /* Path where PID1 listens for varlink subscriptions from systemd-oomd to notify of changes in ManagedOOM settings. */
-#define VARLINK_ADDR_PATH_MANAGED_OOM_SYSTEM "/run/systemd/io.systemd.ManagedOOM"
+#define VARLINK_PATH_MANAGED_OOM_SYSTEM "/run/systemd/io.systemd.ManagedOOM"
 /* Path where systemd-oomd listens for varlink connections from user managers to report changes in ManagedOOM settings. */
-#define VARLINK_ADDR_PATH_MANAGED_OOM_USER "/run/systemd/oom/io.systemd.ManagedOOM"
+#define VARLINK_PATH_MANAGED_OOM_USER "/run/systemd/oom/io.systemd.ManagedOOM"
+/* Path where systemd-machined listens to userdb varlink queries */
+#define VARLINK_PATH_MACHINED_USERDB "/run/systemd/userdb/io.systemd.Machine"
+/* Path where systemd-machined listens to resolve.hook varlink queries */
+#define VARLINK_PATH_MACHINED_RESOLVE_HOOK "/run/systemd/resolve.hook/io.systemd.Machine"
+/* Path where to connect to send varlink prekill events */
+#define VARLINK_DIR_OOMD_PREKILL_HOOK "/run/systemd/oomd.prekill.hook/"
+/* Directory whose sockets receive io.systemd.SysUpdate.Notify() after a successful sysupdate run */
+#define VARLINK_DIR_SYSUPDATE_NOTIFY_HOOK "/run/systemd/sysupdate/notify/"
 
 /* Recommended baseline - see README for details */
-#define KERNEL_BASELINE_VERSION "5.7"
+#define KERNEL_BASELINE_VERSION "5.14"

@@ -12,16 +12,19 @@ rules = [
                '60-drm.rules',
                '60-evdev.rules',
                '60-fido-id.rules',
+               '60-gpiochip.rules',
                '60-infiniband.rules',
                '60-input-id.rules',
                '60-persistent-alsa.rules',
                '60-persistent-hidraw.rules',
                '60-persistent-input.rules',
+               '60-persistent-media-controller.rules',
                '60-persistent-storage-mtd.rules',
                '60-persistent-storage-tape.rules',
                '60-persistent-v4l.rules',
                '60-sensor.rules',
                '60-serial.rules',
+               '65-integration.rules',
                '70-camera.rules',
                '70-joystick.rules',
                '70-mouse.rules',
@@ -32,18 +35,22 @@ rules = [
                '80-net-setup-link.rules',
                '81-net-bridge.rules',
                '81-net-dhcp.rules',
+               '82-net-auto-link-local.rules',
                '90-image-dissect.rules',
                '90-iocost.rules',
               )],
 
-        [files('80-drivers.rules'),
-         conf.get('HAVE_KMOD') == 1],
+        [files('60-tpm2-id.rules'),
+         conf.get('HAVE_TPM2') == 1],
 
         [files('70-memory.rules'),
          conf.get('HAVE_DMI') == 1],
 
         [files('70-power-switch.rules'),
-         conf.get('ENABLE_LOGIND') == 1]
+         conf.get('ENABLE_LOGIND') == 1],
+
+        [files('80-drivers.rules'),
+         conf.get('HAVE_KMOD') == 1],
 ]
 
 all_rules = []

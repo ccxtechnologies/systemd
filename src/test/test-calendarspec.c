@@ -7,6 +7,11 @@
 #include "calendarspec.h"
 #include "env-util.h"
 #include "errno-util.h"
+#include "fd-util.h"
+#include "io-util.h"
+#include "log.h"
+#include "memfd-util.h"
+#include "process-util.h"
 #include "string-util.h"
 #include "tests.h"
 #include "time-util.h"
@@ -44,12 +49,9 @@ static void _test_one(int line, const char *input, const char *output) {
 static void _test_next(int line, const char *input, const char *new_tz, usec_t after, usec_t expect) {
         _cleanup_(calendar_spec_freep) CalendarSpec *c = NULL;
         usec_t u;
-        char *old_tz;
         int r;
 
-        old_tz = getenv("TZ");
-        if (old_tz)
-                old_tz = strdupa_safe(old_tz);
+        SAVE_TIMEZONE;
 
         if (!isempty(new_tz) && !strchr(new_tz, ','))
                 new_tz = strjoina(":", new_tz);
@@ -68,9 +70,6 @@ static void _test_next(int line, const char *input, const char *new_tz, usec_t a
                 assert_se(r >= 0 && u == expect);
         else
                 assert_se(r == -ENOENT);
-
-        assert_se(set_unset_env("TZ", old_tz, true) == 0);
-        tzset();
 }
 #define test_next(input, new_tz, after, expect) _test_next(__LINE__, input,new_tz,after,expect)
 
@@ -225,6 +224,8 @@ TEST(calendar_spec_next) {
         test_next("Sun *-*-* 01:00:00 Europe/Dublin", "IST", 1616412478000000, 1617494400000000);
         /* Europe/Dublin TZ that moves DST backwards */
         test_next("hourly", "IST-1GMT-0,M10.5.0/1,M3.5.0/1", 1743292800000000, 1743296400000000);
+        /* Check when the year changes, see issue #40260 */
+        test_next("*-*-1/11 23:00:00 UTC", "", 1763938800000000, 1764630000000000);
 }
 
 TEST(calendar_spec_from_string) {
@@ -258,6 +259,76 @@ TEST(calendar_spec_from_string) {
         assert_se(calendar_spec_from_string("*:4,30:*,5", &c) == -EINVAL);
         assert_se(calendar_spec_from_string("*:4,30:5,*", &c) == -EINVAL);
         assert_se(calendar_spec_from_string("*:4,30:*\n", &c) == -EINVAL);
+}
+
+/* Fork a child with stderr redirected to a memfd, invoke calendar_spec_from_string_full()
+ * with warn=true, wait, then return the memfd rewound to 0. */
+static int run_in_child_capture_stderr(const char *spec) {
+        _cleanup_close_ int memfd = memfd_new("calendarspec-warn-test");
+        assert_se(memfd >= 0);
+
+        int r = pidref_safe_fork_full(
+                        "(calendarspec-warn)",
+                        (const int[3]) { -1, -1, memfd },
+                        NULL, 0,
+                        FORK_WAIT|FORK_LOG|FORK_REARRANGE_STDIO,
+                        NULL);
+        assert_se(r >= 0);
+
+        if (r == 0) {
+                /* log.c may have inherited a console fd that no longer points at stderr. */
+                log_close();
+                log_set_target_and_open(LOG_TARGET_CONSOLE);
+                log_set_max_level(LOG_WARNING);
+
+                _cleanup_(calendar_spec_freep) CalendarSpec *c = NULL;
+                (void) calendar_spec_from_string_full(spec, &c, /* warn_on_weekday_mismatch= */ true);
+                /* Write PARSE_OK to stderr as a positive anchor. */
+                fputs("PARSE_OK\n", stderr);
+                _exit(0);
+        }
+
+        assert_se(lseek(memfd, 0, SEEK_SET) == 0);
+        return TAKE_FD(memfd);
+}
+
+TEST(calendar_spec_weekday_conflict) {
+        char buf[4096];
+        ssize_t n;
+
+        /* Case 1: conflicting weekday — warning must be emitted */
+        {
+                _cleanup_close_ int fd = run_in_child_capture_stderr("Thu 2027-01-01");
+                n = loop_read(fd, buf, sizeof(buf) - 1, /* do_poll= */ false);
+                assert_se(n > 0);
+                buf[n] = '\0';
+                /* Check date, weekday text and warning phrase are present. */
+                assert_se(strstr(buf, "2027-01-01"));
+                assert_se(strstr(buf, "which is a Fri"));
+                assert_se(strstr(buf, "will never elapse"));
+        }
+
+        /* Case 2: correct weekday — no warning */
+        {
+                _cleanup_close_ int fd = run_in_child_capture_stderr("Fri 2027-01-01");
+                n = loop_read(fd, buf, sizeof(buf) - 1, /* do_poll= */ false);
+                /* Ensure child wrote PARSE_OK. */
+                assert_se(n >= 0);
+                buf[MAX(n, (ssize_t)0)] = '\0';
+                assert_se(strstr(buf, "PARSE_OK"));
+                assert_se(!strstr(buf, "will never elapse"));
+        }
+
+        /* Case 3: wildcard date — no static conflict, no warning */
+        {
+                _cleanup_close_ int fd = run_in_child_capture_stderr("Thu *-*-*");
+                n = loop_read(fd, buf, sizeof(buf) - 1, /* do_poll= */ false);
+                /* Ensure child wrote PARSE_OK. */
+                assert_se(n >= 0);
+                buf[MAX(n, (ssize_t)0)] = '\0';
+                assert_se(strstr(buf, "PARSE_OK"));
+                assert_se(!strstr(buf, "will never elapse"));
+        }
 }
 
 static int intro(void) {

@@ -16,20 +16,25 @@
 #include "iovec-util.h"
 #include "label-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "manager.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
+#include "namespace-util.h"
 #include "ordered-set.h"
 #include "path-lookup.h"
 #include "path-util.h"
+#include "pidref.h"
 #include "process-util.h"
 #include "random-util.h"
 #include "recurse-dir.h"
 #include "rm-rf.h"
 #include "siphash24.h"
+#include "socket-util.h"
 #include "stat-util.h"
+#include "string-util.h"
 #include "strv.h"
-#include "tmpfile-util.h"
+#include "unit.h"
 #include "user-util.h"
 
 ExecSetCredential* exec_set_credential_free(ExecSetCredential *sc) {
@@ -311,66 +316,33 @@ int exec_context_destroy_credentials(const ExecContext *c, const char *runtime_p
         return 0;
 }
 
-static int write_credential(
-                int dfd,
-                const char *id,
-                const void *data,
-                size_t size,
-                uid_t uid,
-                gid_t gid,
-                bool ownership_ok) {
+typedef struct SetupCredentialsContext {
+        RuntimeScope scope;
 
-        _cleanup_free_ char *tmp = NULL;
-        _cleanup_close_ int fd = -EBADF;
-        int r;
+        const ExecContext *exec_context;
+        const char *unit;
 
-        assert(dfd >= 0);
-        assert(id);
-        assert(data || size == 0);
+        const char *runtime_prefix;
 
-        r = tempfn_random_child("", "cred", &tmp);
-        if (r < 0)
-                return r;
+        const char *received_credentials_directory;
+        const char *received_encrypted_credentials_directory;
 
-        fd = openat(dfd, tmp, O_CREAT|O_RDWR|O_CLOEXEC|O_EXCL|O_NOFOLLOW|O_NOCTTY, 0600);
-        if (fd < 0)
-                return -errno;
+        bool always_ipc;
 
-        r = loop_write(fd, data, size);
-        if (r < 0)
-                goto fail;
+        uid_t uid;
+        gid_t gid;
+} SetupCredentialsContext;
 
-        r = RET_NERRNO(fchmod(fd, 0400)); /* Take away "w" bit */
-        if (r < 0)
-                goto fail;
+typedef struct LoadCredentialArguments {
+        const SetupCredentialsContext *context;
 
-        if (uid_is_valid(uid) && uid != getuid()) {
-                r = fd_add_uid_acl_permission(fd, uid, ACL_READ);
-                if (r < 0) {
-                        /* Ideally we use ACLs, since we can neatly express what we want to express:
-                         * the user gets read access and nothing else. But if the backing fs can't
-                         * support that (e.g. ramfs), then we can use file ownership instead. But that's
-                         * only safe if we can then re-mount the whole thing read-only, so that the user
-                         * can no longer chmod() the file to gain write access. */
-                        if (!ownership_ok || (!ERRNO_IS_NOT_SUPPORTED(r) && !ERRNO_IS_PRIVILEGE(r)))
-                                goto fail;
+        bool encrypted;
 
-                        r = RET_NERRNO(fchown(fd, uid, gid));
-                        if (r < 0)
-                                goto fail;
-                }
-        }
+        int write_dfd;
+        bool ownership_ok;
 
-        r = RET_NERRNO(renameat(dfd, tmp, dfd, id));
-        if (r < 0)
-                goto fail;
-
-        return 0;
-
-fail:
-        (void) unlinkat(dfd, tmp, /* flags = */ 0);
-        return r;
-}
+        uint64_t left;
+} LoadCredentialArguments;
 
 typedef enum CredentialSearchPath {
         CREDENTIAL_SEARCH_PATH_TRUSTED,
@@ -380,11 +352,15 @@ typedef enum CredentialSearchPath {
         _CREDENTIAL_SEARCH_PATH_INVALID = -EINVAL,
 } CredentialSearchPath;
 
-static int credential_search_path(const ExecParameters *params, CredentialSearchPath path, char ***ret) {
+static int credential_search_path(
+                const SetupCredentialsContext *context,
+                CredentialSearchPath path,
+                char ***ret) {
+
         _cleanup_strv_free_ char **l = NULL;
         int r;
 
-        assert(params);
+        assert(context);
         assert(path >= 0 && path < _CREDENTIAL_SEARCH_PATH_MAX);
         assert(ret);
 
@@ -393,12 +369,12 @@ static int credential_search_path(const ExecParameters *params, CredentialSearch
          * credentials, we'll look in /etc/credstore.encrypted/ (and similar dirs). */
 
         if (IN_SET(path, CREDENTIAL_SEARCH_PATH_ENCRYPTED, CREDENTIAL_SEARCH_PATH_ALL)) {
-                r = strv_extend(&l, params->received_encrypted_credentials_directory);
+                r = strv_extend(&l, context->received_encrypted_credentials_directory);
                 if (r < 0)
                         return r;
 
                 _cleanup_strv_free_ char **add = NULL;
-                r = credential_store_path_encrypted(params->runtime_scope, &add);
+                r = credential_store_path_encrypted(context->scope, &add);
                 if (r < 0)
                         return r;
 
@@ -408,12 +384,12 @@ static int credential_search_path(const ExecParameters *params, CredentialSearch
         }
 
         if (IN_SET(path, CREDENTIAL_SEARCH_PATH_TRUSTED, CREDENTIAL_SEARCH_PATH_ALL)) {
-                r = strv_extend(&l, params->received_credentials_directory);
+                r = strv_extend(&l, context->received_credentials_directory);
                 if (r < 0)
                         return r;
 
                 _cleanup_strv_free_ char **add = NULL;
-                r = credential_store_path(params->runtime_scope, &add);
+                r = credential_store_path(context->scope, &add);
                 if (r < 0)
                         return r;
 
@@ -431,44 +407,56 @@ static int credential_search_path(const ExecParameters *params, CredentialSearch
         return 0;
 }
 
-static bool device_nodes_restricted(
-                const ExecContext *c,
-                const CGroupContext *cgroup_context) {
+static int write_credential(
+                int dfd,
+                const char *id,
+                const void *data,
+                size_t size,
+                uid_t uid,
+                gid_t gid,
+                bool ownership_ok) {
 
-        assert(c);
-        assert(cgroup_context);
+        _cleanup_close_ int fd = -EBADF;
+        int r;
 
-        /* Returns true if we have any reason to believe we might not be able to access the TPM device
-         * directly, even if we run as root/PID 1. This could be because /dev/ is replaced by a private
-         * version, or because a device node access list is configured. */
+        assert(dfd >= 0);
+        assert(id);
+        assert(data || size == 0);
 
-        if (c->private_devices)
-                return true;
+        fd = openat(dfd, id, O_CREAT|O_EXCL|O_WRONLY|O_CLOEXEC, 0600);
+        if (fd < 0)
+                return -errno;
 
-        if (cgroup_context_has_device_policy(cgroup_context))
-                return true;
+        r = loop_write(fd, data, size);
+        if (r < 0)
+                return r;
 
-        return false;
+        r = RET_NERRNO(fchmod(fd, 0400)); /* Take away "w" bit */
+        if (r < 0)
+                return r;
+
+        if (uid_is_valid(uid) && uid != getuid()) {
+                r = fd_add_uid_acl_permission(fd, uid, ACL_READ);
+                /* Ideally we use ACLs, since we can neatly express what we want to express:
+                 * the user gets read access and nothing else. But if the backing fs can't
+                 * support that (e.g. ramfs), then we can use file ownership instead. But that's
+                 * only safe if we can then re-mount the whole thing read-only, so that the user
+                 * can no longer chmod() the file to gain write access. */
+                if ((ERRNO_IS_NEG_NOT_SUPPORTED(r) || ERRNO_IS_NEG_PRIVILEGE(r)) && ownership_ok)
+                        r = RET_NERRNO(fchown(fd, uid, gid));
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
 }
 
-struct load_cred_args {
-        const ExecContext *context;
-        const CGroupContext *cgroup_context;
-        const ExecParameters *params;
-        const char *unit;
-        bool encrypted;
-        int write_dfd;
-        uid_t uid;
-        gid_t gid;
-        bool ownership_ok;
-        uint64_t left;
-};
-
 static int maybe_decrypt_and_write_credential(
-                struct load_cred_args *args,
+                LoadCredentialArguments *args,
                 const char *id,
                 const char *data,
-                size_t size) {
+                size_t size,
+                bool graceful) {
 
         _cleanup_(iovec_done_erase) struct iovec plaintext = {};
         size_t add;
@@ -482,7 +470,7 @@ static int maybe_decrypt_and_write_credential(
         if (args->encrypted) {
                 CredentialFlags flags = 0; /* only allow user creds in user scope */
 
-                switch (args->params->runtime_scope) {
+                switch (args->context->scope) {
 
                 case RUNTIME_SCOPE_SYSTEM:
                         /* In system mode talk directly to the TPM – unless we live in a device sandbox
@@ -490,7 +478,7 @@ static int maybe_decrypt_and_write_credential(
 
                         flags |= CREDENTIAL_ANY_SCOPE;
 
-                        if (!device_nodes_restricted(args->context, args->cgroup_context)) {
+                        if (!args->context->always_ipc) {
                                 r = decrypt_credential_and_warn(
                                                 id,
                                                 now(CLOCK_REALTIME),
@@ -522,8 +510,14 @@ static int maybe_decrypt_and_write_credential(
                 default:
                         assert_not_reached();
                 }
-                if (r < 0)
+                if (r < 0) {
+                        if (graceful) {
+                                log_warning_errno(r, "Unable to decrypt credential '%s', skipping: %m", id);
+                                return 0;
+                        }
+
                         return r;
+                }
 
                 data = plaintext.iov_base;
                 size = plaintext.iov_len;
@@ -533,7 +527,7 @@ static int maybe_decrypt_and_write_credential(
         if (add > args->left)
                 return -E2BIG;
 
-        r = write_credential(args->write_dfd, id, data, size, args->uid, args->gid, args->ownership_ok);
+        r = write_credential(args->write_dfd, id, data, size, args->context->uid, args->context->gid, args->ownership_ok);
         if (r < 0)
                 return log_debug_errno(r, "Failed to write credential '%s': %m", id);
 
@@ -543,7 +537,7 @@ static int maybe_decrypt_and_write_credential(
 }
 
 static int load_credential_glob(
-                struct load_cred_args *args,
+                LoadCredentialArguments *args,
                 const ExecImportCredential *ic,
                 char * const *search_path,
                 ReadFullFileFlags flags) {
@@ -563,7 +557,7 @@ static int load_credential_glob(
                 if (!j)
                         return -ENOMEM;
 
-                r = safe_glob(j, /* flags = */ 0, &paths);
+                r = safe_glob(j, /* flags= */ 0, &paths);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)
@@ -612,7 +606,7 @@ static int load_credential_glob(
                         if (r < 0)
                                 return log_debug_errno(r, "Failed to read credential '%s': %m", *p);
 
-                        r = maybe_decrypt_and_write_credential(args, fn, data, size);
+                        r = maybe_decrypt_and_write_credential(args, fn, data, size, /* graceful= */ true);
                         if (r < 0)
                                 return r;
                 }
@@ -622,10 +616,11 @@ static int load_credential_glob(
 }
 
 static int load_credential(
-                struct load_cred_args *args,
+                LoadCredentialArguments *args,
                 const char *id,
                 int read_dfd,
-                const char *path) {
+                const char *path,
+                bool connect_socket) {
 
         ReadFullFileFlags flags = READ_FULL_FILE_SECURE|READ_FULL_FILE_FAIL_WHEN_LARGER;
         _cleanup_strv_free_ char **search_path = NULL;
@@ -638,18 +633,15 @@ static int load_credential(
 
         assert(args);
         assert(args->context);
-        assert(args->params);
-        assert(args->unit);
-        assert(args->write_dfd >= 0);
+        assert(args->context->exec_context);
+        assert(args->context->unit);
         assert(id);
         assert(read_dfd >= 0 || read_dfd == AT_FDCWD);
         assert(path);
 
         if (read_dfd >= 0) {
-                /* If a directory fd is specified, then read the file directly from that dir. In this case we
-                 * won't do AF_UNIX stuff (we simply don't want to recursively iterate down a tree of AF_UNIX
-                 * IPC sockets). It's OK if a file vanishes here in the time we enumerate it and intend to
-                 * open it. */
+                /* If a directory fd is specified, then read the credential directly from that dir. It's OK
+                 * if an entry vanishes in the time between enumeration and opening it. */
 
                 if (!filename_is_valid(path)) /* safety check */
                         return -EINVAL;
@@ -664,13 +656,7 @@ static int load_credential(
                 if (!path_is_valid(path)) /* safety check */
                         return -EINVAL;
 
-                flags |= READ_FULL_FILE_CONNECT_SOCKET;
-
-                /* Pass some minimal info about the unit and the credential name we are looking to acquire
-                 * via the source socket address in case we read off an AF_UNIX socket. */
-                if (asprintf(&bindname, "@%" PRIx64 "/unit/%s/%s", random_u64(), args->unit, id) < 0)
-                        return -ENOMEM;
-
+                connect_socket = true;
                 missing_ok = false;
                 source = path;
 
@@ -679,7 +665,7 @@ static int load_credential(
                  * directory we received ourselves. We don't support the AF_UNIX stuff in this mode, since we
                  * are operating on a credential store, i.e. this is guaranteed to be regular files. */
 
-                r = credential_search_path(args->params, CREDENTIAL_SEARCH_PATH_ALL, &search_path);
+                r = credential_search_path(args->context, CREDENTIAL_SEARCH_PATH_ALL, &search_path);
                 if (r < 0)
                         return r;
 
@@ -692,6 +678,15 @@ static int load_credential(
                 maxsz = CREDENTIAL_ENCRYPTED_SIZE_MAX;
         } else
                 maxsz = CREDENTIAL_SIZE_MAX;
+
+        if (connect_socket) {
+                flags |= READ_FULL_FILE_CONNECT_SOCKET;
+
+                /* Pass some minimal info about the unit and the credential name we are looking to acquire
+                 * via the source socket address in case we read off an AF_UNIX socket. */
+                if (asprintf(&bindname, "@%" PRIx64 "/unit/%s/%s", random_u64(), args->context->unit, id) < 0)
+                        return -ENOMEM;
+        }
 
         if (search_path)
                 STRV_FOREACH(d, search_path) {
@@ -722,22 +717,25 @@ static int load_credential(
         else
                 assert_not_reached();
 
-        if (r == -ENOENT && (missing_ok || hashmap_contains(args->context->set_credentials, id))) {
-                /* Make a missing inherited credential non-fatal, let's just continue. After all apps
-                 * will get clear errors if we don't pass such a missing credential on as they
-                 * themselves will get ENOENT when trying to read them, which should not be much
-                 * worse than when we handle the error here and make it fatal.
-                 *
-                 * Also, if the source file doesn't exist, but a fallback is set via SetCredentials=
-                 * we are fine, too. */
-                log_full_errno(hashmap_contains(args->context->set_credentials, id) ? LOG_DEBUG : LOG_INFO,
-                               r, "Couldn't read inherited credential '%s', skipping: %m", path);
-                return 0;
+        if (r == -ENOENT) {
+                bool in_set_credentials = hashmap_contains(args->context->exec_context->set_credentials, id);
+                if (missing_ok || in_set_credentials) {
+                        /* Make a missing inherited credential non-fatal, let's just continue. After all apps
+                         * will get clear errors if we don't pass such a missing credential on as they
+                         * themselves will get ENOENT when trying to read them, which should not be much
+                         * worse than when we handle the error here and make it fatal.
+                         *
+                         * Also, if the source file doesn't exist, but a fallback is set via SetCredentials=
+                         * we are fine, too. */
+                        log_full_errno(in_set_credentials ? LOG_DEBUG : LOG_INFO,
+                                       r, "Couldn't read inherited credential '%s', skipping: %m", path);
+                        return 0;
+                }
         }
         if (r < 0)
                 return log_debug_errno(r, "Failed to read credential '%s': %m", path);
 
-        return maybe_decrypt_and_write_credential(args, id, data, size);
+        return maybe_decrypt_and_write_credential(args, id, data, size, /* graceful= */ false);
 }
 
 static int load_cred_recurse_dir_cb(
@@ -749,7 +747,7 @@ static int load_cred_recurse_dir_cb(
                 const struct statx *sx,
                 void *userdata) {
 
-        struct load_cred_args *args = ASSERT_PTR(userdata);
+        LoadCredentialArguments *args = ASSERT_PTR(userdata);
         _cleanup_free_ char *sub_id = NULL;
         int r;
 
@@ -778,55 +776,56 @@ static int load_cred_recurse_dir_cb(
 
         r = load_credential(args,
                             sub_id,
-                            dir_fd, de->d_name);
+                            dir_fd, de->d_name,
+                            de->d_type == DT_SOCK);
         if (r < 0)
                 return r;
 
         return RECURSE_DIR_CONTINUE;
 }
 
+static bool device_nodes_restricted(
+                const ExecContext *c,
+                const CGroupContext *cgroup_context) {
+
+        assert(c);
+        assert(cgroup_context);
+
+        /* Returns true if we have any reason to believe we might not be able to access the TPM device
+         * directly, even if we run as root/PID 1. This could be because /dev/ is replaced by a private
+         * version, or because a device node access list is configured. */
+
+        if (c->private_devices)
+                return true;
+
+        if (cgroup_context_has_device_policy(cgroup_context))
+                return true;
+
+        return false;
+}
+
 static int acquire_credentials(
-                const ExecContext *context,
-                const CGroupContext *cgroup_context,
-                const ExecParameters *params,
-                const char *unit,
-                const char *p,
-                uid_t uid,
-                gid_t gid,
+                const SetupCredentialsContext *context,
+                int dfd,
                 bool ownership_ok) {
 
-        _cleanup_close_ int dfd = -EBADF;
         int r;
 
         assert(context);
-        assert(cgroup_context);
-        assert(params);
-        assert(unit);
-        assert(p);
+        assert(context->exec_context);
+        assert(dfd >= 0);
 
-        dfd = open(p, O_DIRECTORY|O_CLOEXEC);
-        if (dfd < 0)
-                return -errno;
-
-        r = fd_acl_make_writable(dfd); /* Add the "w" bit, if we are reusing an already set up credentials dir where it was unset */
-        if (r < 0)
-                return r;
-
-        struct load_cred_args args = {
+        LoadCredentialArguments args = {
                 .context = context,
-                .cgroup_context = cgroup_context,
-                .params = params,
-                .unit = unit,
+
                 .write_dfd = dfd,
-                .uid = uid,
-                .gid = gid,
                 .ownership_ok = ownership_ok,
                 .left = CREDENTIALS_TOTAL_SIZE_MAX,
         };
 
         /* First, load credentials off disk (or acquire via AF_UNIX socket) */
         ExecLoadCredential *lc;
-        HASHMAP_FOREACH(lc, context->load_credentials) {
+        HASHMAP_FOREACH(lc, context->exec_context->load_credentials) {
                 _cleanup_close_ int sub_fd = -EBADF;
 
                 args.encrypted = lc->encrypted;
@@ -848,7 +847,8 @@ static int acquire_credentials(
                         /* Regular file (incl. a credential passed in from higher up) */
                         r = load_credential(&args,
                                             lc->id,
-                                            AT_FDCWD, lc->path);
+                                            AT_FDCWD, lc->path,
+                                            /* connect_socket= */ false);
                 else
                         /* Directory */
                         r = recurse_dir(sub_fd,
@@ -865,34 +865,36 @@ static int acquire_credentials(
         /* Next, look for system credentials and credentials in the credentials store. Note that these do not
          * override any credentials found earlier. */
         ExecImportCredential *ic;
-        ORDERED_SET_FOREACH(ic, context->import_credentials) {
+        ORDERED_SET_FOREACH(ic, context->exec_context->import_credentials) {
                 _cleanup_free_ char **search_path = NULL;
 
-                r = credential_search_path(params, CREDENTIAL_SEARCH_PATH_TRUSTED, &search_path);
+                r = credential_search_path(context, CREDENTIAL_SEARCH_PATH_TRUSTED, &search_path);
                 if (r < 0)
                         return r;
 
                 args.encrypted = false;
 
-                r = load_credential_glob(&args,
-                                         ic,
-                                         search_path,
-                                         READ_FULL_FILE_SECURE|READ_FULL_FILE_FAIL_WHEN_LARGER);
+                r = load_credential_glob(
+                                &args,
+                                ic,
+                                search_path,
+                                READ_FULL_FILE_SECURE|READ_FULL_FILE_FAIL_WHEN_LARGER);
                 if (r < 0)
                         return r;
 
                 search_path = strv_free(search_path);
 
-                r = credential_search_path(params, CREDENTIAL_SEARCH_PATH_ENCRYPTED, &search_path);
+                r = credential_search_path(context, CREDENTIAL_SEARCH_PATH_ENCRYPTED, &search_path);
                 if (r < 0)
                         return r;
 
                 args.encrypted = true;
 
-                r = load_credential_glob(&args,
-                                         ic,
-                                         search_path,
-                                         READ_FULL_FILE_SECURE|READ_FULL_FILE_FAIL_WHEN_LARGER|READ_FULL_FILE_UNBASE64);
+                r = load_credential_glob(
+                                &args,
+                                ic,
+                                search_path,
+                                READ_FULL_FILE_SECURE|READ_FULL_FILE_FAIL_WHEN_LARGER|READ_FULL_FILE_UNBASE64);
                 if (r < 0)
                         return r;
         }
@@ -900,7 +902,7 @@ static int acquire_credentials(
         /* Finally, we add in literally specified credentials. If the credentials already exist, we'll not
          * add them, so that they can act as a "default" if the same credential is specified multiple times. */
         ExecSetCredential *sc;
-        HASHMAP_FOREACH(sc, context->set_credentials) {
+        HASHMAP_FOREACH(sc, context->exec_context->set_credentials) {
                 args.encrypted = sc->encrypted;
 
                 if (faccessat(dfd, sc->id, F_OK, AT_SYMLINK_NOFOLLOW) >= 0) {
@@ -910,12 +912,20 @@ static int acquire_credentials(
                 if (errno != ENOENT)
                         return log_debug_errno(errno, "Failed to test if credential %s exists: %m", sc->id);
 
-                r = maybe_decrypt_and_write_credential(&args, sc->id, sc->data, sc->size);
+                r = maybe_decrypt_and_write_credential(&args, sc->id, sc->data, sc->size, /* graceful= */ false);
                 if (r < 0)
                         return r;
         }
 
-        r = fd_acl_make_read_only(dfd); /* Now take away the "w" bit */
+        return 0;
+}
+
+static int credentials_dir_finalize_permissions(int dfd, uid_t uid, gid_t gid, bool ownership_ok) {
+        int r;
+
+        assert(dfd >= 0);
+
+        r = fd_acl_make_read_only(dfd); /* Take away the "w" bit */
         if (r < 0)
                 return r;
 
@@ -939,156 +949,163 @@ static int acquire_credentials(
         return 0;
 }
 
-static int setup_credentials_internal(
-                const ExecContext *context,
-                const CGroupContext *cgroup_context,
-                const ExecParameters *params,
-                const char *unit,
-                const char *final,        /* This is where the credential store shall eventually end up at */
-                const char *workspace,    /* This is where we can prepare it before moving it to the final place */
-                bool reuse_workspace,     /* Whether to reuse any existing workspace mount if it already is a mount */
-                bool must_mount,          /* Whether to require that we mount something, it's not OK to use the plain directory fall back */
-                uid_t uid,
-                gid_t gid) {
+static int setup_credentials_plain_dir(
+                const SetupCredentialsContext *context,
+                const char *cred_dir) {
 
-        bool final_mounted;
-        int r, workspace_mounted; /* negative if we don't know yet whether we have/can mount something; true
-                                   * if we mounted something; false if we definitely can't mount anything */
+        _cleanup_free_ char *t = NULL, *workspace = NULL;
+        _cleanup_(rm_rf_safep) const char *workspace_rm = NULL;
+        _cleanup_close_ int dfd = -EBADF;
+        int r;
 
         assert(context);
-        assert(params);
-        assert(unit);
-        assert(final);
-        assert(workspace);
+        assert(context->unit);
+        assert(context->runtime_prefix);
+        assert(cred_dir);
 
-        r = path_is_mount_point(final);
+        /* Temporary workspace, that remains inaccessible all the time. We prepare stuff there before moving
+         * it into place, so that users can't access half-initialized credential stores. */
+        t = path_join(context->runtime_prefix, "systemd/temporary-credentials");
+        if (!t)
+                return -ENOMEM;
+
+        r = mkdir_label(t, 0700);
+        if (r < 0 && r != -EEXIST)
+                return r;
+
+        workspace = path_join(t, context->unit);
+        if (!workspace)
+                return -ENOMEM;
+
+        dfd = open_mkdir(workspace, O_CLOEXEC|O_EXCL, 0700);
+        if (dfd < 0)
+                return log_debug_errno(dfd, "Failed to create workspace for credentials: %m");
+        workspace_rm = workspace;
+
+        (void) label_fix_full(dfd, /* inode_path= */ NULL, cred_dir, /* flags= */ 0, /* label_context= */ NULL);
+
+        r = acquire_credentials(context, dfd, /* ownership_ok= */ false);
         if (r < 0)
-                return log_debug_errno(r, "Failed to determine if '%s' is a mountpoint: %m", final);
-        final_mounted = r > 0;
+                return r;
 
-        if (final_mounted) {
-                if (FLAGS_SET(params->flags, EXEC_SETUP_CREDENTIALS_FRESH)) {
-                        r = umount_verbose(LOG_DEBUG, final, MNT_DETACH|UMOUNT_NOFOLLOW);
+        r = RET_NERRNO(rename(workspace, cred_dir));
+        if (r >= 0)
+                workspace_rm = NULL;
+        if (IN_SET(r, -ENOTEMPTY, -EEXIST)) {
+                _cleanup_close_ int old_dfd = open(cred_dir, O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+                if (old_dfd < 0)
+                        return log_debug_errno(errno, "Failed to open credentials dir '%s': %m", cred_dir);
+
+                (void) fd_acl_make_writable(old_dfd);
+
+                log_debug_errno(r, "Credential dir '%s' already populated, exchanging with workspace.", cred_dir);
+                r = RET_NERRNO(renameat2(AT_FDCWD, workspace, AT_FDCWD, cred_dir, RENAME_EXCHANGE));
+        }
+        if (r < 0)
+                return log_debug_errno(r, "Failed to move credentials workspace into place: %m");
+
+        /* rename() requires both the source and target to be writable, hence lock down write permission
+         * as last step. */
+        r = credentials_dir_finalize_permissions(dfd, context->uid, context->gid, /* ownership_ok= */ false);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to adjust ACLs of credentials dir: %m");
+
+        return 0;
+}
+
+static int setup_credentials_internal(
+                const SetupCredentialsContext *context,
+                bool may_reuse,
+                const char *cred_dir) {
+
+        _cleanup_close_ int fs_fd = -EBADF, mfd = -EBADF, dfd = -EBADF;
+        bool dir_mounted;
+        int r;
+
+        assert(context);
+        assert(cred_dir);
+
+        r = path_is_mount_point(cred_dir);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to determine if '%s' is a mountpoint: %m", cred_dir);
+        dir_mounted = r > 0;
+
+        if (may_reuse) {
+                bool populated;
+
+                /* If the cred dir is a mount, let's treat it as populated, and only look at the contents
+                 * if it's a plain dir, where we can't reasonably differentiate populated yet empty vs
+                 * not set up. */
+
+                if (dir_mounted)
+                        populated = true;
+                else {
+                        r = dir_is_empty(cred_dir, /* ignore_hidden_or_backup= */ false);
                         if (r < 0)
                                 return r;
-
-                        final_mounted = false;
-                } else {
-                        /* We can reuse the previous credential dir */
-                        r = dir_is_empty(final, /* ignore_hidden_or_backup = */ false);
-                        if (r < 0)
-                                return r;
-                        if (r == 0) {
-                                log_debug("Credential dir for unit '%s' already set up, skipping.", unit);
-                                return 0;
-                        }
+                        populated = r == 0;
+                }
+                if (populated) {
+                        log_debug("Credential dir for unit '%s' already set up, skipping.", context->unit);
+                        return 0;
                 }
         }
 
-        if (reuse_workspace) {
-                r = path_is_mount_point(workspace);
-                if (r < 0)
-                        return r;
-                if (r > 0)
-                        workspace_mounted = true; /* If this is already a mount, and we are supposed to reuse
-                                                   * it, let's keep this in mind */
-                else
-                        workspace_mounted = -1; /* We need to figure out if we can mount something to the workspace */
-        } else
-                workspace_mounted = -1; /* ditto */
-
-        /* If both the final place and the workspace are mounted, we have no mounts to set up, based on
-         * the assumption that they're actually the same tmpfs (but the latter with MS_RDONLY different).
-         * If the workspace is not mounted, we just bind the final place over and make it writable. */
-        must_mount = must_mount || final_mounted;
-
-        if (workspace_mounted < 0) {
-                if (!final_mounted)
-                        /* Nothing is mounted on the workspace yet, let's try to mount a new tmpfs if
-                         * not using the final place. */
-                        r = mount_credentials_fs(workspace, CREDENTIALS_TOTAL_SIZE_MAX, /* ro= */ false);
-                if (final_mounted || r < 0) {
-                        /* If using final place or failed to mount new tmpfs, make a bind mount from
-                         * the final to the workspace, so that we can make it writable there. */
-                        r = mount_nofollow_verbose(LOG_DEBUG, final, workspace, NULL, MS_BIND|MS_REC, NULL);
-                        if (r < 0) {
-                                if (!ERRNO_IS_PRIVILEGE(r))
-                                        /* Propagate anything that isn't a permission problem. */
-                                        return r;
-
-                                if (must_mount)
-                                        /* If it's not OK to use the plain directory fallback, propagate all
-                                         * errors too. */
-                                        return r;
-
-                                /* If we lack privileges to bind mount stuff, then let's gracefully proceed
-                                 * for compat with container envs, and just use the final dir as is.
-                                 * Final place must not be mounted in this case (refused by must_mount
-                                 * above) */
-
-                                workspace_mounted = false;
-                        } else {
-                                /* Make the new bind mount writable (i.e. drop MS_RDONLY) */
-                                r = mount_nofollow_verbose(LOG_DEBUG,
-                                                           NULL,
-                                                           workspace,
-                                                           NULL,
-                                                           MS_BIND|MS_REMOUNT|credentials_fs_mount_flags(/* ro= */ false),
-                                                           NULL);
-                                if (r < 0)
-                                        return r;
-
-                                workspace_mounted = true;
-                        }
-                } else
-                        workspace_mounted = true;
+        mfd = fsmount_credentials_fs(&fs_fd);
+        if (ERRNO_IS_NEG_PRIVILEGE(mfd) && !dir_mounted) {
+                log_debug_errno(mfd, "Lacking privilege to mount credentials fs, falling back to plain directory.");
+                return setup_credentials_plain_dir(context, cred_dir);
         }
+        if (mfd < 0)
+                return log_debug_errno(mfd, "Failed to mount credentials fs: %m");
 
-        assert(workspace_mounted >= 0);
-        assert(!must_mount || workspace_mounted);
+        dfd = fd_reopen(mfd, O_DIRECTORY|O_CLOEXEC);
+        if (dfd < 0)
+                return dfd;
 
-        const char *where = workspace_mounted ? workspace : final;
+        (void) label_fix_full(dfd, /* inode_path= */ NULL, cred_dir, /* flags= */ 0, /* label_context= */ NULL);
 
-        (void) label_fix_full(AT_FDCWD, where, final, 0);
-
-        r = acquire_credentials(context, cgroup_context, params, unit, where, uid, gid, workspace_mounted);
-        if (r < 0) {
-                /* If we're using final place as workspace, and failed to acquire credentials, we might
-                 * have left half-written creds there. Let's get rid of the whole mount, so future
-                 * calls won't reuse it. */
-                if (final_mounted)
-                        (void) umount_verbose(LOG_DEBUG, final, MNT_DETACH|UMOUNT_NOFOLLOW);
-
+        r = acquire_credentials(context, dfd, /* ownership_ok= */ true);
+        if (r < 0)
                 return r;
-        }
 
-        if (workspace_mounted) {
-                if (!final_mounted) {
-                        /* Make workspace read-only now, so that any bind mount we make from it defaults to
-                         * read-only too */
-                        r = mount_nofollow_verbose(LOG_DEBUG, NULL, workspace, NULL, MS_BIND|MS_REMOUNT|credentials_fs_mount_flags(/* ro= */ true), NULL);
-                        if (r < 0)
-                                return r;
+        r = credentials_dir_finalize_permissions(dfd, context->uid, context->gid, /* ownership_ok= */ true);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to adjust ACLs of credentials dir: %m");
 
-                        /* And mount it to the final place, read-only */
-                        r = mount_nofollow_verbose(LOG_DEBUG, workspace, final, NULL, MS_MOVE, NULL);
-                } else
-                        /* Otherwise we just get rid of the bind mount of final place */
-                        r = umount_verbose(LOG_DEBUG, workspace, MNT_DETACH|UMOUNT_NOFOLLOW);
+        // Work around a kernel bug that results in tmpfs reconfiguration failure.
+        // FIXME: drop this once https://lore.kernel.org/linux-fsdevel/20251108190930.440685-1-me@yhndnzj.com/
+        // is merged and hits the distro kernels.
+        (void) fsconfig(fs_fd, FSCONFIG_SET_FLAG, "noswap", NULL, 0);
+
+        if (fsconfig(fs_fd, FSCONFIG_SET_FLAG, "ro", NULL, 0) < 0)
+                return -errno;
+
+        if (fsconfig(fs_fd, FSCONFIG_CMD_RECONFIGURE, NULL, NULL, 0) < 0)
+                return -errno;
+
+        log_debug("Successfully reconfigured credentials fs to be read only.");
+
+        if (dir_mounted) {
+                /* Firstly, try to move beneath the existing mount, which guarantees strictly atomic replacement
+                 * (needs kernel >= 6.5) */
+                r = move_mount(mfd, "", AT_FDCWD, cred_dir, MOVE_MOUNT_F_EMPTY_PATH|MOVE_MOUNT_BENEATH);
+                if (r >= 0)
+                        return umount_verbose(LOG_DEBUG, cred_dir, MNT_DETACH|UMOUNT_NOFOLLOW);
+                if (errno != EINVAL)
+                        return log_debug_errno(errno, "Failed to move credentials fs into place: %m");
+
+                log_debug_errno(errno, "Unable to move credentials fs beneath existing mount '%s', unmounting instead: %m",
+                                cred_dir);
+
+                r = umount_verbose(LOG_DEBUG, cred_dir, MNT_DETACH|UMOUNT_NOFOLLOW);
                 if (r < 0)
                         return r;
-        } else {
-                _cleanup_free_ char *parent = NULL;
-
-                /* If we do not have our own mount put used the plain directory fallback, then we need to
-                 * open access to the top-level credential directory and the per-service directory now */
-
-                r = path_extract_directory(final, &parent);
-                if (r < 0)
-                        return r;
-                if (chmod(parent, 0755) < 0)
-                        return -errno;
         }
+
+        r = move_mount(mfd, "", AT_FDCWD, cred_dir, MOVE_MOUNT_F_EMPTY_PATH);
+        if (r < 0)
+                return log_debug_errno(errno, "Failed to move credentials fs into place: %m");
 
         return 0;
 }
@@ -1097,7 +1114,6 @@ int exec_setup_credentials(
                 const ExecContext *context,
                 const CGroupContext *cgroup_context,
                 const ExecParameters *params,
-                const char *unit,
                 uid_t uid,
                 gid_t gid) {
 
@@ -1106,7 +1122,6 @@ int exec_setup_credentials(
 
         assert(context);
         assert(params);
-        assert(unit);
 
         if (!exec_params_need_credentials(params) || !exec_context_has_credentials(context))
                 return 0;
@@ -1124,7 +1139,7 @@ int exec_setup_credentials(
         if (r < 0 && r != -EEXIST)
                 return r;
 
-        p = path_join(q, unit);
+        p = path_join(q, params->unit_id);
         if (!p)
                 return -ENOMEM;
 
@@ -1132,96 +1147,211 @@ int exec_setup_credentials(
         if (r < 0 && r != -EEXIST)
                 return r;
 
-        r = safe_fork("(sd-mkdcreds)", FORK_DEATHSIG_SIGTERM|FORK_WAIT|FORK_NEW_MOUNTNS, NULL);
-        if (r < 0) {
-                _cleanup_(rmdir_and_freep) char *u = NULL; /* remove the temporary workspace if we can */
-                _cleanup_free_ char *t = NULL;
+        SetupCredentialsContext ctx = {
+                .scope = params->runtime_scope,
+                .exec_context = context,
+                .unit = params->unit_id,
 
-                /* If this is not a privilege or support issue then propagate the error */
-                if (!ERRNO_IS_NOT_SUPPORTED(r) && !ERRNO_IS_PRIVILEGE(r))
-                        return r;
+                .runtime_prefix = params->prefix[EXEC_DIRECTORY_RUNTIME],
+                .received_credentials_directory = params->received_credentials_directory,
+                .received_encrypted_credentials_directory = params->received_encrypted_credentials_directory,
 
-                /* Temporary workspace, that remains inaccessible all the time. We prepare stuff there before moving
-                 * it into place, so that users can't access half-initialized credential stores. */
-                t = path_join(params->prefix[EXEC_DIRECTORY_RUNTIME], "systemd/temporary-credentials");
-                if (!t)
-                        return -ENOMEM;
+                .always_ipc = device_nodes_restricted(context, cgroup_context),
 
-                /* We can't set up a mount namespace. In that case operate on a fixed, inaccessible per-unit
-                 * directory outside of /run/credentials/ first, and then move it over to /run/credentials/
-                 * after it is fully set up */
-                u = path_join(t, unit);
-                if (!u)
-                        return -ENOMEM;
+                .uid = uid,
+                .gid = gid,
+        };
 
-                FOREACH_STRING(i, t, u) {
-                        r = mkdir_label(i, 0700);
-                        if (r < 0 && r != -EEXIST)
-                                return log_debug_errno(r, "Failed to make directory '%s': %m", i);
+        r = setup_credentials_internal(&ctx, /* may_reuse = */ !FLAGS_SET(params->flags, EXEC_SETUP_CREDENTIALS_FRESH), p);
+        if (r < 0)
+                (void) rmdir(p);
+
+        return r;
+}
+
+static int refresh_credentials_in_namespace_child(int cfd, const char *cred_dir) {
+        int r;
+
+        assert(cfd >= 0);
+        assert(cred_dir);
+
+        /* Paranoia: before doing anything, check if the credentials tree inside the mountns is available.
+         *
+         * Note that setup_namespace() always installs a mount for cred dir, hence path_is_mount_point()
+         * is the appropriate check here. */
+        r = path_is_mount_point(cred_dir);
+        if (IN_SET(r, 0, -ENOENT)) {
+                log_full_errno_zerook(LOG_WARNING, r,
+                                      "Credentials tree in the unit mount namespace is masked, skipping refresh.");
+                return 0;
+        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to check whether '%s' is a mountpoint in unit mount namespace: %m",
+                                       cred_dir);
+
+        /* Inform the parent that we're good to go */
+        ssize_t n = write(cfd, &r, sizeof(r));
+        if (n < 0)
+                return log_error_errno(errno, "Failed to write to socket: %m");
+
+        _cleanup_close_ int mfd = receive_one_fd(cfd, /* flags = */ 0);
+        if (mfd < 0)
+                return log_error_errno(mfd, "Failed to receive credentials tree fd from socket: %m");
+
+        r = mount_exchange_graceful(mfd, cred_dir, /* mount_beneath = */ true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to update credentials mount in namespace: %m");
+
+        return 1;
+}
+
+int unit_refresh_credentials(Unit *u) {
+        _cleanup_free_ char *cred_dir = NULL;
+        int r;
+
+        /* Refresh the credentials for a unit, potentially forking off a second process to join the mountns
+         * if needed. Returns > 0 on successful refresh, == 0 if the credentials tree is masked and the operation
+         * is skipped. */
+
+        assert(u);
+        assert(u->manager);
+
+        r = get_credential_directory(u->manager->prefix[EXEC_DIRECTORY_RUNTIME], u->id, &cred_dir);
+        if (r < 0)
+                return log_oom();
+        assert(r > 0);
+
+        if (access(cred_dir, F_OK) < 0) {
+                if (errno == ENOENT) {
+                        log_warning_errno(errno, "Requested to refresh credentials, but credentials aren't populated, skipping.");
+                        return 0;
                 }
 
-                r = setup_credentials_internal(
-                                context,
-                                cgroup_context,
-                                params,
-                                unit,
-                                p,       /* final mount point */
-                                u,       /* temporary workspace to overmount */
-                                true,    /* reuse the workspace if it is already a mount */
-                                false,   /* it's OK to fall back to a plain directory if we can't mount anything */
-                                uid,
-                                gid);
+                return log_error_errno(errno, "Failed to check if credentials dir '%s' exists: %m", cred_dir);
+        }
+
+        _cleanup_close_pair_ int tunnel_fds[2] = EBADF_PAIR;
+        _cleanup_(pidref_done) PidRef child = PIDREF_NULL;
+        _cleanup_close_ int userns_fd = -EBADF;
+
+        PidRef *main_pid = unit_main_pid(u);
+        if (pidref_is_set(main_pid)) {
+                _cleanup_close_ int mntns_fd = -EBADF, root_fd = -EBADF, pidns_fd = -EBADF;
+
+                r = pidref_namespace_open(main_pid,
+                                          &pidns_fd,
+                                          &mntns_fd,
+                                          /* ret_netns_fd = */ NULL,
+                                          MANAGER_IS_USER(u->manager) ? &userns_fd : NULL,
+                                          &root_fd);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to open namespace of unit main process '" PID_FMT "': %m",
+                                               main_pid->pid);
+
+                r = is_our_namespace(mntns_fd, NAMESPACE_MOUNT);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to check if main process resides in a separate mount namespace: %m");
+                if (r == 0) {
+                        if (socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0, tunnel_fds) < 0)
+                                return log_error_errno(errno, "Failed to allocate socket pair: %m");
+
+                        /* User units with PrivateUsers=self only map the user manager's own identity. Keep it
+                         * in that case, but still become root when a managed UID/GID range is mapped. */
+                        r = namespace_fork_full("(sd-creds-ns)", "(sd-creds-ns-inner)",
+                                                (int[]) { tunnel_fds[1] }, 1,
+                                                FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGKILL|FORK_CLOSE_ALL_FDS|FORK_REOPEN_LOG,
+                                                pidns_fd, mntns_fd, /* netns_fd = */ -EBADF, userns_fd, root_fd,
+                                                MANAGER_IS_USER(u->manager) ?
+                                                NAMESPACE_ENTER_KEEP_UID_GID_IF_ROOT_UNMAPPED : 0,
+                                                &child);
+                        if (r < 0)
+                                return log_full_errno(ERRNO_IS_NEG_PRIVILEGE(r) ? LOG_WARNING : LOG_ERR, r,
+                                                      "Failed to fork off process into unit namespace to refresh credentials: %m");
+                        if (r == 0) {
+                                r = refresh_credentials_in_namespace_child(tunnel_fds[1], cred_dir);
+                                report_errno_and_exit(tunnel_fds[1], r);
+                        }
+
+                        tunnel_fds[1] = safe_close(tunnel_fds[1]);
+
+                        /* Wait for the child to validate the creds tree in the unit namespace is populated. */
+                        ssize_t n = read(tunnel_fds[0], &r, sizeof(r));
+                        if (n < 0)
+                                return log_error_errno(errno, "Failed to read from socket: %m");
+                        if (!IN_SET(n, 0, sizeof(r)))
+                                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Received unexpected amount of bytes (%zi) while reading errno.", n);
+                        if (n == 0 || r == 0) {
+                                /* The child exited without sending anything or 0 is received signifying
+                                 * the credentials are masked? Check the exit status to be sure. */
+                                r = pidref_wait_for_terminate_and_check("(sd-creds-ns)", &child, WAIT_LOG);
+                                if (r < 0)
+                                        return r;
+                                if (r != EXIT_SUCCESS)
+                                        return -EPROTO;
+
+                                return 0; /* skipped */
+                        }
+                        if (r < 0)
+                                return r;
+
+                        /* Yay! Got > 0 from child indicating all good, proceed with refreshing. */
+                }
+        }
+
+        SetupCredentialsContext ctx = {
+                .scope = u->manager->runtime_scope,
+                .exec_context = ASSERT_PTR(unit_get_exec_context(u)),
+                .unit = u->id,
+
+                .runtime_prefix = u->manager->prefix[EXEC_DIRECTORY_RUNTIME],
+                .received_credentials_directory = u->manager->received_credentials_directory,
+                .received_encrypted_credentials_directory = u->manager->received_encrypted_credentials_directory,
+
+                .always_ipc = false, /* we don't migrate to unit cgroup, hence cannot be restricted by cgroup bpf */
+
+                .uid = u->ref_uid,
+                .gid = u->ref_gid,
+        };
+
+        r = setup_credentials_internal(&ctx, /* may_reuse = */ false, cred_dir);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set up credentials: %m");
+
+        /* The main process doesn't run in a mountns hence nothing got forked off? Then we're all set. */
+        if (!pidref_is_set(&child))
+                return 1;
+
+        if (userns_fd >= 0) {
+                assert(MANAGER_IS_USER(u->manager));
+
+                /* Enter the unit userns now and unshare mountns, so that we have permissions to clone
+                 * the mount tree using open_tree() */
+
+                if (setns(userns_fd, CLONE_NEWUSER) < 0)
+                        return log_error_errno(errno, "Failed to enter user namespace: %m");
+
+                if (unshare(CLONE_NEWNS) < 0)
+                        return log_error_errno(errno, "Failed to unshare mount namespace: %m");
+        }
+
+        _cleanup_close_ int tfd = open_tree(AT_FDCWD, cred_dir, OPEN_TREE_CLONE|OPEN_TREE_CLOEXEC|AT_SYMLINK_NOFOLLOW);
+        if (tfd < 0)
+                return log_error_errno(errno, "Failed to clone mount tree at '%s': %m", cred_dir);
+
+        r = send_one_fd(tunnel_fds[0], tfd, /* flags = */ 0);
+        if (r < 0)
+                return log_error_errno(r, "Failed to send mount fd to child: %m");
+
+        r = pidref_wait_for_terminate_and_check("(sd-creds-ns)", &child, WAIT_LOG_ABNORMAL);
+        if (r < 0)
+                return r;
+        if (r != EXIT_SUCCESS) {
+                r = read_errno(tunnel_fds[0]);
                 if (r < 0)
                         return r;
 
-        } else if (r == 0) {
-
-                /* We managed to set up a mount namespace, and are now in a child. That's great. In this case
-                 * we can use the same directory for all cases, after turning off propagation. Question
-                 * though is: where do we turn off propagation exactly, and where do we place the workspace
-                 * directory? We need some place that is guaranteed to be a mount point in the host, and
-                 * which is guaranteed to have a subdir we can mount over. /run/ is not suitable for this,
-                 * since we ultimately want to move the resulting file system there, i.e. we need propagation
-                 * for /run/ eventually. We could use our own /run/systemd/bind mount on itself, but that
-                 * would be visible in the host mount table all the time, which we want to avoid. Hence, what
-                 * we do here instead we use /dev/ and /dev/shm/ for our purposes. We know for sure that
-                 * /dev/ is a mount point and we now for sure that /dev/shm/ exists. Hence we can turn off
-                 * propagation on the former, and then overmount the latter.
-                 *
-                 * Yes it's nasty playing games with /dev/ and /dev/shm/ like this, since it does not exist
-                 * for this purpose, but there are few other candidates that work equally well for us, and
-                 * given that we do this in a privately namespaced short-lived single-threaded process that
-                 * no one else sees this should be OK to do. */
-
-                /* Turn off propagation from our namespace to host */
-                r = mount_nofollow_verbose(LOG_DEBUG, NULL, "/dev", NULL, MS_SLAVE|MS_REC, NULL);
-                if (r < 0)
-                        goto child_fail;
-
-                r = setup_credentials_internal(
-                                context,
-                                cgroup_context,
-                                params,
-                                unit,
-                                p,           /* final mount point */
-                                "/dev/shm",  /* temporary workspace to overmount */
-                                false,       /* do not reuse /dev/shm if it is already a mount, under no circumstances */
-                                true,        /* insist that something is mounted, do not allow fallback to plain directory */
-                                uid,
-                                gid);
-                if (r < 0)
-                        goto child_fail;
-
-                _exit(EXIT_SUCCESS);
-
-        child_fail:
-                _exit(EXIT_FAILURE);
+                return -EPROTO;
         }
 
-        /* If the credentials dir is empty and not a mount point, then there's no point in having it. Let's
-         * try to remove it. This matters in particular if we created the dir as mount point but then didn't
-         * actually end up mounting anything on it. In that case we'd rather have ENOENT than EACCESS being
-         * seen by users when trying access this inode. */
-        (void) rmdir(p);
-        return 0;
+        return 1;
 }

@@ -1,4 +1,4 @@
----
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 name: Gather Pull Request Metadata
 
@@ -16,14 +16,16 @@ jobs:
 
     steps:
       - name: Repository checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - id: metadata
         name: Gather Pull Request Metadata
-        uses: redhat-plumbers-in-action/gather-pull-request-metadata@5da2967931dd7c4b9ccd22f49b045e2c1f05165b
+        uses: redhat-plumbers-in-action/gather-pull-request-metadata@ecc2e46fe4f0b2e9a7b236d6012bc9f74af318d0
 
       - name: Upload Pull Request Metadata artifact
-        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           name: Pull Request Metadata
           path: ${{ steps.metadata.outputs.metadata-file }}

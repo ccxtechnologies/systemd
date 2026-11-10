@@ -3,8 +3,25 @@
 set -eux
 set -o pipefail
 
+if ! command -v userdbctl >/dev/null; then
+    echo "userdbctl is not installed, skipping the test."
+    exit 77
+fi
+
 # shellcheck source=test/units/util.sh
 . "$(dirname "$0")"/util.sh
+
+cleanup() {
+    set +e
+    userdel -r test-74-userdbctl
+    groupdel test-74-userdbctl
+}
+
+trap cleanup EXIT
+
+systemd-sysusers - <<EOF
+u test-74-userdbctl - "Test user for TEST-74-AUX-UTILS.userdbctl.sh" / /bin/bash
+EOF
 
 # Root
 userdbctl user root
@@ -38,26 +55,41 @@ assert_eq "$(userdbctl user 2147352576 -j | jq -r .userName)" foreign-0
 assert_eq "$(userdbctl user 2147352577 -j | jq -r .userName)" foreign-1
 assert_eq "$(userdbctl user 2147418110 -j | jq -r .userName)" foreign-65534
 
-# Make sure that -F shows same data as if we'd ask directly
-userdbctl user root -j | userdbctl -F- user  | cmp - <(userdbctl user root)
-userdbctl user systemd-network -j | userdbctl -F- user  | cmp - <(userdbctl user systemd-network)
-userdbctl user 65534 -j | userdbctl -F- user  | cmp - <(userdbctl user 65534)
+(! userdbctl --uuid=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa user root)
+(! userdbctl --uuid=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa group root)
 
-userdbctl group root -j | userdbctl -F- group  | cmp - <(userdbctl group root)
-userdbctl group systemd-network -j | userdbctl -F- group  | cmp - <(userdbctl group systemd-network)
-userdbctl group 65534 -j | userdbctl -F- group  | cmp - <(userdbctl group 65534)
+# Make sure that -F shows same data as if we'd ask directly
+userdbctl user root -j | userdbctl -F- user | cmp - <(userdbctl user root)
+userdbctl user test-74-userdbctl -j | userdbctl -F- user | cmp - <(userdbctl user test-74-userdbctl)
+userdbctl user 65534 -j | userdbctl -F- user | cmp - <(userdbctl user 65534)
+
+userdbctl group root -j | userdbctl -F- group | cmp - <(userdbctl group root)
+userdbctl group test-74-userdbctl -j | userdbctl -F- group | cmp - <(userdbctl group test-74-userdbctl)
+userdbctl group 65534 -j | userdbctl -F- group | cmp - <(userdbctl group 65534)
 
 # Ensure NSS doesn't try to automount via open_tree
 if [[ ! -v ASAN_OPTIONS ]]; then
     systemctl stop systemd-userdbd.socket systemd-userdbd.service
-    set +o pipefail
-    systemd-run -q -t --property SystemCallFilter=~open_tree id definitelynotarealuser | grep -q "no such user"
-    systemd-run -q -t --property SystemCallFilter=~open_tree id --groups definitelynotarealuser | grep -q "no such user"
-    systemd-run -q -t --property SystemCallFilter=~open_tree groups definitelynotarealuser | grep -q "no such user"
-    set -o pipefail
+    (! systemd-run -q -t --property SystemCallFilter=~open_tree id definitelynotarealuser) | grep "no such user" >/dev/null
+    (! systemd-run -q -t --property SystemCallFilter=~open_tree id --groups definitelynotarealuser) | grep "no such user" >/dev/null
+    (! systemd-run -q -t --property SystemCallFilter=~open_tree groups definitelynotarealuser) | grep "no such user" >/dev/null
     # getent shows no output when the entry is not found, but exists with 2, while sd-run crashing will exit
     # with 1
     assert_rc 2 systemd-run -q -t --property SystemCallFilter=~open_tree getent passwd definitelynotarealuser
     assert_rc 2 systemd-run -q -t --property SystemCallFilter=~open_tree getent group definitelynotarealgroup
     systemctl start systemd-userdbd.socket systemd-userdbd.service
 fi
+
+# For issue 40228
+UNIT="sleep$RANDOM"
+DISK_GID=$(userdbctl -j group disk | jq .gid)
+systemd-run -p DynamicUser=yes -p Group=disk -u "$UNIT" sleep infinity
+userdbctl group disk | grep -F 'io.systemd.NameServiceSwitch' >/dev/null
+userdbctl group "$DISK_GID" | grep -F 'io.systemd.NameServiceSwitch' >/dev/null
+(! busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LookupDynamicUserByName "s" disk)
+(! busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LookupDynamicUserByUID "u" "$DISK_GID")
+systemctl stop "$UNIT"
+
+# Probe specific user records
+echo '{"userName":"weightmin","cpuWeight":1,"ioWeight":1}' | userdbctl -F -
+echo '{"userName":"weightmax","cpuWeight":10000,"ioWeight":10000}' | userdbctl -F -

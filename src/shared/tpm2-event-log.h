@@ -2,7 +2,7 @@
 #pragma once
 
 #include "forward.h"
-#include "tpm2-util.h"
+#include "tpm2-util.h"          /* IWYU pragma: keep */
 
 /* Definitions as per "TCG PC Client Specific Platform Firmware Profile Specification"
  * (https://trustedcomputinggroup.org/resource/pc-client-specific-platform-firmware-profile-specification/),
@@ -54,7 +54,7 @@
 #define LOAD_OPTIONS_EVENT_TAG_ID UINT32_C(0x8F3B22ED)
 #endif
 
-const char* tpm2_log_event_type_to_string(uint32_t type) _const_;
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(tpm2_log_event_type, uint32_t);
 
 #if HAVE_TPM2
 

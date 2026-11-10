@@ -8,7 +8,7 @@ set -o pipefail
 # shellcheck source=test/units/util.sh
 . "$(dirname "$0")"/util.sh
 
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     cd /
     rm -rf "${workdir}"
@@ -118,8 +118,7 @@ assert_1 --resolve-names=now
 assert_1 ./nosuchfile
 # Failed to parse rules file ./nosuchfile: No such file or directory
 assert_1 ./nosuchfile /dev/null
-# '/dev/null' is neither a regular file nor a directory: File descriptor in bad state
-assert_1 /dev/null
+assert_0 /dev/null
 
 rules_dir='etc/udev/rules.d'
 mkdir -p "${rules_dir}"
@@ -160,13 +159,13 @@ echo "Failed to parse rules file $(pwd)/${rules}: No buffer space available" >"$
 assert_1 "${rules}"
 
 {
-    printf 'RUN+="/bin/true",%8174s\\\n' ' '
-    printf 'RUN+="/bin/false"%8174s\\\n' ' '
+    printf 'RUN+="/usr/bin/true",%8170s\\\n' ' '
+    printf 'RUN+="/usr/bin/false"%8170s\\\n' ' '
     echo
 } >"${rules}"
 assert_0 "${rules}"
 
-printf 'RUN+="/bin/true"%8176s\\\n #\n' ' ' ' ' >"${rules}"
+printf 'RUN+="/usr/bin/true"%8176s\\\n #\n' ' ' ' ' >"${rules}"
 echo >>"${rules}"
 cat >"${exp}" <<EOF
 $(pwd)/${rules}:1 Line is too long, ignored.
@@ -309,15 +308,17 @@ assert_0 "${rules}"
 test_syntax_error 'OWNER=":nosuchuser:"' "Failed to resolve user ':nosuchuser:', ignoring: Invalid argument"
 # nonexistent user
 if ! getent passwd nosuchuser >/dev/null; then
-    test_syntax_error 'OWNER="nosuchuser"' "Unknown user 'nosuchuser', ignoring."
+    test_syntax_error 'OWNER="nosuchuser"' "Failed to resolve user 'nosuchuser', ignoring: Unknown user"
 fi
 if ! getent passwd 12345 >/dev/null; then
-    test_syntax_error 'OWNER="12345"' "Unknown user '12345', ignoring."
+    test_syntax_error 'OWNER="12345"' "Failed to resolve user '12345', ignoring: Unknown user"
 fi
 # regular user
 if getent passwd testuser >/dev/null; then
-    test_syntax_error 'OWNER="testuser"' "User 'testuser' is not a system user, ignoring."
-    test_syntax_error "OWNER=\"$(id -u testuser)\"" "User '$(id -u testuser)' is not a system user, ignoring."
+    echo 'OWNER="testuser"' >"${rules}"
+    udevadm verify "${rules}"
+    echo "OWNER=\"$(id -u testuser)\"" >"${rules}"
+    udevadm verify "${rules}"
 fi
 test_syntax_error 'GROUP{a}="b"' 'Invalid attribute for GROUP.'
 test_syntax_error 'GROUP-="b"' 'Invalid operator for GROUP.'
@@ -341,15 +342,18 @@ assert_0 "${rules}"
 test_syntax_error 'GROUP=":nosuchgroup:"' "Failed to resolve group ':nosuchgroup:', ignoring: Invalid argument"
 # nonexistent group
 if ! getent group nosuchgroup >/dev/null; then
-    test_syntax_error 'GROUP="nosuchgroup"' "Unknown group 'nosuchgroup', ignoring."
+    test_syntax_error 'GROUP="nosuchgroup"' "Failed to resolve group 'nosuchgroup', ignoring: Unknown group"
 fi
 if ! getent group 12345 >/dev/null; then
-    test_syntax_error 'GROUP="12345"' "Unknown group '12345', ignoring."
+    test_syntax_error 'GROUP="12345"' "Failed to resolve group '12345', ignoring: Unknown group"
 fi
 # regular group
 if getent group testuser >/dev/null; then
-    test_syntax_error 'GROUP="testuser"' "Group 'testuser' is not a system group, ignoring."
-    test_syntax_error "GROUP=\"$(id -g testuser)\"" "Group '$(id -g testuser)' is not a system group, ignoring."
+    echo 'GROUP="testuser"' >"${rules}"
+    udevadm verify "${rules}"
+
+    echo "GROUP=\"$(id -g testuser)\"" >"${rules}"
+    udevadm verify "${rules}"
 fi
 test_syntax_error 'MODE{a}="b"' 'Invalid attribute for MODE.'
 test_syntax_error 'MODE-="b"' 'Invalid operator for MODE.'

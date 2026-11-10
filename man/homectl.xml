@@ -206,20 +206,71 @@
       </varlistentry>
 
       <varlistentry>
-        <term><option>--match=</option></term>
+        <term><option>--prompt-new-user</option></term>
+
+        <listitem><para>If used in conjunction with <command>firstboot</command> and no regular user account
+        exists on the system so far the tool will interactively query for user information and create an
+        account.</para>
+
+        <xi:include href="version-info.xml" xpointer="v256"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--prompt-shell=</option></term>
+
+        <listitem><para>Takes a boolean argument. Controls whether to interactively query for a login shell,
+        if <command>firstboot --prompt-new-user</command> is used. Defaults to true.</para>
+
+        <xi:include href="version-info.xml" xpointer="v259"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--prompt-groups=</option></term>
+
+        <listitem><para>Takes a boolean argument. Controls whether to interactively query for auxiliary
+        groups to add the new user to, if <command>firstboot --prompt-new-user</command> is used. Defaults to
+        true.</para>
+
+        <xi:include href="version-info.xml" xpointer="v259"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--chrome=</option></term>
+
+        <listitem><para>Takes a boolean argument. By default the interactive user creation via
+        <command>firstboot --prompt-new-user</command> screen will show reverse color "chrome" bars at the
+        top and the bottom of the terminal screen, which may be disabled by setting this option to
+        false.</para>
+
+        <xi:include href="version-info.xml" xpointer="v259"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--mute-console=</option></term>
+
+        <listitem><para>Takes a boolean argument. If true kernel log output and service manager status output
+        to the system console is temporarily disabled while <command>firstboot --prompt-new-user</command> is
+        running, so that its own output is not interrupted. Defaults to false.</para>
+
+        <xi:include href="version-info.xml" xpointer="v259"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--match=this|other|any|auto</option></term>
         <term><option>-A</option></term>
         <term><option>-N</option></term>
         <term><option>-T</option></term>
 
-        <listitem><para>Takes one of <literal>this</literal>, <literal>other</literal>,
-        <literal>any</literal> or <literal>auto</literal>. Some user record settings can be defined to match
-        only specific machines, or all machines but one, or all machines. With this switch it is possibly to
-        control to which machines to apply the settings appearing on the command line after it. If
-        <literal>this</literal> is specified the setting will only apply to the local system (positive
-        match), if <literal>other</literal> it will apply to all but the local system (negative match), if
-        <literal>any</literal> it will apply to all systems (unless there's a matching positive or negative
-        per-machine setting). If <literal>auto</literal> returns to the default logic: whether a setting
-        applies by default to the local system or all systems depends on the option in question.</para>
+        <listitem><para>Option <option>--match=</option> takes one of <literal>this</literal>,
+        <literal>other</literal>, <literal>any</literal> or <literal>auto</literal>. Some user record
+        settings can be defined to match only specific machines, or all machines but one, or all machines.
+        With this switch it is possibly to control to which machines to apply the settings appearing on the
+        command line after it. If <literal>this</literal> is specified the setting will only apply to the
+        local system (positive match), if <literal>other</literal> it will apply to all but the local system
+        (negative match), if <literal>any</literal> it will apply to all systems (unless there's a matching
+        positive or negative per-machine setting). If <literal>auto</literal> returns to the default logic:
+        whether a setting applies by default to the local system or all systems depends on the option in
+        question.</para>
 
         <para>Note that only some user record settings can be conditioned like this. This option has no
         effect on the others and is ignored there. This option may appear multiple times in a single command
@@ -313,6 +364,16 @@
         Germany"</option> or <option>--location="Basement, Room 3a"</option></para>
 
         <xi:include href="version-info.xml" xpointer="v245"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--birth-date=<optional><replaceable>DATE</replaceable></optional></option></term>
+
+        <listitem><para>Takes a birth date for the user in ISO 8601 calendar date format
+        (<literal>YYYY-MM-DD</literal>). The earliest representable year is 1900. If an empty string is
+        passed the birth date is reset to unset.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -630,6 +691,17 @@
         may be entered instead of a regular password to unlock the account.</para>
 
         <xi:include href="version-info.xml" xpointer="v247"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--recovery-key-file=<replaceable>PATH</replaceable></option></term>
+
+        <listitem><para>Attempts to write the generated recovery key to the specified file. The file is
+        created with access mode <literal>0600</literal> and must not exist yet. This option may only be used
+        together with <option>--recovery-key=yes</option>. If the file cannot be written, a warning is shown
+        and the account operation still succeeds. The recovery key is always shown on screen.</para>
+
+        <xi:include href="version-info.xml" xpointer="v262"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -1424,9 +1496,10 @@ $ ssh lennart@targetsystem</programlisting>
 
         <listitem><para>This command is supposed to be invoked during the initial boot of the system. It
         checks whether any regular home area exists so far, and if not queries the user interactively on the
-        console for user name and password and creates one. Alternatively, if one or more service credentials
-        whose name starts with <literal>home.create.</literal> are passed to the command (containing a user
-        record in JSON format) these users are automatically created at boot.</para>
+        console for user name and password and creates one (only if <option>--prompt-new-user</option> is
+        specified). Alternatively, if one or more service credentials whose name starts with
+        <literal>home.create.</literal> are passed to the command (containing a user record in JSON format)
+        these users are automatically created at boot.</para>
 
         <para>This command is invoked by the <filename>systemd-homed-firstboot.service</filename> service
         unit.</para>
@@ -1583,6 +1656,13 @@ homectl update lafcadio --pkcs11-token-uri=auto</programlisting>
 
       <programlisting># Allow a FIDO2 security token to unlock the account of user 'nihilbaxter'.
 homectl update nihilbaxter --fido2-device=auto</programlisting>
+    </example>
+
+    <example>
+      <title>Add a recovery key to an existing user account:</title>
+
+      <programlisting># Generate and add a recovery key for user 'emily'.
+homectl update emily --recovery-key=yes</programlisting>
     </example>
   </refsect1>
 

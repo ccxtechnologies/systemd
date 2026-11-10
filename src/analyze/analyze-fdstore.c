@@ -93,7 +93,7 @@ static int dump_fdstore(sd_bus *bus, const char *arg) {
         if (table_isempty(table) && !sd_json_format_enabled(arg_json_format_flags))
                 log_info("No file descriptors in fdstore of '%s'.", unit);
         else {
-                r = table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, /* show_header= */true);
+                r = table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, /* show_header= */ true);
                 if (r < 0)
                         return r;
         }
@@ -101,7 +101,7 @@ static int dump_fdstore(sd_bus *bus, const char *arg) {
         return EXIT_SUCCESS;
 }
 
-int verb_fdstore(int argc, char *argv[], void *userdata) {
+int verb_fdstore(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 

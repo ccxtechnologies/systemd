@@ -20,12 +20,11 @@ typedef struct Writer {
 } Writer;
 
 int writer_new(RemoteServer *server, Writer **ret);
-Writer* writer_ref(Writer *w);
-Writer* writer_unref(Writer *w);
+DECLARE_TRIVIAL_REF_UNREF_FUNC(Writer, writer);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Writer*, writer_unref);
 
-int writer_write(Writer *s,
+int writer_write(Writer *w,
                  const struct iovec_wrapper *iovw,
                  const dual_timestamp *ts,
                  const sd_id128_t *boot_id,

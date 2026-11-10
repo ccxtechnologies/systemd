@@ -27,7 +27,12 @@ int dns_label_unescape(const char **name, char *dest, size_t sz, DNSLabelFlags f
         int r = 0;
 
         assert(name);
-        assert(*name);
+
+        if (isempty(*name)) {
+                if (dest && sz >= 1)
+                        dest[0] = 0;
+                return 0;
+        }
 
         n = *name;
         d = dest;
@@ -296,111 +301,6 @@ int dns_name_parent(const char **name) {
         return dns_label_unescape(name, NULL, DNS_LABEL_MAX, 0);
 }
 
-#if HAVE_LIBIDN
-int dns_label_apply_idna(const char *encoded, size_t encoded_size, char *decoded, size_t decoded_max) {
-        _cleanup_free_ uint32_t *input = NULL;
-        size_t input_size, l;
-        bool contains_8_bit = false;
-        char buffer[DNS_LABEL_MAX+1];
-        int r;
-
-        assert(encoded);
-        assert(decoded);
-
-        /* Converts a U-label into an A-label */
-
-        r = dlopen_idn();
-        if (r < 0)
-                return r;
-
-        if (encoded_size <= 0)
-                return -EINVAL;
-
-        for (const char *p = encoded; p < encoded + encoded_size; p++)
-                if ((uint8_t) *p > 127)
-                        contains_8_bit = true;
-
-        if (!contains_8_bit) {
-                if (encoded_size > DNS_LABEL_MAX)
-                        return -EINVAL;
-
-                return 0;
-        }
-
-        input = sym_stringprep_utf8_to_ucs4(encoded, encoded_size, &input_size);
-        if (!input)
-                return -ENOMEM;
-
-        if (sym_idna_to_ascii_4i(input, input_size, buffer, 0) != 0)
-                return -EINVAL;
-
-        l = strlen(buffer);
-
-        /* Verify that the result is not longer than one DNS label. */
-        if (l <= 0 || l > DNS_LABEL_MAX)
-                return -EINVAL;
-        if (l > decoded_max)
-                return -ENOBUFS;
-
-        memcpy(decoded, buffer, l);
-
-        /* If there's room, append a trailing NUL byte, but only then */
-        if (decoded_max > l)
-                decoded[l] = 0;
-
-        return (int) l;
-}
-
-int dns_label_undo_idna(const char *encoded, size_t encoded_size, char *decoded, size_t decoded_max) {
-        size_t input_size, output_size;
-        _cleanup_free_ uint32_t *input = NULL;
-        _cleanup_free_ char *result = NULL;
-        uint32_t *output = NULL;
-        size_t w;
-        int r;
-
-        /* To be invoked after unescaping. Converts an A-label into a U-label. */
-
-        assert(encoded);
-        assert(decoded);
-
-        r = dlopen_idn();
-        if (r < 0)
-                return r;
-
-        if (encoded_size <= 0 || encoded_size > DNS_LABEL_MAX)
-                return -EINVAL;
-
-        if (!memory_startswith(encoded, encoded_size, IDNA_ACE_PREFIX))
-                return 0;
-
-        input = sym_stringprep_utf8_to_ucs4(encoded, encoded_size, &input_size);
-        if (!input)
-                return -ENOMEM;
-
-        output_size = input_size;
-        output = newa(uint32_t, output_size);
-
-        sym_idna_to_unicode_44i(input, input_size, output, &output_size, 0);
-
-        result = sym_stringprep_ucs4_to_utf8(output, output_size, NULL, &w);
-        if (!result)
-                return -ENOMEM;
-        if (w <= 0)
-                return -EINVAL;
-        if (w > decoded_max)
-                return -ENOBUFS;
-
-        memcpy(decoded, result, w);
-
-        /* Append trailing NUL byte if there's space, but only then. */
-        if (decoded_max > w)
-                decoded[w] = 0;
-
-        return w;
-}
-#endif
-
 int dns_name_concat(const char *a, const char *b, DNSLabelFlags flags, char **ret) {
         _cleanup_free_ char *result = NULL;
         size_t n_result = 0, n_unescaped = 0;
@@ -649,12 +549,10 @@ int dns_name_change_suffix(const char *name, const char *old_suffix, const char 
         int r, q;
 
         assert(name);
-        assert(old_suffix);
-        assert(new_suffix);
         assert(ret);
 
         n = name;
-        s = old_suffix;
+        s = strempty(old_suffix);
 
         for (;;) {
                 char ln[DNS_LABEL_MAX+1], ls[DNS_LABEL_MAX+1];
@@ -753,12 +651,12 @@ int dns_name_reverse(int family, const union in_addr_union *a, char **ret) {
         return 0;
 }
 
-int dns_name_address(const char *p, int *ret_family, union in_addr_union *ret_address) {
+int dns_name_address(const char *p, int *ret_family, union in_addr_union *ret) {
         int r;
 
         assert(p);
         assert(ret_family);
-        assert(ret_address);
+        assert(ret);
 
         r = dns_name_endswith(p, "in-addr.arpa");
         if (r < 0)
@@ -787,7 +685,7 @@ int dns_name_address(const char *p, int *ret_family, union in_addr_union *ret_ad
                         return r;
 
                 *ret_family = AF_INET;
-                ret_address->in.s_addr = htobe32(((uint32_t) a[3] << 24) |
+                ret->in.s_addr = htobe32(((uint32_t) a[3] << 24) |
                                                  ((uint32_t) a[2] << 16) |
                                                  ((uint32_t) a[1] << 8) |
                                                  (uint32_t) a[0]);
@@ -831,12 +729,12 @@ int dns_name_address(const char *p, int *ret_family, union in_addr_union *ret_ad
                         return r;
 
                 *ret_family = AF_INET6;
-                ret_address->in6 = a;
+                ret->in6 = a;
                 return 1;
         }
 
         *ret_family = AF_UNSPEC;
-        *ret_address = IN_ADDR_NULL;
+        *ret = IN_ADDR_NULL;
 
         return 0;
 }
@@ -1366,19 +1264,17 @@ int dns_name_apply_idna(const char *name, char **ret) {
 
         /* Return negative on error, 0 if not implemented, positive on success. */
 
-#if HAVE_LIBIDN2 || HAVE_LIBIDN2
+#if HAVE_LIBIDN2
         int r;
 
-        r = dlopen_idn();
+        r = dlopen_idn(LOG_DEBUG);
         if (r == -EOPNOTSUPP) {
                 *ret = NULL;
                 return 0;
         }
         if (r < 0)
                 return r;
-#endif
 
-#if HAVE_LIBIDN2
         _cleanup_free_ char *t = NULL;
 
         assert(name);
@@ -1426,55 +1322,6 @@ int dns_name_apply_idna(const char *name, char **ret) {
                 return -ENOSPC;
 
         return -EINVAL;
-#elif HAVE_LIBIDN
-        _cleanup_free_ char *buf = NULL;
-        size_t n = 0;
-        bool first = true;
-        int r, q;
-
-        assert(name);
-        assert(ret);
-
-        for (;;) {
-                char label[DNS_LABEL_MAX+1];
-
-                r = dns_label_unescape(&name, label, sizeof label, 0);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        break;
-
-                q = dns_label_apply_idna(label, r, label, sizeof label);
-                if (q < 0)
-                        return q;
-                if (q > 0)
-                        r = q;
-
-                if (!GREEDY_REALLOC(buf, n + !first + DNS_LABEL_ESCAPED_MAX))
-                        return -ENOMEM;
-
-                r = dns_label_escape(label, r, buf + n + !first, DNS_LABEL_ESCAPED_MAX);
-                if (r < 0)
-                        return r;
-
-                if (first)
-                        first = false;
-                else
-                        buf[n++] = '.';
-
-                n += r;
-        }
-
-        if (n > DNS_HOSTNAME_MAX)
-                return -EINVAL;
-
-        if (!GREEDY_REALLOC(buf, n + 1))
-                return -ENOMEM;
-
-        buf[n] = 0;
-        *ret = TAKE_PTR(buf);
-
-        return 1;
 #else
         *ret = NULL;
         return 0;
@@ -1519,6 +1366,10 @@ bool dns_name_dont_resolve(const char *name) {
 
         /* Never respond to some of the domains listed in RFC6761 */
         if (dns_name_endswith(name, "invalid") > 0)
+                return true;
+
+        /* Never respond to the domains listed in RFC7686 */
+        if (dns_name_endswith(name, "onion") > 0)
                 return true;
 
         /* Never respond to some of the domains listed in RFC9476 */

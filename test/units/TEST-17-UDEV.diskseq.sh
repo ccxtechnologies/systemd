@@ -11,6 +11,7 @@ set -o pipefail
 
 # This is a test case for issue #34637.
 
+# shellcheck disable=SC2329
 at_exit() (
     set +e
 
@@ -19,13 +20,9 @@ at_exit() (
     systemctl daemon-reload
 
     [[ -d "$TMPDIR" ]] && rm -rf "$TMPDIR"
-
-    udevadm control --log-level=info
 )
 
 trap at_exit EXIT
-
-udevadm control --log-level=debug
 
 TMPDIR="$(mktemp -d)"
 truncate -s 16M "$TMPDIR"/foo.raw

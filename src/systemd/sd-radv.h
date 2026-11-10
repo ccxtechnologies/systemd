@@ -30,11 +30,10 @@ typedef struct sd_event sd_event;
 typedef struct sd_radv sd_radv;
 
 int sd_radv_new(sd_radv **ret);
-sd_radv *sd_radv_ref(sd_radv *ra);
-sd_radv *sd_radv_unref(sd_radv *ra);
+_SD_DECLARE_TRIVIAL_REF_UNREF_FUNC(sd_radv);
 
 int sd_radv_attach_event(sd_radv *ra, sd_event *event, int64_t priority);
-int sd_radv_detach_event(sd_radv *nd);
+int sd_radv_detach_event(sd_radv *ra);
 sd_event *sd_radv_get_event(sd_radv *ra);
 
 int sd_radv_start(sd_radv *ra);
@@ -42,8 +41,8 @@ int sd_radv_stop(sd_radv *ra);
 int sd_radv_is_running(sd_radv *ra);
 int sd_radv_send(sd_radv *ra);
 
-int sd_radv_set_ifindex(sd_radv *ra, int interface_index);
-int sd_radv_set_ifname(sd_radv *ra, const char *interface_name);
+int sd_radv_set_ifindex(sd_radv *ra, int ifindex);
+int sd_radv_set_ifname(sd_radv *ra, const char *ifname);
 int sd_radv_get_ifname(sd_radv *ra, const char **ret);
 int sd_radv_set_link_local_address(sd_radv *ra, const struct in6_addr *addr);
 

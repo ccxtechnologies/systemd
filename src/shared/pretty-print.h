@@ -21,7 +21,10 @@ bool urlify_enabled(void);
 
 int terminal_urlify(const char *url, const char *text, char **ret);
 int terminal_urlify_path(const char *path, const char *text, char **ret);
-int terminal_urlify_man(const char *page, const char *section, char **ret);
+int terminal_urlify_man_full(const char *page, const char *section, const char *suffix, char **ret);
+static inline int terminal_urlify_man(const char *page, const char *section, char **ret) {
+        return terminal_urlify_man_full(page, section, " man page", ret);
+}
 
 typedef enum CatFlags {
         CAT_CONFIG_OFF          = 0,
@@ -92,3 +95,6 @@ static inline void fflush_and_disable_bufferingp(FILE **p) {
 
 #define WITH_BUFFERED_STDERR                                            \
         _WITH_BUFFERED_STREAM(stderr, LONG_LINE_MAX, UNIQ_T(p, UNIQ))
+
+#define WITH_BUFFERED_STDOUT                                            \
+        _WITH_BUFFERED_STREAM(stdout, LONG_LINE_MAX, UNIQ_T(p, UNIQ))

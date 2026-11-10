@@ -15,6 +15,7 @@
 #include "local-addresses.h"
 #include "log.h"
 #include "main-func.h"
+#include "memory-util.h"
 #include "nss-test-util.h"
 #include "nss-util.h"
 #include "parse-util.h"
@@ -67,6 +68,16 @@ static int print_gaih_addrtuples(const struct gaih_addrtuple *tuples) {
         return n;
 }
 
+static void assert_myhostname_gaih_addrtuples(const struct gaih_addrtuple *tuples) {
+        assert(tuples);
+
+        for (const struct gaih_addrtuple *it = tuples; it; it = it->next)
+                if (it->family == AF_INET)
+                        assert_se(memeqzero(
+                                        (const uint8_t*) it->addr + sizeof(struct in_addr),
+                                        sizeof(it->addr) - sizeof(struct in_addr)));
+}
+
 static void print_struct_hostent(struct hostent *host, const char *canon) {
         log_info("        \"%s\"", host->h_name);
         STRV_FOREACH(s, host->h_aliases)
@@ -112,6 +123,9 @@ static void test_gethostbyname4_r(void *handle, const char *module, const char *
                 return;
         }
 
+        /* Poison the scratch buffer so uninitialized padding in NSS replies is observable. */
+        memset(buffer, 0xa5, sizeof(buffer));
+
         status = f(name, &pat, buffer, sizeof buffer, &errno1, &errno2, &ttl);
         if (status == NSS_STATUS_SUCCESS) {
                 log_info("%s(\"%s\") → status=%s%-20spat=buffer+0x%"PRIxPTR" errno=%d/%s h_errno=%d/%s ttl=%"PRIi32,
@@ -122,6 +136,8 @@ static void test_gethostbyname4_r(void *handle, const char *module, const char *
                          errno2, hstrerror(errno2),
                          ttl);
                 n = print_gaih_addrtuples(pat);
+                if (streq(module, "myhostname"))
+                        assert_myhostname_gaih_addrtuples(pat);
         } else {
                 log_info("%s(\"%s\") → status=%s%-20spat=0x%p errno=%d/%s h_errno=%d/%s",
                          fname, name,
@@ -490,18 +506,18 @@ static int run(int argc, char **argv) {
                 /* Testing with several syscalls filtered, and check if the nss modules gracefully handle failures in
                  * masked syscalls. See issue #38582. */
 
-                ASSERT_OK(r = safe_fork("(with-seccomp)", FORK_LOG | FORK_WAIT, /* ret_pid = */ NULL));
+                r = ASSERT_OK(pidref_safe_fork("(with-seccomp)", FORK_LOG|FORK_WAIT, /* ret= */ NULL));
                 if (r == 0) {
                         _cleanup_hashmap_free_ Hashmap *filter = NULL;
                         ASSERT_NOT_NULL(filter = hashmap_new(NULL));
                         FOREACH_STRING(s, "uname", "olduname", "oldolduname", "sigprocmask", "rt_sigprocmask", "osf_sigprocmask")
-                                ASSERT_OK(seccomp_filter_set_add_by_name(filter, /* add = */ true, s));
-                        ASSERT_OK(seccomp_load_syscall_filter_set_raw(SCMP_ACT_ALLOW, filter, SCMP_ACT_ERRNO(ENOSYS), /* log_missing = */ true));
+                                ASSERT_OK(seccomp_filter_set_add_by_name(filter, /* add= */ true, s));
+                        ASSERT_OK(seccomp_load_syscall_filter_set_raw(SCMP_ACT_ALLOW, filter, SCMP_ACT_ERRNO(ENOSYS), /* log_missing= */ true));
 
                         /* To make assert_return() and friends not call abort(), even built as developer mode. */
-                        ASSERT_OK_ERRNO(setenv("SYSTEMD_ASSERT_RETURN_IS_CRITICAL", "0", /* overwrite = */ true));
+                        ASSERT_OK_ERRNO(setenv("SYSTEMD_ASSERT_RETURN_IS_CRITICAL", "0", /* overwrite= */ true));
                         /* Let's also make nss modules output debugging logs. */
-                        ASSERT_OK_ERRNO(setenv("SYSTEMD_LOG_LEVEL", "debug", /* overwrite = */ true));
+                        ASSERT_OK_ERRNO(setenv("SYSTEMD_LOG_LEVEL", "debug", /* overwrite= */ true));
 
                         STRV_FOREACH(module, modules)
                                 ASSERT_OK(test_one_module(dir, *module, names, addresses, n_addresses));

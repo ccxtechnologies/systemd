@@ -13,7 +13,7 @@ _Note that this document describes the binary serialization format of journals o
 For interfacing with web technologies there's the Journal JSON Format, described below.
 The binary format on disk is documented as the [Journal File Format](/JOURNAL_FILE_FORMAT)._
 
-_Before reading on, please make sure you are aware of the [basic properties of journal entries](https://www.freedesktop.org/software/systemd/man/systemd.journal-fields.html), in particular realize that they may include binary non-text data (though usually don't), and the same field might have multiple values assigned within the same entry (though usually hasn't)._
+_Before reading on, please make sure you are aware of the [basic properties of journal entries](https://www.freedesktop.org/software/systemd/man/latest/systemd.journal-fields.html), in particular realize that they may include binary non-text data (though usually don't), and the same field might have multiple values assigned within the same entry (though usually hasn't)._
 
 When exporting journal data for other uses or transferring it via the network/local IPC the _journal export format_ is used.
 It's a simple serialization of journal entries, that is easy to read without any special tools, but still binary safe where necessary.
@@ -23,7 +23,8 @@ The format is like this:
 * Journal fields consisting only of valid non-control UTF-8 codepoints are serialized as they are
   (i.e. the field name, followed by '=', followed by field data), followed by a newline as separator to the next field.
   Note that fields containing newlines cannot be formatted like this.
-  Non-control UTF-8 codepoints are the codepoints with value at or above 32 (' '), or equal to 9 (TAB).
+  Non-control UTF-8 codepoints are the codepoints with value equal to 9 (TAB), or greater than or equal to 32 (' '),
+  excluding 127 (DEL) and the range 128-159 of C1 control codepoints.
 * Other journal fields are serialized in a special binary safe way:
   field name, followed by newline, followed by a binary 64-bit little endian size value, followed by the binary field data, followed by a newline as separator to the next field.
 * Entry metadata that is not actually a field is serialized like it was a field, but beginning with two underscores.
@@ -138,7 +139,7 @@ _Note that this section describes the JSON serialization format of the journal o
 For binary transfer of journal data across the network there's the Journal Export Format described above.
 The binary format on disk is documented as [Journal File Format](/JOURNAL_FILE_FORMAT)._
 
-_Before reading on, please make sure you are aware of the [basic properties of journal entries](https://www.freedesktop.org/software/systemd/man/systemd.journal-fields.html), in particular realize that they may include binary non-text data (though usually don't), and the same field might have multiple values assigned within the same entry (though usually hasn't)._
+_Before reading on, please make sure you are aware of the [basic properties of journal entries](https://www.freedesktop.org/software/systemd/man/latest/systemd.journal-fields.html), in particular realize that they may include binary non-text data (though usually don't), and the same field might have multiple values assigned within the same entry (though usually hasn't)._
 
 In most cases the Journal JSON serialization is the obvious mapping of the entry field names (as JSON strings) to the entry field values (also as JSON strings) encapsulated in one JSON object. However, there are a few special cases to handle:
 

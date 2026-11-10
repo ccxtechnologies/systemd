@@ -258,7 +258,18 @@ static int show(Context *c) {
                                 return log_error_errno(r, "Failed to get MESSAGE field: %m");
                         }
 
-                        assert_se(message = startswith(message, "MESSAGE="));
+                        message = startswith(message, "MESSAGE=");
+                        if (!message) {
+                                /* The data object doesn't carry the expected field prefix, e.g. because
+                                 * the journal file is corrupted. Skip over it instead of aborting. */
+                                log_notice("MESSAGE field does not start with \"MESSAGE=\", skipping.");
+
+                                if (!arg_reverse)
+                                        c->until_safe = false;
+
+                                c->need_seek = true;
+                                continue;
+                        }
 
                         r = pattern_matches_and_log(arg_compiled_pattern, message,
                                                     len - strlen("MESSAGE="), highlight);
@@ -341,8 +352,8 @@ static int on_first_event(sd_event_source *s, void *userdata) {
         if (r < 0)
                 return r;
 
-        if (arg_follow && !arg_reverse && !c->has_cursor && !arg_since_set) {
-                r = sd_journal_get_cursor(c->journal, /* ret_cursor= */ NULL);
+        if (arg_follow && !c->has_cursor && !arg_since_set) {
+                r = sd_journal_get_cursor(c->journal, /* ret= */ NULL);
                 if (r == -EADDRNOTAVAIL) {
                         /* If we shall operate in --follow mode, and we are unable to get a cursor after
                          * doing our first round of output, then this means there was no data to show
@@ -362,7 +373,9 @@ static int on_first_event(sd_event_source *s, void *userdata) {
                         return log_error_errno(r, "Failed to get cursor: %m");
         }
 
+        /* Setup and initial processing are done, we're ready to wait for more data. */
         (void) sd_notify(/* unset_environment= */ false, "READY=1");
+
         return 0;
 }
 
@@ -458,12 +471,12 @@ static int setup_event(Context *c, int fd) {
         (void) sd_event_add_signal(e, /* ret= */ NULL, SIGTERM | SD_EVENT_SIGNAL_PROCMASK, on_signal, c);
         (void) sd_event_add_signal(e, /* ret= */ NULL, SIGINT | SD_EVENT_SIGNAL_PROCMASK, on_signal, c);
 
-        r = sd_event_add_io(e, /* ret = */ NULL, fd, EPOLLIN, &on_journal_event, c);
+        r = sd_event_add_io(e, /* ret= */ NULL, fd, EPOLLIN, &on_journal_event, c);
         if (r < 0)
                 return log_error_errno(r, "Failed to add io event source for journal: %m");
 
         /* Also keeps an eye on STDOUT, and exits as soon as we see a POLLHUP on that, i.e. when it is closed. */
-        r = sd_event_add_io(e, /* ret = */ NULL, STDOUT_FILENO, EPOLLHUP|EPOLLERR, /* callback = */ NULL, /* userdata = */ NULL);
+        r = sd_event_add_io(e, /* ret= */ NULL, STDOUT_FILENO, EPOLLHUP|EPOLLERR, /* callback= */ NULL, /* userdata= */ NULL);
         if (r == -EPERM)
                 /* Installing an epoll watch on a regular file doesn't work and fails with EPERM. Which is
                  * totally OK, handle it gracefully. epoll_ctl() documents EPERM as the error returned when
@@ -472,11 +485,9 @@ static int setup_event(Context *c, int fd) {
         else if (r < 0)
                 return log_error_errno(r, "Failed to add io event source for stdout: %m");
 
-        if (arg_lines != 0 || arg_since_set) {
-                r = sd_event_add_defer(e, NULL, on_first_event, c);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to add defer event source: %m");
-        }
+        r = sd_event_add_defer(e, NULL, on_first_event, c);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add defer event source: %m");
 
         c->event = TAKE_PTR(e);
         return 0;
@@ -583,6 +594,7 @@ int action_show(char **matches) {
                 return 0;
         }
 
+        /* Setup is done, we'll start processing data. */
         (void) sd_notify(/* unset_environment= */ false, "READY=1");
 
         r = show(&c);

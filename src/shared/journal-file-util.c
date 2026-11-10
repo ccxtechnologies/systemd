@@ -377,8 +377,10 @@ int journal_file_set_offline(JournalFile *f, bool wait) {
                 assert_se(sigdelset(&ss, SIGBUS) >= 0);
 
                 r = pthread_sigmask(SIG_BLOCK, &ss, &saved_ss);
-                if (r > 0)
+                if (r > 0) {
+                        f->offline_state = OFFLINE_JOINED;
                         return -r;
+                }
 
                 r = pthread_create(&f->offline_thread, NULL, journal_file_set_offline_thread, f);
 
@@ -405,23 +407,15 @@ bool journal_file_is_offlining(JournalFile *f) {
         return true;
 }
 
-void journal_file_write_final_tag(JournalFile *f) {
-        assert(f);
-#if HAVE_GCRYPT
-        if (!JOURNAL_HEADER_SEALED(f->header) || !journal_file_writable(f))
-                return;
-
-        int r = journal_file_append_tag(f);
-        if (r < 0)
-                log_debug_errno(r, "Failed to append tag when closing journal: %m");
-#endif
-}
-
 JournalFile* journal_file_offline_close(JournalFile *f) {
+        int r;
+
         if (!f)
                 return NULL;
 
-        journal_file_write_final_tag(f);
+        r = journal_file_auth_append_tag(f);
+        if (r < 0)
+                log_debug_errno(r, "Failed to append tag when closing journal, ignoring: %m");
 
         if (sd_event_source_get_enabled(f->post_change_timer, NULL) > 0)
                 journal_file_post_change(f);
@@ -464,7 +458,10 @@ int journal_file_rotate(
         assert(f);
         assert(*f);
 
-        journal_file_write_final_tag(*f);
+        r = journal_file_auth_append_tag(*f);
+        if (r < 0)
+                log_debug_errno(r, "Failed to append tag when closing journal, ignoring: %m");
+
         r = journal_file_archive(*f, &path);
         if (r < 0)
                 return r;
@@ -511,7 +508,7 @@ int journal_file_open_reliably(
                         compress_threshold_bytes,
                         metrics,
                         mmap_cache,
-                        /* template = */ NULL,
+                        /* template= */ NULL,
                         ret);
         if (!IN_SET(r,
                     -EBADMSG,           /* Corrupted */
@@ -535,14 +532,14 @@ int journal_file_open_reliably(
                 return r;
 
         /* The file is corrupted. Rotate it away and try it again (but only once) */
-        log_warning_errno(r, "File %s corrupted or uncleanly shut down, renaming and replacing.", fname);
+        log_warning_errno(r, "File %s corrupted or uncleanly shut down, renaming and replacing: %m", fname);
 
         /* The file is corrupted. Try opening it read-only as the template before rotating to inherit its
          * sequence number and ID. */
         r = journal_file_open(-EBADF, fname,
                               (open_flags & ~(O_ACCMODE_STRICT|O_CREAT|O_EXCL)) | O_RDONLY,
                               file_flags, 0, compress_threshold_bytes, NULL,
-                              mmap_cache, /* template = */ NULL, &old_file);
+                              mmap_cache, /* template= */ NULL, &old_file);
         if (r < 0)
                 log_debug_errno(r, "Failed to continue sequence from file %s, ignoring: %m", fname);
 
@@ -551,7 +548,7 @@ int journal_file_open_reliably(
                 return r;
 
         return journal_file_open(-EBADF, fname, open_flags, file_flags, mode, compress_threshold_bytes, metrics,
-                                 mmap_cache, /* template = */ old_file, ret);
+                                 mmap_cache, /* template= */ old_file, ret);
 }
 
 DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(

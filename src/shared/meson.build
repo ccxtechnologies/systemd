@@ -19,8 +19,8 @@ shared_sources = files(
         'boot-entry.c',
         'boot-timestamps.c',
         'bootspec.c',
-        'bpf-dlopen.c',
         'bpf-program.c',
+        'bpf-util.c',
         'bridge-util.c',
         'btrfs-util.c',
         'bus-get-properties.c',
@@ -51,17 +51,24 @@ shared_sources = files(
         'coredump-util.c',
         'cpu-set-util.c',
         'creds-util.c',
+        'crypto-util.c',
         'cryptsetup-fido2.c',
         'cryptsetup-tpm2.c',
         'cryptsetup-util.c',
+        'curl-util.c',
         'daemon-util.c',
         'data-fd-util.c',
         'dev-setup.c',
-        'device-nodes.c',
         'discover-image.c',
         'dissect-image.c',
         'dm-util.c',
+        'dns-answer.c',
+        'dns-configuration.c',
         'dns-domain.c',
+        'dns-packet.c',
+        'dns-question.c',
+        'dns-rr.c',
+        'dns-type.c',
         'dropin.c',
         'edit-util.c',
         'efi-api.c',
@@ -73,16 +80,19 @@ shared_sources = files(
         'exit-status.c',
         'extension-util.c',
         'factory-reset.c',
+        'fdisk-util.c',
         'fdset.c',
         'fido2-util.c',
         'find-esp.c',
-        'firewall-util-nft.c',
         'firewall-util.c',
+        'firstboot-util.c',
         'fork-notify.c',
         'format-table.c',
+        'fsprg-openssl.c',
         'fstab-util.c',
         'generator.c',
         'geneve-util.c',
+        'gnutls-util.c',
         'gpt.c',
         'group-record.c',
         'hibernate-util.c',
@@ -94,12 +104,14 @@ shared_sources = files(
         'image-policy.c',
         'import-util.c',
         'in-addr-prefix-util.c',
+        'initrd-cpio.c',
         'install-file.c',
         'install-printf.c',
         'install.c',
         'ioprio-util.c',
         'ip-protocol-list.c',
         'ipvlan-util.c',
+        'journal-authenticate.c',
         'journal-file-util.c',
         'journal-importer.c',
         'journal-util.c',
@@ -115,21 +127,27 @@ shared_sources = files(
         'libmount-util.c',
         'local-addresses.c',
         'locale-setup.c',
+        'log-assert-critical.c',
         'logs-show.c',
         'loop-util.c',
         'loopback-setup.c',
         'lsm-util.c',
+        'luo-util.c',
         'machine-bind-user.c',
         'machine-credential.c',
         'machine-id-setup.c',
-        'machine-pool.c',
+        'machine-register.c',
+        'machine-util.c',
         'macvlan-util.c',
         'main-func.c',
-        'mkdir-label.c',
+        'metrics.c',
+        'microhttpd-util.c',
+        'mkdir.c',
         'mkfs-util.c',
         'module-util.c',
         'mount-setup.c',
         'mount-util.c',
+        'mstack.c',
         'net-condition.c',
         'netif-naming-scheme.c',
         'netif-sriov.c',
@@ -139,10 +157,11 @@ shared_sources = files(
         'nsresource.c',
         'numa-util.c',
         'open-file.c',
-        'openssl-util.c',
+        'options.c',
         'osc-context.c',
         'output-mode.c',
         'pager.c',
+        'pam-util.c',
         'parse-argument.c',
         'parse-helpers.c',
         'password-quality-util-passwdqc.c',
@@ -150,18 +169,25 @@ shared_sources = files(
         'pcre2-util.c',
         'pcrextend-util.c',
         'pe-binary.c',
+        'pkcs7-util.c',
         'pkcs11-util.c',
         'plymouth-util.c',
         'polkit-agent.c',
         'portable-util.c',
         'pretty-print.c',
+        'printk-util.c',
+        'prompt-util.c',
         'ptyfwd.c',
+        'qmp-client.c',
         'qrcode-util.c',
         'quota-util.c',
         'reboot-util.c',
         'recovery-key.c',
+        'reread-partition-table.c',
         'resize-fs.c',
+        'resolve-hook-util.c',
         'resolve-util.c',
+        'resolve-varlink-util.c',
         'rm-rf.c',
         'seccomp-util.c',
         'securebits-util.c',
@@ -172,14 +198,21 @@ shared_sources = files(
         'sleep-config.c',
         'smack-util.c',
         'smbios11.c',
+        'snapshot-util.c',
+        'socket-forward.c',
         'socket-label.c',
         'socket-netlink.c',
         'specifier.c',
+        'ssl-util.c',
+        'storage-util.c',
         'switch-root.c',
-        'tmpfile-util-label.c',
+        'swtpm-util.c',
+        'tar-util.c',
+        'tmpfile-util.c',
         'tomoyo-util.c',
         'tpm2-util.c',
         'tpm2-event-log.c',
+        'tsm-report.c',
         'udev-util.c',
         'unit-file.c',
         'user-record-nss.c',
@@ -191,26 +224,46 @@ shared_sources = files(
         'varlink-io.systemd.AskPassword.c',
         'varlink-io.systemd.BootControl.c',
         'varlink-io.systemd.Credentials.c',
+        'varlink-io.systemd.CryptEnroll.c',
         'varlink-io.systemd.FactoryReset.c',
         'varlink-io.systemd.Hostname.c',
         'varlink-io.systemd.Import.c',
+        'varlink-io.systemd.InstanceMetadata.c',
+        'varlink-io.systemd.Job.c',
         'varlink-io.systemd.Journal.c',
+        'varlink-io.systemd.JournalAccess.c',
         'varlink-io.systemd.Login.c',
         'varlink-io.systemd.Machine.c',
         'varlink-io.systemd.MachineImage.c',
+        'varlink-io.systemd.MachineInstance.c',
         'varlink-io.systemd.ManagedOOM.c',
         'varlink-io.systemd.Manager.c',
+        'varlink-io.systemd.Metrics.c',
         'varlink-io.systemd.MountFileSystem.c',
+        'varlink-io.systemd.MuteConsole.c',
         'varlink-io.systemd.NamespaceResource.c',
         'varlink-io.systemd.Network.c',
+        'varlink-io.systemd.Network.Link.c',
         'varlink-io.systemd.PCRExtend.c',
         'varlink-io.systemd.PCRLock.c',
+        'varlink-io.systemd.Repart.c',
+        'varlink-io.systemd.Report.c',
+        'varlink-io.systemd.Report.Signer.c',
+        'varlink-io.systemd.Report.Uploader.c',
         'varlink-io.systemd.Resolve.c',
+        'varlink-io.systemd.Resolve.Hook.c',
         'varlink-io.systemd.Resolve.Monitor.c',
+        'varlink-io.systemd.Shutdown.c',
+        'varlink-io.systemd.StorageProvider.c',
+        'varlink-io.systemd.SysInstall.c',
+        'varlink-io.systemd.SysUpdate.c',
+        'varlink-io.systemd.SysUpdate.Notify.c',
         'varlink-io.systemd.Udev.c',
         'varlink-io.systemd.Unit.c',
         'varlink-io.systemd.UserDatabase.c',
+        'varlink-io.systemd.VirtualMachineInstance.c',
         'varlink-io.systemd.oom.c',
+        'varlink-io.systemd.oom.Prekill.c',
         'varlink-io.systemd.service.c',
         'varlink-io.systemd.sysext.c',
         'varlink-serialize.c',
@@ -220,16 +273,13 @@ shared_sources = files(
         'vlan-util.c',
         'volatile-util.c',
         'vpick.c',
+        'vsock-util.c',
         'wall.c',
         'watchdog.c',
         'web-util.c',
         'wifi-util.c',
         'xml.c',
 )
-
-if conf.get('ENABLE_NSS') == 1
-        shared_sources += files('nss-util.c')
-endif
 
 if get_option('tests') != 'false'
         shared_sources += files('tests.c')
@@ -245,20 +295,20 @@ syscall_list_inc = custom_target(
 generated_sources += syscall_list_inc
 shared_sources += syscall_list_inc
 
-if conf.get('ENABLE_UTMP') == 1
-        shared_sources += files('utmp-wtmp.c')
+if conf.get('ENABLE_NSS') == 1
+        shared_sources += files('nss-util.c')
 endif
 
-if conf.get('HAVE_LIBIPTC') == 1
-        shared_sources += files('firewall-util-iptables.c')
+if conf.get('ENABLE_UTMP') == 1
+        shared_sources += files('utmp-wtmp.c')
 endif
 
 if conf.get('HAVE_LIBBPF') == 1
         shared_sources += files('bpf-link.c')
 endif
 
-if conf.get('HAVE_PAM') == 1
-        shared_sources += files('pam-util.c')
+if conf.get('HAVE_TPM2') == 1
+        shared_sources += files('tpm2-report.c')
 endif
 
 generate_ip_protocol_list = files('generate-ip-protocol-list.sh')
@@ -313,29 +363,73 @@ ethtool_link_mode_xml = custom_target(
         capture : true)
 man_page_depends += ethtool_link_mode_xml
 
+dns_type_list_txt = custom_target(
+        input : ['generate-dns_type-list.sed', 'dns-type.h'],
+        output : 'dns_type-list.txt',
+        command : [sed, '-n', '-r', '-f', '@INPUT0@', '@INPUT1@'],
+        capture : true)
+
+gperf_file = custom_target(
+        input : dns_type_list_txt,
+        output : 'dns_type-from-name.gperf',
+        command : [files('generate-dns_type-gperf.py'),
+                   'dns_type',
+                   'DNS_TYPE_',
+                   '@INPUT@'],
+        capture : true)
+
+dns_type_from_name_inc = custom_target(
+        input : gperf_file,
+        output : 'dns_type-from-name.inc',
+        command : [gperf,
+                   '-L', 'ANSI-C', '-t', '--ignore-case',
+                   '-N', 'lookup_dns_type',
+                   '-H', 'hash_dns_type_name',
+                   '-p', '-C',
+                   '@INPUT@'],
+        capture : true)
+
+dns_type_to_name_inc = custom_target(
+        input : ['dns_type-to-name.awk', dns_type_list_txt],
+        output : 'dns_type-to-name.inc',
+        command : [awk, '-f', '@INPUT0@', '@INPUT1@'],
+        capture : true)
+
+generated_sources += [dns_type_from_name_inc, dns_type_to_name_inc]
+shared_sources += [dns_type_from_name_inc, dns_type_to_name_inc]
+
 libshared_name = 'systemd-shared-@0@'.format(shared_lib_tag)
 
-libshared_deps = [threads,
-                  libacl,
-                  libaudit,
-                  libblkid,
-                  libcap,
-                  libcrypt,
-                  libdl,
-                  libgcrypt,
-                  libiptc_cflags,
+libshared_deps = [libacl_cflags,
+                  libapparmor_cflags,
+                  libarchive_cflags,
+                  libaudit_cflags,
+                  libblkid_cflags,
+                  libbpf_cflags,
+                  libcrypt_cflags,
+                  libcryptsetup_cflags,
+                  libcurl_cflags,
+                  libelf_cflags,
+                  libfdisk_cflags,
+                  libfido2_cflags,
+                  libgnutls_cflags,
+                  libidn2_cflags,
                   libkmod_cflags,
-                  liblz4_cflags,
-                  libmount,
-                  libopenssl,
+                  libmicrohttpd_cflags,
+                  libmount_cflags,
+                  libopenssl_cflags,
                   libp11kit_cflags,
-                  libpam,
-                  librt,
-                  libseccomp,
-                  libselinux,
+                  libpam_cflags,
+                  libpcre2_cflags,
+                  libpwquality_cflags,
+                  libqrencode_cflags,
+                  libseccomp_cflags,
+                  libselinux_cflags,
+                  libucontext,
                   libxenctrl_cflags,
                   libxz_cflags,
-                  libzstd_cflags]
+                  libzstd_cflags,
+                  tpm2_cflags]
 
 libshared_sym_path = meson.current_source_dir() / 'libshared.sym'
 libshared_build_dir = meson.current_build_dir()
@@ -366,15 +460,3 @@ libshared = shared_library(
                         userspace],
         install : true,
         install_dir : pkglibdir)
-
-shared_fdisk_sources = files('fdisk-util.c')
-
-libshared_fdisk = static_library(
-        'shared-fdisk',
-        shared_fdisk_sources,
-        include_directories : includes,
-        implicit_include_directories : false,
-        dependencies : [libfdisk,
-                        userspace],
-        c_args : ['-fvisibility=default'],
-        build_by_default : false)

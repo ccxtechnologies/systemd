@@ -13,15 +13,17 @@ if conf.get('ENABLE_SYSUSERS') == 1
                      # https://github.com/mesonbuild/meson/issues/2681
                      args : exe.full_path(),
                      depends : exe,
+                     env : test_env,
                      suite : 'sysusers')
 
-                if have_standalone_binaries
+                if 'systemd-sysusers.standalone' in executables_by_name
                         exe = executables_by_name.get('systemd-sysusers.standalone')
                         test('test-sysusers.standalone',
                              test_sysusers_sh,
                              # https://github.com/mesonbuild/meson/issues/2681
                              args : exe.full_path(),
                              depends : exe,
+                             env : test_env,
                              suite : 'sysusers')
                 endif
         endif
@@ -63,16 +65,6 @@ endif
 
 ############################################################
 
-if want_tests != 'false' and conf.get('HAVE_SYSV_COMPAT') == 1
-        exe = executables_by_name.get('systemd-sysv-generator')
-        test('sysv-generator-test',
-             files('sysv-generator-test.py'),
-             depends : exe,
-             suite : 'sysv')
-endif
-
-############################################################
-
 if want_tests != 'false' and conf.get('HAVE_BLKID') == 1
         exe = executables_by_name.get('bootctl')
         test('test-bootctl-json',
@@ -93,7 +85,7 @@ if want_tests != 'false' and conf.get('ENABLE_TMPFILES') == 1
              depends : exe,
              suite : 'tmpfiles')
 
-        if have_standalone_binaries
+        if 'systemd-tmpfiles.standalone' in executables_by_name
                 exe = executables_by_name.get('systemd-tmpfiles.standalone')
                 test('test-systemd-tmpfiles.standalone',
                      test_systemd_tmpfiles_py,
@@ -106,7 +98,7 @@ endif
 ############################################################
 
 test_compare_versions_sh = files('test-compare-versions.sh')
-if want_tests != 'false'
+if want_tests != 'false' and 'systemd-analyze' in executables_by_name
         exe = executables_by_name.get('systemd-analyze')
         test('test-compare-versions',
              test_compare_versions_sh,
@@ -132,6 +124,21 @@ if want_tests != 'false'
              exe,
              suite : 'udev',
              args : ['verify', '--resolve-names=late', all_rules])
+
+        link_abi_targets = [libsystemd, libudev, libshared, libcore]
+        link_abi_targets += module_targets
+        foreach _, exe : executables_by_name
+                link_abi_targets += exe
+        endforeach
+
+        if conf.get('BUILD_MODE_DEVELOPER') == 1
+                test('test-link-abi',
+                     files('test-link-abi.py'),
+                     args : link_abi_targets,
+                     depends : link_abi_targets,
+                     suite : 'dist',
+                     timeout : 120)
+        endif
 endif
 
 ############################################################
@@ -149,7 +156,7 @@ endif
 ############################################################
 
 test_fstab_generator_sh = files('test-fstab-generator.sh')
-if want_tests != 'false'
+if want_tests != 'false' and 'systemd-fstab-generator' in executables_by_name
         exe = executables_by_name.get('systemd-fstab-generator')
         test('test-fstab-generator',
              test_fstab_generator_sh,
@@ -192,7 +199,7 @@ if want_tests != 'false'
         test('test-udev',
              test_udev_py,
              args : ['-v'],
-             env : ['UDEV_RULE_RUNNER=' + exe.full_path()],
+             env : test_env + { 'UDEV_RULE_RUNNER' : exe.full_path() },
              depends : exe,
              timeout : 180,
              suite : 'udev')
@@ -227,13 +234,18 @@ if want_tests != 'false' and conf.get('HAVE_DMI') == 1
         udev_dmi_memory_id_test = files('udev-dmi-memory-id-test.sh')
         exe = executables_by_name.get('dmi_memory_id')
 
-        if git.found() and fs.is_dir(meson.project_source_root() / '.git')
+        # In a git worktree, .git is a file that contains the path of the repository. git fails when the
+        # repository isn't at the path in .git, for example in a container that only mounts the worktree.
+        use_git = git.found() and fs.exists(meson.project_source_root() / '.git')
+        if use_git
                 out = run_command(
                         env, '-u', 'GIT_WORK_TREE',
                         git, '--git-dir=@0@/.git'.format(meson.project_source_root()),
                         'ls-files', ':/test/dmidecode-dumps/*.bin',
-                        check: true)
-        else
+                        check: false)
+                use_git = out.returncode() == 0
+        endif
+        if not use_git
                 out = run_command(
                         sh, '-c', 'cd "$1"; echo test/dmidecode-dumps/*.bin', '_', meson.project_source_root(),
                         check: true)
@@ -258,8 +270,12 @@ if want_tests != 'false' and conf.get('ENABLE_KERNEL_INSTALL') == 1
         args = [kernel_install.full_path(), loaderentry_install.full_path(), uki_copy_install]
         deps = [kernel_install, loaderentry_install]
         if want_ukify and boot_stubs.length() > 0
-                args += [ukify.full_path(), ukify_install.full_path(), boot_stubs[0]]
+                args += [ukify.full_path(), ukify_install.full_path(), test_ukify_install_py, boot_stubs[0]]
                 deps += [ukify, ukify_install, boot_stubs[0]]
+        endif
+        # test-kernel-install.sh runs $PROJECT_BUILD_ROOT/bootctl if it exists.
+        if 'bootctl' in executables_by_name
+                deps += [executables_by_name.get('bootctl')]
         endif
 
         test('test-kernel-install',
@@ -268,6 +284,60 @@ if want_tests != 'false' and conf.get('ENABLE_KERNEL_INSTALL') == 1
              args : args,
              depends : deps,
              suite : 'kernel-install')
+endif
+
+############################################################
+
+test_dlopen_note_py = files('test-dlopen-note.py')
+
+if want_dlopen_tests
+        foreach name, exe : executables_by_name
+                if name.endswith('.static') or name.endswith('.shared')
+                        continue
+                endif
+
+                name_static = name + '.static'
+                if name + '.standalone' in executables_by_name
+                        exe_shared = exe
+                        exe_static = executables_by_name.get(name + '.standalone')
+                elif name + '.shared' in executables_by_name
+                        exe_shared = executables_by_name.get(name + '.shared')
+                        exe_static = exe
+                else
+                        continue
+                endif
+
+                test(name,
+                     test_dlopen_note_py,
+                     env : test_env,
+                     args : ['--shared', exe_shared.full_path(), '--static', exe_static.full_path()],
+                     depends : [exe_shared, exe_static],
+                     suite : 'dlopen')
+        endforeach
+
+        foreach name, lib : modules_by_name
+                if name.endswith('.standalone')
+                        continue
+                endif
+
+                lib_static = modules_by_name.get(name + '.standalone', lib)
+
+                test('lib' + lib.name(),
+                     test_dlopen_note_py,
+                     env : test_env,
+                     args : ['--shared', lib.full_path(), '--static', lib_static.full_path()],
+                     depends : [lib, lib_static],
+                     suite : 'dlopen')
+        endforeach
+
+        foreach lib : [libshared, libsystemd, libudev]
+                test('lib' + lib.name(),
+                     test_dlopen_note_py,
+                     env : test_env,
+                     args : ['--shared', lib.full_path(), '--static', lib.full_path()],
+                     depends : [lib],
+                     suite : 'dlopen')
+        endforeach
 endif
 
 ############################################################
@@ -340,7 +410,6 @@ if install_tests
                 'journal-data',
                 'knot-data',
                 'test-cgroup-mask',
-                'test-cgroup-unit-default',
                 'test-engine',
                 'test-execute',
                 'test-fstab-generator',
@@ -360,11 +429,13 @@ if install_tests
                 'integration-tests/TEST-30-ONCLOCKCHANGE/TEST-30-ONCLOCKCHANGE.units',
                 'integration-tests/TEST-38-FREEZER/TEST-38-FREEZER.units',
                 'integration-tests/TEST-52-HONORFIRSTSHUTDOWN/TEST-52-HONORFIRSTSHUTDOWN.units',
+                'integration-tests/TEST-54-CREDS/TEST-54-CREDS.units',
                 'integration-tests/TEST-55-OOMD/TEST-55-OOMD.units',
                 'integration-tests/TEST-62-RESTRICT-IFACES/TEST-62-RESTRICT-IFACES.units',
                 'integration-tests/TEST-63-PATH/TEST-63-PATH.units',
                 'integration-tests/TEST-65-ANALYZE/TEST-65-ANALYZE.units',
                 'integration-tests/TEST-66-DEVICE-ISOLATION/TEST-66-DEVICE-ISOLATION.units',
+                'integration-tests/TEST-74-AUX-UTILS/TEST-74-AUX-UTILS.units',
                 'integration-tests/TEST-80-NOTIFYACCESS/TEST-80-NOTIFYACCESS.units',
                 'units',
         ]

@@ -9,6 +9,7 @@
 #include "time-util.h"
 
 int test_fd[2] = EBADF_PAIR;
+int test_ifindex = 42;
 
 static struct in6_addr dummy_link_local = {
         .s6_addr = {
@@ -18,6 +19,8 @@ static struct in6_addr dummy_link_local = {
 };
 
 int icmp6_bind(int ifindex, bool is_router) {
+        test_ifindex = ifindex;
+
         if (!is_router && socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, test_fd) < 0)
                 return -errno;
 
@@ -30,18 +33,22 @@ int icmp6_send(int fd, const struct in6_addr *dst, const struct iovec *iov, size
 
 int icmp6_receive(
                 int fd,
-                void *iov_base,
-                size_t iov_len,
+                void *buffer,
+                size_t size,
                 struct in6_addr *ret_sender,
+                int *ret_ifindex,
                 triple_timestamp *ret_timestamp) {
 
-        assert_se(read (fd, iov_base, iov_len) == (ssize_t) iov_len);
+        assert_se(read(fd, buffer, size) == (ssize_t) size);
 
         if (ret_timestamp)
                 triple_timestamp_now(ret_timestamp);
 
         if (ret_sender)
                 *ret_sender = dummy_link_local;
+
+        if (ret_ifindex)
+                *ret_ifindex = test_ifindex;
 
         return 0;
 }

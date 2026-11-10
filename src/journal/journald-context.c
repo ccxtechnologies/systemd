@@ -1,9 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#if HAVE_SELINUX
-#include <selinux/selinux.h>
-#endif
-
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -27,7 +23,9 @@
 #include "prioq.h"
 #include "process-util.h"
 #include "procfs-util.h"
+#include "selinux-util.h"
 #include "set.h"
+#include "special.h"
 #include "string-util.h"
 #include "syslog-util.h"
 #include "time-util.h"
@@ -179,7 +177,6 @@ static void client_context_reset(Manager *m, ClientContext *c) {
         c->invocation_id = SD_ID128_NULL;
 
         c->label = mfree(c->label);
-        c->label_size = 0;
 
         c->extra_fields_iovec = mfree(c->extra_fields_iovec);
         c->extra_fields_n_iovec = 0;
@@ -251,23 +248,21 @@ static void client_context_read_basic(ClientContext *c) {
 
 static int client_context_read_label(
                 ClientContext *c,
-                const char *label, size_t label_size) {
+                const char *label) {
+
+        int r;
 
         assert(c);
         assert(pid_is_valid(c->pid));
-        assert(label_size == 0 || label);
 
-        if (label_size > 0) {
-                char *l;
+        if (!mac_selinux_use())
+                return 0;
 
+        if (label) {
                 /* If we got an SELinux label passed in it counts. */
-
-                l = newdup_suffix0(char, label, label_size);
-                if (!l)
+                r = free_and_strdup(&c->label, label);
+                if (r < 0)
                         return -ENOMEM;
-
-                free_and_replace(c->label, l);
-                c->label_size = label_size;
         }
 #if HAVE_SELINUX
         else {
@@ -275,10 +270,8 @@ static int client_context_read_label(
 
                 /* If we got no SELinux label passed in, let's try to acquire one */
 
-                if (getpidcon(c->pid, &con) >= 0 && con) {
+                if (sym_getpidcon_raw(c->pid, &con) >= 0 && con)
                         free_and_replace(c->label, con);
-                        c->label_size = strlen(c->label);
-                }
         }
 #endif
 
@@ -294,9 +287,10 @@ static int client_context_read_cgroup(Manager *m, ClientContext *c, const char *
         /* Try to acquire the current cgroup path */
         r = cg_pid_get_path_shifted(c->pid, m->cgroup_root, &t);
         if (r < 0 || empty_or_root(t)) {
-                /* We use the unit ID passed in as fallback if we have nothing cached yet and cg_pid_get_path_shifted()
-                 * failed or process is running in a root cgroup. Zombie processes are automatically migrated to root cgroup
-                 * on cgroup v1 and we want to be able to map log messages from them too. */
+                /* We use the unit ID passed in as fallback if cg_pid_get_path_shifted() failed (e.g. because
+                 * the process already exited by the time we process the stdout stream it connected to us) or
+                 * the process is running in a root cgroup. Zombie processes are automatically migrated to root
+                 * cgroup on cgroup v1 and we want to be able to map log messages from them too. */
                 if (unit_id && !c->unit) {
                         c->unit = strdup(unit_id);
                         if (c->unit)
@@ -451,9 +445,12 @@ static int client_context_read_extra_fields(
                 if (v < 2)
                         return -EBADMSG;
 
-                n = sizeof(uint64_t) + v;
-                if (left < n)
+                /* left >= sizeof(uint64_t) here, so the subtraction is safe and we avoid
+                 * overflowing sizeof(uint64_t) + v when v is close to UINT64_MAX. */
+                if (v > left - sizeof(uint64_t))
                         return -EBADMSG;
+
+                n = sizeof(uint64_t) + v;
 
                 field = q + sizeof(uint64_t);
 
@@ -533,7 +530,7 @@ static void client_context_really_refresh(
                 Manager *m,
                 ClientContext *c,
                 const struct ucred *ucred,
-                const char *label, size_t label_size,
+                const char *label,
                 const char *unit_id,
                 usec_t timestamp) {
 
@@ -544,9 +541,22 @@ static void client_context_really_refresh(
         if (timestamp == USEC_INFINITY)
                 timestamp = now(CLOCK_MONOTONIC);
 
+        /* If the caller tells us about a unit (i.e. the one a stdout stream was opened for, which is always
+         * a system unit), but we have the process cached as part of PID 1's own cgroup, then the cached data
+         * is stale: on kernels lacking CLONE_INTO_CGROUP sd-executor logs a few messages while still in
+         * init.scope, and only then attaches itself to the unit's cgroup and connects stdout/stderr to
+         * us. Flush out everything we know in that case, so that we don't keep sd-executor's identity or
+         * init.scope's per-unit settings around. If the process is still around we'll reacquire everything
+         * below, and if it already exited we'll at least use the stream's unit ID as fallback. Note that we
+         * do not do this if the cached data refers to any other unit, since processes of a unit might very
+         * well have been migrated elsewhere (e.g. into a session scope) while still writing to the stream
+         * they inherited. */
+        if (unit_id && streq_ptr(c->unit, SPECIAL_INIT_SCOPE) && !streq(unit_id, SPECIAL_INIT_SCOPE))
+                client_context_reset(m, c);
+
         client_context_read_uid_gid(c, ucred);
         client_context_read_basic(c);
-        (void) client_context_read_label(c, label, label_size);
+        (void) client_context_read_label(c, label);
 
         (void) audit_session_from_pid(&PIDREF_MAKE_FROM_PID(c->pid), &c->auditid);
         (void) audit_loginuid_from_pid(&PIDREF_MAKE_FROM_PID(c->pid), &c->loginuid);
@@ -570,7 +580,7 @@ void client_context_maybe_refresh(
                 Manager *m,
                 ClientContext *c,
                 const struct ucred *ucred,
-                const char *label, size_t label_size,
+                const char *label,
                 const char *unit_id,
                 usec_t timestamp) {
 
@@ -602,13 +612,21 @@ void client_context_maybe_refresh(
         if (ucred && gid_is_valid(ucred->gid) && c->gid != ucred->gid)
                 goto refresh;
 
-        if (label_size > 0 && (label_size != c->label_size || memcmp(label, c->label, label_size) != 0))
+        if (label && !streq_ptr(label, c->label))
+                goto refresh;
+
+        /* If the unit the caller told us about (i.e. the one a stdout stream was opened for) doesn't match
+         * the cached data, then the process likely was moved to a different cgroup since we cached it. This
+         * happens in particular for sd-executor on kernels lacking CLONE_INTO_CGROUP: it logs a few messages
+         * while still in the service manager's cgroup, and then attaches itself to the unit's cgroup before
+         * connecting stdout/stderr to us. */
+        if (unit_id && !streq_ptr(unit_id, c->unit) && !streq_ptr(unit_id, c->user_unit))
                 goto refresh;
 
         return;
 
 refresh:
-        client_context_really_refresh(m, c, ucred, label, label_size, unit_id, timestamp);
+        client_context_really_refresh(m, c, ucred, label, unit_id, timestamp);
 }
 
 static void client_context_refresh_on_reload(Manager *m, ClientContext *c) {
@@ -710,7 +728,7 @@ static int client_context_get_internal(
                 Manager *m,
                 pid_t pid,
                 const struct ucred *ucred,
-                const char *label, size_t label_len,
+                const char *label,
                 const char *unit_id,
                 bool add_ref,
                 ClientContext **ret) {
@@ -738,7 +756,7 @@ static int client_context_get_internal(
                         c->n_ref++;
                 }
 
-                client_context_maybe_refresh(m, c, ucred, label, label_len, unit_id, USEC_INFINITY);
+                client_context_maybe_refresh(m, c, ucred, label, unit_id, USEC_INFINITY);
 
                 *ret = c;
                 return 0;
@@ -762,7 +780,7 @@ static int client_context_get_internal(
                 c->in_lru = true;
         }
 
-        client_context_really_refresh(m, c, ucred, label, label_len, unit_id, USEC_INFINITY);
+        client_context_really_refresh(m, c, ucred, label, unit_id, USEC_INFINITY);
 
         *ret = c;
         return 0;
@@ -772,22 +790,22 @@ int client_context_get(
                 Manager *m,
                 pid_t pid,
                 const struct ucred *ucred,
-                const char *label, size_t label_len,
+                const char *label,
                 const char *unit_id,
                 ClientContext **ret) {
 
-        return client_context_get_internal(m, pid, ucred, label, label_len, unit_id, false, ret);
+        return client_context_get_internal(m, pid, ucred, label, unit_id, /* add_ref= */ false, ret);
 }
 
 int client_context_acquire(
                 Manager *m,
                 pid_t pid,
                 const struct ucred *ucred,
-                const char *label, size_t label_len,
+                const char *label,
                 const char *unit_id,
                 ClientContext **ret) {
 
-        return client_context_get_internal(m, pid, ucred, label, label_len, unit_id, true, ret);
+        return client_context_get_internal(m, pid, ucred, label, unit_id, /* add_ref= */ true, ret);
 };
 
 ClientContext *client_context_release(Manager *m, ClientContext *c) {
@@ -829,7 +847,7 @@ void client_context_acquire_default(Manager *m) {
                         .gid = getgid(),
                 };
 
-                r = client_context_acquire(m, ucred.pid, &ucred, NULL, 0, NULL, &m->my_context);
+                r = client_context_acquire(m, ucred.pid, &ucred, /* label= */ NULL, /* unit_id= */ NULL, &m->my_context);
                 if (r < 0)
                         log_ratelimit_warning_errno(r, JOURNAL_LOG_RATELIMIT,
                                                     "Failed to acquire our own context, ignoring: %m");
@@ -839,7 +857,7 @@ void client_context_acquire_default(Manager *m) {
                 /* Acquire PID1's context, but only if we are in non-namespaced mode, since PID 1 is only
                  * going to log to the non-namespaced journal instance. */
 
-                r = client_context_acquire(m, 1, NULL, NULL, 0, NULL, &m->pid1_context);
+                r = client_context_acquire(m, 1, /* ucred= */ NULL, /* label= */ NULL, /* unit_id= */ NULL, &m->pid1_context);
                 if (r < 0)
                         log_ratelimit_warning_errno(r, JOURNAL_LOG_RATELIMIT,
                                                     "Failed to acquire PID1's context, ignoring: %m");

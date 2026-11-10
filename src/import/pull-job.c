@@ -3,22 +3,39 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
+#include "compress.h"
+#include "crypto-util.h"
+#include "curl-util.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "hexdecoct.h"
+#include "import-common.h"
 #include "io-util.h"
 #include "log.h"
 #include "parse-util.h"
-#include "pull-common.h"
 #include "pull-job.h"
-#include "curl-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "sync-util.h"
 #include "time-util.h"
 #include "xattr-util.h"
+
+static int http_status_ok(CURLcode status) {
+        /* Consider all HTTP status code in the 2xx range as OK */
+        return status >= 200 && status <= 299;
+}
+
+static int http_status_etag_exists(CURLcode status) {
+        /* This one is special, it's triggered by our etag mgmt logic */
+        return status == 304;
+}
+
+static int http_status_need_authentication(CURLcode status) {
+        return status == 401;
+}
 
 void pull_job_close_disk_fd(PullJob *j) {
         if (!j)
@@ -36,33 +53,48 @@ PullJob* pull_job_unref(PullJob *j) {
 
         pull_job_close_disk_fd(j);
 
-        curl_glue_remove_and_free(j->glue, j->curl);
-        curl_slist_free_all(j->request_header);
+        curl_slot_unref(j->slot);
+        sym_curl_slist_free_all(j->request_header);
 
-        import_compress_free(&j->compress);
+        j->compress = compressor_free(j->compress);
 
         if (j->checksum_ctx)
-                EVP_MD_CTX_free(j->checksum_ctx);
+                sym_EVP_MD_CTX_free(j->checksum_ctx);
 
         free(j->url);
         free(j->etag);
         strv_free(j->old_etags);
-        free(j->payload);
-        free(j->checksum);
+        iovec_done(&j->payload);
+        iovec_done(&j->checksum);
+        iovec_done(&j->expected_checksum);
+        free(j->content_type);
+
+        if (j->free_userdata)
+                j->free_userdata(j->userdata);
+        free(j->description);
+        free(j->authentication_challenge);
 
         return mfree(j);
 }
 
-static void pull_job_finish(PullJob *j, int ret) {
+static const char* pull_job_description(PullJob *j) {
         assert(j);
 
+        return j->description ?: j->url;
+}
+
+static int pull_job_finish(PullJob *j, int ret) {
+        assert(j);
+
+        /* Returns 0 so callers in int-returning paths can `return pull_job_finish(...)` directly. */
+
         if (IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED))
-                return;
+                return 0;
 
         if (ret == 0) {
                 j->state = PULL_JOB_DONE;
                 j->progress_percent = 100;
-                log_info("Download of %s complete.", j->url);
+                log_info("Download of %s complete.", pull_job_description(j));
         } else {
                 j->state = PULL_JOB_FAILED;
                 j->error = ret;
@@ -70,40 +102,48 @@ static void pull_job_finish(PullJob *j, int ret) {
 
         if (j->on_finished)
                 j->on_finished(j);
+
+        return 0;
 }
 
-static int pull_job_restart(PullJob *j, const char *new_url) {
+int pull_job_restart(PullJob *j, const char *new_url) {
         int r;
 
         assert(j);
-        assert(new_url);
 
-        r = free_and_strdup(&j->url, new_url);
-        if (r < 0)
-                return r;
+        /* If an URL is specified we retry the same request, just towards a different URL. If the URL is NULL
+         * then we'll fire the same request again (which is useful if some parameters have been changed) */
+
+        if (new_url) {
+                r = free_and_strdup(&j->url, new_url);
+                if (r < 0)
+                        return r;
+        }
 
         j->state = PULL_JOB_INIT;
         j->error = 0;
-        j->payload = mfree(j->payload);
-        j->payload_size = 0;
+        iovec_done(&j->payload);
         j->written_compressed = 0;
         j->written_uncompressed = 0;
         j->content_length = UINT64_MAX;
         j->etag = mfree(j->etag);
         j->etag_exists = false;
         j->mtime = 0;
-        j->checksum = mfree(j->checksum);
+        iovec_done(&j->checksum);
+        j->content_type = mfree(j->content_type);
 
-        curl_glue_remove_and_free(j->glue, j->curl);
-        j->curl = NULL;
+        if (new_url) {
+                /* Reset expectations if the URL changes */
+                iovec_done(&j->expected_checksum);
+                j->expected_content_length = UINT64_MAX;
+        }
 
-        curl_slist_free_all(j->request_header);
-        j->request_header = NULL;
+        j->slot = curl_slot_unref(j->slot);
 
-        import_compress_free(&j->compress);
+        j->compress = compressor_free(j->compress);
 
         if (j->checksum_ctx) {
-                EVP_MD_CTX_free(j->checksum_ctx);
+                sym_EVP_MD_CTX_free(j->checksum_ctx);
                 j->checksum_ctx = NULL;
         }
 
@@ -114,172 +154,13 @@ static int pull_job_restart(PullJob *j, const char *new_url) {
         return 0;
 }
 
-void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
-        PullJob *j = NULL;
-        char *scheme = NULL;
-        CURLcode code;
-        int r;
+static uint64_t pull_job_content_length_effective(PullJob *j) {
+        assert(j);
 
-        if (curl_easy_getinfo(curl, CURLINFO_PRIVATE, (char **)&j) != CURLE_OK)
-                return;
+        if (j->expected_content_length != UINT64_MAX)
+                return j->expected_content_length;
 
-        if (!j || IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED))
-                return;
-
-        if (result != CURLE_OK) {
-                r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Transfer failed: %s", curl_easy_strerror(result));
-                goto finish;
-        }
-
-        code = curl_easy_getinfo(curl, CURLINFO_SCHEME, &scheme);
-        if (code != CURLE_OK || !scheme) {
-                r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve URL scheme.");
-                goto finish;
-        }
-
-        if (STRCASE_IN_SET(scheme, "HTTP", "HTTPS")) {
-                long status;
-
-                code = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-                if (code != CURLE_OK) {
-                        r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve response code: %s", curl_easy_strerror(code));
-                        goto finish;
-                }
-
-                if (status == 304) {
-                        log_info("Image already downloaded. Skipping download.");
-                        j->etag_exists = true;
-                        r = 0;
-                        goto finish;
-                } else if (status >= 300) {
-
-                        if (status == 404 && j->on_not_found) {
-                                _cleanup_free_ char *new_url = NULL;
-
-                                /* This resource wasn't found, but the implementor wants to maybe let us know a new URL, query for it. */
-                                r = j->on_not_found(j, &new_url);
-                                if (r < 0)
-                                        goto finish;
-
-                                if (r > 0) { /* A new url to use */
-                                        assert(new_url);
-
-                                        r = pull_job_restart(j, new_url);
-                                        if (r < 0)
-                                                goto finish;
-
-                                        code = curl_easy_getinfo(j->curl, CURLINFO_RESPONSE_CODE, &status);
-                                        if (code != CURLE_OK) {
-                                                r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve response code: %s", curl_easy_strerror(code));
-                                                goto finish;
-                                        }
-
-                                        if (status == 0)
-                                                return;
-                                }
-                        }
-
-                        r = log_notice_errno(
-                                        status == 404 ? SYNTHETIC_ERRNO(ENOMEDIUM) : SYNTHETIC_ERRNO(EIO), /* Make the most common error recognizable */
-                                        "HTTP request to %s failed with code %li.", j->url, status);
-                        goto finish;
-                } else if (status < 200) {
-                        r = log_error_errno(SYNTHETIC_ERRNO(EIO), "HTTP request to %s finished with unexpected code %li.", j->url, status);
-                        goto finish;
-                }
-        }
-
-        if (j->state != PULL_JOB_RUNNING) {
-                r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Premature connection termination.");
-                goto finish;
-        }
-
-        if (j->content_length != UINT64_MAX &&
-            j->content_length != j->written_compressed) {
-                r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Download truncated.");
-                goto finish;
-        }
-
-        if (j->checksum_ctx) {
-                unsigned checksum_len;
-                uint8_t k[EVP_MAX_MD_SIZE];
-
-                r = EVP_DigestFinal_ex(j->checksum_ctx, k, &checksum_len);
-                if (r == 0) {
-                        r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to get checksum.");
-                        goto finish;
-                }
-                assert(checksum_len <= sizeof k);
-
-                j->checksum = hexmem(k, checksum_len);
-                if (!j->checksum) {
-                        r = log_oom();
-                        goto finish;
-                }
-
-                log_debug("SHA256 of %s is %s.", j->url, j->checksum);
-        }
-
-        /* Do a couple of finishing disk operations, but only if we are the sole owner of the file (i.e. no
-         * offset is specified, which indicates we only own the file partially) */
-
-        if (j->disk_fd >= 0) {
-
-                if (S_ISREG(j->disk_stat.st_mode)) {
-
-                        if (j->offset == UINT64_MAX) {
-
-                                if (j->written_compressed > 0) {
-                                        /* Make sure the file size is right, in case the file was sparse and
-                                         * we just moved to the last part. */
-                                        if (ftruncate(j->disk_fd, j->written_uncompressed) < 0) {
-                                                r = log_error_errno(errno, "Failed to truncate file: %m");
-                                                goto finish;
-                                        }
-                                }
-
-                                if (j->etag)
-                                        (void) fsetxattr(j->disk_fd, "user.source_etag", j->etag, strlen(j->etag), 0);
-                                if (j->url)
-                                        (void) fsetxattr(j->disk_fd, "user.source_url", j->url, strlen(j->url), 0);
-
-                                if (j->mtime != 0) {
-                                        struct timespec ut;
-
-                                        timespec_store(&ut, j->mtime);
-
-                                        if (futimens(j->disk_fd, (struct timespec[]) { ut, ut }) < 0)
-                                                log_debug_errno(errno, "Failed to adjust atime/mtime of created image, ignoring: %m");
-
-                                        r = fd_setcrtime(j->disk_fd, j->mtime);
-                                        if (r < 0)
-                                                log_debug_errno(r, "Failed to adjust crtime of created image, ignoring: %m");
-                                }
-                        }
-
-                        if (j->sync) {
-                                r = fsync_full(j->disk_fd);
-                                if (r < 0) {
-                                        log_error_errno(r, "Failed to synchronize file to disk: %m");
-                                        goto finish;
-                                }
-                        }
-
-                } else if (S_ISBLK(j->disk_stat.st_mode) && j->sync) {
-
-                        if (fsync(j->disk_fd) < 0) {
-                                r = log_error_errno(errno, "Failed to synchronize block device: %m");
-                                goto finish;
-                        }
-                }
-        }
-
-        log_info("Acquired %s.", FORMAT_BYTES(j->written_uncompressed));
-
-        r = 0;
-
-finish:
-        pull_job_finish(j, r);
+        return j->content_length;
 }
 
 static int pull_job_write_uncompressed(const void *p, size_t sz, void *userdata) {
@@ -323,11 +204,14 @@ static int pull_job_write_uncompressed(const void *p, size_t sz, void *userdata)
         }
 
         if (j->disk_fd < 0 || j->force_memory) {
-                if (!GREEDY_REALLOC(j->payload, j->payload_size + sz))
+                uint8_t *a = j->payload.iov_base;
+
+                if (!GREEDY_REALLOC(a, j->payload.iov_len + sz + 1))
                         return log_oom();
 
-                memcpy(j->payload + j->payload_size, p, sz);
-                j->payload_size += sz;
+                *((uint8_t*) mempcpy(a + j->payload.iov_len, p, sz)) = 0;
+                j->payload.iov_base = a;
+                j->payload.iov_len += sz;
         }
 
         j->written_uncompressed += sz;
@@ -339,38 +223,39 @@ finish:
         return 0;
 }
 
-static int pull_job_write_compressed(PullJob *j, void *p, size_t sz) {
+static int pull_job_write_compressed(PullJob *j, const struct iovec *data) {
         int r;
 
         assert(j);
-        assert(p);
+        assert(iovec_is_valid(data));
 
-        if (sz <= 0)
+        if (!iovec_is_set(data))
                 return 0;
 
-        if (j->written_compressed + sz < j->written_compressed)
+        if (j->written_compressed + data->iov_len < j->written_compressed)
                 return log_error_errno(SYNTHETIC_ERRNO(EOVERFLOW), "File too large, overflow");
 
-        if (j->written_compressed + sz > j->compressed_max)
+        if (j->written_compressed + data->iov_len > j->compressed_max)
                 return log_error_errno(SYNTHETIC_ERRNO(EFBIG), "File overly large, refusing.");
 
-        if (j->content_length != UINT64_MAX &&
-            j->written_compressed + sz > j->content_length)
+        uint64_t cl = pull_job_content_length_effective(j);
+        if (cl != UINT64_MAX &&
+            j->written_compressed + data->iov_len > cl)
                 return log_error_errno(SYNTHETIC_ERRNO(EFBIG),
                                        "Content length incorrect.");
 
         if (j->checksum_ctx) {
-                r = EVP_DigestUpdate(j->checksum_ctx, p, sz);
+                r = sym_EVP_DigestUpdate(j->checksum_ctx, data->iov_base, data->iov_len);
                 if (r == 0)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                                "Could not hash chunk.");
         }
 
-        r = import_uncompress(&j->compress, p, sz, pull_job_write_uncompressed, j);
+        r = decompressor_push(j->compress, data->iov_base, data->iov_len, pull_job_write_uncompressed, j);
         if (r < 0)
                 return r;
 
-        j->written_compressed += sz;
+        j->written_compressed += data->iov_len;
 
         return 0;
 }
@@ -397,11 +282,15 @@ static int pull_job_open_disk(PullJob *j) {
         }
 
         if (j->calc_checksum) {
-                j->checksum_ctx = EVP_MD_CTX_new();
+                r = dlopen_libcrypto(LOG_ERR);
+                if (r < 0)
+                        return r;
+
+                j->checksum_ctx = sym_EVP_MD_CTX_new();
                 if (!j->checksum_ctx)
                         return log_oom();
 
-                r = EVP_DigestInit_ex(j->checksum_ctx, EVP_sha256(), NULL);
+                r = sym_EVP_DigestInit_ex(j->checksum_ctx, sym_EVP_sha256(), NULL);
                 if (r == 0)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                                "Failed to initialize hash context.");
@@ -410,40 +299,239 @@ static int pull_job_open_disk(PullJob *j) {
         return 0;
 }
 
-static int pull_job_detect_compression(PullJob *j) {
-        _cleanup_free_ uint8_t *stub = NULL;
-        size_t stub_size;
-
+static int pull_job_begin_running(PullJob *j) {
         int r;
 
         assert(j);
-
-        r = import_uncompress_detect(&j->compress, j->payload, j->payload_size);
-        if (r < 0)
-                return log_error_errno(r, "Failed to initialize compressor: %m");
-        if (r == 0)
-                return 0;
-
-        log_debug("Stream is compressed: %s", import_compress_type_to_string(j->compress.type));
+        assert(j->state == PULL_JOB_ANALYZING);
+        assert(j->compress);
 
         r = pull_job_open_disk(j);
         if (r < 0)
                 return r;
 
         /* Now, take the payload we read so far, and decompress it */
-        stub = j->payload;
-        stub_size = j->payload_size;
-
-        j->payload = NULL;
-        j->payload_size = 0;
+        _cleanup_(iovec_done) struct iovec stub = TAKE_STRUCT(j->payload);
 
         j->state = PULL_JOB_RUNNING;
 
-        r = pull_job_write_compressed(j, stub, stub_size);
+        r = pull_job_write_compressed(j, &stub);
         if (r < 0)
                 return r;
 
         return 0;
+}
+
+static int pull_job_curl_on_finished(CurlSlot *slot, CURL *curl, CURLcode result, void *userdata) {
+        PullJob *j = ASSERT_PTR(userdata);
+        char *scheme = NULL;
+        CURLcode code;
+        int r;
+
+        if (IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED))
+                return 0;
+
+        code = sym_curl_easy_getinfo(curl, CURLINFO_SCHEME, &scheme);
+        if (code != CURLE_OK || !scheme)
+                return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve URL scheme."));
+
+        if (strcaseeq(scheme, "FILE") && result == CURLE_FILE_COULDNT_READ_FILE && j->on_not_found) {
+                _cleanup_free_ char *new_url = NULL;
+
+                /* This resource wasn't found, but the implementer wants to maybe let us know a new URL, query for it. */
+                r = j->on_not_found(j, &new_url);
+                if (r < 0)
+                        return pull_job_finish(j, r);
+                if (r > 0) { /* A new url to use */
+                        assert(new_url);
+
+                        r = pull_job_restart(j, new_url);
+                        if (r < 0)
+                                return pull_job_finish(j, r);
+
+                        return 0;
+                }
+
+                /* if this didn't work, handle like any other error below */
+        }
+
+        if (result != CURLE_OK)
+                return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Transfer failed: %s", sym_curl_easy_strerror(result)));
+
+        if (STRCASE_IN_SET(scheme, "HTTP", "HTTPS")) {
+                long status;
+
+                code = sym_curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+                if (code != CURLE_OK)
+                        return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve response code: %s", sym_curl_easy_strerror(code)));
+
+                if (http_status_etag_exists(status)) {
+                        log_info("Image already downloaded. Skipping download.");
+                        j->etag_exists = true;
+                        return pull_job_finish(j, 0);
+                } else if (http_status_need_authentication(status)) {
+                        log_info("Access to image requires authentication.");
+                        return pull_job_finish(j, -ENOKEY);
+                } else if (status >= 300) {
+
+                        if (status == 404 && j->on_not_found) {
+                                _cleanup_free_ char *new_url = NULL;
+
+                                /* This resource wasn't found, but the implementer wants to maybe let us know a new URL, query for it. */
+                                r = j->on_not_found(j, &new_url);
+                                if (r < 0)
+                                        return pull_job_finish(j, r);
+
+                                if (r > 0) { /* A new url to use */
+                                        assert(new_url);
+
+                                        r = pull_job_restart(j, new_url);
+                                        if (r < 0)
+                                                return pull_job_finish(j, r);
+
+                                        code = sym_curl_easy_getinfo(curl_slot_get_easy(j->slot), CURLINFO_RESPONSE_CODE, &status);
+                                        if (code != CURLE_OK)
+                                                return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve response code: %s", sym_curl_easy_strerror(code)));
+
+                                        if (status == 0)
+                                                return 0;
+                                }
+                        }
+
+                        return pull_job_finish(j, log_notice_errno(
+                                        status == 404 ? SYNTHETIC_ERRNO(ENOMEDIUM) : SYNTHETIC_ERRNO(EIO), /* Make the most common error recognizable */
+                                        "HTTP request to %s failed with code %li.", j->url, status));
+                } else if (status < 200)
+                        return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "HTTP request to %s finished with unexpected code %li.", j->url, status));
+        }
+
+        if (j->state == PULL_JOB_ANALYZING) {
+                /* When curl finished the download while we were still looking for a compression magic
+                 * header the content isn't compressed but should be written out as is. */
+                assert(result == CURLE_OK);
+
+                r = decompressor_force_off(&j->compress);
+                if (r < 0)
+                        return pull_job_finish(j, r);
+
+                r = pull_job_begin_running(j);
+                if (r < 0)
+                        return pull_job_finish(j, r);
+        }
+
+        if (j->state != PULL_JOB_RUNNING)
+                return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Premature connection termination."));
+
+        /* Finalize decompressor. */
+        r = decompressor_push(j->compress, /* data= */ NULL, /* size= */ 0, pull_job_write_uncompressed, j);
+        if (r < 0)
+                return pull_job_finish(j, r);
+
+        uint64_t cl = pull_job_content_length_effective(j);
+        if (cl != UINT64_MAX &&
+            cl != j->written_compressed)
+                return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Download truncated."));
+
+        if (j->checksum_ctx) {
+                unsigned checksum_len;
+
+                iovec_done(&j->checksum);
+                j->checksum.iov_base = malloc(EVP_MAX_MD_SIZE);
+                if (!j->checksum.iov_base)
+                        return pull_job_finish(j, log_oom());
+
+                r = sym_EVP_DigestFinal_ex(j->checksum_ctx, j->checksum.iov_base, &checksum_len);
+                if (r == 0)
+                        return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to get checksum."));
+                assert(checksum_len <= EVP_MAX_MD_SIZE);
+                j->checksum.iov_len = checksum_len;
+
+                if (DEBUG_LOGGING) {
+                        _cleanup_free_ char *h = hexmem(j->checksum.iov_base, j->checksum.iov_len);
+                        if (!h)
+                                return pull_job_finish(j, log_oom());
+
+                        log_debug("%s of %s is %s.", sym_EVP_MD_CTX_get0_name(j->checksum_ctx), pull_job_description(j), h);
+                }
+
+                if (iovec_is_set(&j->expected_checksum) &&
+                    !iovec_equal(&j->checksum, &j->expected_checksum))
+                        return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Checksum of downloaded resource does not match expected checksum, yikes."));
+        }
+
+        if (j->disk_fd >= 0 && j->zero_fill) {
+                r = import_zero_fill(j->disk_fd, j->offset, j->uncompressed_max, j->written_uncompressed);
+                if (r < 0)
+                        return pull_job_finish(j, r);
+        }
+
+        /* Do a couple of finishing disk operations, but only if we are the sole owner of the file (i.e. no
+         * offset is specified, which indicates we only own the file partially) */
+
+        if (j->disk_fd >= 0) {
+
+                if (S_ISREG(j->disk_stat.st_mode)) {
+
+                        if (j->offset == UINT64_MAX) {
+
+                                if (j->written_compressed > 0) {
+                                        /* Make sure the file size is right, in case the file was sparse and
+                                         * we just moved to the last part. */
+                                        if (ftruncate(j->disk_fd, j->written_uncompressed) < 0)
+                                                return pull_job_finish(j, log_error_errno(errno, "Failed to truncate file: %m"));
+                                }
+
+                                if (j->etag)
+                                        (void) fsetxattr(j->disk_fd, "user.source_etag", j->etag, strlen(j->etag), 0);
+                                if (j->url)
+                                        (void) fsetxattr(j->disk_fd, "user.source_url", j->url, strlen(j->url), 0);
+
+                                if (j->mtime != 0) {
+                                        struct timespec ut;
+
+                                        timespec_store(&ut, j->mtime);
+
+                                        if (futimens(j->disk_fd, (struct timespec[]) { ut, ut }) < 0)
+                                                log_debug_errno(errno, "Failed to adjust atime/mtime of created image, ignoring: %m");
+
+                                        r = fd_setcrtime(j->disk_fd, j->mtime);
+                                        if (r < 0)
+                                                log_debug_errno(r, "Failed to adjust crtime of created image, ignoring: %m");
+                                }
+                        }
+
+                        if (j->sync) {
+                                r = fsync_full(j->disk_fd);
+                                if (r < 0)
+                                        return pull_job_finish(j, log_error_errno(r, "Failed to synchronize file to disk: %m"));
+                        }
+
+                } else if (S_ISBLK(j->disk_stat.st_mode) && j->sync) {
+
+                        if (fsync(j->disk_fd) < 0)
+                                return pull_job_finish(j, log_error_errno(errno, "Failed to synchronize block device: %m"));
+                }
+        }
+
+        log_info("Acquired %s for %s.", FORMAT_BYTES(j->written_uncompressed), pull_job_description(j));
+
+        return pull_job_finish(j, 0);
+}
+
+static int pull_job_detect_compression(PullJob *j) {
+        int r;
+
+        assert(j);
+
+        r = decompressor_detect(&j->compress, j->payload.iov_base, j->payload.iov_len);
+        if (r < 0)
+                return log_error_errno(r, "Failed to initialize compressor: %m");
+        if (r == 0)
+                return 0;
+
+        log_debug("Stream is compressed: %s", compression_to_string(compressor_type(j->compress)));
+
+        return pull_job_begin_running(j);
 }
 
 static size_t pull_job_write_callback(void *contents, size_t size, size_t nmemb, void *userdata) {
@@ -457,14 +545,10 @@ static size_t pull_job_write_callback(void *contents, size_t size, size_t nmemb,
 
         case PULL_JOB_ANALYZING:
                 /* Let's first check what it actually is */
-
-                if (!GREEDY_REALLOC(j->payload, j->payload_size + sz)) {
+                if (!iovec_append(&j->payload, &IOVEC_MAKE(contents, sz))) {
                         r = log_oom();
                         goto fail;
                 }
-
-                memcpy(j->payload + j->payload_size, contents, sz);
-                j->payload_size += sz;
 
                 r = pull_job_detect_compression(j);
                 if (r < 0)
@@ -473,8 +557,7 @@ static size_t pull_job_write_callback(void *contents, size_t size, size_t nmemb,
                 break;
 
         case PULL_JOB_RUNNING:
-
-                r = pull_job_write_compressed(j, contents, sz);
+                r = pull_job_write_compressed(j, &IOVEC_MAKE(contents, sz));
                 if (r < 0)
                         goto fail;
 
@@ -496,18 +579,8 @@ fail:
         return 0;
 }
 
-static int http_status_ok(CURLcode status) {
-        /* Consider all HTTP status code in the 2xx range as OK */
-        return status >= 200 && status <= 299;
-}
-
-static int http_status_etag_exists(CURLcode status) {
-        /* This one is special, it's triggered by our etag mgmt logic */
-        return status == 304;
-}
-
 static size_t pull_job_header_callback(void *contents, size_t size, size_t nmemb, void *userdata) {
-        _cleanup_free_ char *length = NULL, *last_modified = NULL, *etag = NULL;
+        _cleanup_free_ char *length = NULL, *last_modified = NULL, *etag = NULL, *ct = NULL;
         size_t sz = size * nmemb;
         PullJob *j = ASSERT_PTR(userdata);
         CURLcode code;
@@ -523,10 +596,23 @@ static size_t pull_job_header_callback(void *contents, size_t size, size_t nmemb
 
         assert(j->state == PULL_JOB_ANALYZING);
 
-        code = curl_easy_getinfo(j->curl, CURLINFO_RESPONSE_CODE, &status);
+        code = sym_curl_easy_getinfo(curl_slot_get_easy(j->slot), CURLINFO_RESPONSE_CODE, &status);
         if (code != CURLE_OK) {
-                r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve response code: %s", curl_easy_strerror(code));
+                r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve response code: %s", sym_curl_easy_strerror(code));
                 goto fail;
+        }
+
+        if (http_status_need_authentication(status)) {
+                _cleanup_free_ char *challenge = NULL;
+
+                r = curl_header_strdup(contents, sz, "WWW-Authenticate:", &challenge);
+                if (r < 0) {
+                        log_oom();
+                        goto fail;
+                }
+                if (r > 0)
+                        free_and_replace(j->authentication_challenge, challenge);
+                return sz;
         }
 
         if (http_status_ok(status) || http_status_etag_exists(status)) {
@@ -569,7 +655,13 @@ static size_t pull_job_header_callback(void *contents, size_t size, size_t nmemb
                                 goto fail;
                         }
 
-                        log_info("Downloading %s for %s.", FORMAT_BYTES(j->content_length), j->url);
+                        if (j->expected_content_length != UINT64_MAX &&
+                            j->expected_content_length != j->content_length) {
+                                r = log_error_errno(SYNTHETIC_ERRNO(EPROTO), "Content does not have expected size.");
+                                goto fail;
+                        }
+
+                        log_info("Downloading %s for %s.", FORMAT_BYTES(j->content_length), pull_job_description(j));
                 }
 
                 return sz;
@@ -582,6 +674,16 @@ static size_t pull_job_header_callback(void *contents, size_t size, size_t nmemb
         }
         if (r > 0) {
                 (void) curl_parse_http_time(last_modified, &j->mtime);
+                return sz;
+        }
+
+        r = curl_header_strdup(contents, sz, "Content-Type:", &ct);
+        if (r < 0) {
+                log_oom();
+                goto fail;
+        }
+        if (r > 0) {
+                free_and_replace(j->content_type, ct);
                 return sz;
         }
 
@@ -621,11 +723,11 @@ static int pull_job_progress_callback(void *userdata, curl_off_t dltotal, curl_o
 
                         log_info("Got %u%% of %s. %s left at %s/s.",
                                  percent,
-                                 j->url,
+                                 pull_job_description(j),
                                  FORMAT_TIMESPAN(left, USEC_PER_SEC),
                                  FORMAT_BYTES((uint64_t) ((double) dlnow / ((double) done / (double) USEC_PER_SEC))));
                 } else
-                        log_info("Got %u%% of %s.", percent, j->url);
+                        log_info("Got %u%% of %s.", percent, pull_job_description(j));
 
                 j->progress_percent = percent;
                 j->last_status_usec = n;
@@ -671,9 +773,31 @@ int pull_job_new(
                 .url = TAKE_PTR(u),
                 .offset = UINT64_MAX,
                 .sync = true,
+                .expected_content_length = UINT64_MAX,
         };
 
         *ret = TAKE_PTR(j);
+
+        return 0;
+}
+
+int pull_job_add_request_header(PullJob *j, const char *hdr) {
+        assert(j);
+        assert(hdr);
+
+        if (j->request_header) {
+                struct curl_slist *l;
+
+                l = sym_curl_slist_append(j->request_header, hdr);
+                if (!l)
+                        return -ENOMEM;
+
+                j->request_header = l;
+        } else {
+                j->request_header = curl_slist_new(hdr, NULL);
+                if (!j->request_header)
+                        return -ENOMEM;
+        }
 
         return 0;
 }
@@ -686,7 +810,8 @@ int pull_job_begin(PullJob *j) {
         if (j->state != PULL_JOB_INIT)
                 return -EBUSY;
 
-        r = curl_glue_make(&j->curl, j->url, j);
+        _cleanup_(curl_easy_cleanupp) CURL *easy = NULL;
+        r = curl_glue_make(&easy, j->url);
         if (r < 0)
                 return r;
 
@@ -701,52 +826,70 @@ int pull_job_begin(PullJob *j) {
                 if (!hdr)
                         return -ENOMEM;
 
-                if (!j->request_header) {
-                        j->request_header = curl_slist_new(hdr, NULL);
-                        if (!j->request_header)
-                                return -ENOMEM;
-                } else {
-                        struct curl_slist *l;
-
-                        l = curl_slist_append(j->request_header, hdr);
-                        if (!l)
-                                return -ENOMEM;
-
-                        j->request_header = l;
-                }
+                r = pull_job_add_request_header(j, hdr);
+                if (r < 0)
+                        return r;
         }
 
         if (j->request_header) {
-                if (curl_easy_setopt(j->curl, CURLOPT_HTTPHEADER, j->request_header) != CURLE_OK)
+                if (sym_curl_easy_setopt(easy, CURLOPT_HTTPHEADER, j->request_header) != CURLE_OK)
                         return -EIO;
         }
 
-        if (curl_easy_setopt(j->curl, CURLOPT_WRITEFUNCTION, pull_job_write_callback) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, pull_job_write_callback) != CURLE_OK)
                 return -EIO;
 
-        if (curl_easy_setopt(j->curl, CURLOPT_WRITEDATA, j) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_WRITEDATA, j) != CURLE_OK)
                 return -EIO;
 
-        if (curl_easy_setopt(j->curl, CURLOPT_HEADERFUNCTION, pull_job_header_callback) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, pull_job_header_callback) != CURLE_OK)
                 return -EIO;
 
-        if (curl_easy_setopt(j->curl, CURLOPT_HEADERDATA, j) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_HEADERDATA, j) != CURLE_OK)
                 return -EIO;
 
-        if (curl_easy_setopt(j->curl, CURLOPT_XFERINFOFUNCTION, pull_job_progress_callback) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_XFERINFOFUNCTION, pull_job_progress_callback) != CURLE_OK)
                 return -EIO;
 
-        if (curl_easy_setopt(j->curl, CURLOPT_XFERINFODATA, j) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_XFERINFODATA, j) != CURLE_OK)
                 return -EIO;
 
-        if (curl_easy_setopt(j->curl, CURLOPT_NOPROGRESS, 0) != CURLE_OK)
+        if (sym_curl_easy_setopt(easy, CURLOPT_NOPROGRESS, 0L) != CURLE_OK)
                 return -EIO;
 
-        r = curl_glue_add(j->glue, j->curl);
+        r = curl_glue_perform_async(j->glue, easy, pull_job_curl_on_finished, j, &j->slot);
         if (r < 0)
                 return r;
+        TAKE_PTR(easy);
 
         j->state = PULL_JOB_ANALYZING;
 
         return 0;
+}
+
+int pull_job_set_accept(PullJob *j, char * const *l) {
+        assert(j);
+
+        if (strv_isempty(l))
+                return 0;
+
+        _cleanup_free_ char *joined = strv_join(l, ", ");
+        if (!joined)
+                return -ENOMEM;
+
+        _cleanup_free_ char *f = strjoin("Accept: ", joined);
+        if (!f)
+                return -ENOMEM;
+
+        return pull_job_add_request_header(j, f);
+}
+
+int pull_job_set_bearer_token(PullJob *j, const char *token) {
+        assert(j);
+
+        _cleanup_free_ char *f = strjoin("Authorization: Bearer ", token);
+        if (!f)
+                return -ENOMEM;
+
+        return pull_job_add_request_header(j, f);
 }

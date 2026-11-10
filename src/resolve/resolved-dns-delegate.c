@@ -172,8 +172,8 @@ static int dns_delegate_load(Manager *m, const char *path) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "DNS delegate file name does not end in .dns-delegate, refusing: %s", fn);
 
         _cleanup_free_ char *id = strndup(fn, e - fn);
-        if (!string_is_safe(id))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "DNS delegate file name contains weird characters, refusing: %s", fn);
+        if (!string_is_safe(id, /* flags= */ 0))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "DNS delegate file name is invalid, refusing: %s", fn);
 
         _cleanup_free_ char *dropin_dirname = strjoin(id, ".dns-delegate.d");
         if (!dropin_dirname)
@@ -188,14 +188,11 @@ static int dns_delegate_load(Manager *m, const char *path) {
                         STRV_MAKE_CONST(path),
                         DNS_DELEGATE_SEARCH_DIRS,
                         dropin_dirname,
-                        /* root= */ NULL,
                         "Delegate\0",
                         config_item_perf_lookup,
                         resolved_dns_delegate_gperf_lookup,
                         /* flags= */ 0,
-                        d,
-                        /* ret_stats_by_path= */ NULL,
-                        /* ret_drop_in_files= */ NULL);
+                        d);
         if (r < 0)
                 return r;
 
@@ -211,7 +208,7 @@ int manager_load_delegates(Manager *m) {
 
         assert(m);
 
-        r = conf_files_list_strv(&files, ".dns-delegate", /* root= */ NULL, /* flags= */ 0, DNS_DELEGATE_SEARCH_DIRS);
+        r = conf_files_list_strv(&files, ".dns-delegate", /* root= */ NULL, CONF_FILES_WARN, DNS_DELEGATE_SEARCH_DIRS);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate .dns-delegate files: %m");
 
@@ -284,7 +281,7 @@ int config_parse_delegate_dns_servers(
                         /* Drop the marker. This is used to find the servers that ceased to exist, see
                          * manager_mark_dns_servers() and manager_flush_marked_dns_servers(). */
                         dns_server_move_back_and_unmark(s);
-                        return 0;
+                        continue;
                 }
 
                 r = dns_server_new(

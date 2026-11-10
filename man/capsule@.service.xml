@@ -77,13 +77,13 @@
     for example with the <option>--what=all</option> switch.</para>
 
     <para>The <filename>capsule@.service</filename> unit invokes a <command>systemd --user</command>
-    service manager process. This means unit files are looked for according to the sames rules as for regular user
+    service manager process. This means unit files are looked for according to the same rules as for regular user
     service managers, for example in
     <filename>/var/lib/capsules/<replaceable>NAME</replaceable>/.config/systemd/user/</filename>.</para>
 
     <para>Capsule names may be chosen freely by the user, however, they must be suitable as UNIX filenames
     (i.e. 255 characters max, and contain no <literal>/</literal>), and when prefixed with
-    <literal>p-</literal> be suitable as a user name matching strict POSIX rules, see <ulink
+    <literal>c-</literal> be suitable as a user name matching strict POSIX rules, see <ulink
     url="https://systemd.io/USER_NAMES">User/Group Name Syntax</ulink> for details.</para>
 
     <xi:include href="version-info.xml" xpointer="v256"/>

@@ -7,12 +7,16 @@
 
 #include "conf-parser.h"
 #include "dhcp-protocol.h"
+#include "dhcp-server-internal.h"
 #include "dhcp-server-lease-internal.h"
+#include "dns-domain.h"
 #include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "hashmap.h"
+#include "hostname-setup.h"
+#include "iovec-util.h"
 #include "network-common.h"
 #include "networkd-address.h"
 #include "networkd-dhcp-server.h"
@@ -23,6 +27,7 @@
 #include "networkd-network.h"
 #include "networkd-ntp.h"
 #include "networkd-queue.h"
+#include "networkd-resolve-hook.h"
 #include "networkd-route-util.h"
 #include "path-util.h"
 #include "set.h"
@@ -58,6 +63,31 @@ int network_adjust_dhcp_server(Network *network, Set **addresses) {
         if (network->bond) {
                 log_warning("%s: DHCPServer= is enabled for bond slave. Disabling DHCP server.",
                             network->filename);
+                network->dhcp_server = false;
+                return 0;
+        }
+
+        if (in4_addr_is_set(&network->dhcp_relay_target_address)) {
+                if (!in4_addr_is_set(&network->manager->dhcp_relay_server_address)) {
+                        /* [DHCPServer] RelayTarget= in .network file is replaced with
+                         * [DHCPRelay] ServerAddress= in networkd.conf. */
+                        network->manager->dhcp_relay_server_address = network->dhcp_relay_target_address;
+
+                        /* [DHCPServer] RelayAgentRemoteId= in .network file is replaced with
+                         * [DHCPRelay] RemoteId= in networkd.conf. */
+                        if (!iovec_is_set(&network->manager->dhcp_relay_remote_id)) {
+                                iovec_done(&network->manager->dhcp_relay_remote_id);
+                                network->manager->dhcp_relay_remote_id = TAKE_STRUCT(network->dhcp_relay_remote_id);
+                        }
+                }
+
+                /* Copy [DHCPServer] ServerAddress= to [DHCPRelay] AgentAddress= if unspecified. */
+                if (!in4_addr_is_set(&network->dhcp_relay_agent_address_in_addr))
+                        network->dhcp_relay_agent_address_in_addr = network->dhcp_server_address_in_addr;
+
+                /* Assume this interface acts as a downstream interface of the DHCP relay agent. Also,
+                 * configure a catch-all upstream socket. */
+                network->dhcp_relay_interface_mode = DHCP_RELAY_INTERFACE_COMPAT;
                 network->dhcp_server = false;
                 return 0;
         }
@@ -155,9 +185,6 @@ static DHCPServerPersistLeases link_get_dhcp_server_persist_leases(Link *link) {
         assert(link);
         assert(link->manager);
         assert(link->network);
-
-        if (in4_addr_is_set(&link->network->dhcp_server_relay_target))
-                return DHCP_SERVER_PERSIST_LEASES_NO; /* On relay mode. Nothing saved in the persistent storage. */
 
         if (link->network->dhcp_server_persist_leases >= 0)
                 return link->network->dhcp_server_persist_leases;
@@ -323,6 +350,7 @@ void manager_toggle_dhcp4_server_state(Manager *manager, bool start) {
 
 static int dhcp_server_find_uplink(Link *link, Link **ret) {
         assert(link);
+        assert(ret);
 
         if (link->network->dhcp_server_uplink_name)
                 return link_get_by_name(link->manager, link->network->dhcp_server_uplink_name, ret);
@@ -452,6 +480,9 @@ static int dhcp4_server_parse_dns_server_string_and_warn(
                 struct in_addr **addresses,
                 size_t *n_addresses) {
 
+        assert(addresses);
+        assert(n_addresses);
+
         for (;;) {
                 _cleanup_free_ char *word = NULL, *server_name = NULL;
                 union in_addr_union address;
@@ -528,13 +559,41 @@ static int dhcp4_server_set_dns_from_resolve_conf(Link *link) {
         return sd_dhcp_server_set_dns(link->dhcp_server, addresses, n_addresses);
 }
 
+static int dhcp_server_set_domain(Link *link) {
+        int r;
+
+        assert(link);
+        assert(link->network);
+        assert(link->dhcp_server);
+
+        if (!link->network->dhcp_server_emit_domain)
+                return 0;
+
+        if (link->network->dhcp_server_domain)
+                return sd_dhcp_server_set_domain_name(link->dhcp_server, link->network->dhcp_server_domain);
+
+        /* When domain is not specified, use the domain part of the current hostname. */
+        _cleanup_free_ char *hostname = NULL;
+        r = gethostname_full(GET_HOSTNAME_ALLOW_LOCALHOST | GET_HOSTNAME_FALLBACK_DEFAULT, &hostname);
+        if (r < 0)
+                return r;
+
+        const char *domain = hostname;
+        r = dns_name_parent(&domain);
+        if (r < 0)
+                return r;
+
+        if (isempty(domain))
+                return -ENXIO;
+
+        return sd_dhcp_server_set_domain_name(link->dhcp_server, domain);
+}
+
 static int dhcp4_server_configure(Link *link) {
         bool acquired_uplink = false;
-        sd_dhcp_option *p;
         DHCPStaticLease *static_lease;
         Link *uplink = NULL;
         Address *address;
-        bool bind_to_interface;
         int r;
 
         assert(link);
@@ -644,19 +703,6 @@ static int dhcp4_server_configure(Link *link) {
                         return log_link_error_errno(link, r, "Failed to set router address for DHCP server: %m");
         }
 
-        r = sd_dhcp_server_set_relay_target(link->dhcp_server, &link->network->dhcp_server_relay_target);
-        if (r < 0)
-                return log_link_error_errno(link, r, "Failed to set relay target for DHCP server: %m");
-
-        bind_to_interface = sd_dhcp_server_is_in_relay_mode(link->dhcp_server) ? false : link->network->dhcp_server_bind_to_interface;
-        r = sd_dhcp_server_set_bind_to_interface(link->dhcp_server, bind_to_interface);
-        if (r < 0)
-                return log_link_error_errno(link, r, "Failed to set interface binding for DHCP server: %m");
-
-        r = sd_dhcp_server_set_relay_agent_information(link->dhcp_server, link->network->dhcp_server_relay_agent_circuit_id, link->network->dhcp_server_relay_agent_remote_id);
-        if (r < 0)
-                return log_link_error_errno(link, r, "Failed to set agent circuit/remote id for DHCP server: %m");
-
         if (link->network->dhcp_server_emit_timezone) {
                 _cleanup_free_ char *buffer = NULL;
                 const char *tz = NULL;
@@ -678,24 +724,27 @@ static int dhcp4_server_configure(Link *link) {
                 }
         }
 
-        ORDERED_HASHMAP_FOREACH(p, link->network->dhcp_server_send_options) {
-                r = sd_dhcp_server_add_option(link->dhcp_server, p);
-                if (r == -EEXIST)
-                        continue;
-                if (r < 0)
-                        return log_link_error_errno(link, r, "Failed to set DHCPv4 option: %m");
-        }
+        r = dhcp_server_set_domain(link);
+        if (r == -ENXIO)
+                log_link_warning_errno(link, r, "Cannot get domain from the current hostname, DHCP server will not emit domain option.");
+        else if (r < 0)
+                return log_link_error_errno(link, r, "Failed to set domain name for DHCP server: %m");
 
-        ORDERED_HASHMAP_FOREACH(p, link->network->dhcp_server_send_vendor_options) {
-                r = sd_dhcp_server_add_vendor_option(link->dhcp_server, p);
-                if (r == -EEXIST)
-                        continue;
-                if (r < 0)
-                        return log_link_error_errno(link, r, "Failed to set DHCPv4 option: %m");
-        }
+        r = dhcp_server_set_extra_options(link->dhcp_server, &link->network->dhcp_server_extra_options);
+        if (r < 0)
+                return log_link_error_errno(link, r, "Failed to set DHCPv4 extra options: %m");
+
+        r = dhcp_server_set_vendor_options(link->dhcp_server, &link->network->dhcp_server_vendor_options);
+        if (r < 0)
+                return log_link_error_errno(link, r, "Failed to set DHCPv4 vendor options: %m");
 
         HASHMAP_FOREACH(static_lease, link->network->dhcp_static_leases_by_section) {
-                r = sd_dhcp_server_set_static_lease(link->dhcp_server, &static_lease->address, static_lease->client_id, static_lease->client_id_size);
+                r = sd_dhcp_server_set_static_lease(
+                                link->dhcp_server,
+                                &static_lease->address,
+                                static_lease->client_id,
+                                static_lease->client_id_size,
+                                static_lease->hostname);
                 if (r < 0)
                         return log_link_error_errno(link, r, "Failed to set DHCPv4 static lease for DHCP server: %m");
         }
@@ -703,6 +752,8 @@ static int dhcp4_server_configure(Link *link) {
         r = link_start_dhcp4_server(link);
         if (r < 0)
                 return log_link_error_errno(link, r, "Could not start DHCPv4 server instance: %m");
+
+        manager_notify_hook_filters(link->manager);
 
         return 0;
 }
@@ -715,7 +766,7 @@ static bool dhcp_server_is_ready_to_configure(Link *link) {
         assert(link->network);
         assert(link->network->dhcp_server_address);
 
-        if (!link_is_ready_to_configure(link, /* allow_unmanaged = */ false))
+        if (!link_is_ready_to_configure(link, /* allow_unmanaged= */ false))
                 return false;
 
         if (!link_has_carrier(link))
@@ -771,38 +822,6 @@ int link_request_dhcp_server(Link *link) {
                 return log_link_warning_errno(link, r, "Failed to request configuration of DHCP server: %m");
 
         return 0;
-}
-
-int config_parse_dhcp_server_relay_agent_suboption(
-                const char *unit,
-                const char *filename,
-                unsigned line,
-                const char *section,
-                unsigned section_line,
-                const char *lvalue,
-                int ltype,
-                const char *rvalue,
-                void *data,
-                void *userdata) {
-
-        char **suboption_value = data;
-
-        assert(filename);
-        assert(lvalue);
-        assert(rvalue);
-
-        if (isempty(rvalue)) {
-                *suboption_value = mfree(*suboption_value);
-                return 0;
-        }
-
-        const char *p = startswith(rvalue, "string:");
-        if (!p) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Failed to parse %s=%s'. Invalid format, ignoring.", lvalue, rvalue);
-                return 0;
-        }
-        return free_and_strdup(suboption_value, empty_to_null(p));
 }
 
 int config_parse_dhcp_server_emit(

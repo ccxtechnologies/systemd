@@ -60,7 +60,9 @@ wait_for_start() {
 
 wait_for_stop() {
     timeout 30 bash -c "while systemctl -q is-active '$UNIT_NAME.service'; do sleep .5; done"
-    assert_eq "$(systemctl show "$UNIT_NAME.socket" -P SubState)" "listening"
+    # The socket's SubState transitions from 'running' to 'listening' shortly after the triggered
+    # service becomes inactive, so wait for that transition instead of checking once and racing.
+    timeout 30 bash -c "until [[ \$(systemctl show '$UNIT_NAME.socket' -P SubState) == 'listening' ]]; do sleep .5; done"
 }
 
 # DeferTrigger=no: job mode replace
@@ -71,16 +73,18 @@ assert_eq "$(systemctl show "$UNIT_NAME.socket" -P SubState)" "listening"
 (! systemctl -q is-active "$UNIT_NAME.service")
 
 socat -u - UNIX-CONNECT:"/tmp/$UNIT_NAME/test" &
+PID=$!
 wait_for_start
-kill %%
+wait $PID
 
 touch "/tmp/$UNIT_NAME/flag"
 systemctl start "$UNIT_NAME-conflict2.service"
 wait_for_stop
 
 socat -u - UNIX-CONNECT:"/tmp/$UNIT_NAME/test" &
+PID=$!
 wait_for_start
-kill %%
+wait $PID
 (! systemctl -q is-active "$UNIT_NAME-conflict2.service")
 
 # DeferTrigger=yes
@@ -97,9 +101,10 @@ assert_eq "$(systemctl show "$UNIT_NAME-conflict1.service" -P SubState)" "start"
 # Wait in "deferred" state
 
 socat -u - UNIX-CONNECT:"/tmp/$UNIT_NAME/test" &
+PID=$!
 timeout 30 bash -c "until [[ \$(systemctl show '$UNIT_NAME.socket' -P SubState) == 'deferred' ]]; do sleep .5; done"
 (! systemctl -q is-active "$UNIT_NAME.service")
-kill %%
+wait $PID
 assert_eq "$(systemctl show "$UNIT_NAME-conflict1.service" -P SubState)" "start"
 
 systemctl daemon-reload
@@ -120,9 +125,10 @@ systemctl start "$UNIT_NAME-conflict2.service"
 wait_for_stop
 
 socat -u - UNIX-CONNECT:"/tmp/$UNIT_NAME/test" &
+PID=$!
 timeout 30 bash -c "until [[ \$(systemctl show '$UNIT_NAME.socket' -P SubState) == 'deferred' ]]; do sleep .5; done"
 (! systemctl -q is-active "$UNIT_NAME.service")
-kill %%
+wait $PID
 
 rm "/tmp/$UNIT_NAME/flag"
 timeout 30 bash -c "while systemctl -q is-active '$UNIT_NAME-conflict2.service'; do sleep .2; done"
@@ -136,9 +142,10 @@ wait_for_stop
 assert_eq "$(systemctl show "$UNIT_NAME-conflict1.service" -P SubState)" "start"
 
 socat -u - UNIX-CONNECT:"/tmp/$UNIT_NAME/test" &
+PID=$!
 timeout 30 bash -c "until [[ \$(systemctl show '$UNIT_NAME.socket' -P SubState) == 'deferred' ]]; do sleep .5; done"
 (! systemctl -q is-active "$UNIT_NAME.service")
-kill %%
+wait $PID
 
 echo "DeferTriggerMaxSec=20s" >>/run/systemd/system/"$UNIT_NAME.socket"
 systemctl daemon-reload

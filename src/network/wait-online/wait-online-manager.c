@@ -68,7 +68,7 @@ static const LinkOperationalStateRange* get_state_range(Manager *m, Link *l, con
                 if (operational_state_range_is_valid(range))
                         return range;
 
-        /* l->requred_operstate should be always valid. */
+        /* l->required_operstate should be always valid. */
         assert_not_reached();
 }
 
@@ -212,7 +212,7 @@ bool manager_configured(Manager *m) {
                         continue;
                 }
 
-                range = get_state_range(m, l, /* from_cmdline = */ NULL);
+                range = get_state_range(m, l, /* from_cmdline= */ NULL);
 
                 r = manager_link_is_online(m, l, range);
                 /* Unlike the above loop, unmanaged interfaces are ignored here. Also, Configured but offline

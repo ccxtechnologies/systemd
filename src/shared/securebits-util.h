@@ -5,8 +5,8 @@
 
 #include "forward.h"
 
-int secure_bits_to_string_alloc(int i, char **s);
-int secure_bits_from_string(const char *s);
+int secure_bits_to_strv(int i, char ***ret);
+DECLARE_STRING_TABLE_LOOKUP_WITH_FALLBACK(secure_bits, int);
 
 static inline bool secure_bits_is_valid(int i) {
         return ((SECURE_ALL_BITS | SECURE_ALL_LOCKS) & i) == i;

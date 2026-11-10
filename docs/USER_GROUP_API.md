@@ -23,7 +23,7 @@ The concepts described here define an IPC interface.
 Alternatively, user/group records may be dropped in number of drop-in directories as files where they are
 picked up in addition to the users/groups defined by this IPC logic.
 See
-[`nss-systemd(8)`](https://www.freedesktop.org/software/systemd/man/nss-systemd.html)
+[`nss-systemd(8)`](https://www.freedesktop.org/software/systemd/man/latest/nss-systemd.html)
 for details.
 
 This simple API only exposes only three method calls, and requires only a small
@@ -150,7 +150,7 @@ synthesize NSS records for users/groups natively defined via a Varlink API.
 Special care is taken to avoid recursion between these two compatibility mechanisms.
 
 Subsystems that shall provide user/group records to the system may choose
-between offering them via an NSS module or via a this Varlink API, either way
+between offering them via an NSS module or via this Varlink API, either way
 all records are accessible via both APIs, due to the bidirectional forwarding.
 It is also possible to provide the same records via both APIs
 directly, but in that case the compatibility logic must be turned off.
@@ -175,6 +175,7 @@ method GetUserRecord(
         dispositionMask: ?[]string,
         uidMin: ?int,
         uidMax: ?int,
+        uuid: ?string,
         service : string
 ) -> (
         record : object,
@@ -188,6 +189,7 @@ method GetGroupRecord(
         dispositionMask: ?[]string,
         gidMin: ?int,
         gidMax: ?int,
+        uuid: ?string,
         service : string
 ) -> (
         record : object,
@@ -222,7 +224,7 @@ If neither of the two parameters are set the whole user database is enumerated.
 In this case the method call needs to be made with `more` set, so that multiple method call replies may be generated as
 effect, each carrying one user record.
 
-The `fuzzyNames`, `dispositionMask`, `uidMin`, `uidMax` fields permit
+The `fuzzyNames`, `dispositionMask`, `uidMin`, `uidMax` and `uuid` fields permit
 *additional* filtering of the returned set of user records. The `fuzzyNames`
 parameter shall be one or more strings that shall be searched for in "fuzzy"
 way. What specifically this means is left for the backend to decide, but
@@ -232,19 +234,20 @@ carry identifying information for the user. The `dispositionMask` field shall
 be one of more user record `disposition` strings. If specified only user
 records matching one of the specified dispositions should be enumerated. The
 `uidMin` and `uidMax` fields specify a minimum and maximum value for the UID of
-returned records. Inline searching for `uid` and `userName` support for
+returned records. The `uuid` field specifies to search for the user record associated
+with the specified UUID. Inline searching for `uid` and `userName` support for
 filtering with these four additional parameters is optional, and clients are
 expected to be able to do client-side filtering in case the parameters are not
 supported by a service. The service should return the usual `InvalidParameter`
 error for the relevant parameter if one is passed and it does not support
 it. If a request is made specifying `uid` or `userName` and a suitable record
 is found, but the specified filter via `fuzzyNames`, `dispositionMask`,
-`uidMin`, or `uidMax` does not match, a `NonMatchingRecordFound` error should
+`uidMin`, `uidMax` or `uuid` does not match, a `NonMatchingRecordFound` error should
 be returned.
 
 Or to say this differently: the *primary search keys* are
 `userName`/`groupName` and `uid`/`gid` and the *secondary search filters* are
-`fuzzyNames`, `dispositionMask`, `uidMin`, `uidMax`. If no entry matching
+`fuzzyNames`, `dispositionMask`, `uidMin`, `uidMax`, `uuid`. If no entry matching
 either of the primary search keys are found `NoRecordFound()` is returned. If
 one is found that matches one but not the other primary search key
 `ConflictingRecordFound()` is returned. If an entry is found that matches the
@@ -323,6 +326,37 @@ result in more than one reply, because neither UID/GID nor name is specified) is
 Services which are asked for enumeration may return the `EnumerationNotSupported` error in this case.
 
 And that's really all there is to it.
+
+## Reducing IPC Requests
+
+In many cases backends are only interested in responding to certain UID/GID
+ranges, or only to user/group names matching a specific pattern. To optimize
+look-ups in this case it is possible to indicate on the Varlink entrypoint
+socket inode of the service which ranges or patterns these are: if the kernel
+supports extended attributes on socket inodes (Linux >= 7.1), the following
+extended attributes may be set:
+
+* `user.userdb.uid` takes a comma separated list of UIDs or dash-separated UID
+  range pairs. If set, then the service will not be contacted for any UID
+  look-ups outside of this range. Example: setting the extended attribute to
+  `61184-65519,524288-1879048191,4711` will have the effect that a lookup for
+  UID 1051 will not be attempted against this service, but one for 62334 will be.
+
+* `user.userdb.gid` is similar, but for GIDs and GID ranges.
+
+* `user.userdb.username` takes a NUL separated list of `fnmatch()` style glob
+  expressions. If set only look-ups for user names matching at least one of
+  these expressions will be routed to this service. Example: setting the
+  extended attribute to `foo-*\0www*h?` (where `\0` shall indicate the NUL
+  byte) will route only look-ups for `foo-bar` and `wwwooosh7` to this service,
+  but not `waldo`.
+
+* `user.userdb.groupname` is similar, but for group names.
+
+Note that these extended attributes are intended for optimization only: any
+backend *must* be prepared to answer look-ups for any UID, GID, user and group
+name, and respond with `NoRecordFound` for requests outside of the
+ranges/patterns defined this way.
 
 ## Command Line Access
 

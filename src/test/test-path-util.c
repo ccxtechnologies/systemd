@@ -6,6 +6,7 @@
 
 #include "alloc-util.h"
 #include "argv-util.h"
+#include "errno-util.h"
 #include "exec-util.h"
 #include "fd-util.h"
 #include "path-util.h"
@@ -23,8 +24,12 @@ TEST(print_paths) {
 }
 
 TEST(path) {
+        assert_se(!path_is_absolute(NULL));
+        assert_se(!path_is_absolute(""));
         assert_se( path_is_absolute("/"));
+        assert_se( path_is_absolute("//"));
         assert_se(!path_is_absolute("./"));
+        assert_se(!path_is_absolute("foo/bar"));
 
         assert_se( PATH_IN_SET("/bin", "/", "/bin", "/foo"));
         assert_se( PATH_IN_SET("/bin", "/bin"));
@@ -39,6 +44,21 @@ TEST(path) {
         assert_se(!path_equal(NULL, "/a"));
         assert_se(!path_equal("a", NULL));
         assert_se(!path_equal(NULL, "a"));
+}
+
+TEST(path_is_normalized) {
+        assert_se( path_is_normalized("/"));
+        assert_se( path_is_normalized("/usr/bin"));
+        assert_se( path_is_normalized("usr/bin"));
+
+        assert_se(!path_is_normalized(""));
+        assert_se(!path_is_normalized("."));
+        assert_se(!path_is_normalized("./usr/bin"));
+        assert_se(!path_is_normalized("/usr//bin"));
+        assert_se(!path_is_normalized("/usr/./bin"));
+        assert_se(!path_is_normalized("/usr/bin/."));
+        assert_se(!path_is_normalized("../usr/bin"));
+        assert_se(!path_is_normalized("/usr/../bin"));
 }
 
 TEST(is_path) {
@@ -463,7 +483,6 @@ TEST(find_executable) {
 static void test_find_executable_exec_one(const char *path) {
         _cleanup_free_ char *t = NULL;
         _cleanup_close_ int fd = -EBADF;
-        pid_t pid;
         int r;
 
         r = find_executable_full(path, NULL, NULL, false, &t, &fd);
@@ -475,15 +494,16 @@ static void test_find_executable_exec_one(const char *path) {
         if (path_is_absolute(path))
                 ASSERT_STREQ(t, path);
 
-        pid = fork();
-        assert_se(pid >= 0);
-        if (pid == 0) {
+        r = ASSERT_OK(pidref_safe_fork(
+                        "(find-exec)",
+                        FORK_LOG|FORK_DEATHSIG_SIGKILL|FORK_WAIT,
+                        /* ret= */ NULL));
+
+        if (r == 0) {
                 r = fexecve_or_execve(fd, t, STRV_MAKE(t, "--version"), STRV_MAKE(NULL));
                 log_error_errno(r, "[f]execve: %m");
                 _exit(EXIT_FAILURE);
         }
-
-        assert_se(wait_for_terminate_and_check(t, pid, WAIT_LOG) == 0);
 }
 
 TEST(find_executable_exec) {
@@ -759,6 +779,9 @@ TEST(path_startswith) {
         test_path_startswith_one("/foo/bar/barfoo/", "/foo/bar/barfo", NULL, NULL);
         test_path_startswith_one("/foo/bar/barfoo/", "/foo/bar/bar", NULL, NULL);
         test_path_startswith_one("/foo/bar/barfoo/", "/fo", NULL, NULL);
+        test_path_startswith_one("/usr/binary", "/usr/bin", NULL, NULL);
+        test_path_startswith_one("/foo/barista", "/foo/bar", NULL, NULL);
+        test_path_startswith_one("foo/barista", "foo/bar", NULL, NULL);
 }
 
 static void test_path_startswith_return_leading_slash_one(const char *path, const char *prefix, const char *expected) {
@@ -1026,7 +1049,7 @@ TEST(last_path_component) {
 }
 
 static void test_path_extract_filename_one(const char *input, const char *output, int ret) {
-        _cleanup_free_ char *k = NULL;
+        _cleanup_free_ char *k = NULL, *k2 = NULL;
         int r;
 
         r = path_extract_filename(input, &k);
@@ -1036,6 +1059,13 @@ static void test_path_extract_filename_one(const char *input, const char *output
                  strnull(output), ret < 0 ? STRERROR(ret) : "-");
         ASSERT_STREQ(k, output);
         assert_se(r == ret);
+
+        /* Extra safety check: make sure that path_split_prefix_filename() behaves the same */
+        r = path_split_prefix_filename(input, NULL, &k2);
+        if (r >= 0) {
+                ASSERT_STREQ(k2, k);
+                assert_se(r == ret);
+        }
 }
 
 TEST(path_extract_filename) {
@@ -1070,7 +1100,7 @@ TEST(path_extract_filename) {
 }
 
 static void test_path_extract_directory_one(const char *input, const char *output, int ret) {
-        _cleanup_free_ char *k = NULL;
+        _cleanup_free_ char *k = NULL, *k2 = NULL;
         int r;
 
         r = path_extract_directory(input, &k);
@@ -1081,10 +1111,18 @@ static void test_path_extract_directory_one(const char *input, const char *outpu
         ASSERT_STREQ(k, output);
         assert_se(r == ret);
 
+        /* Extra safety check: make sure that path_split_prefix_filename() behaves the same.
+         * We can’t check the return value from it though as that differs based on the filename component.
+         * We can only assert that if path_extract_directory() fails, then
+         * path_split_prefix_filename() must also fail. */
+        r = path_split_prefix_filename(input, &k2, NULL);
+        ASSERT_STREQ(k2, k);
+        assert_se(!(ret < 0) || r < 0);
+
         /* Extra safety check: let's make sure that if we split out the filename too (and it works) the
          * joined parts are identical to the original again */
         if (r >= 0) {
-                _cleanup_free_ char *f = NULL;
+                _cleanup_free_ char *f = NULL, *k3 = NULL, *f2 = NULL;
 
                 r = path_extract_filename(input, &f);
                 if (r >= 0) {
@@ -1092,6 +1130,13 @@ static void test_path_extract_directory_one(const char *input, const char *outpu
 
                         assert_se(j = path_join(k, f));
                         assert_se(path_equal(input, j));
+                }
+
+                /* And the same, but for path_split_prefix_filename() */
+                r = path_split_prefix_filename(input, &k3, &f2);
+                if (r >= 0) {
+                        ASSERT_STREQ(k3, k);
+                        ASSERT_STREQ(f2, f);
                 }
         }
 }
@@ -1202,6 +1247,7 @@ TEST(hidden_or_backup_file) {
         assert_se(hidden_or_backup_file("aquota.user"));
         assert_se(hidden_or_backup_file("aquota.group"));
 
+        assert_se(hidden_or_backup_file("test.ignore"));
         assert_se(hidden_or_backup_file("test.rpmnew"));
         assert_se(hidden_or_backup_file("test.dpkg-old"));
         assert_se(hidden_or_backup_file("test.dpkg-remove"));

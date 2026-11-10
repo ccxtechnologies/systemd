@@ -8,19 +8,7 @@
 #include "iovec-wrapper.h"
 #include "time-util.h"
 
-/* Make sure not to make this smaller than the maximum coredump size.
- * See JOURNAL_SIZE_MAX in coredump.c */
-#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
-#define ENTRY_SIZE_MAX (1024*1024*770u)
-#define DATA_SIZE_MAX (1024*1024*768u)
-#else
-#define ENTRY_SIZE_MAX (1024*1024*13u)
-#define DATA_SIZE_MAX (1024*1024*11u)
-#endif
 #define LINE_CHUNK 8*1024u
-
-/* The maximum number of fields in an entry */
-#define ENTRY_FIELD_COUNT_MAX 1024u
 
 typedef struct JournalImporter {
         int fd;
@@ -45,11 +33,11 @@ typedef struct JournalImporter {
 #define JOURNAL_IMPORTER_INIT(_fd) { .fd = (_fd), .iovw = {} }
 #define JOURNAL_IMPORTER_MAKE(_fd) (JournalImporter) JOURNAL_IMPORTER_INIT(_fd)
 
-void journal_importer_cleanup(JournalImporter *);
-int journal_importer_process_data(JournalImporter *);
-int journal_importer_push_data(JournalImporter *, const char *data, size_t size);
-void journal_importer_drop_iovw(JournalImporter *);
-bool journal_importer_eof(const JournalImporter *);
+void journal_importer_cleanup(JournalImporter *imp);
+int journal_importer_process_data(JournalImporter *imp);
+int journal_importer_push_data(JournalImporter *imp, const char *data, size_t size);
+void journal_importer_drop_iovw(JournalImporter *imp);
+bool journal_importer_eof(const JournalImporter *imp);
 
 static inline size_t journal_importer_bytes_remaining(const JournalImporter *imp) {
         return imp->filled;

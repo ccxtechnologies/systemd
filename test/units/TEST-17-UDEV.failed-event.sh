@@ -17,8 +17,8 @@ SUBSYSTEM!="mem", GOTO="test_end"
 KERNEL!="null", GOTO="test_end"
 
 OPTIONS="log_level=debug"
-PROGRAM=="/bin/touch /tmp/test-udev-marker"
-PROGRAM!="/bin/sleep 60", ENV{PROGRAM_RESULT}="KILLED"
+PROGRAM=="/usr/bin/touch /tmp/test-udev-marker"
+PROGRAM!="/usr/bin/sleep 60", ENV{PROGRAM_RESULT}="KILLED"
 
 LABEL="test_end"
 EOF
@@ -30,7 +30,7 @@ EOF
     systemctl reload systemd-udevd.service
 }
 
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 teardown() {
     set +e
 
@@ -83,7 +83,7 @@ run_test_killed() {
     for _ in {1..40}; do
         if [[ -z "$killed" ]]; then
             if [[ -e /tmp/test-udev-marker ]]; then
-                killall --signal ABRT --regexp udev-worker
+                pkill -ABRT udev-worker
                 killed=1
             fi
         elif grep -q 'UDEV_WORKER_FAILED=1' "$TMPDIR"/monitor.txt; then

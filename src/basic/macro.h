@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "macro-fundamental.h" /* IWYU pragma: export */
+#include "../fundamental/macro.h" /* IWYU pragma: export */
 
 #if !defined(HAS_FEATURE_MEMORY_SANITIZER)
 #  if defined(__has_feature)
@@ -152,7 +152,6 @@ static inline unsigned long ALIGN_POWER2(unsigned long u) {
         } while (false)
 
 #define STRV_MAKE(...) ((char**) ((const char*[]) { __VA_ARGS__, NULL }))
-#define STRV_EMPTY ((char*[1]) { NULL })
 #define STRV_MAKE_CONST(...) ((const char* const*) ((const char*[]) { __VA_ARGS__, NULL }))
 
 /* Pointers range from NULL to POINTER_MAX */

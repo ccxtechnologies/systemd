@@ -22,12 +22,13 @@
 #include "fs-util.h"
 #include "fsck-util.h"
 #include "main-func.h"
-#include "parse-util.h"
 #include "path-util.h"
+#include "pidref.h"
 #include "proc-cmdline.h"
 #include "process-util.h"
 #include "socket-util.h"
 #include "special.h"
+#include "stat-util.h"
 #include "stdio-util.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -107,18 +108,22 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                 if (proc_cmdline_value_missing(key, value))
                         return 0;
 
-                arg_mode = fsck_mode_from_string(value);
-                if (arg_mode < 0)
-                        log_warning_errno(arg_mode, "Invalid fsck.mode= parameter, ignoring: %s", value);
+                FSCKMode mode = fsck_mode_from_string(value);
+                if (mode < 0)
+                        log_warning_errno(mode, "Invalid fsck.mode= parameter, ignoring: %s", value);
+                else
+                        arg_mode = mode;
 
         } else if (streq(key, "fsck.repair")) {
 
                 if (proc_cmdline_value_missing(key, value))
                         return 0;
 
-                arg_repair = fsck_repair_from_string(value);
-                if (arg_repair < 0)
-                        log_warning_errno(arg_repair, "Invalid fsck.repair= parameter, ignoring: %s", value);
+                FSCKRepair repair = fsck_repair_from_string(value);
+                if (repair < 0)
+                        log_warning_errno(repair, "Invalid fsck.repair= parameter, ignoring: %s", value);
+                else
+                        arg_repair = repair;
         }
 
         else if (streq(key, "fastboot") && !value)
@@ -134,24 +139,28 @@ static void parse_credentials(void) {
         _cleanup_free_ char *value = NULL;
         int r;
 
-        r = read_credential("fsck.mode", (void**) &value, /* ret_size = */ NULL);
+        r = read_credential("fsck.mode", (void**) &value, /* ret_size= */ NULL);
         if (r < 0)
                 log_debug_errno(r, "Failed to read credential 'fsck.mode', ignoring: %m");
         else {
-                arg_mode = fsck_mode_from_string(value);
-                if (arg_mode < 0)
-                        log_warning_errno(arg_mode, "Invalid 'fsck.mode' credential, ignoring: %s", value);
+                FSCKMode mode = fsck_mode_from_string(value);
+                if (mode < 0)
+                        log_warning_errno(mode, "Invalid 'fsck.mode' credential, ignoring: %s", value);
+                else
+                        arg_mode = mode;
         }
 
         value = mfree(value);
 
-        r = read_credential("fsck.repair", (void**) &value, /* ret_size = */ NULL);
+        r = read_credential("fsck.repair", (void**) &value, /* ret_size= */ NULL);
         if (r < 0)
                 log_debug_errno(r, "Failed to read credential 'fsck.repair', ignoring: %m");
         else {
-                arg_repair = fsck_repair_from_string(value);
-                if (arg_repair < 0)
-                        log_warning_errno(arg_repair, "Invalid 'fsck.repair' credential, ignoring: %s", value);
+                FSCKRepair repair = fsck_repair_from_string(value);
+                if (repair < 0)
+                        log_warning_errno(repair, "Invalid 'fsck.repair' credential, ignoring: %s", value);
+                else
+                        arg_repair = repair;
         }
 }
 
@@ -218,6 +227,7 @@ static int process_progress(int fd, FILE* console) {
 
                 /* Only update once every 50ms */
                 t = now(CLOCK_MONOTONIC);
+                assert_cc(50 * USEC_PER_MSEC <= USEC_INFINITY);
                 if (last + 50 * USEC_PER_MSEC > t)
                         continue;
 
@@ -268,7 +278,6 @@ static int run(int argc, char *argv[]) {
         bool root_directory;
         struct stat st;
         int r, exit_status;
-        pid_t pid;
 
         log_setup();
 
@@ -299,10 +308,9 @@ static int run(int argc, char *argv[]) {
                 if (stat(device, &st) < 0)
                         return log_error_errno(errno, "Failed to stat %s: %m", device);
 
-                if (!S_ISBLK(st.st_mode))
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "%s is not a block device.",
-                                               device);
+                r = stat_verify_block(&st);
+                if (r < 0)
+                        return log_error_errno(r, "'%s' is not a block device.", device);
 
                 r = sd_device_new_from_stat_rdev(&dev, &st);
                 if (r < 0)
@@ -367,7 +375,11 @@ static int run(int argc, char *argv[]) {
             pipe(progress_pipe) < 0)
                 return log_error_errno(errno, "pipe(): %m");
 
-        r = safe_fork("(fsck)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE, &pid);
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = pidref_safe_fork(
+                        "(fsck)",
+                        FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
+                        &pidref);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -425,7 +437,7 @@ static int run(int argc, char *argv[]) {
                 (void) process_progress(TAKE_FD(progress_pipe[0]), console);
         }
 
-        exit_status = wait_for_terminate_and_check("fsck", pid, WAIT_LOG_ABNORMAL);
+        exit_status = pidref_wait_for_terminate_and_check("fsck", &pidref, WAIT_LOG_ABNORMAL);
         if (exit_status < 0)
                 return exit_status;
         if ((exit_status & ~FSCK_ERROR_CORRECTED) != FSCK_SUCCESS) {

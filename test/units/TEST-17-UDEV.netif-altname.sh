@@ -22,15 +22,13 @@ EOF
     udevadm control --reload
 }
 
-udevadm control --log-level=debug
-
 create_link_file test1
 ip link add address 00:50:56:c0:00:18 type dummy
 udevadm wait --settle --timeout=30 /sys/class/net/test1
 output=$(ip link show dev test1)
 if ! [[ "$output" =~ altname ]]; then
     echo "alternative name for network interface not supported, skipping test."
-    exit 0
+    exit 77
 fi
 assert_not_in "altname test1" "$output"
 assert_in "altname test2" "$output"
@@ -81,6 +79,6 @@ assert_not_in "altname hoge" "$output"
 ip link del dev test3
 
 rm -f /run/systemd/network/10-test.link
-udevadm control --reload --log-level=info
+udevadm control --reload
 
 exit 0

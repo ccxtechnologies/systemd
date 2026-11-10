@@ -14,15 +14,13 @@ typedef enum IPVlanMode {
 } IPVlanMode;
 
 typedef enum IPVlanFlags {
-        NETDEV_IPVLAN_FLAGS_BRIGDE,
+        NETDEV_IPVLAN_FLAGS_BRIDGE,
         NETDEV_IPVLAN_FLAGS_PRIVATE = IPVLAN_F_PRIVATE,
         NETDEV_IPVLAN_FLAGS_VEPA = IPVLAN_F_VEPA,
         _NETDEV_IPVLAN_FLAGS_MAX,
         _NETDEV_IPVLAN_FLAGS_INVALID = -EINVAL,
 } IPVlanFlags;
 
-const char* ipvlan_mode_to_string(IPVlanMode d) _const_;
-IPVlanMode ipvlan_mode_from_string(const char *d) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(ipvlan_mode, IPVlanMode);
 
-const char* ipvlan_flags_to_string(IPVlanFlags d) _const_;
-IPVlanFlags ipvlan_flags_from_string(const char *d) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(ipvlan_flags, IPVlanFlags);

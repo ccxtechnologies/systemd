@@ -5,7 +5,6 @@ executables += [
                 'name' : 'systemd-userwork',
                 'conditions' : ['ENABLE_USERDB'],
                 'sources' : files('userwork.c'),
-                'dependencies' : threads,
         },
         libexec_template + {
                 'name' : 'systemd-userdbd',
@@ -14,13 +13,12 @@ executables += [
                         'userdbd-manager.c',
                         'userdbd.c',
                 ),
-                'dependencies' : threads,
         },
         executable_template + {
                 'name' : 'userdbctl',
+                'public' : true,
                 'conditions' : ['ENABLE_USERDB'],
                 'sources' : files('userdbctl.c'),
-                'dependencies' : threads,
         },
 ]
 
@@ -32,7 +30,7 @@ if conf.get('ENABLE_SSH_USERDB_CONFIG') == 1
                 install : true,
                 install_dir : sshdconfdir.startswith('/usr/') ? sshdconfdir : libexecdir / 'sshd_config.d')
 
-        if conf.get('LINK_SSHD_USERDB_DROPIN') == 1
+        if (not sshdconfdir.startswith(sysconfdir) or install_sysconfdir) and conf.get('LINK_SSHD_USERDB_DROPIN') == 1
                 if meson.version().version_compare('>=1.3.0')
                         install_symlink(
                                 '20-systemd-userdb.conf',

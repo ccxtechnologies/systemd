@@ -1,4 +1,4 @@
----
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # https://github.com/redhat-plumbers-in-action/differential-shellcheck#readme
 
 name: Differential ShellCheck
@@ -15,7 +15,9 @@ permissions:
 
 jobs:
   lint:
-    if: github.event.repository.name != 'systemd-security'
+    if: >
+      github.event.repository.name != 'systemd-security' &&
+      (github.event_name != 'push' || github.repository == 'systemd/systemd')
     runs-on: ubuntu-24.04
 
     permissions:
@@ -23,12 +25,13 @@ jobs:
 
     steps:
       - name: Repository checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Differential ShellCheck
-        uses: redhat-plumbers-in-action/differential-shellcheck@dd551ce780d8af741f8cd8bab6982667b906b457
+        uses: redhat-plumbers-in-action/differential-shellcheck@f51c7c0d32777d00de777131d25918617a246415
         with:
           # exclude all `.in` files because they may contain unsupported syntax, and they have to be preprocessed first
           # TEMPORARY: exclude bash completion files, they would generate too many defects in Code scanning dashboard (600+)

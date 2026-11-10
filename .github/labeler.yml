@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 # vi: sw=2 ts=2 et:
 
+changed-files-labels-limit: 5
 analyze:
   - changed-files:
     - any-glob-to-any-file: 'src/analyze/*'
@@ -108,7 +109,7 @@ hwdb:
     - any-glob-to-any-file: '**/*hwdb*'
 import:
   - changed-files:
-    - any-glob-to-any-file: '**/*import*'
+    - any-glob-to-any-file: ['src/import/*', 'src/shared/*import*', 'units/**/*import*']
 integritysetup:
   - changed-files:
     - any-glob-to-any-file: '**/*integrity*'
@@ -132,7 +133,7 @@ login:
     - any-glob-to-any-file: ['src/login/*', '**/sd-login*/**']
 machine:
   - changed-files:
-    - any-glob-to-any-file: ['src/machine/*', 'units/*machine*']
+    - any-glob-to-any-file: ['src/machine/*', 'units/**/*machine*']
 meson:
   - changed-files:
     - any-glob-to-any-file: ['meson_options.txt', '**/meson.build']
@@ -172,9 +173,6 @@ pstore:
 random-seed:
   - changed-files:
     - any-glob-to-any-file: '**/*random-seed*'
-rc-local-generator:
-  - changed-files:
-    - any-glob-to-any-file: 'src/rc-local-generator/*'
 remount-fs:
   - changed-files:
     - any-glob-to-any-file: '**/*remount-fs*'
@@ -226,9 +224,12 @@ sd-resolve:
 selinux:
   - changed-files:
     - any-glob-to-any-file: '**/*selinux*'
-shell-completion:
+shell completion:
   - changed-files:
-    - any-glob-to-any-file: 'shell-completion/*'
+    - any-glob-to-any-file: 'shell-completion/**'
+shell profile:
+  - changed-files:
+    - any-glob-to-any-file: 'profile.d/*'
 shutdown:
   - changed-files:
     - any-glob-to-any-file: ['src/shutdown/*', 'units/**/*shutdown*']
@@ -265,12 +266,6 @@ sysupdate:
 sysusers:
   - changed-files:
     - any-glob-to-any-file: '**/*sysusers*'
-sysv-generator:
-  - changed-files:
-    - any-glob-to-any-file: '**/*sysv-generator*'
-sysvcompat:
-  - changed-files:
-    - any-glob-to-any-file: '**/*sysv*'
 tests:
   - changed-files:
     - any-glob-to-any-file: [

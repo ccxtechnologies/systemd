@@ -57,6 +57,15 @@ assert_le() {(
     fi
 )}
 
+assert_ge() {(
+    set +ex
+
+    if [[ "${1:?}" -lt "${2:?}" ]]; then
+        echo "FAIL: '$1' < '$2'" >&2
+        exit 1
+    fi
+)}
+
 assert_in() {(
     set +ex
 
@@ -194,7 +203,7 @@ can_do_rootless_nspawn() {
     # Need to have bpf-lsm
     grep -q bpf /sys/kernel/security/lsm &&
     # ...and libbpf installed
-    find /usr/lib* -name "libbpf.so.*" 2>/dev/null | grep -q . &&
+    find /usr/lib* -name "libbpf.so.*" 2>/dev/null | grep . >/dev/null &&
 
     # Ensure mountfsd/nsresourced are listening
     systemctl start systemd-mountfsd.socket systemd-nsresourced.socket &&
@@ -213,7 +222,7 @@ can_do_rootless_nspawn() {
            io.systemd.NamespaceResource.AllocateUserRange \
            '{"name":"test-supported","size":65536,"userNamespaceFileDescriptor":0}' \
            2>&1 || true) |
-        grep -q "io.systemd.NamespaceResource.UserNamespaceInterfaceNotSupported"
+        grep "io.systemd.NamespaceResource.UserNamespaceInterfaceNotSupported" >/dev/null
 }
 
 # Bump the reboot counter and call systemctl with the given arguments
@@ -240,6 +249,24 @@ cgroupfs_supports_user_xattrs() {
 
     setfattr --name="$xattr" --value=254 /sys/fs/cgroup
     [[ "$(getfattr --name="$xattr" --absolute-names --only-values /sys/fs/cgroup)" -eq 254 ]]
+}
+
+socket_inode_supports_user_xattrs() {
+    local socket xattr
+
+    # The XAttr*= socket settings and "varlinkctl list-sockets" rely on extended
+    # attributes on socket inodes. This needs a sufficiently new kernel, but the
+    # kernel version alone is not a reliable indicator: some kernels that report
+    # >= 7.0 still reject user.* xattrs on socket inodes (with EPERM/EOPNOTSUPP).
+    # Hence probe for actual support, mirroring socket_xattr_supported() in the
+    # C code, by binding a throwaway socket and trying to tag it.
+    socket="$(mktemp -u /run/socket-xattr-probe.XXXXXX.sock)"
+    xattr="user.probe_$RANDOM"
+    # shellcheck disable=SC2064
+    trap "rm -f '$socket'" RETURN
+
+    python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$socket" || return 1
+    setfattr --name="$xattr" --value=1 "$socket" 2>/dev/null
 }
 
 tpm_has_pcr() {
@@ -276,6 +303,20 @@ kernel_supports_lsm() {
     return 1
 }
 
+machine_supports_verity_keyring() {
+    # Requires kernel built with certain kconfigs, as listed in README:
+    # https://oracle.github.io/kconfigs/?config=UTS_RELEASE&config=DM_VERITY_VERIFY_ROOTHASH_SIG&config=DM_VERITY_VERIFY_ROOTHASH_SIG_SECONDARY_KEYRING&config=DM_VERITY_VERIFY_ROOTHASH_SIG_PLATFORM_KEYRING&config=IMA_ARCH_POLICY&config=INTEGRITY_MACHINE_KEYRING
+    if grep -q "$(openssl x509 -noout -subject -in /usr/share/mkosi.crt | sed 's/^.*CN=//')" /proc/keys && \
+            ( . /etc/os-release; [ "$ID" != "centos" ] || systemd-analyze compare-versions "$VERSION_ID" ge 10 ) && \
+            ( . /etc/os-release; [ "$ID" != "debian" ] || [ -z "${VERSION_ID:-}" ] || systemd-analyze compare-versions "$VERSION_ID" ge 13 ) && \
+            ( . /etc/os-release; [ "$ID" != "ubuntu" ] || systemd-analyze compare-versions "$VERSION_ID" ge 24.04 ) && \
+            systemd-analyze compare-versions "$(cryptsetup --version | sed 's/^cryptsetup \([0-9]*\.[0-9]*\.[0-9]*\) .*/\1/')" ge 2.3.0; then
+        return 0
+    fi
+
+    return 1
+}
+
 install_extension_images() {
         local os_release
         os_release="$(test -e /etc/os-release && echo /etc/os-release || echo /usr/lib/os-release)"
@@ -287,24 +328,27 @@ install_extension_images() {
         fi
 
         local initdir="/var/tmp/app0"
-        mkdir -p "$initdir/usr/lib/extension-release.d" "$initdir/usr/lib/systemd/system" "$initdir/opt"
+        mkdir -p "$initdir/usr/lib/extension-release.d" "$initdir/opt"
         grep "^ID=" "$os_release" >"$initdir/usr/lib/extension-release.d/extension-release.app0"
         echo "$version_id" >>"$initdir/usr/lib/extension-release.d/extension-release.app0"
         (
             echo "$version_id"
             echo "SYSEXT_IMAGE_ID=app"
         ) >>"$initdir/usr/lib/extension-release.d/extension-release.app0"
-        cat >"$initdir/usr/lib/systemd/system/app0.service" <<EOF
+        for scope in system user; do
+            mkdir -p "$initdir/usr/lib/systemd/$scope"
+            cat >"$initdir/usr/lib/systemd/$scope/app0.service" <<EOF
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/opt/script0.sh
-TemporaryFileSystem=/var/lib
+TemporaryFileSystem=/var/lib /home
 StateDirectory=app0
 RuntimeDirectory=app0
 EOF
+        done
         cat >"$initdir/opt/script0.sh" <<EOF
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 test -e /usr/lib/os-release
 echo bar >\${STATE_DIRECTORY}/foo
@@ -314,6 +358,13 @@ EOF
         echo MARKER=1 >"$initdir/usr/lib/systemd/system/some_file"
         mksquashfs "$initdir" /tmp/app0.raw -noappend
         veritysetup format /tmp/app0.raw /tmp/app0.verity --root-hash-file /tmp/app0.roothash
+        openssl smime -sign -nocerts -noattr -binary \
+                -in /tmp/app0.roothash \
+                -inkey /usr/share/mkosi.key \
+                -signer /usr/share/mkosi.crt \
+                -outform der \
+                -out /tmp/app0.roothash.p7s
+        chmod go+r /tmp/app0*
 
         initdir="/var/tmp/conf0"
         mkdir -p "$initdir/etc/extension-release.d" "$initdir/etc/systemd/system" "$initdir/opt"
@@ -326,9 +377,16 @@ EOF
         echo MARKER_1 >"$initdir/etc/systemd/system/some_file"
         mksquashfs "$initdir" /tmp/conf0.raw -noappend
         veritysetup format /tmp/conf0.raw /tmp/conf0.verity --root-hash-file /tmp/conf0.roothash
+        openssl smime -sign -nocerts -noattr -binary \
+                -in /tmp/conf0.roothash \
+                -inkey /usr/share/mkosi.key \
+                -signer /usr/share/mkosi.crt \
+                -outform der \
+                -out /tmp/conf0.roothash.p7s
+        chmod go+r /tmp/conf0*
 
         initdir="/var/tmp/app1"
-        mkdir -p "$initdir/usr/lib/extension-release.d" "$initdir/usr/lib/systemd/system" "$initdir/opt"
+        mkdir -p "$initdir/usr/lib/extension-release.d" "$initdir/opt"
         grep "^ID=" "$os_release" >"$initdir/usr/lib/extension-release.d/extension-release.app2"
         (
             echo "$version_id"
@@ -338,16 +396,20 @@ EOF
             echo "PORTABLE_PREFIXES=app1"
         ) >>"$initdir/usr/lib/extension-release.d/extension-release.app2"
         setfattr -n user.extension-release.strict -v false "$initdir/usr/lib/extension-release.d/extension-release.app2"
-        cat >"$initdir/usr/lib/systemd/system/app1.service" <<EOF
+        for scope in system user; do
+            mkdir -p "$initdir/usr/lib/systemd/$scope"
+            cat >"$initdir/usr/lib/systemd/$scope/app1.service" <<EOF
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/opt/script1.sh
+TemporaryFileSystem=/home
 StateDirectory=app1
 RuntimeDirectory=app1
 EOF
+        done
         cat >"$initdir/opt/script1.sh" <<EOF
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 test -e /usr/lib/os-release
 echo baz >\${STATE_DIRECTORY}/foo
@@ -356,6 +418,18 @@ EOF
         chmod +x "$initdir/opt/script1.sh"
         echo MARKER=1 >"$initdir/usr/lib/systemd/system/other_file"
         mksquashfs "$initdir" /tmp/app1.raw -noappend
+
+        # Create a data-only extension image (no unit files) to test that
+        # ExtensionImages= is added to the drop-in even when the extension
+        # does not carry any units.
+        initdir="/var/tmp/app-data-only"
+        mkdir -p "$initdir/usr/lib/extension-release.d" "$initdir/opt"
+        (
+            echo "ID=_any"
+            echo "ARCHITECTURE=_any"
+        ) >"$initdir/usr/lib/extension-release.d/extension-release.app-data-only"
+        echo "MARKER_DATA_ONLY=1" >"$initdir/opt/data-file"
+        mksquashfs "$initdir" /tmp/app-data-only.raw -noappend
 
         initdir="/var/tmp/app-nodistro"
         mkdir -p "$initdir/usr/lib/extension-release.d" "$initdir/usr/lib/systemd/system"
@@ -429,4 +503,189 @@ generate_locale() {
         echo "$locale UTF-8" >/etc/locale.gen
         locale-gen "$locale"
     fi
+}
+
+built_with_musl() (
+    set +ex
+    ! systemd-analyze --quiet condition 'ConditionVersion=glibc $= ?*'
+)
+
+check_nss_module() (
+    set +e
+
+    local name="${1:?}"
+    local have=
+    local i
+
+    if [[ ! -e /etc/nsswitch.conf ]]; then
+        : "/etc/nsswitch.conf not found."
+        return 1
+    fi
+
+    if ! find /usr/lib* -name "libnss_${name}.so.*" 2>/dev/null | grep . >/dev/null; then
+        : "NSS module $name not found."
+        return 1
+    fi
+
+    if [[ "$name" == systemd ]]; then
+        for i in passwd group shadow; do
+            if ! grep -qE "^$i:.*[[:space:]]*systemd" /etc/nsswitch.conf; then
+                : "systemd NSS module is not enabled for $i database."
+                return 1
+            fi
+        done
+    else
+        if ! grep -qE "^hosts:.*[[:space:]]*$name" /etc/nsswitch.conf; then
+            : "$name NSS module is not enabled for hosts database."
+            return 1
+        fi
+    fi
+
+    return 0
+)
+
+find_qemu_binary() {
+    # Mirrors find_qemu_binary() from src/vmspawn/vmspawn-util.c.
+    # Returns 0 if a usable QEMU binary exists, 1 otherwise.
+    for binary in qemu qemu-kvm; do
+        if command -v "$binary" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+
+    if test -x /usr/libexec/qemu-kvm; then
+        return 0
+    fi
+
+    local arch
+    case "$(uname -m)" in
+        x86_64)      arch=x86_64 ;;
+        i?86)        arch=i386 ;;
+        aarch64)     arch=aarch64 ;;
+        armv*l|arm*) arch=arm ;;
+        alpha)       arch=alpha ;;
+        loongarch64) arch=loongarch64 ;;
+        mips*)       arch=mips ;;
+        parisc*)     arch=hppa ;;
+        ppc64*|ppc*) arch=ppc ;;
+        riscv32)     arch=riscv32 ;;
+        riscv64)     arch=riscv64 ;;
+        s390x)       arch=s390x ;;
+        *)           return 1 ;;
+    esac
+
+    command -v "qemu-system-$arch" >/dev/null 2>&1
+}
+
+# Waits for a systemd-vmspawn machine to register with machined. If vmspawn bailed out because
+# vhost-user-fs isn't available (e.g. inside a nested VM) the test is skipped gracefully; any other
+# early vmspawn exit is treated as a failure. Args: machine name, vmspawn PID, vmspawn console log.
+wait_for_machine() {
+    local machine="$1" pid="$2" log="$3"
+    timeout 30 bash -c "
+        while ! machinectl list --no-legend 2>/dev/null | grep >/dev/null '$machine'; do
+            if ! kill -0 $pid 2>/dev/null; then
+                if grep >/dev/null 'virtiofs.*QMP\|vhost-user-fs-pci' '$log'; then
+                    echo 'vhost-user-fs not supported (nested VM?), skipping'
+                    exit 77
+                fi
+                echo 'vmspawn exited before registering'
+                cat '$log'
+                exit 1
+            fi
+            sleep .5
+        done
+    "
+}
+
+assert_unit_state() {
+    local unit=${1:?}
+    local activestate=${2:?}
+    local substate=${3:?}
+    local syspath=${4:-}
+
+    assert_eq "$(systemctl show -q --property=ActiveState --value "$unit")" "$activestate"
+    assert_eq "$(systemctl show -q --property=SubState --value "$unit")" "$substate"
+
+    if [[ -n "$syspath" ]]; then
+        assert_eq "$(systemctl show -q --property=SysFSPath --value "$unit")" "$syspath"
+    fi
+}
+
+assert_wc_l() {
+    local path=${1:?}
+    local expected=${2:?}
+    local lines=0
+
+    if [[ -f "$path" ]]; then
+        lines=$(wc -l <"$path")
+    fi
+
+    assert_eq "$lines" "$expected"
+}
+
+start_bound_service() {
+    local path=${1:?}
+    local name=${2:?}
+    local escaped
+
+    escaped=$(systemd-escape --path "$path")
+    escaped=${escaped//\\/\\\\} # escape backslash, as systemd-run unescapes it.
+
+    systemd-run \
+        -p After="${escaped}.device" \
+        -p BindsTo="${escaped}.device" \
+        -p ReloadPropagatedFrom="${escaped}.device" \
+        -p ExecStartPre="rm -f /tmp/testsleep-reload-${name}.txt" \
+        -p ExecReload="bash -c 'echo reloaded >>/tmp/testsleep-reload-${name}.txt'" \
+        -u "testsleep-${name}.service" \
+        sleep 1h
+
+    assert_unit_state "testsleep-${name}.service" active running
+    assert_wc_l "/tmp/testsleep-reload-${name}.txt" 0
+}
+
+get_invocation_id() {
+    local unit=${1:?}
+
+    systemctl show -q --property=InvocationID --value "$unit"
+}
+
+wait_for_inactive() {
+    local unit=${1:?}
+
+    # Note that do not use 'systemctl stop foo.device' to wait for the device unit to become inactive. Unlike
+    # 'systemctl start foo.device', which waits for the device unit to become active,
+    # 'systemctl stop foo.device' also kills device units with the same sysfs path and the units that depend
+    # on these device units.
+
+    # shellcheck disable=SC2016
+    timeout 30 bash -c 'until [[ "$(systemctl show -q --property=ActiveState --value '"$unit"')" == inactive ]]; do sleep .5; done'
+}
+
+kill_sleep_by_udevd() {
+    local pid comm
+    local -a pids
+
+    # Collect PIDs first, then kill: killing while reading cgroup.procs would
+    # mutate the set we are iterating over.
+
+    while read -r pid; do
+        read -r comm <"/proc/$pid/comm" 2>/dev/null || continue
+        [[ "${comm##*/}" == sleep ]] && pids+=("$pid")
+    done <"/sys/fs/cgroup$(systemctl show -P ControlGroup systemd-udevd.service)/workers/cgroup.procs"
+
+    for pid in "${pids[@]}"; do
+        kill "$pid" || :
+    done
+
+    return 0
+}
+
+device_get_udev_db() {
+    local dev=${1:?}
+    local id
+
+    id=$(udevadm info "$dev" | awk '/^J:/ { print $2 }')
+    echo /run/udev/data/"$id"
 }

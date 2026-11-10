@@ -4,7 +4,6 @@
 #include <linux/l2tp.h>
 
 #include "in-addr-util.h"
-#include "forward.h"
 #include "netdev.h"
 
 typedef enum L2tpL2specType {

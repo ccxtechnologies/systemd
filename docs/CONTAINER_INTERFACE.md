@@ -86,6 +86,12 @@ manager, please consider supporting the following interfaces.
    confuse systemd and the admin, but also prevent your implementation from
    being "stackable".
 
+8. The mount hierarchy of the container should be mounted `MS_SHARED` before
+   invoking `systemd` as PID 1. Things will break at various places if this is
+   not done. Note that of course it's OK if the mounts are first marked
+   `MS_PRIVATE`/`MS_SLAVE` (to disconnect propagation at least partially) as
+   long as they are remounted `MS_SHARED` before `systemd` is invoked.
+
 ## Environment Variables
 
 1. To allow systemd (and other programs) to identify that it is executed within
@@ -182,7 +188,7 @@ manager, please consider supporting the following interfaces.
    activation work. The protocol to hand sockets from systemd to services is
    hence the same as from the container manager to the container systemd. For
    further details see the explanations of
-   [sd_listen_fds(1)](https://0pointer.de/public/systemd-man/sd_listen_fds.html)
+   [sd_listen_fds(1)](https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html)
    and the [blog story for service
    developers](https://0pointer.de/blog/projects/socket-activation.html).
 
@@ -301,6 +307,12 @@ care should be taken to avoid naming conflicts. `systemd` (and in particular
     may be used in combination with `/run/host/userdb/` above: one defines the
     user record, the other contains the user's home directory.
 
+12. The `/run/host/root/` directory may be used to bind mount the host root
+    filesystem. Binding the host's root filesystem into the container is a
+    major security hole: any container manager that maintains a security
+    boundary should not use this; however, if having the root filesystem in
+    the container is desired, this is a good place to mount it to.
+
 ## What You Shouldn't Do
 
 1. Do not drop `CAP_MKNOD` from the container. `PrivateDevices=` is a commonly
@@ -391,9 +403,9 @@ its user to 2 (to effectively disallow `fork()`ing) you cannot run more than
 one Avahi instance on the entire system...
 
 People have been asking to be able to run systemd without `CAP_SYS_ADMIN` and
-`CAP_SYS_MKNOD` in the container. This is now supported to some level in
+`CAP_MKNOD` in the container. This is now supported to some level in
 systemd, but we recommend against it (see above). If `CAP_SYS_ADMIN` and
-`CAP_SYS_MKNOD` are missing from the container systemd will now gracefully turn
+`CAP_MKNOD` are missing from the container systemd will now gracefully turn
 off `PrivateTmp=`, `PrivateNetwork=`, `ProtectHome=`, `ProtectSystem=` and
 others, because those capabilities are required to implement these options. The
 services using these settings (which include many of systemd's own) will hence

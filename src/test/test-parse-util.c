@@ -2,11 +2,12 @@
 
 #include <linux/netfilter/nf_tables.h>
 #include <locale.h>
-#include <math.h>
-#include <stdlib.h>
 #include <sys/socket.h>
 
+#include "capability-util.h"
+#include "locale-util.h"
 #include "parse-util.h"
+#include "stdio-util.h"
 #include "tests.h"
 
 TEST(parse_boolean) {
@@ -655,47 +656,25 @@ TEST(safe_atoux64) {
 
 TEST(safe_atod) {
         double d;
-        char *e;
 
         ASSERT_ERROR(safe_atod("junk", &d), EINVAL);
 
         ASSERT_OK_ZERO(safe_atod("0.2244", &d));
-        assert_se(fabs(d - 0.2244) < 0.000001);
+        assert_se(ABS(d - 0.2244) < 0.000001);
 
         ASSERT_ERROR(safe_atod("0,5", &d), EINVAL);
-
-        errno = 0;
-        strtod("0,5", &e);
-        assert_se(*e == ',');
-
         ASSERT_ERROR(safe_atod("", &d), EINVAL);
 
         /* Check if this really is locale independent */
-        if (setlocale(LC_NUMERIC, "de_DE.utf8")) {
-
-                ASSERT_OK_ZERO(safe_atod("0.2244", &d));
-                assert_se(fabs(d - 0.2244) < 0.000001);
-
-                ASSERT_ERROR(safe_atod("0,5", &d), EINVAL);
-
-                errno = 0;
-                assert_se(fabs(strtod("0,5", &e) - 0.5) < 0.00001);
-
-                ASSERT_ERROR(safe_atod("", &d), EINVAL);
-        }
-
-        /* And check again, reset */
-        ASSERT_NOT_NULL(setlocale(LC_NUMERIC, "C"));
+        _cleanup_(freelocalep) locale_t loc =
+                newlocale(LC_NUMERIC_MASK, "de_DE.utf8", (locale_t) 0);
+        if (!loc)
+                return (void) log_tests_skipped_errno(errno, "locale de_DE.utf8 not found");
 
         ASSERT_OK_ZERO(safe_atod("0.2244", &d));
-        assert_se(fabs(d - 0.2244) < 0.000001);
+        assert_se(ABS(d - 0.2244) < 0.000001);
 
         ASSERT_ERROR(safe_atod("0,5", &d), EINVAL);
-
-        errno = 0;
-        strtod("0,5", &e);
-        assert_se(*e == ',');
-
         ASSERT_ERROR(safe_atod("", &d), EINVAL);
 }
 
@@ -886,6 +865,26 @@ TEST(parse_loadavg_fixed_point) {
         ASSERT_ERROR(parse_loadavg_fixed_point("4096.4096", &fp), ERANGE);
         ASSERT_ERROR(parse_loadavg_fixed_point("-4000.5", &fp), ERANGE);
         ASSERT_ERROR(parse_loadavg_fixed_point("18446744073709551615.5", &fp), ERANGE);
+
+        /* Neither part may be large enough to overflow the shift by LOADAVG_PRECISION_BITS. Derive the
+         * boundary from the width of unsigned long, so that this holds on 32 bit too: the largest integer
+         * part that still fits is ~0UL >> LOADAVG_PRECISION_BITS (2^53-1 on 64 bit), and one more than
+         * that used to shift clean out of the word and be reported as a load of zero. */
+        unsigned long max_side = ~0UL >> LOADAVG_PRECISION_BITS;
+        char buf[DECIMAL_STR_MAX(unsigned long) + STRLEN(".99")];
+
+        xsprintf(buf, "%lu.99", max_side);
+        ASSERT_OK_ZERO(parse_loadavg_fixed_point(buf, &fp));
+        ASSERT_EQ(LOADAVG_INT_SIDE(fp), max_side);
+        ASSERT_EQ(LOADAVG_DECIMAL_SIDE(fp), 99U);
+
+        xsprintf(buf, "%lu.00", max_side + 1);
+        ASSERT_ERROR(parse_loadavg_fixed_point(buf, &fp), ERANGE);
+
+        /* Same for the fractional part, which used to be shifted before it was range checked. */
+        xsprintf(buf, "1.%lu", max_side + 1);
+        ASSERT_ERROR(parse_loadavg_fixed_point(buf, &fp), ERANGE);
+
         ASSERT_ERROR(parse_loadavg_fixed_point("foobar", &fp), EINVAL);
         ASSERT_ERROR(parse_loadavg_fixed_point("3333", &fp), EINVAL);
         ASSERT_ERROR(parse_loadavg_fixed_point("1.2.3", &fp), EINVAL);
@@ -908,6 +907,129 @@ TEST(nft_identifier_valid) {
         char s[NFT_NAME_MAXLEN+1];
         *(char*) mempset(s, 'a', NFT_NAME_MAXLEN) = '\0';
         ASSERT_FALSE(nft_identifier_valid(s));
+}
+
+static uint64_t make_cap(int cap) {
+        return ((uint64_t) 1ULL << (uint64_t) cap);
+}
+
+TEST(parse_capability_set) {
+        uint64_t current;
+
+        /* Empty string resets to CAP_MASK_UNSET */
+        current = 0x1234;
+        ASSERT_OK(parse_capability_set("", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, CAP_MASK_UNSET);
+
+        /* Single capability by name - replaces if current == initial */
+        current = CAP_MASK_UNSET;
+        ASSERT_OK(parse_capability_set("cap_chown", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(CAP_CHOWN));
+
+        /* Single capability by name - merges if current != initial */
+        current = make_cap(CAP_SETUID);
+        ASSERT_OK(parse_capability_set("cap_chown", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(CAP_CHOWN) | make_cap(CAP_SETUID));
+
+        /* Multiple capabilities - replaces when current == initial */
+        current = CAP_MASK_UNSET;
+        ASSERT_OK(parse_capability_set("cap_chown cap_setuid", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(CAP_CHOWN) | make_cap(CAP_SETUID));
+
+        /* Multiple capabilities - merges when current != initial */
+        current = make_cap(CAP_SETGID);
+        ASSERT_OK(parse_capability_set("cap_chown cap_setuid", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(CAP_CHOWN) | make_cap(CAP_SETUID) | make_cap(CAP_SETGID));
+
+        /* Inverted capabilities - replaces with complement when current == initial */
+        current = CAP_MASK_UNSET;
+        ASSERT_OK(parse_capability_set("~cap_chown", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, all_capabilities() & ~make_cap(CAP_CHOWN));
+
+        /* Inverted capabilities - removes from current when current != initial */
+        current = all_capabilities();
+        ASSERT_OK(parse_capability_set("~cap_chown", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, all_capabilities() & ~make_cap(CAP_CHOWN));
+
+        /* Inverted multiple capabilities */
+        current = all_capabilities();
+        ASSERT_OK(parse_capability_set("~cap_chown cap_setuid", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, all_capabilities() & ~(make_cap(CAP_CHOWN) | make_cap(CAP_SETUID)));
+
+        /* Tilde alone resets to all capabilities complement (i.e., empty) */
+        current = 0x1234;
+        ASSERT_OK(parse_capability_set("~", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, all_capabilities());
+
+        /* Sequential calls - testing merge behavior */
+        current = CAP_MASK_UNSET;
+        ASSERT_OK(parse_capability_set("cap_chown", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(CAP_CHOWN));
+        ASSERT_OK(parse_capability_set("cap_setuid", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(CAP_CHOWN) | make_cap(CAP_SETUID));
+
+        /* Sequential calls with invert */
+        current = all_capabilities();
+        ASSERT_OK(parse_capability_set("~cap_chown", CAP_MASK_UNSET, &current));
+        ASSERT_OK(parse_capability_set("~cap_setuid", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, all_capabilities() & ~(make_cap(CAP_CHOWN) | make_cap(CAP_SETUID)));
+
+        /* Numeric capability */
+        current = CAP_MASK_UNSET;
+        ASSERT_OK(parse_capability_set("0", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(0));
+
+        current = CAP_MASK_UNSET;
+        ASSERT_OK(parse_capability_set("5", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(5));
+
+        /* Mixed numeric and named capabilities */
+        current = CAP_MASK_UNSET;
+        ASSERT_OK(parse_capability_set("0 cap_chown 5", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(0) | make_cap(CAP_CHOWN) | make_cap(5));
+
+        /* Invalid capabilities are ignored but function returns 0 */
+        current = CAP_MASK_UNSET;
+        ASSERT_OK_ZERO(parse_capability_set("invalid_cap", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, 0U);
+
+        /* Mix of valid and invalid capabilities */
+        current = CAP_MASK_UNSET;
+        ASSERT_OK_ZERO(parse_capability_set("cap_chown invalid_cap cap_setuid", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(CAP_CHOWN) | make_cap(CAP_SETUID));
+
+        /* Case insensitivity */
+        current = CAP_MASK_UNSET;
+        ASSERT_OK(parse_capability_set("CAP_CHOWN", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(CAP_CHOWN));
+
+        current = CAP_MASK_UNSET;
+        ASSERT_OK(parse_capability_set("CaP_ChOwN", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(CAP_CHOWN));
+
+        /* Inverted with invalid capabilities */
+        current = all_capabilities();
+        ASSERT_OK_ZERO(parse_capability_set("~invalid_cap", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, all_capabilities());
+
+        /* Inverted with mix of valid and invalid */
+        current = all_capabilities();
+        ASSERT_OK_ZERO(parse_capability_set("~cap_chown invalid_cap", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, all_capabilities() & ~make_cap(CAP_CHOWN));
+
+        /* Whitespace handling */
+        current = 0;
+        ASSERT_OK(parse_capability_set("  cap_chown   cap_setuid  ", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(CAP_CHOWN) | make_cap(CAP_SETUID));
+
+        /* Testing that initial value determines replace vs merge */
+        current = make_cap(CAP_SETGID);
+        ASSERT_OK(parse_capability_set("cap_chown", make_cap(CAP_SETGID), &current));
+        ASSERT_EQ(current, make_cap(CAP_CHOWN)); /* Replace because current == initial */
+
+        current = make_cap(CAP_SETGID);
+        ASSERT_OK(parse_capability_set("cap_chown", CAP_MASK_UNSET, &current));
+        ASSERT_EQ(current, make_cap(CAP_CHOWN) | make_cap(CAP_SETGID)); /* Merge because current != initial */
 }
 
 DEFINE_TEST_MAIN(LOG_INFO);

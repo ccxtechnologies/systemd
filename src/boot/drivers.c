@@ -3,7 +3,7 @@
 #include "device-path-util.h"
 #include "drivers.h"
 #include "efi-log.h"
-#include "string-util-fundamental.h"
+#include "string-util.h"
 #include "util.h"
 
 static EFI_STATUS load_one_driver(
@@ -35,7 +35,7 @@ static EFI_STATUS load_one_driver(
 
         if (loaded_image->ImageCodeType != EfiBootServicesCode &&
             loaded_image->ImageCodeType != EfiRuntimeServicesCode)
-                return log_error("Image %ls is not a driver, refusing.", fname);
+                return log_error_status(EFI_INVALID_PARAMETER, "Image %ls is not a driver, refusing.", fname);
 
         err = BS->StartImage(image, NULL, NULL);
         if (err != EFI_SUCCESS) {

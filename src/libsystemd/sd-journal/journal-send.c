@@ -16,7 +16,6 @@
 #include "io-util.h"
 #include "iovec-util.h"
 #include "journal-send.h"
-#include "log.h"
 #include "memfd-util.h"
 #include "process-util.h"
 #include "socket-util.h"
@@ -274,13 +273,11 @@ _public_ int sd_journal_sendv(const struct iovec *iov, int n) {
         }
 
         if (!have_syslog_identifier &&
-            string_is_safe(program_invocation_short_name)) {
+            string_is_safe(program_invocation_short_name, /* flags= */ 0)) {
 
-                /* Implicitly add program_invocation_short_name, if it
-                 * is not set explicitly. We only do this for
-                 * program_invocation_short_name, and nothing else
-                 * since everything else is much nicer to retrieve
-                 * from the outside. */
+                /* Implicitly add program_invocation_short_name, if it is not set explicitly. We only do this
+                 * for program_invocation_short_name, and nothing else since everything else is much nicer to
+                 * retrieve from the outside. */
 
                 w[j++] = IOVEC_MAKE_STRING("SYSLOG_IDENTIFIER=");
                 w[j++] = IOVEC_MAKE_STRING(program_invocation_short_name);
@@ -387,6 +384,19 @@ _public_ int sd_journal_stream_fd_with_namespace(
 
         assert_return(priority >= 0, -EINVAL);
         assert_return(priority <= 7, -EINVAL);
+
+        if (name_space) {
+                /* If $LOG_NAMESPACE is set, we're already placed in a mountns with /run/systemd/journal/
+                 * being a bind mount for the journald namespace instance, in which case we shall go by
+                 * the standard journal socket path. */
+                const char *env = secure_getenv("LOG_NAMESPACE");
+                if (env) {
+                        if (!streq(name_space, env))
+                                return -EREMOTE;
+
+                        name_space = NULL;
+                }
+        }
 
         path = journal_stream_path(name_space);
         if (!path)

@@ -10,7 +10,7 @@ set -o pipefail
 
 if [[ "$(get_cgroup_hierarchy)" != unified ]]; then
     echo "Skipping $0 as we're not running with the unified cgroup hierarchy"
-    exit 0
+    exit 77
 fi
 
 testcase_iodevice_dbus () {
@@ -43,7 +43,7 @@ EOF
 testcase_iodevice_unitfile () {
     cat >/run/systemd/system/test1.service <<EOF
 [Service]
-ExecStart=/usr/bin/sleep inf
+ExecStart=sleep inf
 IOReadBandwidthMax=/dev/sda1 1M
 IOReadBandwidthMax=/dev/sda2 2M
 IOReadBandwidthMax=/dev/sda3 4M

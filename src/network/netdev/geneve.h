@@ -3,7 +3,6 @@
 
 #include <linux/if_link.h>
 
-#include "forward.h"
 #include "in-addr-util.h"
 #include "netdev.h"
 
@@ -44,8 +43,7 @@ typedef struct Geneve {
 DEFINE_NETDEV_CAST(GENEVE, Geneve);
 extern const NetDevVTable geneve_vtable;
 
-const char* geneve_df_to_string(GeneveDF d) _const_;
-GeneveDF geneve_df_from_string(const char *d) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(geneve_df, GeneveDF);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_geneve_vni);
 CONFIG_PARSER_PROTOTYPE(config_parse_geneve_address);
