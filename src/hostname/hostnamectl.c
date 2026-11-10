@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <linux/vm_sockets.h>
 #include <locale.h>
 #include <string.h>
@@ -10,6 +9,7 @@
 #include "sd-json.h"
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "build.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
@@ -23,11 +23,12 @@
 #include "hostname-util.h"
 #include "log.h"
 #include "main-func.h"
+#include "os-util.h"
 #include "parse-argument.h"
 #include "polkit-agent.h"
-#include "pretty-print.h"
 #include "runtime-scope.h"
 #include "string-util.h"
+#include "strv.h"
 #include "time-util.h"
 #include "verbs.h"
 
@@ -39,6 +40,12 @@ static bool arg_pretty = false;
 static bool arg_static = false;
 static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 
+COMMAND(
+        "hostnamectl\0",
+        "Query or change system hostname.",
+        .man_pages = "hostnamectl(1)\0",
+);
+
 typedef struct StatusInfo {
         const char *hostname;
         const char *static_hostname;
@@ -48,9 +55,11 @@ typedef struct StatusInfo {
         const char *chassis_asset_tag;
         const char *deployment;
         const char *location;
+        char **tags;
         const char *kernel_name;
         const char *kernel_release;
         const char *os_pretty_name;
+        const char *os_fancy_name;
         const char *os_cpe_name;
         usec_t os_support_end;
         const char *os_image_id;
@@ -83,11 +92,11 @@ static const char* chassis_string_to_glyph(const char *chassis) {
         if (streq_ptr(chassis, "watch"))
                 return UTF8("⌚"); /* Watch */
         if (streq_ptr(chassis, "handset"))
-                return UTF8("🕻"); /* Left Hand Telephone Receiver */
+                return UTF8("📱"); /* Mobile Phone */
         if (streq_ptr(chassis, "vm"))
-                return UTF8("🖴"); /* Hard disk */
+                return UTF8("💽"); /* Computer disk */
         if (streq_ptr(chassis, "container"))
-                return UTF8("☐"); /* Ballot Box  */
+                return UTF8("📦"); /* Package  */
         return NULL;
 }
 
@@ -194,6 +203,18 @@ static int print_status_info(StatusInfo *i) {
                         return table_log_add_error(r);
         }
 
+        if (!strv_isempty(i->tags)) {
+                _cleanup_free_ char *j = strv_join(i->tags, ":");
+                if (!j)
+                        return log_oom();
+
+                r = table_add_many(table,
+                                   TABLE_FIELD, "Tags",
+                                   TABLE_STRING, j);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
         if (!sd_id128_is_null(i->machine_id)) {
                 r = table_add_many(table,
                                    TABLE_FIELD, "Machine ID",
@@ -234,7 +255,14 @@ static int print_status_info(StatusInfo *i) {
                         return table_log_add_error(r);
         }
 
-        if (!isempty(i->os_pretty_name)) {
+        if (use_fancy_name(i->os_fancy_name)) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "Operating System",
+                                   TABLE_STRING_WITH_ANSI, i->os_fancy_name,
+                                   TABLE_SET_URL, i->home_url);
+                if (r < 0)
+                        return table_log_add_error(r);
+        } else if (!isempty(i->os_pretty_name)) {
                 r = table_add_many(table,
                                    TABLE_FIELD, "Operating System",
                                    TABLE_STRING, i->os_pretty_name,
@@ -366,11 +394,7 @@ static int print_status_info(StatusInfo *i) {
                 }
         }
 
-        r = table_print(table, NULL);
-        if (r < 0)
-                return table_log_print_error(r);
-
-        return 0;
+        return table_print_or_warn(table);
 }
 
 static int get_one_name(sd_bus *bus, const char* attr, char **ret) {
@@ -406,8 +430,14 @@ static int get_one_name(sd_bus *bus, const char* attr, char **ret) {
         return 0;
 }
 
+static void status_info_done(StatusInfo *info) {
+        assert(info);
+
+        info->tags = strv_free(info->tags);
+}
+
 static int show_all_names(sd_bus *bus) {
-        StatusInfo info = {
+        _cleanup_(status_info_done) StatusInfo info = {
                 .vsock_cid = VMADDR_CID_ANY,
                 .os_support_end = USEC_INFINITY,
                 .firmware_date = USEC_INFINITY,
@@ -422,9 +452,11 @@ static int show_all_names(sd_bus *bus) {
                 { "ChassisAssetTag",             "s",  NULL,          offsetof(StatusInfo, chassis_asset_tag)},
                 { "Deployment",                  "s",  NULL,          offsetof(StatusInfo, deployment)       },
                 { "Location",                    "s",  NULL,          offsetof(StatusInfo, location)         },
+                { "Tags",                        "as", NULL,          offsetof(StatusInfo, tags)             },
                 { "KernelName",                  "s",  NULL,          offsetof(StatusInfo, kernel_name)      },
                 { "KernelRelease",               "s",  NULL,          offsetof(StatusInfo, kernel_release)   },
                 { "OperatingSystemPrettyName",   "s",  NULL,          offsetof(StatusInfo, os_pretty_name)   },
+                { "OperatingSystemFancyName",    "s",  NULL,          offsetof(StatusInfo, os_fancy_name)    },
                 { "OperatingSystemCPEName",      "s",  NULL,          offsetof(StatusInfo, os_cpe_name)      },
                 { "OperatingSystemSupportEnd",   "t",  NULL,          offsetof(StatusInfo, os_support_end)   },
                 { "OperatingSystemImageID",      "s",  NULL,          offsetof(StatusInfo, os_image_id)      },
@@ -539,7 +571,8 @@ static int get_hostname_based_on_flag(sd_bus *bus) {
         return get_one_name(bus, attr, NULL);
 }
 
-static int show_status(int argc, char **argv, void *userdata) {
+VERB_DEFAULT_NOARG(verb_show_status, "status", "Show current hostname settings");
+static int verb_show_status(int argc, char *argv[], uintptr_t _data, void *userdata) {
         sd_bus *bus = userdata;
         int r;
 
@@ -557,7 +590,7 @@ static int show_status(int argc, char **argv, void *userdata) {
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = sd_json_parse(text, 0, &v, NULL, NULL);
+                r = sd_json_parse(text, SD_JSON_PARSE_MUST_BE_OBJECT, &v, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse JSON: %m");
 
@@ -591,7 +624,7 @@ static int set_simple_string(sd_bus *bus, const char *target, const char *method
         return set_simple_string_internal(bus, NULL, target, method, value);
 }
 
-static int set_hostname(int argc, char **argv, void *userdata) {
+static int verb_set_hostname(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_free_ char *h = NULL;
         const char *hostname = argv[1];
         sd_bus *bus = userdata;
@@ -677,191 +710,221 @@ static int set_hostname(int argc, char **argv, void *userdata) {
         return ret;
 }
 
-static int get_or_set_hostname(int argc, char **argv, void *userdata) {
+VERB(verb_get_or_set_hostname, "hostname", "[NAME]\0", VERB_ANY, 2, 0, "Get/set system hostname");
+VERB(verb_get_or_set_hostname, "set-hostname", "NAME\0", 2, 2, 0, NULL); /* obsolete */
+static int verb_get_or_set_hostname(int argc, char *argv[], uintptr_t data, void *userdata) {
         return argc == 1 ? get_hostname_based_on_flag(userdata) :
-                           set_hostname(argc, argv, userdata);
+                           verb_set_hostname(argc, argv, data, userdata);
 }
 
-static int get_or_set_icon_name(int argc, char **argv, void *userdata) {
+VERB(verb_get_or_set_icon_name, "icon-name", "[NAME]\0", VERB_ANY, 2, 0, "Get/set icon name for host");
+VERB(verb_get_or_set_icon_name, "set-icon-name", "NAME\0", 2, 2, 0, NULL); /* obsolete */
+static int verb_get_or_set_icon_name(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return argc == 1 ? get_one_name(userdata, "IconName", NULL) :
                            set_simple_string(userdata, "icon", "SetIconName", argv[1]);
 }
 
-static int get_or_set_chassis(int argc, char **argv, void *userdata) {
+VERB(verb_get_or_set_chassis, "chassis", "[NAME]\0", VERB_ANY, 2, 0, "Get/set chassis type for host");
+VERB(verb_get_or_set_chassis, "set-chassis", "NAME\0", 2, 2, 0, NULL); /* obsolete */
+static int verb_get_or_set_chassis(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return argc == 1 ? get_one_name(userdata, "Chassis", NULL) :
                            set_simple_string(userdata, "chassis", "SetChassis", argv[1]);
 }
 
-static int get_or_set_deployment(int argc, char **argv, void *userdata) {
+VERB(verb_get_or_set_deployment, "deployment", "[NAME]\0", VERB_ANY, 2, 0, "Get/set deployment environment for host");
+VERB(verb_get_or_set_deployment, "set-deployment", "NAME\0", 2, 2, 0, NULL); /* obsolete */
+static int verb_get_or_set_deployment(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return argc == 1 ? get_one_name(userdata, "Deployment", NULL) :
                            set_simple_string(userdata, "deployment", "SetDeployment", argv[1]);
 }
 
-static int get_or_set_location(int argc, char **argv, void *userdata) {
+VERB(verb_get_or_set_location, "location", "[NAME]\0", VERB_ANY, 2, 0, "Get/set location for host");
+VERB(verb_get_or_set_location, "set-location", "NAME\0", 2, 2, 0, NULL); /* obsolete */
+static int verb_get_or_set_location(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return argc == 1 ? get_one_name(userdata, "Location", NULL) :
                            set_simple_string(userdata, "location", "SetLocation", argv[1]);
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
+VERB(verb_get_or_set_tags, "tags", "[TAG…]\0", VERB_ANY, VERB_ANY, 0, "Get/set machine tags for host");
+static int verb_get_or_set_tags(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        r = terminal_urlify_man("hostnamectl", "1", &link);
-        if (r < 0)
-                return log_oom();
+        if (argc == 1) {
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
 
-        printf("%1$s [OPTIONS...] COMMAND ...\n\n"
-               "%2$sQuery or change system hostname.%3$s\n"
-               "\n%4$sCommands:%5$s\n"
-               "  status                 Show current hostname settings\n"
-               "  hostname [NAME]        Get/set system hostname\n"
-               "  icon-name [NAME]       Get/set icon name for host\n"
-               "  chassis [NAME]         Get/set chassis type for host\n"
-               "  deployment [NAME]      Get/set deployment environment for host\n"
-               "  location [NAME]        Get/set location for host\n"
-               "\n%4$sOptions:%5$s\n"
-               "  -h --help              Show this help\n"
-               "     --version           Show package version\n"
-               "     --no-ask-password   Do not prompt for password\n"
-               "  -H --host=[USER@]HOST  Operate on remote host\n"
-               "  -M --machine=CONTAINER Operate on local container\n"
-               "     --transient         Only set transient hostname\n"
-               "     --static            Only set static hostname\n"
-               "     --pretty            Only set pretty hostname\n"
-               "     --json=pretty|short|off\n"
-               "                         Generate JSON output\n"
-               "  -j                     Same as --json=pretty on tty, --json=short otherwise\n"
-               "\nSee the %6$s for details.\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               ansi_underline(),
-               ansi_normal(),
-               link);
+                _cleanup_free_ char *j = NULL;
+                r = bus_get_property(bus, bus_hostname, "Tags", &error, &reply, "as");
+                if (r < 0) {
+                        if (!sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_PROPERTY))
+                                return log_error_errno(r, "Could not get property: %s", bus_error_message(&error, r));
+
+                        /* Old hostnamed didn't know the tags concept, hence such a machine has no tags. */
+                } else {
+                        _cleanup_strv_free_ char **l = NULL;
+                        r = sd_bus_message_read_strv(reply, &l);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        j = strv_join(l, ":");
+                        if (!j)
+                                return log_oom();
+                }
+
+                printf("%s\n", strempty(j));
+                return 0;
+        }
+
+        _cleanup_strv_free_ char **plain = NULL, **add = NULL, **remove = NULL;
+        bool prefixed = false, unprefixed = false;
+        for (int i = 1; i < argc; i++) {
+                const char *e = argv[i];
+                char ***dest;
+
+                /* The first character of each argument selects the mode for all (colon-separated) tags in
+                 * that argument: a leading '+' adds them, a leading '-' removes them, and otherwise the
+                 * argument lists tags to set verbatim. Setting and adding/removing may not be mixed. */
+                if (e[0] == '+') {
+                        dest = &add;
+                        e++;
+                        prefixed = true;
+                } else if (e[0] == '-') {
+                        dest = &remove;
+                        e++;
+                        prefixed = true;
+                } else {
+                        dest = &plain;
+                        unprefixed = true;
+                }
+
+                if (isempty(e)) {
+                        if (dest == &plain && !*dest) {
+                                *dest = new0(char*, 1);
+                                if (!*dest)
+                                        return log_oom();
+                        }
+                } else if (strv_split_and_extend(dest, e, ":", /* filter_duplicates= */ true) < 0)
+                        return log_oom();
+        }
+
+        if (prefixed && unprefixed)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Plain tags may not be combined with '+'/'-' prefixed tags.");
+
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+
+        if (!prefixed) {
+                /* No prefixes used: replace the whole tag list with the given tags (possibly empty, which
+                 * clears all tags). */
+                strv_sort(plain);
+
+                r = bus_message_new_method_call(bus, &m, bus_hostname, "SetTags");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append_strv(m, plain);
+                if (r < 0)
+                        return bus_log_create_error(r);
+        } else {
+                /* Prefixes used: incrementally add and/or remove tags. */
+                strv_sort(add);
+                strv_sort(remove);
+
+                r = bus_message_new_method_call(bus, &m, bus_hostname, "AddAndRemoveTags");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append_strv(m, add);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append_strv(m, remove);
+                if (r < 0)
+                        return bus_log_create_error(r);
+        }
+
+        r = sd_bus_call(bus, m, /* usec= */ 0, &error, /* ret_reply= */ NULL);
+        if (r < 0)
+                return log_error_errno(r, "Could not set tags: %s", bus_error_message(&error, r));
 
         return 0;
 }
 
-static int verb_help(int argc, char **argv, void *userdata) {
-        return help();
-}
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
-static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_NO_ASK_PASSWORD,
-                ARG_TRANSIENT,
-                ARG_STATIC,
-                ARG_PRETTY,
-                ARG_JSON,
-        };
-
-        static const struct option options[] = {
-                { "help",            no_argument,       NULL, 'h'                 },
-                { "version",         no_argument,       NULL, ARG_VERSION         },
-                { "transient",       no_argument,       NULL, ARG_TRANSIENT       },
-                { "static",          no_argument,       NULL, ARG_STATIC          },
-                { "pretty",          no_argument,       NULL, ARG_PRETTY          },
-                { "host",            required_argument, NULL, 'H'                 },
-                { "machine",         required_argument, NULL, 'M'                 },
-                { "no-ask-password", no_argument,       NULL, ARG_NO_ASK_PASSWORD },
-                { "json",            required_argument, NULL, ARG_JSON            },
-                {}
-        };
-
-        int c, r;
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
+        int r;
 
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hH:M:j", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case 'h':
-                        return help();
-
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case 'H':
-                        arg_transport = BUS_TRANSPORT_REMOTE;
-                        arg_host = optarg;
+                OPTION_COMMON_NO_ASK_PASSWORD:
+                        arg_ask_password = false;
                         break;
 
-                case 'M':
-                        r = parse_machine_argument(optarg, &arg_host, &arg_transport);
+                OPTION_COMMON_HOST:
+                        arg_transport = BUS_TRANSPORT_REMOTE;
+                        arg_host = opts.arg;
+                        break;
+
+                OPTION_COMMON_MACHINE:
+                        r = parse_machine_argument(opts.arg, &arg_host, &arg_transport);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_TRANSIENT:
+                OPTION_LONG("transient", NULL, "Only set transient hostname"):
                         arg_transient = true;
                         break;
 
-                case ARG_PRETTY:
-                        arg_pretty = true;
-                        break;
-
-                case ARG_STATIC:
+                OPTION_LONG("static", NULL, "Only set static hostname"):
                         arg_static = true;
                         break;
 
-                case ARG_NO_ASK_PASSWORD:
-                        arg_ask_password = false;
+                OPTION_LONG("pretty", NULL, "Only set pretty hostname"):
+                        arg_pretty = true;
                         break;
 
-                case ARG_JSON:
-                        r = parse_json_argument(optarg, &arg_json_format_flags);
+                OPTION_COMMON_JSON:
+                        r = parse_json_argument(opts.arg, &arg_json_format_flags);
                         if (r <= 0)
                                 return r;
-
                         break;
 
-                case 'j':
+                OPTION_COMMON_LOWERCASE_J:
                         arg_json_format_flags = SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(arg_json_format_flags);
                 }
 
+        *ret_args = option_parser_get_args(&opts);
         return 1;
-}
-
-static int hostnamectl_main(sd_bus *bus, int argc, char *argv[]) {
-
-        static const Verb verbs[] = {
-                { "status",         VERB_ANY, 1,        VERB_DEFAULT, show_status           },
-                { "hostname",       VERB_ANY, 2,        0,            get_or_set_hostname   },
-                { "set-hostname",   2,        2,        0,            get_or_set_hostname   }, /* obsolete */
-                { "icon-name",      VERB_ANY, 2,        0,            get_or_set_icon_name  },
-                { "set-icon-name",  2,        2,        0,            get_or_set_icon_name  }, /* obsolete */
-                { "chassis",        VERB_ANY, 2,        0,            get_or_set_chassis    },
-                { "set-chassis",    2,        2,        0,            get_or_set_chassis    }, /* obsolete */
-                { "deployment",     VERB_ANY, 2,        0,            get_or_set_deployment },
-                { "set-deployment", 2,        2,        0,            get_or_set_deployment }, /* obsolete */
-                { "location",       VERB_ANY, 2,        0,            get_or_set_location   },
-                { "set-location",   2,        2,        0,            get_or_set_location   }, /* obsolete */
-                { "help",           VERB_ANY, VERB_ANY, 0,            verb_help             }, /* Not documented, but supported since it is created. */
-                {}
-        };
-
-        return dispatch_verb(argc, argv, verbs, bus);
 }
 
 static int run(int argc, char *argv[]) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        char **args = NULL;
         int r;
 
         setlocale(LC_ALL, "");
         log_setup();
 
-        r = parse_argv(argc, argv);
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
@@ -869,7 +932,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return bus_log_connect_error(r, arg_transport, RUNTIME_SCOPE_SYSTEM);
 
-        return hostnamectl_main(bus, argc, argv);
+        return dispatch_verb(args, bus);
 }
 
 DEFINE_MAIN_FUNCTION(run);

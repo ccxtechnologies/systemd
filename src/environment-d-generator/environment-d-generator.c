@@ -20,6 +20,8 @@ static int environment_dirs(char ***ret) {
         _cleanup_free_ char *c = NULL;
         int r;
 
+        assert(ret);
+
         dirs = strv_new(CONF_PATHS("environment.d"));
         if (!dirs)
                 return -ENOMEM;
@@ -52,7 +54,7 @@ static int load_and_print(void) {
         if (r < 0)
                 return r;
 
-        r = conf_files_list_strv(&files, ".conf", NULL, 0, (const char **) dirs);
+        r = conf_files_list_strv(&files, ".conf", /* root= */ NULL, CONF_FILES_WARN, (const char **) dirs);
         if (r < 0)
                 return r;
 

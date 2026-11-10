@@ -30,45 +30,36 @@ systemctl_sources = files(
         'systemctl-trivial-method.c',
         'systemctl-whoami.c',
 )
-systemctl_extract_sources = files(
+systemctl_export_sources = files(
         'systemctl-compat-halt.c',
         'systemctl-compat-shutdown.c',
         'systemctl-daemon-reload.c',
         'systemctl-logind.c',
         'systemctl-start-unit.c',
-        'systemctl-sysv-compat.c',
         'systemctl-util.c',
         'systemctl.c',
 )
-
-if get_option('link-systemctl-shared')
-        systemctl_link_with = [libshared]
-else
-        systemctl_link_with = [libsystemd_static,
-                               libshared_static]
-endif
 
 executables += [
         executable_template + {
                 'name' : 'systemctl',
                 'public' : true,
-                'sources' : systemctl_sources + systemctl_extract_sources,
-                'extract' : systemctl_extract_sources,
-                'link_with' : systemctl_link_with,
+                'sources' : systemctl_sources,
+                'export' : systemctl_export_sources,
                 'dependencies' : [
-                        libcap,
                         liblz4_cflags,
-                        libselinux,
                         libxz_cflags,
                         libzstd_cflags,
-                        threads,
                 ],
+                'install' : get_option('link-systemctl-shared') ? 'yes' : 'static',
                 'install_tag' : 'systemctl',
         },
         fuzz_template + {
                 'sources' : files('fuzz-systemctl-parse-argv.c'),
-                'objects' : ['systemctl'],
-                'link_with' : systemctl_link_with,
+                'import' : ['systemctl'],
+                'dependencies' : [
+                        libselinux_cflags,
+                ],
         },
 ]
 

@@ -229,6 +229,8 @@ int nss_pack_group_record(
         assert(g->group_name);
         required = strlen(g->group_name) + 1;
 
+        required += strlen(PASSWORD_SEE_SHADOW) + 1;
+
         STRV_FOREACH(m, g->members) {
                 required += sizeof(char*);  /* space for ptr array entry */
                 required += strlen(*m) + 1;
@@ -267,11 +269,13 @@ int nss_pack_group_record(
         array[n] = NULL;
 
         *gr = (struct group) {
-                .gr_name = strcpy(p, g->group_name),
+                .gr_name = p,
                 .gr_gid = g->gid,
-                .gr_passwd = (char*) PASSWORD_SEE_SHADOW,
                 .gr_mem = array,
         };
+
+        gr->gr_passwd = stpcpy(gr->gr_name, g->group_name) + 1;
+        strcpy(gr->gr_passwd, PASSWORD_SEE_SHADOW);
 
         return 0;
 }
@@ -315,7 +319,7 @@ enum nss_status userdb_getgrnam(
                  * accessible via non-NSS. Hence let's do what we have to do, and query NSS after all to
                  * acquire it, so that we can extend it (that's because glibc's group merging feature will
                  * merge groups only if both GID and name match and thus we need to have both first). It
-                 * sucks behaving recursively likely this, but it's apparently what everybody does. We break
+                 * sucks behaving recursively like this, but it's apparently what everybody does. We break
                  * the recursion for ourselves via the _nss_systemd_block_nss() lock. */
 
                 r = _nss_systemd_block(true);
@@ -411,6 +415,43 @@ enum nss_status userdb_getgrgid(
         return NSS_STATUS_SUCCESS;
 }
 
+/* Counts string pointers (including terminating NULL element) of given
+ * string vector strv and stores amount of pointers in n and total
+ * length of all contained strings including NUL bytes in len. */
+static void nss_count_strv(char * const *strv, size_t *n, size_t *len) {
+        assert(n);
+        assert(len);
+
+        STRV_FOREACH(str, strv) {
+                (*len) += sizeof(char*);  /* space for array entry */
+                (*len) += strlen(*str) + 1;
+                (*n)++;
+        }
+        (*len) += sizeof(char*); /* trailing NULL in array entry */
+        (*n)++;
+}
+
+/* Performs deep copy of given string vector src and stores content
+ * of contained strings into buf with references to these strings
+ * in dst. At dst location, a new NULL-terminated string vector is
+ * created. The dst and buf locations are updated to point just behind
+ * the last pointer or char respectively. Returns total amount of
+ * pointers in newly created string vector in dst, including the
+ * terminating NULL element. */
+static size_t nss_deep_copy_strv(char * const *src, char ***dst, char **buf) {
+        char *p = *buf;
+        size_t i = 0;
+
+        STRV_FOREACH(str, src) {
+                (*dst)[i++] = p;
+                p = stpcpy(p, *str) + 1;
+        }
+        (*dst)[i++] = NULL;
+        *dst += i;
+        *buf = p;
+        return i;
+}
+
 int nss_pack_group_record_shadow(
                 GroupRecord *hr,
                 struct sgrp *sgrp,
@@ -418,7 +459,8 @@ int nss_pack_group_record_shadow(
                 size_t buflen) {
 
         const char *hashed;
-        size_t required;
+        char **array = NULL, *p;
+        size_t i = 0, n = 0, required;
 
         assert(hr);
         assert(sgrp);
@@ -429,15 +471,28 @@ int nss_pack_group_record_shadow(
         assert_se(hashed = strv_isempty(hr->hashed_password) ? PASSWORD_LOCKED_AND_INVALID : hr->hashed_password[0]);
         required += strlen(hashed) + 1;
 
+        nss_count_strv(hr->administrators, &n, &required);
+        nss_count_strv(hr->members, &n, &required);
+
         if (buflen < required)
                 return -ERANGE;
 
-        *sgrp = (struct sgrp) {
-                .sg_namp = buffer,
-        };
-
         assert(buffer);
 
+        /* n already includes trailing NULL pointers from nss_count_strv(), unlike the
+         * non-shadow nss_pack_group_record() where n does not include them. */
+        p = buffer + sizeof(void*) * n;
+        array = (char**) buffer; /* place ptr array at beginning of buffer, under assumption buffer is aligned */
+
+        sgrp->sg_mem = array;
+        i += nss_deep_copy_strv(hr->members, &array, &p);
+
+        sgrp->sg_adm = array;
+        i += nss_deep_copy_strv(hr->administrators, &array, &p);
+
+        assert_se(i == n);
+
+        sgrp->sg_namp = p;
         sgrp->sg_passwd = stpcpy(sgrp->sg_namp, hr->group_name) + 1;
         strcpy(sgrp->sg_passwd, hashed);
 

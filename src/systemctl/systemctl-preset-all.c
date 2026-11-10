@@ -13,23 +13,23 @@
 #include "systemctl-util.h"
 #include "verbs.h"
 
-int verb_preset_all(int argc, char *argv[], void *userdata) {
+int verb_preset_all(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
         if (should_bypass("SYSTEMD_PRESET"))
                 return 0;
 
-        if (install_client_side()) {
+        if (install_client_side() != INSTALL_CLIENT_SIDE_NO) {
                 InstallChange *changes = NULL;
                 size_t n_changes = 0;
 
                 CLEANUP_ARRAY(changes, n_changes, install_changes_free);
 
                 r = unit_file_preset_all(arg_runtime_scope, unit_file_flags_from_args(), arg_root, arg_preset_mode, &changes, &n_changes);
-                install_changes_dump(r, "preset", changes, n_changes, arg_quiet);
-
-                if (r > 0)
-                        r = 0;
+                /* We do not propagate failure for individual units here. */
+                (void) install_changes_dump(r, "preset all", changes, n_changes, arg_quiet);
+                if (r < 0)
+                        return r;
         } else {
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;

@@ -60,21 +60,21 @@ grep -q '^PRIORITY=6$' /tmp/output
 ID="$(systemd-id128 new)"
 echo -e 'HEAD\nTAIL\nTAIL' | systemd-cat -t "$ID"
 journalctl --sync
-journalctl -b -t "$ID" | grep -q HEAD
-journalctl -b -t "$ID" | grep -q TAIL
-journalctl -b -t "$ID" --truncate-newline | grep -q HEAD
-journalctl -b -t "$ID" --truncate-newline | grep -q -v TAIL
+journalctl -b -t "$ID" | grep HEAD >/dev/null
+journalctl -b -t "$ID" | grep TAIL >/dev/null
+journalctl -b -t "$ID" --truncate-newline | grep HEAD >/dev/null
+journalctl -b -t "$ID" --truncate-newline | grep -v TAIL >/dev/null
 
 # '-b all' negates earlier use of -b (-b and -m are otherwise exclusive)
 journalctl -b -1 -b all -m >/dev/null
 
 # -b always behaves like -b0
-journalctl -q -b-1 -b0 | head -1 >/tmp/expected
-journalctl -q -b-1 -b | head -1 >/tmp/output
+journalctl -q -b-1 -b0 -n+1 >/tmp/expected
+journalctl -q -b-1 -b -n+1 >/tmp/output
 diff /tmp/expected /tmp/output
 # ... even when another option follows (both of these should fail due to -m)
-{ journalctl -ball -b0 -m 2>&1 || :; } | head -1 >/tmp/expected
-{ journalctl -ball -b  -m 2>&1 || :; } | head -1 >/tmp/output
+{ journalctl -ball -b0 -n+1 -m 2>&1 || :; } >/tmp/expected
+{ journalctl -ball -b  -n+1 -m 2>&1 || :; } >/tmp/output
 diff /tmp/expected /tmp/output
 
 # https://github.com/systemd/systemd/issues/13708
@@ -93,7 +93,7 @@ grep -vq "^_PID=$PID" /tmp/output
 # https://github.com/systemd/systemd/issues/15654
 ID=$(systemd-id128 new)
 printf "This will\nusually fail\nand be truncated\n" >/tmp/expected
-systemd-cat -t "$ID" /bin/sh -c 'env echo -n "This will";echo;env echo -n "usually fail";echo;env echo -n "and be truncated";echo;'
+systemd-cat -t "$ID" bash -c 'env echo -n "This will"; echo; env echo -n "usually fail"; echo; env echo -n "and be truncated"; echo;'
 journalctl --sync
 journalctl -b -o cat -t "$ID" >/tmp/output
 diff /tmp/expected /tmp/output
@@ -104,10 +104,12 @@ diff /tmp/expected /tmp/output
 
 # test that LogLevelMax can also suppress logging about services, not only by services
 systemctl start silent-success
+journalctl --sync
 [[ -z "$(journalctl -b -q -u silent-success.service)" ]]
 
 # Test syslog identifiers exclusion
 systemctl start verbose-success.service
+journalctl --sync
 [[ -n "$(journalctl -b -q -u verbose-success.service -t systemd)" ]]
 [[ -n "$(journalctl -b -q -u verbose-success.service -t bash)" ]]
 [[ -n "$(journalctl -b -q -u verbose-success.service -T systemd)" ]]
@@ -120,7 +122,7 @@ journalctl -b -n 1 /bin/true /bin/false
 journalctl -b -n 1 /bin/true + /bin/false
 journalctl -b -n 1 -r --unit "systemd*"
 
-systemd-run --user -M "testuser@.host" /bin/echo hello
+systemd-run --user -M "testuser@.host" echo hello
 journalctl --sync
 journalctl -b -n 1 -r --user-unit "*"
 
@@ -156,9 +158,13 @@ journalctl --root / | grep . >/dev/null
 journalctl --cursor "t=0;t=-1;t=0;t=0x0" | grep . >/dev/null
 journalctl --header | grep system.journal
 journalctl --field _EXE | grep . >/dev/null
+journalctl --field _EXE --pager-end | grep . >/dev/null
+(! journalctl -q --field _SYSTEMD_UNIT --unit "test-no-such-unit-$RANDOM.service" --no-pager)
+(! journalctl -q --field _SYSTEMD_UNIT --since "9999-01-01" --no-pager)
+(! journalctl -q --fields --unit "test-no-such-unit-$RANDOM.service" --no-pager)
 journalctl --no-hostname --utc --catalog | grep . >/dev/null
 # Exercise executable_is_script() and the related code, e.g. `journalctl -b /path/to/a/script.sh` should turn
-# into ((_EXE=/bin/bash AND _COMM=script.sh) AND _BOOT_ID=c002e3683ba14fa8b6c1e12878386514)
+# into ((_EXE=/usr/bin/bash AND _COMM=script.sh) AND _BOOT_ID=c002e3683ba14fa8b6c1e12878386514)
 journalctl -b "$(readlink -f "$0")" | grep . >/dev/null
 journalctl -b "$(systemd-id128 boot-id)" | grep . >/dev/null
 journalctl --since yesterday --reverse | grep . >/dev/null
@@ -189,6 +195,35 @@ journalctl --fields
 journalctl --list-boots
 journalctl --update-catalog
 journalctl --list-catalog
+[[ "$(journalctl --list-catalog | wc -l)" -gt 1 ]]
+[[ "$(journalctl --list-catalog f77379a8490b408bbe5f6940505a777b | wc -l)" -eq 1 ]]
+[[ "$(journalctl --dump-catalog | wc -l)" -gt "$(journalctl --dump-catalog f77379a8490b408bbe5f6940505a777b | wc -l)" ]]
+
+# sd_journal_send() passes an entry to journald as a sealed memfd if the entry doesn't fit into a datagram.
+# The maximum datagram size depends on the socket send buffer of the host. Python sends the memfd directly,
+# so that journald always receives a memfd.
+ID="$(systemd-id128 new)"
+{ echo -n "HUGE="; head -c $((4 * 1024 * 1024)) /dev/zero | tr '\0' x; echo; } >/tmp/expected
+python3 - "$ID" /tmp/expected <<'EOF'
+import fcntl, os, socket, sys
+
+with open(sys.argv[2], "rb") as f:
+    huge = f.read()
+
+fd = os.memfd_create("journal-huge", os.MFD_ALLOW_SEALING)
+with open(fd, "wb", closefd=False) as f:
+    f.write(f"MESSAGE=Huge field attached\nSYSLOG_IDENTIFIER={sys.argv[1]}\n".encode() + huge)
+fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
+            fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL)
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+    sock.connect("/run/systemd/journal/socket")
+    socket.send_fds(sock, [], [fd])
+EOF
+journalctl --sync
+journalctl -b -o export -t "$ID" --output-fields=HUGE | grep -a '^HUGE=' >/tmp/output
+cmp /tmp/expected /tmp/output
+rm -f /tmp/expected /tmp/output
 
 # Add new tests before here, the journald restarts below
 # may make tests flappy.
@@ -219,7 +254,7 @@ journalctl --follow --merge | head -n1 | grep .
 rm -f /tmp/issue-26746-log /tmp/issue-26746-cursor
 ID="$(systemd-id128 new)"
 journalctl -t "$ID" --follow --cursor-file=/tmp/issue-26746-cursor | tee /tmp/issue-26746-log &
-systemd-cat -t "$ID" /bin/sh -c 'echo hogehoge'
+systemd-cat -t "$ID" bash -c 'echo hogehoge'
 # shellcheck disable=SC2016
 timeout 10 bash -c 'until [[ -f /tmp/issue-26746-log && "$(cat /tmp/issue-26746-log)" =~ hogehoge ]]; do sleep .5; done'
 pkill -TERM journalctl

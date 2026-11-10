@@ -7,14 +7,17 @@
 
 #include "alloc-util.h"
 #include "argv-util.h"
+#include "capability-util.h"
 #include "copy.h"
 #include "fd-util.h"
 #include "fs-util.h"
 #include "mkdir.h"
 #include "path-util.h"
+#include "pidref.h"
 #include "process-util.h"
 #include "random-util.h"
 #include "rm-rf.h"
+#include "socket-util.h"
 #include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -431,7 +434,7 @@ TEST(conservative_rename) {
         assert_se(access(q, F_OK) < 0 && errno == ENOENT);
 
         /* Check that a manual copy is detected */
-        assert_se(copy_file(p, q, 0, MODE_INVALID, COPY_REFLINK) >= 0);
+        assert_se(copy_file(p, q, 0, MODE_INVALID, /* copy_flags= */ 0) >= 0);
         assert_se(conservative_renameat(AT_FDCWD, q, AT_FDCWD, p) == 0);
         assert_se(access(q, F_OK) < 0 && errno == ENOENT);
 
@@ -739,34 +742,176 @@ TEST(xopenat_regular) {
         assert_se(unlink("/tmp/xopenat-regular-test") >= 0);
 }
 
+TEST(xopenat_socket) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF, fd = -EBADF;
+
+        ASSERT_OK(tfd = mkdtemp_open(NULL, 0, &t));
+
+        /* Create a Unix domain socket via bind(). */
+        fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
+        ASSERT_OK(fd);
+
+        const char *sockpath = strjoina(t, "/test.sock");
+        union sockaddr_union sa = { .un.sun_family = AF_UNIX };
+        strncpy(sa.un.sun_path, sockpath, sizeof(sa.un.sun_path) - 1);
+        ASSERT_OK_ERRNO(bind(fd, &sa.sa, offsetof(struct sockaddr_un, sun_path) + strlen(sockpath) + 1));
+        fd = safe_close(fd);
+
+        /* XO_SOCKET requires O_PATH. */
+        fd = xopenat_full(tfd, "test.sock", O_PATH|O_CLOEXEC, XO_SOCKET, 0);
+        ASSERT_OK(fd);
+        fd = safe_close(fd);
+
+        /* Reopen via empty path should also work. */
+        fd = ASSERT_OK(xopenat_full(tfd, "test.sock", O_PATH|O_CLOEXEC, 0, 0));
+        _cleanup_close_ int fd2 = xopenat_full(fd, NULL, O_PATH|O_CLOEXEC, XO_SOCKET, 0);
+        ASSERT_OK(fd2);
+        fd = safe_close(fd);
+
+        /* Non-socket inodes must be rejected. */
+        ASSERT_OK_ERRNO(mkdirat(tfd, "dir", 0755));
+        ASSERT_ERROR(xopenat_full(tfd, "dir", O_PATH|O_CLOEXEC, XO_SOCKET, 0), EISDIR);
+
+        fd = ASSERT_OK_ERRNO(openat(tfd, "reg", O_CREAT|O_CLOEXEC, 0600));
+        fd = safe_close(fd);
+        ASSERT_ERROR(xopenat_full(tfd, "reg", O_PATH|O_CLOEXEC, XO_SOCKET, 0), ENOTSOCK);
+
+        /* Reopen via empty path of a non-socket fd must also be rejected. */
+        fd = ASSERT_OK(xopenat_full(tfd, "reg", O_PATH|O_CLOEXEC, 0, 0));
+        ASSERT_ERROR(xopenat_full(fd, NULL, O_PATH|O_CLOEXEC, XO_SOCKET, 0), ENOTSOCK);
+        fd = safe_close(fd);
+
+        fd = ASSERT_OK(xopenat_full(tfd, "dir", O_PATH|O_CLOEXEC, 0, 0));
+        ASSERT_ERROR(xopenat_full(fd, NULL, O_PATH|O_CLOEXEC, XO_SOCKET, 0), EISDIR);
+        fd = safe_close(fd);
+}
+
+TEST(xopenat_trigger_automount) {
+        _cleanup_close_ int fd = -EBADF;
+
+        /* We can't easily set up an autofs mount in a test, but we can verify that
+         * XO_TRIGGER_AUTOMOUNT works on a regular path and produces the same inode as a
+         * plain O_PATH open. */
+        fd = xopenat_full(AT_FDCWD, "/usr", O_PATH|O_CLOEXEC|O_DIRECTORY, XO_TRIGGER_AUTOMOUNT, 0);
+        ASSERT_OK(fd);
+
+        _cleanup_close_ int fd2 = xopenat_full(AT_FDCWD, "/usr", O_PATH|O_CLOEXEC|O_DIRECTORY, 0, 0);
+        ASSERT_OK(fd2);
+        ASSERT_OK_POSITIVE(fd_inode_same(fd, fd2));
+}
+
+TEST(xopenat_auto_rw_ro) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF, fd = -EBADF;
+        int fl;
+
+        assert_se((tfd = mkdtemp_open(NULL, 0, &t)) >= 0);
+
+        /* Regular writable file: XO_AUTO_RW_RO should end up in O_RDWR. */
+
+        fd = xopenat_full(tfd, "rw", O_CREAT|O_EXCL|O_CLOEXEC, XO_AUTO_RW_RO, 0644);
+        assert_se(fd >= 0);
+        ASSERT_OK_ERRNO(fl = fcntl(fd, F_GETFL));
+        assert_se((fl & O_ACCMODE) == O_RDWR);
+        fd = safe_close(fd);
+
+        /* Same thing, but with XO_REGULAR set too. */
+
+        fd = xopenat_full(tfd, "rw2", O_CREAT|O_EXCL|O_CLOEXEC, XO_AUTO_RW_RO|XO_REGULAR, 0644);
+        assert_se(fd >= 0);
+        ASSERT_OK_ERRNO(fl = fcntl(fd, F_GETFL));
+        assert_se((fl & O_ACCMODE) == O_RDWR);
+        fd = safe_close(fd);
+
+        /* Reopen via empty path on an O_PATH fd must also end up in O_RDWR. */
+
+        _cleanup_close_ int path_fd = xopenat_full(tfd, "rw", O_PATH|O_CLOEXEC, 0, 0);
+        assert_se(path_fd >= 0);
+        fd = xopenat_full(path_fd, "", O_CLOEXEC, XO_AUTO_RW_RO, 0);
+        assert_se(fd >= 0);
+        ASSERT_OK_ERRNO(fl = fcntl(fd, F_GETFL));
+        assert_se((fl & O_ACCMODE) == O_RDWR);
+        fd = safe_close(fd);
+
+        /* Directories can only be opened read-only: XO_AUTO_RW_RO with O_DIRECTORY must fall back to O_RDONLY. */
+
+        fd = xopenat_full(tfd, "subdir", O_DIRECTORY|O_CREAT|O_CLOEXEC, XO_AUTO_RW_RO, 0755);
+        assert_se(fd >= 0);
+        ASSERT_OK_ERRNO(fl = fcntl(fd, F_GETFL));
+        assert_se((fl & O_ACCMODE) == O_RDONLY);
+        fd = safe_close(fd);
+
+        /* Same for opening an existing directory. */
+
+        fd = xopenat_full(tfd, "subdir", O_DIRECTORY|O_CLOEXEC, XO_AUTO_RW_RO, 0);
+        assert_se(fd >= 0);
+        ASSERT_OK_ERRNO(fl = fcntl(fd, F_GETFL));
+        assert_se((fl & O_ACCMODE) == O_RDONLY);
+        fd = safe_close(fd);
+
+        /* Fallback when the inode is not writable: create a file as read-only mode and verify that
+         * XO_AUTO_RW_RO falls back to O_RDONLY. Root bypasses mode bits via CAP_DAC_OVERRIDE, so skip
+         * this when running as root, or as a user with CAP_DAC_OVERRIDE. */
+
+        if (have_effective_cap(CAP_DAC_OVERRIDE) <= 0) {
+                fd = openat(tfd, "ro", O_CREAT|O_EXCL|O_WRONLY|O_CLOEXEC, 0444);
+                assert_se(fd >= 0);
+                fd = safe_close(fd);
+                assert_se(fchmodat(tfd, "ro", 0444, 0) >= 0);
+
+                /* Plain case: no XO_REGULAR. */
+                fd = xopenat_full(tfd, "ro", O_CLOEXEC, XO_AUTO_RW_RO, 0);
+                assert_se(fd >= 0);
+                ASSERT_OK_ERRNO(fl = fcntl(fd, F_GETFL));
+                assert_se((fl & O_ACCMODE) == O_RDONLY);
+                fd = safe_close(fd);
+
+                /* With XO_REGULAR (exercises the pin-via-O_PATH + reopen path). */
+                fd = xopenat_full(tfd, "ro", O_CLOEXEC, XO_AUTO_RW_RO|XO_REGULAR, 0);
+                assert_se(fd >= 0);
+                ASSERT_OK_ERRNO(fl = fcntl(fd, F_GETFL));
+                assert_se((fl & O_ACCMODE) == O_RDONLY);
+                fd = safe_close(fd);
+
+                /* Also exercise the empty-path/fd-reopen branch. */
+                _cleanup_close_ int ro_path_fd = xopenat_full(tfd, "ro", O_PATH|O_CLOEXEC, 0, 0);
+                assert_se(ro_path_fd >= 0);
+                fd = xopenat_full(ro_path_fd, "", O_CLOEXEC, XO_AUTO_RW_RO, 0);
+                assert_se(fd >= 0);
+                ASSERT_OK_ERRNO(fl = fcntl(fd, F_GETFL));
+                assert_se((fl & O_ACCMODE) == O_RDONLY);
+                fd = safe_close(fd);
+        }
+}
+
 TEST(xopenat_lock_full) {
         _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
         _cleanup_close_ int tfd = -EBADF, fd = -EBADF;
         siginfo_t si;
+        int r;
 
-        assert_se((tfd = mkdtemp_open(NULL, 0, &t)) >= 0);
+        ASSERT_OK((tfd = mkdtemp_open(NULL, 0, &t)));
 
         /* Test that we can acquire an exclusive lock on a directory in one process, remove the directory,
          * and close the file descriptor and still properly create the directory and acquire the lock in
          * another process.  */
 
-        fd = xopenat_lock_full(tfd, "abc", O_CREAT|O_DIRECTORY|O_CLOEXEC, 0, 0755, LOCK_BSD, LOCK_EX);
-        assert_se(fd >= 0);
-        assert_se(faccessat(tfd, "abc", F_OK, 0) >= 0);
-        assert_se(fd_verify_directory(fd) >= 0);
-        assert_se(xopenat_lock_full(tfd, "abc", O_DIRECTORY|O_CLOEXEC, 0, 0755, LOCK_BSD, LOCK_EX|LOCK_NB) == -EAGAIN);
+        fd = ASSERT_OK(xopenat_lock_full(tfd, "abc", O_CREAT|O_DIRECTORY|O_CLOEXEC, 0, 0755, LOCK_BSD, LOCK_EX));
+        ASSERT_OK_ERRNO(faccessat(tfd, "abc", F_OK, 0));
+        ASSERT_OK(fd_verify_directory(fd));
+        ASSERT_ERROR(xopenat_lock_full(tfd, "abc", O_DIRECTORY|O_CLOEXEC, 0, 0755, LOCK_BSD, LOCK_EX|LOCK_NB), EAGAIN);
 
-        pid_t pid = fork();
-        assert_se(pid >= 0);
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = ASSERT_OK(pidref_safe_fork("(lock)", FORK_DEATHSIG_SIGKILL|FORK_LOG, &pidref));
 
-        if (pid == 0) {
+        if (r == 0) {
                 safe_close(fd);
 
-                fd = xopenat_lock_full(tfd, "abc", O_CREAT|O_DIRECTORY|O_CLOEXEC, 0, 0755, LOCK_BSD, LOCK_EX);
-                assert_se(fd >= 0);
-                assert_se(faccessat(tfd, "abc", F_OK, 0) >= 0);
-                assert_se(fd_verify_directory(fd) >= 0);
-                assert_se(xopenat_lock_full(tfd, "abc", O_DIRECTORY|O_CLOEXEC, 0, 0755, LOCK_BSD, LOCK_EX|LOCK_NB) == -EAGAIN);
+                fd = ASSERT_OK(xopenat_lock_full(tfd, "abc", O_CREAT|O_DIRECTORY|O_CLOEXEC, 0, 0755, LOCK_BSD, LOCK_EX));
+                ASSERT_OK_ERRNO(faccessat(tfd, "abc", F_OK, 0));
+                ASSERT_OK(fd_verify_directory(fd));
+                ASSERT_ERROR(xopenat_lock_full(tfd, "abc", O_DIRECTORY|O_CLOEXEC, 0, 0755, LOCK_BSD, LOCK_EX|LOCK_NB), EAGAIN);
 
                 _exit(EXIT_SUCCESS);
         }
@@ -777,16 +922,16 @@ TEST(xopenat_lock_full) {
          * for a little and assume that's enough time for the child process to get along far enough. It
          * doesn't matter if it doesn't get far enough, in that case we just won't trigger the fallback logic
          * in xopenat_lock_full(), but the test will still succeed. */
-        assert_se(usleep_safe(20 * USEC_PER_MSEC) >= 0);
+        ASSERT_OK(usleep_safe(20 * USEC_PER_MSEC));
 
-        assert_se(unlinkat(tfd, "abc", AT_REMOVEDIR) >= 0);
+        ASSERT_OK(unlinkat(tfd, "abc", AT_REMOVEDIR));
         fd = safe_close(fd);
 
-        assert_se(wait_for_terminate(pid, &si) >= 0);
-        assert_se(si.si_code == CLD_EXITED);
+        ASSERT_OK(pidref_wait_for_terminate(&pidref, &si));
+        ASSERT_EQ(si.si_code, CLD_EXITED);
 
-        assert_se(xopenat_lock_full(tfd, "abc", 0, 0, 0755, LOCK_POSIX, LOCK_EX) == -EBADF);
-        assert_se(xopenat_lock_full(tfd, "def", O_DIRECTORY, 0, 0755, LOCK_POSIX, LOCK_EX) == -EBADF);
+        ASSERT_ERROR(xopenat_lock_full(tfd, "abc", 0, 0, 0755, LOCK_POSIX, LOCK_EX), EBADF);
+        ASSERT_ERROR(xopenat_lock_full(tfd, "def", O_DIRECTORY, 0, 0755, LOCK_POSIX, LOCK_EX), EBADF);
 }
 
 TEST(linkat_replace) {
@@ -817,11 +962,6 @@ TEST(linkat_replace) {
 
         assert_se(inode_same_at(fd2, NULL, fd2_check, NULL, AT_EMPTY_PATH) == 0);
         assert_se(inode_same_at(fd1, NULL, fd2_check, NULL, AT_EMPTY_PATH) > 0);
-}
-
-static int intro(void) {
-        arg_test_dir = saved_argv[1];
-        return EXIT_SUCCESS;
 }
 
 TEST(readlinkat_malloc) {
@@ -857,6 +997,70 @@ TEST(readlinkat_malloc) {
         ASSERT_STREQ(p, expect);
         p = mfree(p);
         q = mfree(q);
+}
+
+TEST(xat_fdroot) {
+        _cleanup_free_ char *p = NULL;
+        ASSERT_OK(fd_get_path(XAT_FDROOT, &p));
+        ASSERT_STREQ(p, "/");
+
+        _cleanup_close_ int fd = -EBADF;
+        fd = fd_reopen(XAT_FDROOT, O_CLOEXEC);
+        ASSERT_OK(fd);
+
+        ASSERT_OK_POSITIVE(path_is_root_at(XAT_FDROOT, NULL));
+        ASSERT_OK_POSITIVE(path_is_root_at(XAT_FDROOT, "."));
+        ASSERT_OK_POSITIVE(path_is_root_at(XAT_FDROOT, "/"));
+
+        ASSERT_OK_POSITIVE(path_is_root_at(fd, NULL));
+        ASSERT_OK_POSITIVE(path_is_root_at(fd, "."));
+        ASSERT_OK_POSITIVE(path_is_root_at(fd, "/"));
+
+        ASSERT_OK_POSITIVE(fds_inode_and_mount_same(fd, fd));
+        ASSERT_OK_POSITIVE(fds_inode_and_mount_same(XAT_FDROOT, XAT_FDROOT));
+        ASSERT_OK_POSITIVE(fds_inode_and_mount_same(fd, XAT_FDROOT));
+        ASSERT_OK_POSITIVE(fds_inode_and_mount_same(XAT_FDROOT, fd));
+
+        ASSERT_OK_POSITIVE(dir_fd_is_root(XAT_FDROOT));
+        ASSERT_OK_POSITIVE(dir_fd_is_root(fd));
+
+        ASSERT_OK_POSITIVE(dir_fd_is_root_or_cwd(XAT_FDROOT));
+        ASSERT_OK_POSITIVE(dir_fd_is_root_or_cwd(AT_FDCWD));
+        ASSERT_OK_POSITIVE(dir_fd_is_root_or_cwd(fd));
+
+        ASSERT_OK(access_fd(XAT_FDROOT, F_OK));
+        ASSERT_OK(access_fd(fd, F_OK));
+
+        fd = safe_close(fd);
+        fd = xopenat(XAT_FDROOT, ".", O_RDONLY);
+        ASSERT_OK(fd);
+
+        fd = safe_close(fd);
+        fd = xopenat(XAT_FDROOT, "/", O_RDONLY);
+        ASSERT_OK(fd);
+
+        ASSERT_OK(fd_verify_directory(fd));
+        ASSERT_OK(fd_verify_directory(XAT_FDROOT));
+
+        ASSERT_OK(fd_verify_linked(fd));
+        ASSERT_OK(fd_verify_linked(XAT_FDROOT));
+
+        int a = fd_is_read_only_fs(fd);
+        ASSERT_OK(a);
+        int b = fd_is_read_only_fs(XAT_FDROOT);
+        ASSERT_OK(b);
+        ASSERT_EQ(a, b);
+
+        a = fd_is_temporary_fs(fd);
+        ASSERT_OK(a);
+        b = fd_is_temporary_fs(XAT_FDROOT);
+        ASSERT_OK(b);
+        ASSERT_EQ(a, b);
+}
+
+static int intro(void) {
+        arg_test_dir = saved_argv[1];
+        return EXIT_SUCCESS;
 }
 
 DEFINE_TEST_MAIN_WITH_INTRO(LOG_INFO, intro);

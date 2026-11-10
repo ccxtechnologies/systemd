@@ -41,6 +41,7 @@
         <constant>SD_PATH_SYSTEM_STATE_FACTORY</constant>,
 
         <constant>SD_PATH_SYSTEM_CONFIGURATION</constant>,
+        <constant>SD_PATH_SYSTEM_SEARCH_CONFIGURATION</constant>,
         <constant>SD_PATH_SYSTEM_RUNTIME</constant>,
         <constant>SD_PATH_SYSTEM_RUNTIME_LOGS</constant>,
         <constant>SD_PATH_SYSTEM_STATE_PRIVATE</constant>,
@@ -67,6 +68,7 @@
         <constant>SD_PATH_USER_PUBLIC</constant>,
         <constant>SD_PATH_USER_TEMPLATES</constant>,
         <constant>SD_PATH_USER_DESKTOP</constant>,
+        <constant>SD_PATH_USER_PROJECTS</constant>,
 
         <constant>SD_PATH_SEARCH_BINARIES</constant>,
         <constant>SD_PATH_SEARCH_BINARIES_DEFAULT</constant>,

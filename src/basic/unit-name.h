@@ -56,8 +56,9 @@ int unit_name_from_path_instance(const char *prefix, const char *path, const cha
 int unit_name_to_path(const char *name, char **ret);
 
 typedef enum UnitNameMangle {
-        UNIT_NAME_MANGLE_GLOB = 1 << 0,
-        UNIT_NAME_MANGLE_WARN = 1 << 1,
+        UNIT_NAME_MANGLE_GLOB   = 1 << 0,
+        UNIT_NAME_MANGLE_WARN   = 1 << 1,
+        UNIT_NAME_MANGLE_STRICT = 1 << 2, /* Refuse if the resolved unit type doesn't match the requested suffix */
 } UnitNameMangle;
 
 int unit_name_mangle_with_suffix(const char *name, const char *operation, UnitNameMangle flags, const char *suffix, char **ret);
@@ -67,7 +68,7 @@ static inline int unit_name_mangle(const char *name, UnitNameMangle flags, char 
 }
 
 int slice_build_parent_slice(const char *slice, char **ret);
-int slice_build_subslice(const char *slice, const char *name, char **subslice);
+int slice_build_subslice(const char *slice, const char *name, char **ret);
 bool slice_name_is_valid(const char *name);
 
 bool unit_name_prefix_equal(const char *a, const char *b);

@@ -25,6 +25,7 @@
 #include "conf-files.h"
 #include "constants.h"
 #include "daemon-util.h"
+#include "dlopen-note.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -45,6 +46,7 @@
 #include "time-util.h"
 #include "unit-def.h"
 #include "unit-name.h"
+#include "verbs.h"
 
 #define NULL_ADJTIME_UTC "0.0 0 0\n0\nUTC\n"
 #define NULL_ADJTIME_LOCAL "0.0 0 0\n0\nLOCAL\n"
@@ -184,7 +186,9 @@ static int context_parse_ntp_services_from_disk(Context *c) {
         _cleanup_strv_free_ char **files = NULL;
         int r;
 
-        r = conf_files_list_strv(&files, ".list", NULL, CONF_FILES_FILTER_MASKED, UNIT_LIST_DIRS);
+        r = conf_files_list_strv(&files, ".list", /* root= */ NULL,
+                                 CONF_FILES_FILTER_MASKED | CONF_FILES_WARN,
+                                 UNIT_LIST_DIRS);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate .list files: %m");
 
@@ -308,7 +312,7 @@ static int context_write_data_timezone(Context *c) {
         }
 
         return symlinkat_atomic_full(source, AT_FDCWD, etc_localtime(),
-                                     !secure_getenv("SYSTEMD_ETC_LOCALTIME"));
+                                     !secure_getenv("SYSTEMD_ETC_LOCALTIME") ? SYMLINK_MAKE_RELATIVE : 0);
 }
 
 static const char* etc_adjtime(void) {
@@ -669,6 +673,7 @@ static int property_get_ntp(
 
 static int method_set_timezone(sd_bus_message *m, void *userdata, sd_bus_error *error) {
         Context *c = ASSERT_PTR(userdata);
+        _cleanup_free_ char *old_zone = NULL, *zone = NULL;
         int interactive, r;
         const char *z;
 
@@ -691,19 +696,24 @@ static int method_set_timezone(sd_bus_message *m, void *userdata, sd_bus_error *
                         /* good_user= */ UID_INVALID,
                         interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
         if (r == 0)
                 return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
-        r = free_and_strdup(&c->zone, z);
-        if (r < 0)
-                return r;
+        zone = strdup(z);
+        if (!zone)
+                return -ENOMEM;
+
+        old_zone = TAKE_PTR(c->zone);
+        c->zone = TAKE_PTR(zone);
 
         /* 1. Write new configuration file */
         r = context_write_data_timezone(c);
         if (r < 0) {
+                free_and_replace(c->zone, old_zone);
                 log_error_errno(r, "Failed to set time zone: %m");
                 return sd_bus_error_set_errnof(error, r, "Failed to set time zone: %m");
         }
@@ -733,9 +743,9 @@ static int method_set_timezone(sd_bus_message *m, void *userdata, sd_bus_error *
         log_struct(LOG_INFO,
                    LOG_MESSAGE_ID(SD_MESSAGE_TIMEZONE_CHANGE_STR),
                    LOG_ITEM("TIMEZONE=%s", c->zone),
-                   LOG_ITEM("TIMEZONE_SHORTNAME=%s", tzname[daylight]),
+                   LOG_ITEM("TIMEZONE_SHORTNAME=%s", get_tzname(daylight)),
                    LOG_ITEM("DAYLIGHT=%i", daylight),
-                   LOG_MESSAGE("Changed time zone to '%s' (%s).", c->zone, tzname[daylight]));
+                   LOG_MESSAGE("Changed time zone to '%s' (%s).", c->zone, get_tzname(daylight)));
 
         (void) sd_bus_emit_properties_changed(sd_bus_message_get_bus(m),
                                               "/org/freedesktop/timedate1", "org.freedesktop.timedate1", "Timezone",
@@ -766,6 +776,7 @@ static int method_set_local_rtc(sd_bus_message *m, void *userdata, sd_bus_error 
                         /* good_user= */ UID_INVALID,
                         interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -773,11 +784,14 @@ static int method_set_local_rtc(sd_bus_message *m, void *userdata, sd_bus_error 
                 return 1;
 
         if (lrtc != c->local_rtc) {
+                bool old_local_rtc = c->local_rtc;
+
                 c->local_rtc = lrtc;
 
                 /* 1. Write new configuration file */
                 r = context_write_data_local_rtc(c);
                 if (r < 0) {
+                        c->local_rtc = old_local_rtc;
                         log_error_errno(r, "Failed to set RTC to %s: %m", lrtc ? "local" : "UTC");
                         return sd_bus_error_set_errnof(error, r, "Failed to set RTC to %s: %m", lrtc ? "local" : "UTC");
                 }
@@ -891,7 +905,7 @@ static int method_set_time(sd_bus_message *m, void *userdata, sd_bus_error *erro
         } else
                 timespec_store(&ts, (usec_t) utc);
 
-        /* refuse the request when the time is before systemd build date time*/
+        /* refuse the request when the time is before systemd build date time */
         if (ts.tv_sec < TIME_EPOCH)
                 return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Requested to set the clock to time before build time, refusing.");
 
@@ -902,6 +916,7 @@ static int method_set_time(sd_bus_message *m, void *userdata, sd_bus_error *erro
                         /* good_user= */ UID_INVALID,
                         interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -968,6 +983,7 @@ static int method_set_ntp(sd_bus_message *m, void *userdata, sd_bus_error *error
                         /* good_user= */ UID_INVALID,
                         interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -1107,7 +1123,7 @@ static const sd_bus_vtable timedate_vtable[] = {
         SD_BUS_VTABLE_END,
 };
 
-const BusObjectImplementation manager_object = {
+static const BusObjectImplementation manager_object = {
         "/org/freedesktop/timedate1",
         "org.freedesktop.timedate1",
         .vtables = BUS_VTABLES(timedate_vtable),
@@ -1152,18 +1168,29 @@ static bool context_check_idle(void *userdata) {
         return hashmap_isempty(c->polkit_registry);
 }
 
+COMMAND(
+        "systemd-timedated\0",
+        "Manage the system clock and timezone and NTP enablement.",
+        .man_pages = "systemd-timedated.service(8)\0",
+        .option_namespace = "service",
+        .option_groups =
+                "Options\0"
+                "Bus introspection\0",
+);
+
 static int run(int argc, char *argv[]) {
         _cleanup_(context_clear) Context context = {};
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
+        LIBSELINUX_NOTE(recommended);
+
         log_setup();
 
-        r = service_parse_argv("systemd-timedated.service",
-                               "Manage the system clock and timezone and NTP enablement.",
-                               BUS_IMPLEMENTATIONS(&manager_object,
+        r = service_parse_argv(BUS_IMPLEMENTATIONS(&manager_object,
                                                    &log_control_object),
+                               /* runtime_scope= */ NULL,
                                argc, argv);
         if (r <= 0)
                 return r;

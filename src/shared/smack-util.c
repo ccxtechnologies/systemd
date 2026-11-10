@@ -13,7 +13,6 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "label.h"
 #include "label-util.h"
 #include "log.h"
 #include "path-util.h"
@@ -64,7 +63,7 @@ int mac_smack_read_at(int fd, const char *path, SmackAttr attr, char **ret) {
                 return 0;
         }
 
-        return getxattr_at_malloc(fd, path, smack_attr_to_string(attr), /* at_flags = */ 0, ret, /* ret_size= */ NULL);
+        return getxattr_at_malloc(fd, path, smack_attr_to_string(attr), /* at_flags= */ 0, ret, /* ret_size= */ NULL);
 #else
         return -EOPNOTSUPP;
 #endif
@@ -79,9 +78,9 @@ int mac_smack_apply_at(int fd, const char *path, SmackAttr attr, const char *lab
                 return 0;
 
         if (!label)
-                return xremovexattr(fd, path, /* at_flags = */ 0, smack_attr_to_string(attr));
+                return xremovexattr(fd, path, /* at_flags= */ 0, smack_attr_to_string(attr));
 
-        return xsetxattr(fd, path, /* at_flags = */ 0, smack_attr_to_string(attr), label);
+        return xsetxattr(fd, path, /* at_flags= */ 0, smack_attr_to_string(attr), label);
 #else
         return 0;
 #endif
@@ -142,23 +141,15 @@ static int smack_fix_fd(
         else
                 return 0;
 
-        r = xsetxattr(fd, /* path = */ NULL, AT_EMPTY_PATH, "security.SMACK64", label);
+        r = xsetxattr(fd, /* path= */ NULL, AT_EMPTY_PATH, "security.SMACK64", label);
         if (ERRNO_IS_NEG_NOT_SUPPORTED(r)) /* If the FS doesn't support labels, then exit without warning */
                 return 0;
         if (r == -EROFS && FLAGS_SET(flags, LABEL_IGNORE_EROFS)) /* If the FS is read-only and we were told
                                                                     to ignore failures caused by that,
                                                                     suppress error */
                 return 0;
-        if (r < 0) {
-                /* If the old label is identical to the new one, suppress any kind of error */
-                _cleanup_free_ char *old_label = NULL;
-
-                if (fgetxattr_malloc(fd, "security.SMACK64", &old_label, /* ret_size= */ NULL) >= 0 &&
-                    streq(old_label, label))
-                        return 0;
-
+        if (r < 0)
                 return log_debug_errno(r, "Unable to fix SMACK label of '%s': %m", label_path);
-        }
 
         return 0;
 }
@@ -230,11 +221,11 @@ int renameat_and_apply_smack_floor_label(int fdf, const char *from, int fdt, con
 #endif
 }
 
-static int mac_smack_label_pre(int dir_fd, const char *path, mode_t mode) {
+static int mac_smack_label_pre(int dir_fd, const char *path, mode_t mode, LabelContext *label_context) {
         return 0;
 }
 
-static int mac_smack_label_post(int dir_fd, const char *path, bool created) {
+static int mac_smack_label_post(int dir_fd, const char *path, bool created, LabelContext *label_context) {
         if (!created)
                 return 0;
 

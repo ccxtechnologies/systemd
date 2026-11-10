@@ -12,8 +12,8 @@ libefitest = static_library(
         ),
         build_by_default : false,
         include_directories : [
-                basic_includes,
                 include_directories('.'),
+                basic_includes,
         ],
         implicit_include_directories : false,
         dependencies : userspace)
@@ -29,12 +29,15 @@ efi_fuzz_template = fuzz_template + efitest_base
 
 if conf.get('ENABLE_UKIFY') == 1
         test_hwids_section_c = custom_target(
-                input : ['hwids/device1.json', 'hwids/device2.json', 'hwids/device3.json', 'hwids/device4.json'],
+                input : ['hwids/test/device1.json', 'hwids/test/device2.json', 'hwids/test/device3.json', 'hwids/test/device4.json'],
                 output : 'test-hwids-section.c',
                 command : [files('generate-hwids-section.py'),
-                           meson.current_source_dir()/'hwids'],
+                           meson.current_source_dir()/'hwids/test'],
                 capture : true,
                 build_by_default : want_tests != 'false')
+        install_subdir('hwids',
+                       install_dir : libexecdir / 'boot/',
+                       exclude_directories : ['test'])
 else
         test_hwids_section_c = []
 endif
@@ -77,8 +80,14 @@ endif
 efi_conf = configuration_data()
 
 # import several configs from userspace
-foreach name : ['HAVE_WARNING_ZERO_LENGTH_BOUNDS', 'HAVE_WARNING_ZERO_AS_NULL_POINTER_CONSTANT']
-        efi_conf.set10(name, conf.get(name) == 1)
+foreach name : ['HAVE_WARNING_ZERO_LENGTH_BOUNDS',
+                'HAVE_WARNING_ZERO_AS_NULL_POINTER_CONSTANT']
+        efi_conf.set(name, conf.get(name))
+endforeach
+
+foreach attr : possible_c_attributes
+        name = 'HAVE_ATTRIBUTE_' + attr.to_upper()
+        efi_conf.set(name, conf.get(name))
 endforeach
 
 efi_conf.set10('ENABLE_TPM', get_option('tpm'))
@@ -132,16 +141,19 @@ elif get_option('sbat-distro') != ''
         endif
 endif
 
-summary({'UEFI architectures' : efi_arch + (efi_arch_alt == '' ? '' : ', ' + efi_arch_alt)},
+summary({
+                'UEFI architectures' : efi_arch + (efi_arch_alt == '' ? '' : ', ' + efi_arch_alt)
+        },
         section : 'UEFI')
 
 if efi_conf.get('SBAT_DISTRO', '') != ''
         summary({
-                'SBAT distro':              efi_conf.get('SBAT_DISTRO'),
-                'SBAT distro generation':   efi_conf.get('SBAT_DISTRO_GENERATION'),
-                'SBAT distro version':      efi_conf.get('SBAT_DISTRO_VERSION'),
-                'SBAT distro summary':      efi_conf.get('SBAT_DISTRO_SUMMARY'),
-                'SBAT distro URL':          efi_conf.get('SBAT_DISTRO_URL')},
+                        'SBAT distro'            : efi_conf.get('SBAT_DISTRO'),
+                        'SBAT distro generation' : efi_conf.get('SBAT_DISTRO_GENERATION'),
+                        'SBAT distro version'    : efi_conf.get('SBAT_DISTRO_VERSION'),
+                        'SBAT distro summary'    : efi_conf.get('SBAT_DISTRO_SUMMARY'),
+                        'SBAT distro URL'        : efi_conf.get('SBAT_DISTRO_URL')
+                },
                 section : 'UEFI')
 endif
 
@@ -152,8 +164,8 @@ configure_file(
 ############################################################
 
 efi_includes = [
-        fundamental_include,
         include_directories('.'),
+        fundamental_include,
         version_include,
 ]
 
@@ -177,6 +189,11 @@ efi_c_args += cc.get_supported_arguments(
 # certainly has the means to do their own dev build.
 if get_option('mode') == 'developer' and get_option('debug')
         efi_c_args += '-DEFI_DEBUG'
+endif
+
+if get_option('libc') == 'musl'
+        # To make musl not define wchar_t as int, rather than short.
+        efi_c_args += '-D__DEFINED_wchar_t'
 endif
 
 efi_c_ld_args = [
@@ -204,7 +221,7 @@ efi_c_ld_args = [
 ]
 
 linker_sanity_code = 'void a(void) {}; void _start(void) { a(); }'
-linker_sanity_args = ['-nostdlib', '-Wl,--fatal-warnings']
+linker_sanity_args = ['-nostdlib', '-Wl,--fatal-warnings', '-fno-stack-protector']
 
 # Check if libgcc is available and then use it. It is needed for gcc builds
 # and for ia32 builds with clang.
@@ -249,10 +266,13 @@ if cc.get_id() == 'clang'
 endif
 
 efi_arch_c_args = {
-        'aarch64'     : ['-mgeneral-regs-only'],
+        'aarch64'     : ['-mgeneral-regs-only', '-ffixed-x18'],
         'arm'         : ['-mgeneral-regs-only'],
         # Until -mgeneral-regs-only is supported in LoongArch, use the following option instead:
         'loongarch64' : ['-mno-lsx', '-mno-lasx'],
+        # Assume F/D is usable on RISC-V because they're difficult to disable
+        'riscv32'     : ['-march=rv32imafdc_zicsr_zifencei'],
+        'riscv64'     : ['-march=rv64imafdc_zicsr_zifencei'],
         # Pass -m64/32 explicitly to make building on x32 work.
         'x86_64'      : ['-m64', '-march=x86-64', '-mno-red-zone', '-mgeneral-regs-only'],
         'x86'         : ['-m32', '-march=i686', '-mgeneral-regs-only', '-malign-double'],
@@ -292,6 +312,7 @@ endif
 libefi_sources = files(
         'chid.c',
         'console.c',
+        'cpio.c',
         'device-path-util.c',
         'devicetree.c',
         'drivers.c',
@@ -302,8 +323,10 @@ libefi_sources = files(
         'efi-string.c',
         'export-vars.c',
         'graphics.c',
+        'hii.c',
         'initrd.c',
         'measure.c',
+        'measure-smbios.c',
         'part-discovery.c',
         'pe.c',
         'random-seed.c',
@@ -323,7 +346,7 @@ systemd_boot_sources = files(
 )
 
 stub_sources = files(
-        'cpio.c',
+        'boot-secret.c',
         'linux.c',
         'splash.c',
         'stub.c',
@@ -448,12 +471,12 @@ foreach efi_elf_binary : efi_elf_binaries
                 install_tag : 'systemd-boot',
                 command : [
                         elf2efi_py,
-                        '--version-major=' + project_major_version,
-                        '--version-minor=' + project_minor_version,
+                        f'--version-major=@project_major_version@',
+                        f'--version-minor=@project_minor_version@',
                         '--efi-major=1',
                         '--efi-minor=1',
                         '--subsystem=10',
-                        '--minimum-sections=@0@'.format(minimum_sections),
+                        f'--minimum-sections=@minimum_sections@',
                         '--copy-sections=.sbat,.sdmagic,.osrel',
                         '@INPUT@',
                         '@OUTPUT@',
@@ -464,11 +487,11 @@ foreach efi_elf_binary : efi_elf_binaries
         endif
 
         # This is supposed to match exactly one time
-        if name == 'addon@0@.efi.stub'.format(efi_arch)
+        if name == f'addon@efi_arch@.efi.stub'
                 efi_addon = [exe]
         endif
 
-        test('check-alignment-@0@'.format(name),
+        test(f'check-alignment-@name@',
              check_efi_alignment_py,
              args : exe,
              suite : 'boot')

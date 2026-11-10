@@ -10,8 +10,7 @@ typedef enum HostnameSource {
         _HOSTNAME_INVALID = -EINVAL,
 } HostnameSource;
 
-const char* hostname_source_to_string(HostnameSource source) _const_;
-HostnameSource hostname_source_from_string(const char *str) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(hostname_source, HostnameSource);
 
 int sethostname_idempotent(const char *s);
 
@@ -21,11 +20,18 @@ int read_etc_hostname_stream(FILE *f, bool substitute_wildcards, char **ret);
 int read_etc_hostname(const char *path, bool substitute_wildcards, char **ret);
 
 void hostname_update_source_hint(const char *hostname, HostnameSource source);
+/* Returns > 0 if the hostname is the default we recorded in /run earlier, 0 if not (or if no default was
+ * recorded), and a negative errno if the recorded value could not be read. */
+int hostname_matches_default(const char *hostname);
 int hostname_setup(bool really);
 
-int hostname_substitute_wildcards(char *name);
+int hostname_pick_word(sd_id128_t mid, size_t pos, char **ret);
+int hostname_substitute_wildcards(const char *name, char **ret);
 
-char* get_default_hostname(void);
+/* Returns the default hostname with '?'/'$' wildcards expanded, or a negative errno if the expansion
+ * fails. get_default_hostname_or_fallback() hides such failures behind FALLBACK_HOSTNAME instead. */
+int get_default_hostname(char **ret);
+char* get_default_hostname_or_fallback(void);
 
 typedef enum GetHostnameFlags {
         GET_HOSTNAME_ALLOW_LOCALHOST  = 1 << 0, /* accepts "localhost" or friends. */
@@ -56,3 +62,5 @@ static inline char* gethostname_short_malloc(void) {
 
         return s;
 }
+
+int pidref_gethostname_full(PidRef *pidref, GetHostnameFlags flags, char **ret);

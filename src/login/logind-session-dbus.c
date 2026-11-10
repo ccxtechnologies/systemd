@@ -117,7 +117,7 @@ static int property_get_idle_hint(
         assert(bus);
         assert(reply);
 
-        return sd_bus_message_append(reply, "b", session_get_idle_hint(s, NULL) > 0);
+        return sd_bus_message_append(reply, "b", session_get_idle_hint(s, /* ret_timestamp= */ NULL));
 }
 
 static int property_get_can_idle(
@@ -164,16 +164,13 @@ static int property_get_idle_since_hint(
                 sd_bus_error *error) {
 
         Session *s = ASSERT_PTR(userdata);
-        dual_timestamp t = DUAL_TIMESTAMP_NULL;
+        dual_timestamp t;
         uint64_t u;
-        int r;
 
         assert(bus);
         assert(reply);
 
-        r = session_get_idle_hint(s, &t);
-        if (r < 0)
-                return r;
+        session_get_idle_hint(s, &t);
 
         u = streq(property, "IdleSinceHint") ? t.realtime : t.monotonic;
 
@@ -210,13 +207,14 @@ int bus_session_method_terminate(sd_bus_message *message, void *userdata, sd_bus
                         s->user->user_record->uid,
                         /* flags= */ 0,
                         &s->manager->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = session_stop(s, /* force = */ true);
+        r = session_stop(s, /* force= */ true);
         if (r < 0)
                 return r;
 
@@ -255,6 +253,7 @@ int bus_session_method_lock(sd_bus_message *message, void *userdata, sd_bus_erro
                         s->user->user_record->uid,
                         /* flags= */ 0,
                         &s->manager->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -365,6 +364,7 @@ int bus_session_method_kill(sd_bus_message *message, void *userdata, sd_bus_erro
                         s->user->user_record->uid,
                         /* flags= */ 0,
                         &s->manager->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -531,8 +531,8 @@ static int method_set_display(sd_bus_message *message, void *userdata, sd_bus_er
 
 static int method_set_tty(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Session *s = ASSERT_PTR(userdata);
-        int fd, r, flags;
         _cleanup_free_ char *q = NULL;
+        int fd, r;
 
         assert(message);
 
@@ -543,15 +543,11 @@ static int method_set_tty(sd_bus_message *message, void *userdata, sd_bus_error 
         if (!session_is_controller(s, sd_bus_message_get_sender(message)))
                 return sd_bus_error_set(error, BUS_ERROR_NOT_IN_CONTROL, "You must be in control of this session to set tty");
 
-        assert(fd >= 0);
-
-        flags = fcntl(fd, F_GETFL, 0);
-        if (flags < 0)
-                return -errno;
-        if ((flags & O_ACCMODE_STRICT) != O_RDWR)
+        r = fd_vet_accmode(fd, O_RDWR);
+        if (r == -EPROTOTYPE)
                 return -EACCES;
-        if (FLAGS_SET(flags, O_PATH))
-                return -ENOTTY;
+        if (r < 0)
+                return r;
 
         r = getttyname_malloc(fd, &q);
         if (r < 0)
@@ -587,8 +583,7 @@ static int method_take_device(sd_bus_message *message, void *userdata, sd_bus_er
                 return sd_bus_error_set(error, BUS_ERROR_NOT_IN_CONTROL, "You are not in control of this session");
 
         dev = makedev(major, minor);
-        sd = hashmap_get(s->devices, &dev);
-        if (sd)
+        if (hashmap_contains(s->devices, &dev))
                 /* We don't allow retrieving a device multiple times.
                  * The related ReleaseDevice call is not ref-counted.
                  * The caller should use dup() if it requires more
@@ -989,6 +984,7 @@ static const sd_bus_vtable session_vtable[] = {
         SD_BUS_PROPERTY("Remote", "b", bus_property_get_bool, offsetof(Session, remote), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RemoteHost", "s", NULL, offsetof(Session, remote_host), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RemoteUser", "s", NULL, offsetof(Session, remote_user), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("ExtraDeviceAccess", "as", NULL, offsetof(Session, extra_device_access), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Service", "s", NULL, offsetof(Session, service), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Desktop", "s", NULL, offsetof(Session, desktop), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Scope", "s", NULL, offsetof(Session, scope), SD_BUS_VTABLE_PROPERTY_CONST),

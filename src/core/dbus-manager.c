@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <linux/capability.h>
-#include <sys/prctl.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
@@ -66,7 +65,7 @@ static BUS_DEFINE_PROPERTY_GET_GLOBAL(property_get_version, "s", GIT_VERSION);
 static BUS_DEFINE_PROPERTY_GET_GLOBAL(property_get_features, "s", systemd_features);
 static BUS_DEFINE_PROPERTY_GET_GLOBAL(property_get_architecture, "s", architecture_to_string(uname_architecture()));
 static BUS_DEFINE_PROPERTY_GET2(property_get_system_state, "s", Manager, manager_state, manager_state_to_string);
-static BUS_DEFINE_PROPERTY_GET_GLOBAL(property_get_timer_slack_nsec, "t", (uint64_t) prctl(PR_GET_TIMERSLACK));
+static BUS_DEFINE_PROPERTY_GET_GLOBAL(property_get_timer_slack_nsec, "t", proc_get_timerslack());
 static BUS_DEFINE_PROPERTY_GET_REF(property_get_hashmap_size, "u", Hashmap *, hashmap_size);
 static BUS_DEFINE_PROPERTY_GET_REF(property_get_set_size, "u", Set *, set_size);
 static BUS_DEFINE_PROPERTY_GET(property_get_default_timeout_abort_usec, "t", Manager, manager_default_timeout_abort_usec);
@@ -82,7 +81,7 @@ static int property_get_virtualization(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Virtualization v;
 
@@ -108,7 +107,7 @@ static int property_get_confidential_virtualization(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         ConfidentialVirtualization v;
 
@@ -129,7 +128,7 @@ static int property_get_tainted(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         assert(bus);
         assert(reply);
@@ -148,7 +147,7 @@ static int property_set_log_target(
                 const char *property,
                 sd_bus_message *value,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Manager *m = userdata;
         const char *t;
@@ -168,7 +167,7 @@ static int property_set_log_target(
 
                 target = log_target_from_string(t);
                 if (target < 0)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid log target '%s'", t);
+                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Invalid log target '%s'", t);
 
                 manager_override_log_target(m, target);
         }
@@ -183,7 +182,7 @@ static int property_set_log_level(
                 const char *property,
                 sd_bus_message *value,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Manager *m = userdata;
         const char *t;
@@ -203,7 +202,7 @@ static int property_set_log_level(
 
                 level = log_level_from_string(t);
                 if (level < 0)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid log level '%s'", t);
+                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Invalid log level '%s'", t);
 
                 manager_override_log_level(m, level);
         }
@@ -218,7 +217,7 @@ static int property_get_environment(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         _cleanup_strv_free_ char **l = NULL;
         Manager *m = ASSERT_PTR(userdata);
@@ -241,7 +240,7 @@ static int property_get_show_status(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Manager *m = ASSERT_PTR(userdata);
 
@@ -258,7 +257,7 @@ static int property_get_runtime_watchdog(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Manager *m = ASSERT_PTR(userdata);
 
@@ -275,7 +274,7 @@ static int property_get_pretimeout_watchdog(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Manager *m = ASSERT_PTR(userdata);
 
@@ -292,7 +291,7 @@ static int property_get_pretimeout_watchdog_governor(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Manager *m = ASSERT_PTR(userdata);
 
@@ -309,7 +308,7 @@ static int property_get_reboot_watchdog(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Manager *m = ASSERT_PTR(userdata);
 
@@ -326,7 +325,7 @@ static int property_get_kexec_watchdog(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Manager *m = ASSERT_PTR(userdata);
 
@@ -360,7 +359,7 @@ static int property_set_runtime_watchdog(
                 const char *property,
                 sd_bus_message *value,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         return property_set_watchdog(userdata, WATCHDOG_RUNTIME, value);
 }
@@ -372,7 +371,7 @@ static int property_set_pretimeout_watchdog(
                 const char *property,
                 sd_bus_message *value,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         return property_set_watchdog(userdata, WATCHDOG_PRETIMEOUT, value);
 }
@@ -384,16 +383,19 @@ static int property_set_pretimeout_watchdog_governor(
                 const char *property,
                 sd_bus_message *value,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Manager *m = ASSERT_PTR(userdata);
-        char *governor;
+        const char *governor;
         int r;
 
         r = sd_bus_message_read(value, "s", &governor);
         if (r < 0)
                 return r;
-        if (!string_is_safe(governor))
+
+        if (isempty(governor))
+                governor = NULL;
+        else if (!string_is_safe(governor, /* flags= */ 0))
                 return -EINVAL;
 
         return manager_override_watchdog_pretimeout_governor(m, governor);
@@ -406,7 +408,7 @@ static int property_set_reboot_watchdog(
                 const char *property,
                 sd_bus_message *value,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         return property_set_watchdog(userdata, WATCHDOG_REBOOT, value);
 }
@@ -418,7 +420,7 @@ static int property_set_kexec_watchdog(
                 const char *property,
                 sd_bus_message *value,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         _unused_ Manager *m = ASSERT_PTR(userdata);
 
@@ -435,7 +437,7 @@ static int property_get_oom_score_adjust(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Manager *m = ASSERT_PTR(userdata);
         int r, n;
@@ -455,7 +457,36 @@ static int property_get_oom_score_adjust(
         return sd_bus_message_append(reply, "i", n);
 }
 
-static int bus_get_unit_by_name(Manager *m, sd_bus_message *message, const char *name, Unit **ret_unit, sd_bus_error *error) {
+static int property_get_transactions_with_cycle(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *reterr_error) {
+
+        Manager *m = ASSERT_PTR(userdata);
+        int r;
+
+        assert(bus);
+        assert(reply);
+
+        r = sd_bus_message_open_container(reply, 'a', "t");
+        if (r < 0)
+                return r;
+
+        uint64_t *id;
+        SET_FOREACH(id, m->transactions_with_cycle) {
+                r = sd_bus_message_append_basic(reply, 't', id);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_bus_message_close_container(reply);
+}
+
+static int bus_get_unit_by_name(Manager *m, sd_bus_message *message, const char *name, Unit **ret_unit, sd_bus_error *reterr_error) {
         Unit *u;
         int r;
 
@@ -475,18 +506,18 @@ static int bus_get_unit_by_name(Manager *m, sd_bus_message *message, const char 
 
                 u = manager_get_unit_by_pidref(m, &pidref);
                 if (!u)
-                        return sd_bus_error_set(error, BUS_ERROR_NO_SUCH_UNIT, "Client not member of any unit.");
+                        return sd_bus_error_set(reterr_error, BUS_ERROR_NO_SUCH_UNIT, "Client not member of any unit.");
         } else {
                 u = manager_get_unit(m, name);
                 if (!u)
-                        return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_UNIT, "Unit %s not loaded.", name);
+                        return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_SUCH_UNIT, "Unit %s not loaded.", name);
         }
 
         *ret_unit = u;
         return 0;
 }
 
-static int bus_load_unit_by_name(Manager *m, sd_bus_message *message, const char *name, Unit **ret_unit, sd_bus_error *error) {
+static int bus_load_unit_by_name(Manager *m, sd_bus_message *message, const char *name, Unit **ret_unit, sd_bus_error *reterr_error) {
         assert(m);
         assert(message);
         assert(ret_unit);
@@ -494,19 +525,19 @@ static int bus_load_unit_by_name(Manager *m, sd_bus_message *message, const char
         /* Pretty much the same as bus_get_unit_by_name(), but we also load the unit if necessary. */
 
         if (isempty(name))
-                return bus_get_unit_by_name(m, message, name, ret_unit, error);
+                return bus_get_unit_by_name(m, message, name, ret_unit, reterr_error);
 
-        return manager_load_unit(m, name, NULL, error, ret_unit);
+        return manager_load_unit(m, name, NULL, reterr_error, ret_unit);
 }
 
-static int reply_unit_path(Unit *u, sd_bus_message *message, sd_bus_error *error) {
+static int reply_unit_path(Unit *u, sd_bus_message *message, sd_bus_error *reterr_error) {
         _cleanup_free_ char *path = NULL;
         int r;
 
         assert(u);
         assert(message);
 
-        r = mac_selinux_unit_access_check(u, message, "status", error);
+        r = mac_selinux_unit_access_check(u, message, "status", reterr_error);
         if (r < 0)
                 return r;
 
@@ -517,7 +548,7 @@ static int reply_unit_path(Unit *u, sd_bus_message *message, sd_bus_error *error
         return sd_bus_reply_method_return(message, "o", path);
 }
 
-static int method_get_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_get_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         const char *name;
         Unit *u;
@@ -531,14 +562,14 @@ static int method_get_unit(sd_bus_message *message, void *userdata, sd_bus_error
         if (r < 0)
                 return r;
 
-        r = bus_get_unit_by_name(m, message, name, &u, error);
+        r = bus_get_unit_by_name(m, message, name, &u, reterr_error);
         if (r < 0)
                 return r;
 
-        return reply_unit_path(u, message, error);
+        return reply_unit_path(u, message, reterr_error);
 }
 
-static int method_get_unit_by_pid(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_get_unit_by_pid(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
         Unit *u;
@@ -554,7 +585,7 @@ static int method_get_unit_by_pid(sd_bus_message *message, void *userdata, sd_bu
         if (r < 0)
                 return r;
         if (pidref.pid < 0)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid PID " PID_FMT, pidref.pid);
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Invalid PID " PID_FMT, pidref.pid);
         if (pidref.pid == 0) {
                 r = bus_query_sender_pidref(message, &pidref);
                 if (r < 0)
@@ -563,12 +594,12 @@ static int method_get_unit_by_pid(sd_bus_message *message, void *userdata, sd_bu
 
         u = manager_get_unit_by_pidref(m, &pidref);
         if (!u)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_UNIT_FOR_PID, "PID "PID_FMT" does not belong to any loaded unit.", pidref.pid);
+                return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_UNIT_FOR_PID, "PID "PID_FMT" does not belong to any loaded unit.", pidref.pid);
 
-        return reply_unit_path(u, message, error);
+        return reply_unit_path(u, message, reterr_error);
 }
 
-static int method_get_unit_by_invocation_id(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_get_unit_by_invocation_id(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_free_ char *path = NULL;
         Manager *m = ASSERT_PTR(userdata);
         sd_id128_t id;
@@ -580,7 +611,7 @@ static int method_get_unit_by_invocation_id(sd_bus_message *message, void *userd
         /* Anyone can call this method */
 
         if (bus_message_read_id128(message, &id) < 0)
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid invocation ID");
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Invalid invocation ID");
 
         if (sd_id128_is_null(id)) {
                 _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
@@ -591,15 +622,15 @@ static int method_get_unit_by_invocation_id(sd_bus_message *message, void *userd
 
                 u = manager_get_unit_by_pidref(m, &pidref);
                 if (!u)
-                        return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_UNIT,
+                        return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_SUCH_UNIT,
                                                  "Client " PID_FMT " not member of any unit.", pidref.pid);
         } else {
                 u = hashmap_get(m->units_by_invocation_id, &id);
                 if (!u)
-                        return sd_bus_error_setf(error, BUS_ERROR_NO_UNIT_FOR_INVOCATION_ID, "No unit with the specified invocation ID " SD_ID128_FORMAT_STR " known.", SD_ID128_FORMAT_VAL(id));
+                        return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_UNIT_FOR_INVOCATION_ID, "No unit with the specified invocation ID " SD_ID128_FORMAT_STR " known.", SD_ID128_FORMAT_VAL(id));
         }
 
-        r = mac_selinux_unit_access_check(u, message, "status", error);
+        r = mac_selinux_unit_access_check(u, message, "status", reterr_error);
         if (r < 0)
                 return r;
 
@@ -613,7 +644,7 @@ static int method_get_unit_by_invocation_id(sd_bus_message *message, void *userd
         return sd_bus_reply_method_return(message, "o", path);
 }
 
-static int method_get_unit_by_control_group(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_get_unit_by_control_group(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = userdata;
         const char *cgroup;
         Unit *u;
@@ -623,16 +654,22 @@ static int method_get_unit_by_control_group(sd_bus_message *message, void *userd
         if (r < 0)
                 return r;
 
+        if (!path_is_absolute(cgroup))
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Control group path is not absolute: %s", cgroup);
+
+        if (!path_is_normalized(cgroup))
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Control group path is not normalized: %s", cgroup);
+
         u = manager_get_unit_by_cgroup(m, cgroup);
         if (!u)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_UNIT,
+                return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_SUCH_UNIT,
                                          "Control group '%s' is not valid or not managed by this instance",
                                          cgroup);
 
-        return reply_unit_path(u, message, error);
+        return reply_unit_path(u, message, reterr_error);
 }
 
-static int method_get_unit_by_pidfd(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_get_unit_by_pidfd(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
         Manager *m = ASSERT_PTR(userdata);
@@ -648,13 +685,13 @@ static int method_get_unit_by_pidfd(sd_bus_message *message, void *userdata, sd_
 
         r = pidref_set_pidfd(&pidref, pidfd);
         if (r < 0)
-                return sd_bus_error_set_errnof(error, r, "Failed to get PID from PIDFD: %m");
+                return sd_bus_error_set_errnof(reterr_error, r, "Failed to get PID from PIDFD: %m");
 
         u = manager_get_unit_by_pidref(m, &pidref);
         if (!u)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_UNIT_FOR_PID, "PID "PID_FMT" does not belong to any loaded unit.", pidref.pid);
+                return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_UNIT_FOR_PID, "PID "PID_FMT" does not belong to any loaded unit.", pidref.pid);
 
-        r = mac_selinux_unit_access_check(u, message, "status", error);
+        r = mac_selinux_unit_access_check(u, message, "status", reterr_error);
         if (r < 0)
                 return r;
 
@@ -678,17 +715,17 @@ static int method_get_unit_by_pidfd(sd_bus_message *message, void *userdata, sd_
          * answer. */
         r = pidref_verify(&pidref);
         if (r == -ESRCH)
-                return sd_bus_error_setf(error,
+                return sd_bus_error_setf(reterr_error,
                                          BUS_ERROR_NO_SUCH_PROCESS,
                                          "The PIDFD's PID "PID_FMT" changed during the lookup operation.",
                                          pidref.pid);
         if (r < 0)
-                return sd_bus_error_set_errnof(error, r, "Failed to get PID from PIDFD: %m");
+                return sd_bus_error_set_errnof(reterr_error, r, "Failed to get PID from PIDFD: %m");
 
         return sd_bus_message_send(reply);
 }
 
-static int method_load_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_load_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         const char *name;
         Unit *u;
@@ -702,14 +739,14 @@ static int method_load_unit(sd_bus_message *message, void *userdata, sd_bus_erro
         if (r < 0)
                 return r;
 
-        r = bus_load_unit_by_name(m, message, name, &u, error);
+        r = bus_load_unit_by_name(m, message, name, &u, reterr_error);
         if (r < 0)
                 return r;
 
-        return reply_unit_path(u, message, error);
+        return reply_unit_path(u, message, reterr_error);
 }
 
-static int method_start_unit_generic(sd_bus_message *message, Manager *m, JobType job_type, bool reload_if_possible, sd_bus_error *error) {
+static int method_start_unit_generic(sd_bus_message *message, Manager *m, JobType job_type, bool reload_if_possible, sd_bus_error *reterr_error) {
         const char *name;
         Unit *u;
         int r;
@@ -721,39 +758,39 @@ static int method_start_unit_generic(sd_bus_message *message, Manager *m, JobTyp
         if (r < 0)
                 return r;
 
-        r = manager_load_unit(m, name, NULL, error, &u);
+        r = manager_load_unit(m, name, NULL, reterr_error, &u);
         if (r < 0)
                 return r;
 
-        return bus_unit_method_start_generic(message, u, job_type, reload_if_possible, error);
+        return bus_unit_method_start_generic(message, u, job_type, reload_if_possible, reterr_error);
 }
 
-static int method_start_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_start_unit_generic(message, userdata, JOB_START, /* reload_if_possible = */ false, error);
+static int method_start_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_start_unit_generic(message, userdata, JOB_START, /* reload_if_possible= */ false, reterr_error);
 }
 
-static int method_stop_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_start_unit_generic(message, userdata, JOB_STOP, /* reload_if_possible = */ false, error);
+static int method_stop_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_start_unit_generic(message, userdata, JOB_STOP, /* reload_if_possible= */ false, reterr_error);
 }
 
-static int method_reload_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_start_unit_generic(message, userdata, JOB_RELOAD, /* reload_if_possible = */ false, error);
+static int method_reload_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_start_unit_generic(message, userdata, JOB_RELOAD, /* reload_if_possible= */ false, reterr_error);
 }
 
-static int method_restart_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_start_unit_generic(message, userdata, JOB_RESTART, /* reload_if_possible = */ false, error);
+static int method_restart_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_start_unit_generic(message, userdata, JOB_RESTART, /* reload_if_possible= */ false, reterr_error);
 }
 
-static int method_try_restart_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_start_unit_generic(message, userdata, JOB_TRY_RESTART, /* reload_if_possible = */ false, error);
+static int method_try_restart_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_start_unit_generic(message, userdata, JOB_TRY_RESTART, /* reload_if_possible= */ false, reterr_error);
 }
 
-static int method_reload_or_restart_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_start_unit_generic(message, userdata, JOB_RESTART, /* reload_if_possible = */ true, error);
+static int method_reload_or_restart_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_start_unit_generic(message, userdata, JOB_RESTART, /* reload_if_possible= */ true, reterr_error);
 }
 
-static int method_reload_or_try_restart_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_start_unit_generic(message, userdata, JOB_TRY_RESTART, /* reload_if_possible = */ true, error);
+static int method_reload_or_try_restart_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_start_unit_generic(message, userdata, JOB_TRY_RESTART, /* reload_if_possible= */ true, reterr_error);
 }
 
 typedef enum GenericUnitOperationFlags {
@@ -764,7 +801,7 @@ typedef enum GenericUnitOperationFlags {
 static int method_generic_unit_operation(
                 sd_bus_message *message,
                 Manager *m,
-                sd_bus_error *error,
+                sd_bus_error *reterr_error,
                 UnitType type,
                 sd_bus_message_handler_t handler,
                 GenericUnitOperationFlags flags) {
@@ -785,32 +822,131 @@ static int method_generic_unit_operation(
                 return r;
 
         if (!isempty(name) && FLAGS_SET(flags, GENERIC_UNIT_LOAD))
-                r = manager_load_unit(m, name, NULL, error, &u);
+                r = manager_load_unit(m, name, NULL, reterr_error, &u);
         else
-                r = bus_get_unit_by_name(m, message, name, &u, error);
+                r = bus_get_unit_by_name(m, message, name, &u, reterr_error);
         if (r < 0)
                 return r;
 
         if (type != _UNIT_TYPE_INVALID && u->type != type)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED,
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED,
                                          "%s operation is not supported for unit type '%s'",
                                          sd_bus_message_get_member(message), unit_type_to_string(u->type));
 
         if (FLAGS_SET(flags, GENERIC_UNIT_VALIDATE_LOADED)) {
-                r = bus_unit_validate_load_state(u, error);
+                r = bus_unit_validate_load_state(u, reterr_error);
                 if (r < 0)
                         return r;
         }
 
-        return handler(message, u, error);
+        return handler(message, u, reterr_error);
 }
 
-static int method_enqueue_unit_job(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_enqueue_unit_job(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* We don't bother with GENERIC_UNIT_VALIDATE_LOADED here, as the job logic validates that anyway */
-        return method_generic_unit_operation(message, userdata, error, _UNIT_TYPE_INVALID, bus_unit_method_enqueue_job, GENERIC_UNIT_LOAD);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_enqueue_job, GENERIC_UNIT_LOAD);
 }
 
-static int method_start_unit_replace(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_enqueue_unit_job_many(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        Manager *m = ASSERT_PTR(userdata);
+        _cleanup_strv_free_ char **names = NULL;
+        _cleanup_set_free_ Set *jobs = NULL;
+        const char *jtype, *smode;
+        JobType type;
+        JobMode mode;
+        uint64_t flags;
+        bool reload_if_possible;
+        Job *j;
+        int r;
+
+        assert(message);
+
+        r = sd_bus_message_read_strv(message, &names);
+        if (r < 0)
+                return r;
+
+        if (strv_isempty(names))
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "No units specified.");
+
+        if (strv_length(names) > (unsigned) MANAGER_MAX_NAMES / 2)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED, "Too many unit names requested.");
+
+        r = sd_bus_message_read(message, "sst", &jtype, &smode, &flags);
+        if (r < 0)
+                return r;
+
+        if (flags != 0)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Invalid flags parameter, must be 0.");
+
+        r = bus_unit_parse_job_type(jtype, &type, &reload_if_possible, reterr_error);
+        if (r < 0)
+                return r;
+
+        mode = job_mode_from_string(smode);
+        if (mode < 0)
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Job mode %s invalid", smode);
+
+        r = mac_selinux_access_check(message, job_type_to_access_method(type), reterr_error);
+        if (r < 0)
+                return r;
+
+        r = bus_verify_manage_units_async(m, message, reterr_error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
+
+        jobs = set_new(NULL);
+        if (!jobs)
+                return -ENOMEM;
+
+        r = manager_add_jobs(m, type, names, reload_if_possible, mode,
+                             /* extra_flags= */ 0, /* affected_jobs= */ NULL, reterr_error, jobs);
+        if (r < 0)
+                return r;
+
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        r = sd_bus_message_new_method_return(message, &reply);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_open_container(reply, 'a', "(uosos)");
+        if (r < 0)
+                return r;
+
+        SET_FOREACH(j, jobs) {
+                _cleanup_free_ char *job_path = NULL, *unit_path = NULL;
+
+                r = bus_job_track_sender(j, message);
+                if (r < 0)
+                        return r;
+
+                bus_job_send_pending_change_signal(j, true);
+
+                job_path = job_dbus_path(j);
+                if (!job_path)
+                        return -ENOMEM;
+
+                unit_path = unit_dbus_path(j->unit);
+                if (!unit_path)
+                        return -ENOMEM;
+
+                r = sd_bus_message_append(reply, "(uosos)",
+                                          j->id, job_path,
+                                          j->unit->id, unit_path,
+                                          job_type_to_string(j->type));
+                if (r < 0)
+                        return r;
+        }
+
+        r = sd_bus_message_close_container(reply);
+        if (r < 0)
+                return r;
+
+        return sd_bus_message_send(reply);
+}
+
+static int method_start_unit_replace(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         const char *old_name;
         Unit *u;
@@ -822,73 +958,73 @@ static int method_start_unit_replace(sd_bus_message *message, void *userdata, sd
         if (r < 0)
                 return r;
 
-        r = bus_get_unit_by_name(m, message, old_name, &u, error);
+        r = bus_get_unit_by_name(m, message, old_name, &u, reterr_error);
         if (r < 0)
                 return r;
         if (!u->job || u->job->type != JOB_START)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_JOB, "No job queued for unit %s", old_name);
+                return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_SUCH_JOB, "No job queued for unit %s", old_name);
 
-        return method_start_unit_generic(message, m, JOB_START, /* reload_if_possible = */ false, error);
+        return method_start_unit_generic(message, m, JOB_START, /* reload_if_possible= */ false, reterr_error);
 }
 
-static int method_kill_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_kill_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* We don't bother with GENERIC_UNIT_LOAD or GENERIC_UNIT_VALIDATE_LOADED here, as it shouldn't
          * matter whether a unit is loaded for killing any processes in the unit's cgroup. */
-        return method_generic_unit_operation(message, userdata, error, _UNIT_TYPE_INVALID, bus_unit_method_kill, /* flags = */ 0);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_kill, /* flags= */ 0);
 }
 
-static int method_kill_unit_subgroup(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_kill_unit_subgroup(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* We don't bother with GENERIC_UNIT_LOAD or GENERIC_UNIT_VALIDATE_LOADED here, as it shouldn't
          * matter whether a unit is loaded for killing any processes in the unit's cgroup. */
-        return method_generic_unit_operation(message, userdata, error, _UNIT_TYPE_INVALID, bus_unit_method_kill_subgroup, /* flags = */ 0);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_kill_subgroup, /* flags= */ 0);
 }
 
-static int method_clean_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_clean_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Load the unit if necessary, in order to load it, and insist on the unit being loaded to be
          * cleaned */
-        return method_generic_unit_operation(message, userdata, error, _UNIT_TYPE_INVALID, bus_unit_method_clean, GENERIC_UNIT_LOAD|GENERIC_UNIT_VALIDATE_LOADED);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_clean, GENERIC_UNIT_LOAD|GENERIC_UNIT_VALIDATE_LOADED);
 }
 
-static int method_freeze_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_freeze_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Only active units can be frozen, which must be properly loaded already */
-        return method_generic_unit_operation(message, userdata, error, _UNIT_TYPE_INVALID, bus_unit_method_freeze, GENERIC_UNIT_VALIDATE_LOADED);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_freeze, GENERIC_UNIT_VALIDATE_LOADED);
 }
 
-static int method_thaw_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_thaw_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Same as freeze above */
-        return method_generic_unit_operation(message, userdata, error, _UNIT_TYPE_INVALID, bus_unit_method_thaw, GENERIC_UNIT_VALIDATE_LOADED);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_thaw, GENERIC_UNIT_VALIDATE_LOADED);
 }
 
-static int method_reset_failed_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_reset_failed_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Don't load the unit (because unloaded units can't be in failed state), and don't insist on the
          * unit to be loaded properly (since a failed unit might have its unit file disappeared) */
-        return method_generic_unit_operation(message, userdata, error, _UNIT_TYPE_INVALID, bus_unit_method_reset_failed, /* flags = */ 0);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_reset_failed, /* flags= */ 0);
 }
 
-static int method_set_unit_properties(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_set_unit_properties(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Only change properties on fully loaded units, and load them in order to set properties */
-        return method_generic_unit_operation(message, userdata, error, _UNIT_TYPE_INVALID, bus_unit_method_set_properties, GENERIC_UNIT_LOAD|GENERIC_UNIT_VALIDATE_LOADED);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_set_properties, GENERIC_UNIT_LOAD|GENERIC_UNIT_VALIDATE_LOADED);
 }
 
-static int method_bind_mount_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_bind_mount_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Only add mounts on fully loaded units */
-        return method_generic_unit_operation(message, userdata, error, UNIT_SERVICE, bus_service_method_bind_mount, GENERIC_UNIT_VALIDATE_LOADED);
+        return method_generic_unit_operation(message, userdata, reterr_error, UNIT_SERVICE, bus_service_method_bind_mount, GENERIC_UNIT_VALIDATE_LOADED);
 }
 
-static int method_mount_image_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_mount_image_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Only add mounts on fully loaded units */
-        return method_generic_unit_operation(message, userdata, error, UNIT_SERVICE, bus_service_method_mount_image, GENERIC_UNIT_VALIDATE_LOADED);
+        return method_generic_unit_operation(message, userdata, reterr_error, UNIT_SERVICE, bus_service_method_mount_image, GENERIC_UNIT_VALIDATE_LOADED);
 }
 
-static int method_ref_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_ref_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Only allow reffing of fully loaded units, and make sure reffing a unit loads it. */
-        return method_generic_unit_operation(message, userdata, error, _UNIT_TYPE_INVALID, bus_unit_method_ref, GENERIC_UNIT_LOAD|GENERIC_UNIT_VALIDATE_LOADED);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_ref, GENERIC_UNIT_LOAD|GENERIC_UNIT_VALIDATE_LOADED);
 }
 
-static int method_unref_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_unref_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Dropping a ref OTOH should not require the unit to still be loaded. And since a reffed unit is a
          * loaded unit there's no need to load the unit for unreffing it. */
-        return method_generic_unit_operation(message, userdata, error, _UNIT_TYPE_INVALID, bus_unit_method_unref, /* flags = */ 0);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_unref, /* flags= */ 0);
 }
 
 static int reply_unit_info(sd_bus_message *reply, Unit *u) {
@@ -921,7 +1057,7 @@ static int reply_unit_info(sd_bus_message *reply, Unit *u) {
                         empty_to_root(job_path));
 }
 
-static int method_list_units_by_names(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_list_units_by_names(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Manager *m = ASSERT_PTR(userdata);
         int r;
@@ -932,6 +1068,10 @@ static int method_list_units_by_names(sd_bus_message *message, void *userdata, s
         r = sd_bus_message_read_strv(message, &units);
         if (r < 0)
                 return r;
+
+        if (strv_length(units) > MAX(hashmap_size(m->units), (unsigned) MANAGER_MAX_NAMES / 2))
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many unit names requested.");
 
         r = sd_bus_message_new_method_return(message, &reply);
         if (r < 0)
@@ -947,7 +1087,7 @@ static int method_list_units_by_names(sd_bus_message *message, void *userdata, s
                 if (!unit_name_is_valid(*unit, UNIT_NAME_ANY))
                         continue;
 
-                r = bus_load_unit_by_name(m, message, *unit, &u, error);
+                r = bus_load_unit_by_name(m, message, *unit, &u, reterr_error);
                 if (r < 0)
                         return r;
 
@@ -963,24 +1103,24 @@ static int method_list_units_by_names(sd_bus_message *message, void *userdata, s
         return sd_bus_message_send(reply);
 }
 
-static int method_get_unit_processes(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_get_unit_processes(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Don't load a unit actively (since it won't have any processes if it's not loaded), but don't
          * insist on the unit being loaded either (because even improperly loaded units might still have
          * processes around). */
-        return method_generic_unit_operation(message, userdata, error, _UNIT_TYPE_INVALID, bus_unit_method_get_processes, /* flags = */ 0);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_get_processes, /* flags= */ 0);
 }
 
-static int method_attach_processes_to_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_attach_processes_to_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Don't allow attaching new processes to units that aren't loaded. Don't bother with loading a unit
          * for this purpose though, as an unloaded unit is a stopped unit, and we don't allow attaching
          * processes to stopped units anyway. */
-        return method_generic_unit_operation(message, userdata, error, _UNIT_TYPE_INVALID, bus_unit_method_attach_processes, GENERIC_UNIT_VALIDATE_LOADED);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_attach_processes, GENERIC_UNIT_VALIDATE_LOADED);
 }
 
-static int method_remove_subgroup_from_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_remove_subgroup_from_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         /* Don't allow removal of subgroups from units that aren't loaded. But allow loading the unit, since
          * this is clean-up work, that is OK to do when the unit is stopped already. */
-        return method_generic_unit_operation(message, userdata, error, _UNIT_TYPE_INVALID, bus_unit_method_remove_subgroup, GENERIC_UNIT_LOAD|GENERIC_UNIT_VALIDATE_LOADED);
+        return method_generic_unit_operation(message, userdata, reterr_error, _UNIT_TYPE_INVALID, bus_unit_method_remove_subgroup, GENERIC_UNIT_LOAD|GENERIC_UNIT_VALIDATE_LOADED);
 }
 
 static int transient_unit_from_message(
@@ -988,9 +1128,8 @@ static int transient_unit_from_message(
                 sd_bus_message *message,
                 const char *name,
                 Unit **ret_unit,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
-        UnitType t;
         Unit *u;
         int r;
 
@@ -998,32 +1137,12 @@ static int transient_unit_from_message(
         assert(message);
         assert(name);
 
-        t = unit_name_to_type(name);
-        if (t < 0)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
-                                         "Invalid unit name or type: %s", name);
-
-        if (!unit_vtable[t]->can_transient)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
-                                         "Unit type %s does not support transient units.",
-                                         unit_type_to_string(t));
-
-        r = manager_load_unit(m, name, NULL, error, &u);
-        if (r < 0)
-                return r;
-
-        if (!unit_is_pristine(u))
-                return sd_bus_error_setf(error, BUS_ERROR_UNIT_EXISTS,
-                                         "Unit %s was already loaded or has a fragment file.", name);
-
-        /* OK, the unit failed to load and is unreferenced, now let's
-         * fill in the transient data instead */
-        r = unit_make_transient(u);
+        r = manager_setup_transient_unit(m, name, &u, reterr_error);
         if (r < 0)
                 return r;
 
         /* Set our properties */
-        r = bus_unit_set_properties(u, message, UNIT_RUNTIME, false, error);
+        r = bus_unit_set_properties(u, message, UNIT_RUNTIME, false, reterr_error);
         if (r < 0)
                 return r;
 
@@ -1047,7 +1166,7 @@ static int transient_unit_from_message(
 static int transient_aux_units_from_message(
                 Manager *m,
                 sd_bus_message *message,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         int r;
 
@@ -1065,7 +1184,7 @@ static int transient_aux_units_from_message(
                 if (r < 0)
                         return r;
 
-                r = transient_unit_from_message(m, message, name, /* ret_unit = */ NULL, error);
+                r = transient_unit_from_message(m, message, name, /* ret_unit= */ NULL, reterr_error);
                 if (r < 0)
                         return r;
 
@@ -1083,7 +1202,7 @@ static int transient_aux_units_from_message(
         return 0;
 }
 
-static int method_start_transient_unit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_start_transient_unit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         const char *name, *smode;
         Manager *m = ASSERT_PTR(userdata);
         JobMode mode;
@@ -1092,7 +1211,7 @@ static int method_start_transient_unit(sd_bus_message *message, void *userdata, 
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "start", error);
+        r = mac_selinux_access_check(message, "start", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1102,7 +1221,7 @@ static int method_start_transient_unit(sd_bus_message *message, void *userdata, 
 
         mode = job_mode_from_string(smode);
         if (mode < 0)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Job mode %s is invalid.", smode);
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Job mode %s is invalid.", smode);
 
         r = bus_verify_manage_units_async_impl(
                         m,
@@ -1110,25 +1229,25 @@ static int method_start_transient_unit(sd_bus_message *message, void *userdata, 
                         "start",
                         N_("Authentication is required to start transient unit '$(unit)'."),
                         message,
-                        error);
+                        reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
                 return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
-        r = transient_unit_from_message(m, message, name, &u, error);
+        r = transient_unit_from_message(m, message, name, &u, reterr_error);
         if (r < 0)
                 return r;
 
-        r = transient_aux_units_from_message(m, message, error);
+        r = transient_aux_units_from_message(m, message, reterr_error);
         if (r < 0)
                 return r;
 
         /* Finally, start it */
-        return bus_unit_queue_job(message, u, JOB_START, mode, 0, error);
+        return bus_unit_queue_job(message, u, JOB_START, mode, 0, reterr_error);
 }
 
-static int method_get_job(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_get_job(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_free_ char *path = NULL;
         Manager *m = ASSERT_PTR(userdata);
         uint32_t id;
@@ -1145,9 +1264,9 @@ static int method_get_job(sd_bus_message *message, void *userdata, sd_bus_error 
 
         j = manager_get_job(m, id);
         if (!j)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_JOB, "Job %u does not exist.", (unsigned) id);
+                return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_SUCH_JOB, "Job %u does not exist.", (unsigned) id);
 
-        r = mac_selinux_unit_access_check(j->unit, message, "status", error);
+        r = mac_selinux_unit_access_check(j->unit, message, "status", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1158,7 +1277,7 @@ static int method_get_job(sd_bus_message *message, void *userdata, sd_bus_error 
         return sd_bus_reply_method_return(message, "o", path);
 }
 
-static int method_cancel_job(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_cancel_job(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         uint32_t id;
         Job *j;
@@ -1172,22 +1291,22 @@ static int method_cancel_job(sd_bus_message *message, void *userdata, sd_bus_err
 
         j = manager_get_job(m, id);
         if (!j)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_JOB, "Job %u does not exist.", (unsigned) id);
+                return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_SUCH_JOB, "Job %u does not exist.", (unsigned) id);
 
-        return bus_job_method_cancel(message, j, error);
+        return bus_job_method_cancel(message, j, reterr_error);
 }
 
-static int method_clear_jobs(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_clear_jobs(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "reload", error);
+        r = mac_selinux_access_check(message, "reload", reterr_error);
         if (r < 0)
                 return r;
 
-        r = bus_verify_manage_units_async(m, message, error);
+        r = bus_verify_manage_units_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -1198,17 +1317,17 @@ static int method_clear_jobs(sd_bus_message *message, void *userdata, sd_bus_err
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_reset_failed(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_reset_failed(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "reload", error);
+        r = mac_selinux_access_check(message, "reload", reterr_error);
         if (r < 0)
                 return r;
 
-        r = bus_verify_manage_units_async(m, message, error);
+        r = bus_verify_manage_units_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -1219,7 +1338,7 @@ static int method_reset_failed(sd_bus_message *message, void *userdata, sd_bus_e
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int list_units_filtered(sd_bus_message *message, void *userdata, sd_bus_error *error, char **states, char **patterns) {
+static int list_units_filtered(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error, char **states, char **patterns) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Manager *m = ASSERT_PTR(userdata);
         const char *k;
@@ -1230,9 +1349,13 @@ static int list_units_filtered(sd_bus_message *message, void *userdata, sd_bus_e
 
         /* Anyone can call this method */
 
-        r = mac_selinux_access_check(message, "status", error);
-        if (r < 0)
-                return r;
+        if (strv_length(states) > MANAGER_MAX_STATES_PER_CALL)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many states in a single query.");
+
+        if (strv_length(patterns) > MANAGER_MAX_PATTERNS_PER_CALL)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many patterns in a single query.");
 
         r = sd_bus_message_new_method_return(message, &reply);
         if (r < 0)
@@ -1245,6 +1368,10 @@ static int list_units_filtered(sd_bus_message *message, void *userdata, sd_bus_e
         HASHMAP_FOREACH_KEY(u, k, m->units) {
                 if (k != u->id)
                         continue;
+
+                r = mac_selinux_unit_access_check(u, message, "status", /* reterr_error= */ NULL);
+                if (r < 0)
+                        continue; /* silently skip units the caller is not allowed to see */
 
                 if (!unit_passes_filter(u, states, patterns))
                         continue;
@@ -1261,11 +1388,11 @@ static int list_units_filtered(sd_bus_message *message, void *userdata, sd_bus_e
         return sd_bus_message_send(reply);
 }
 
-static int method_list_units(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return list_units_filtered(message, userdata, error, NULL, NULL);
+static int method_list_units(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return list_units_filtered(message, userdata, reterr_error, NULL, NULL);
 }
 
-static int method_list_units_filtered(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_list_units_filtered(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_strv_free_ char **states = NULL;
         int r;
 
@@ -1273,10 +1400,10 @@ static int method_list_units_filtered(sd_bus_message *message, void *userdata, s
         if (r < 0)
                 return r;
 
-        return list_units_filtered(message, userdata, error, states, NULL);
+        return list_units_filtered(message, userdata, reterr_error, states, NULL);
 }
 
-static int method_list_units_by_patterns(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_list_units_by_patterns(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_strv_free_ char **states = NULL;
         _cleanup_strv_free_ char **patterns = NULL;
         int r;
@@ -1289,10 +1416,10 @@ static int method_list_units_by_patterns(sd_bus_message *message, void *userdata
         if (r < 0)
                 return r;
 
-        return list_units_filtered(message, userdata, error, states, patterns);
+        return list_units_filtered(message, userdata, reterr_error, states, patterns);
 }
 
-static int method_list_jobs(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_list_jobs(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Manager *m = ASSERT_PTR(userdata);
         Job *j;
@@ -1302,7 +1429,7 @@ static int method_list_jobs(sd_bus_message *message, void *userdata, sd_bus_erro
 
         /* Anyone can call this method */
 
-        r = mac_selinux_access_check(message, "status", error);
+        r = mac_selinux_access_check(message, "status", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1344,7 +1471,7 @@ static int method_list_jobs(sd_bus_message *message, void *userdata, sd_bus_erro
         return sd_bus_message_send(reply);
 }
 
-static int method_subscribe(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_subscribe(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
@@ -1352,7 +1479,7 @@ static int method_subscribe(sd_bus_message *message, void *userdata, sd_bus_erro
 
         /* Anyone can call this method */
 
-        r = mac_selinux_access_check(message, "status", error);
+        r = mac_selinux_access_check(message, "status", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1371,13 +1498,13 @@ static int method_subscribe(sd_bus_message *message, void *userdata, sd_bus_erro
                 if (r < 0)
                         return r;
                 if (r == 0)
-                        return sd_bus_error_set(error, BUS_ERROR_ALREADY_SUBSCRIBED, "Client is already subscribed.");
+                        return sd_bus_error_set(reterr_error, BUS_ERROR_ALREADY_SUBSCRIBED, "Client is already subscribed.");
         }
 
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_unsubscribe(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_unsubscribe(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
@@ -1385,7 +1512,7 @@ static int method_unsubscribe(sd_bus_message *message, void *userdata, sd_bus_er
 
         /* Anyone can call this method */
 
-        r = mac_selinux_access_check(message, "status", error);
+        r = mac_selinux_access_check(message, "status", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1394,7 +1521,7 @@ static int method_unsubscribe(sd_bus_message *message, void *userdata, sd_bus_er
                 if (r < 0)
                         return r;
                 if (r == 0)
-                        return sd_bus_error_set(error, BUS_ERROR_NOT_SUBSCRIBED, "Client is not subscribed.");
+                        return sd_bus_error_set(reterr_error, BUS_ERROR_NOT_SUBSCRIBED, "Client is not subscribed.");
         }
 
         return sd_bus_reply_method_return(message, NULL);
@@ -1403,7 +1530,7 @@ static int method_unsubscribe(sd_bus_message *message, void *userdata, sd_bus_er
 static int dump_impl(
                 sd_bus_message *message,
                 void *userdata,
-                sd_bus_error *error,
+                sd_bus_error *reterr_error,
                 char **patterns,
                 int (*reply)(sd_bus_message *, char *)) {
 
@@ -1413,9 +1540,13 @@ static int dump_impl(
 
         assert(message);
 
+        if (strv_length(patterns) > MANAGER_MAX_PATTERNS_PER_CALL)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many patterns in a single query.");
+
         /* 'status' access is the bare minimum always needed for this, as the policy might straight out
          * forbid a client from querying any information from systemd, regardless of any rate limiting. */
-        r = mac_selinux_access_check(message, "status", error);
+        r = mac_selinux_access_check(message, "status", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1428,11 +1559,11 @@ static int dump_impl(
                  * operations, and can cause PID1 to stall. So it seems similar enough in terms of security
                  * considerations and impact, and thus use the same access check for dumps which, given the
                  * large amount of data to fetch, can stall PID1 for quite some time. */
-                r = mac_selinux_access_check(message, "reload", /* error = */ NULL);
+                r = mac_selinux_access_check(message, "reload", /* error= */ NULL);
                 if (r < 0)
                         goto ratelimited;
 
-                r = bus_verify_bypass_dump_ratelimit_async(m, message, /* error = */ NULL);
+                r = bus_verify_bypass_dump_ratelimit_async(m, message, /* reterr_error= */ NULL);
                 if (r < 0)
                         goto ratelimited;
                 if (r == 0)
@@ -1450,7 +1581,7 @@ static int dump_impl(
 ratelimited:
         log_warning("Dump request rejected due to rate limit on unprivileged callers, blocked for %s.",
                     FORMAT_TIMESPAN(ratelimit_left(&m->dump_ratelimit), USEC_PER_SEC));
-        return sd_bus_error_setf(error,
+        return sd_bus_error_setf(reterr_error,
                                  SD_BUS_ERROR_LIMITS_EXCEEDED,
                                  "Dump request rejected due to rate limit on unprivileged callers, blocked for %s.",
                                  FORMAT_TIMESPAN(ratelimit_left(&m->dump_ratelimit), USEC_PER_SEC));
@@ -1460,8 +1591,8 @@ static int reply_dump(sd_bus_message *message, char *dump) {
         return sd_bus_reply_method_return(message, "s", dump);
 }
 
-static int method_dump(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return dump_impl(message, userdata, error, NULL, reply_dump);
+static int method_dump(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return dump_impl(message, userdata, reterr_error, NULL, reply_dump);
 }
 
 static int reply_dump_by_fd(sd_bus_message *message, char *dump) {
@@ -1474,14 +1605,14 @@ static int reply_dump_by_fd(sd_bus_message *message, char *dump) {
         return sd_bus_reply_method_return(message, "h", fd);
 }
 
-static int method_dump_by_fd(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return dump_impl(message, userdata, error, NULL, reply_dump_by_fd);
+static int method_dump_by_fd(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return dump_impl(message, userdata, reterr_error, NULL, reply_dump_by_fd);
 }
 
 static int dump_units_matching_patterns(
                 sd_bus_message *message,
                 void *userdata,
-                sd_bus_error *error,
+                sd_bus_error *reterr_error,
                 int (*reply)(sd_bus_message *, char *)) {
         _cleanup_strv_free_ char **patterns = NULL;
         int r;
@@ -1490,59 +1621,53 @@ static int dump_units_matching_patterns(
         if (r < 0)
                 return r;
 
-        return dump_impl(message, userdata, error, patterns, reply);
+        return dump_impl(message, userdata, reterr_error, patterns, reply);
 }
 
-static int method_dump_units_matching_patterns(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return dump_units_matching_patterns(message, userdata, error, reply_dump);
+static int method_dump_units_matching_patterns(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return dump_units_matching_patterns(message, userdata, reterr_error, reply_dump);
 }
 
-static int method_dump_units_matching_patterns_by_fd(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return dump_units_matching_patterns(message, userdata, error, reply_dump_by_fd);
+static int method_dump_units_matching_patterns_by_fd(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return dump_units_matching_patterns(message, userdata, reterr_error, reply_dump_by_fd);
 }
 
-static int method_refuse_snapshot(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED, "Support for snapshots has been removed.");
+static int method_refuse_snapshot(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return sd_bus_error_set(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED, "Support for snapshots has been removed.");
 }
 
 static void log_caller(sd_bus_message *message, Manager *manager, const char *method) {
         _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
         _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        int r;
 
         assert(message);
         assert(manager);
         assert(method);
 
-        if (sd_bus_query_sender_creds(message, SD_BUS_CREDS_PID|SD_BUS_CREDS_PIDFD|SD_BUS_CREDS_AUGMENT|SD_BUS_CREDS_COMM, &creds) < 0)
-                return;
+        r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_PID|SD_BUS_CREDS_PIDFD|SD_BUS_CREDS_AUGMENT, &creds);
+        if (r < 0)
+                log_debug_errno(r, "Failed to get dbus sender creds, ignoring: %m");
+        else {
+                r = bus_creds_get_pidref(creds, &pidref);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to get peer pidref, ignoring: %m");
+        }
 
-        /* We need at least the PID, otherwise there's nothing to log, the rest is optional. */
-        if (bus_creds_get_pidref(creds, &pidref) < 0)
-                return;
-
-        const char *comm = NULL;
-        Unit *caller;
-
-        (void) sd_bus_creds_get_comm(creds, &comm);
-        caller = manager_get_unit_by_pidref(manager, &pidref);
-
-        log_notice("%s requested from client PID " PID_FMT "%s%s%s%s%s%s...",
-                   method, pidref.pid,
-                   comm ? " ('" : "", strempty(comm), comm ? "')" : "",
-                   caller ? " (unit " : "", caller ? caller->id : "", caller ? ")" : "");
+        manager_log_caller(manager, &pidref, method);
 }
 
-static int method_reload(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_reload(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "reload", error);
+        r = mac_selinux_access_check(message, "reload", reterr_error);
         if (r < 0)
                 return r;
 
-        r = bus_verify_reload_daemon_async(m, message, error);
+        r = bus_verify_reload_daemon_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -1551,10 +1676,19 @@ static int method_reload(sd_bus_message *message, void *userdata, sd_bus_error *
         /* Write a log message noting the unit or process who requested the Reload() */
         log_caller(message, m, "Reload");
 
+        /* The reply to the previous Reload() is normally sent before the next request is dispatched.
+         * If it is still pending, refuse rather than drop it. Do this before the rate limit check, so
+         * that a refused request doesn't use up a token. */
+        if (m->pending_reload_message_dbus || m->pending_reload_message_vl) {
+                log_warning("Reloading request rejected, reply to previous reload still pending.");
+                return sd_bus_error_set_errnof(reterr_error, EBUSY,
+                                               "Reload() request rejected, previous reload still in progress.");
+        }
+
         /* Check the rate limit after the authorization succeeds, to avoid denial-of-service issues. */
         if (!ratelimit_below(&m->reload_reexec_ratelimit)) {
                 log_warning("Reloading request rejected due to rate limit.");
-                return sd_bus_error_set(error,
+                return sd_bus_error_set(reterr_error,
                                         SD_BUS_ERROR_LIMITS_EXCEEDED,
                                         "Reload() request rejected due to rate limit.");
         }
@@ -1564,8 +1698,7 @@ static int method_reload(sd_bus_message *message, void *userdata, sd_bus_error *
          * is finished. That way the caller knows when the reload
          * finished. */
 
-        assert(!m->pending_reload_message);
-        r = sd_bus_message_new_method_return(message, &m->pending_reload_message);
+        r = sd_bus_message_new_method_return(message, &m->pending_reload_message_dbus);
         if (r < 0)
                 return r;
 
@@ -1574,17 +1707,17 @@ static int method_reload(sd_bus_message *message, void *userdata, sd_bus_error *
         return 1;
 }
 
-static int method_reexecute(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_reexecute(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "reload", error);
+        r = mac_selinux_access_check(message, "reload", reterr_error);
         if (r < 0)
                 return r;
 
-        r = bus_verify_reload_daemon_async(m, message, error);
+        r = bus_verify_reload_daemon_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -1596,7 +1729,7 @@ static int method_reexecute(sd_bus_message *message, void *userdata, sd_bus_erro
         /* Check the rate limit after the authorization succeeds, to avoid denial-of-service issues. */
         if (!ratelimit_below(&m->reload_reexec_ratelimit)) {
                 log_warning("Reexecution request rejected due to rate limit.");
-                return sd_bus_error_set(error,
+                return sd_bus_error_set(reterr_error,
                                         SD_BUS_ERROR_LIMITS_EXCEEDED,
                                         "Reexecute() request rejected due to rate limit.");
         }
@@ -1608,13 +1741,13 @@ static int method_reexecute(sd_bus_message *message, void *userdata, sd_bus_erro
         return 1;
 }
 
-static int method_exit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_exit(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "halt", error);
+        r = mac_selinux_access_check(message, "halt", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1630,17 +1763,17 @@ static int method_exit(sd_bus_message *message, void *userdata, sd_bus_error *er
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_reboot(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_reboot(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
         if (!MANAGER_IS_SYSTEM(m))
-                return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED,
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED,
                                         "Reboot is only supported by system manager.");
 
-        r = mac_selinux_access_check(message, "reboot", error);
+        r = mac_selinux_access_check(message, "reboot", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1651,7 +1784,7 @@ static int method_reboot(sd_bus_message *message, void *userdata, sd_bus_error *
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_soft_reboot(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_soft_reboot(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         _cleanup_free_ char *rt = NULL;
         const char *root;
@@ -1660,10 +1793,11 @@ static int method_soft_reboot(sd_bus_message *message, void *userdata, sd_bus_er
         assert(message);
 
         if (!MANAGER_IS_SYSTEM(m))
-                return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED,
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED,
                                         "Soft reboot is only supported by system manager.");
 
-        r = mac_selinux_access_check(message, "reboot", error);
+        /* Keep the checks in sync with varlink-manager.c:vl_method_soft_reboot_manager() */
+        r = mac_selinux_access_check(message, "reboot", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1673,10 +1807,10 @@ static int method_soft_reboot(sd_bus_message *message, void *userdata, sd_bus_er
 
         if (!isempty(root)) {
                 if (!path_is_valid(root))
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                                  "New root directory '%s' must be a valid path.", root);
                 if (!path_is_absolute(root))
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                                  "New root directory path '%s' is not absolute.", root);
 
                 r = path_simplify_alloc(root, &rt);
@@ -1692,17 +1826,17 @@ static int method_soft_reboot(sd_bus_message *message, void *userdata, sd_bus_er
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_poweroff(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_poweroff(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
         if (!MANAGER_IS_SYSTEM(m))
-                return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED,
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED,
                                         "Powering off is only supported by system manager.");
 
-        r = mac_selinux_access_check(message, "halt", error);
+        r = mac_selinux_access_check(message, "halt", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1713,17 +1847,17 @@ static int method_poweroff(sd_bus_message *message, void *userdata, sd_bus_error
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_halt(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_halt(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
         if (!MANAGER_IS_SYSTEM(m))
-                return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED,
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED,
                                         "Halt is only supported by system manager.");
 
-        r = mac_selinux_access_check(message, "halt", error);
+        r = mac_selinux_access_check(message, "halt", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1734,17 +1868,17 @@ static int method_halt(sd_bus_message *message, void *userdata, sd_bus_error *er
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_kexec(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_kexec(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
         if (!MANAGER_IS_SYSTEM(m))
-                return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED,
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED,
                                         "KExec is only supported by system manager.");
 
-        r = mac_selinux_access_check(message, "reboot", error);
+        r = mac_selinux_access_check(message, "reboot", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1755,7 +1889,7 @@ static int method_kexec(sd_bus_message *message, void *userdata, sd_bus_error *e
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_switch_root(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_switch_root(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         _cleanup_free_ char *ri = NULL, *rt = NULL;
         const char *root, *init;
@@ -1764,10 +1898,10 @@ static int method_switch_root(sd_bus_message *message, void *userdata, sd_bus_er
         assert(message);
 
         if (!MANAGER_IS_SYSTEM(m))
-                return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED,
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED,
                                         "Root switching is only supported by system manager.");
 
-        r = mac_selinux_access_check(message, "reboot", error);
+        r = mac_selinux_access_check(message, "reboot", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1781,53 +1915,53 @@ static int method_switch_root(sd_bus_message *message, void *userdata, sd_bus_er
                 root = "/sysroot";
         else {
                 if (!path_is_valid(root))
-                        return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS,
+                        return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                                 "New root directory must be a valid path.");
 
                 if (!path_is_absolute(root))
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                                  "New root path '%s' is not absolute.", root);
 
                 r = path_is_root(root);
                 if (r < 0)
-                        return sd_bus_error_set_errnof(error, r,
+                        return sd_bus_error_set_errnof(reterr_error, r,
                                                        "Failed to check if new root directory '%s' is the same as old root: %m",
                                                        root);
                 if (r > 0)
-                        return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS,
+                        return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                                 "New root directory cannot be the old root directory.");
         }
 
         /* Safety check */
         if (!in_initrd())
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS,
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                         "Not in initrd, refusing switch-root operation.");
 
         r = path_is_os_tree(root);
         if (r < 0)
-                return sd_bus_error_set_errnof(error, r,
+                return sd_bus_error_set_errnof(reterr_error, r,
                                                "Failed to determine whether root path '%s' contains an OS tree: %m",
                                                root);
         if (r == 0)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                          "Specified switch root path '%s' does not seem to be an OS tree. os-release file is missing.",
                                          root);
 
         if (!isempty(init)) {
                 if (!path_is_valid(init))
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                                  "Path to init binary '%s' is not a valid path.", init);
 
                 if (!path_is_absolute(init))
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                                  "Path to init binary '%s' not absolute.", init);
 
                 r = chase_and_access(init, root, CHASE_PREFIX_ROOT, X_OK, NULL);
                 if (r == -EACCES)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                                  "Init binary %s is not executable.", init);
                 if (r < 0)
-                        return sd_bus_error_set_errnof(error, r,
+                        return sd_bus_error_set_errnof(reterr_error, r,
                                                        "Could not resolve init executable %s: %m", init);
         }
 
@@ -1849,24 +1983,28 @@ static int method_switch_root(sd_bus_message *message, void *userdata, sd_bus_er
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_set_environment(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_set_environment(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_strv_free_ char **plus = NULL;
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "reload", error);
+        r = mac_selinux_access_check(message, "reload", reterr_error);
         if (r < 0)
                 return r;
 
         r = sd_bus_message_read_strv(message, &plus);
         if (r < 0)
                 return r;
-        if (!strv_env_is_valid(plus))
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid environment assignments");
 
-        r = bus_verify_set_environment_async(m, message, error);
+        if (strv_length(plus) > ENVIRONMENT_ASSIGNMENTS_MAX)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many environment assignments in a single query.");
+        if (!strv_env_is_valid(plus))
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Invalid environment assignments");
+
+        r = bus_verify_set_environment_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -1879,14 +2017,14 @@ static int method_set_environment(sd_bus_message *message, void *userdata, sd_bu
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_unset_environment(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_unset_environment(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_strv_free_ char **minus = NULL;
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "reload", error);
+        r = mac_selinux_access_check(message, "reload", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1894,11 +2032,14 @@ static int method_unset_environment(sd_bus_message *message, void *userdata, sd_
         if (r < 0)
                 return r;
 
+        if (strv_length(minus) > ENVIRONMENT_ASSIGNMENTS_MAX)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many environment variable names in a single query.");
         if (!strv_env_name_or_assignment_is_valid(minus))
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS,
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                         "Invalid environment variable names or assignments");
 
-        r = bus_verify_set_environment_async(m, message, error);
+        r = bus_verify_set_environment_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -1911,14 +2052,14 @@ static int method_unset_environment(sd_bus_message *message, void *userdata, sd_
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_unset_and_set_environment(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_unset_and_set_environment(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_strv_free_ char **minus = NULL, **plus = NULL;
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "reload", error);
+        r = mac_selinux_access_check(message, "reload", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1930,14 +2071,17 @@ static int method_unset_and_set_environment(sd_bus_message *message, void *userd
         if (r < 0)
                 return r;
 
+        if (strv_length(plus) > ENVIRONMENT_ASSIGNMENTS_MAX || strv_length(minus) > ENVIRONMENT_ASSIGNMENTS_MAX)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many environment variable names or assignments in a single query.");
         if (!strv_env_name_or_assignment_is_valid(minus))
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS,
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                         "Invalid environment variable names or assignments");
         if (!strv_env_is_valid(plus))
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS,
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                         "Invalid environment assignments");
 
-        r = bus_verify_set_environment_async(m, message, error);
+        r = bus_verify_set_environment_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -1950,14 +2094,14 @@ static int method_unset_and_set_environment(sd_bus_message *message, void *userd
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_set_exit_code(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_set_exit_code(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         uint8_t code;
         int r;
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "exit", error);
+        r = mac_selinux_access_check(message, "exit", reterr_error);
         if (r < 0)
                 return r;
 
@@ -1970,7 +2114,7 @@ static int method_set_exit_code(sd_bus_message *message, void *userdata, sd_bus_
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_lookup_dynamic_user_by_name(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_lookup_dynamic_user_by_name(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         const char *name;
         uid_t uid;
@@ -1983,15 +2127,15 @@ static int method_lookup_dynamic_user_by_name(sd_bus_message *message, void *use
                 return r;
 
         if (!MANAGER_IS_SYSTEM(m))
-                return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED,
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED,
                                         "Dynamic users are only supported in the system instance.");
         if (!valid_user_group_name(name, VALID_USER_RELAX))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                          "User name invalid: %s", name);
 
         r = dynamic_user_lookup_name(m, name, &uid);
         if (r == -ESRCH)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_DYNAMIC_USER,
+                return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_SUCH_DYNAMIC_USER,
                                          "Dynamic user %s does not exist.", name);
         if (r < 0)
                 return r;
@@ -1999,7 +2143,7 @@ static int method_lookup_dynamic_user_by_name(sd_bus_message *message, void *use
         return sd_bus_reply_method_return(message, "u", (uint32_t) uid);
 }
 
-static int method_lookup_dynamic_user_by_uid(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_lookup_dynamic_user_by_uid(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_free_ char *name = NULL;
         Manager *m = ASSERT_PTR(userdata);
         uid_t uid;
@@ -2013,15 +2157,15 @@ static int method_lookup_dynamic_user_by_uid(sd_bus_message *message, void *user
                 return r;
 
         if (!MANAGER_IS_SYSTEM(m))
-                return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED,
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED,
                                         "Dynamic users are only supported in the system instance.");
         if (!uid_is_valid(uid))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                          "User ID invalid: " UID_FMT, uid);
 
         r = dynamic_user_lookup_uid(m, uid, &name);
         if (r == -ESRCH)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_DYNAMIC_USER,
+                return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_SUCH_DYNAMIC_USER,
                                          "Dynamic user ID " UID_FMT " does not exist.", uid);
         if (r < 0)
                 return r;
@@ -2029,7 +2173,7 @@ static int method_lookup_dynamic_user_by_uid(sd_bus_message *message, void *user
         return sd_bus_reply_method_return(message, "s", name);
 }
 
-static int method_get_dynamic_users(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_get_dynamic_users(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Manager *m = ASSERT_PTR(userdata);
         DynamicUser *d;
@@ -2040,7 +2184,7 @@ static int method_get_dynamic_users(sd_bus_message *message, void *userdata, sd_
         assert_cc(sizeof(uid_t) == sizeof(uint32_t));
 
         if (!MANAGER_IS_SYSTEM(m))
-                return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED,
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED,
                                         "Dynamic users are only supported in the system instance.");
 
         r = sd_bus_message_new_method_return(message, &reply);
@@ -2058,7 +2202,7 @@ static int method_get_dynamic_users(sd_bus_message *message, void *userdata, sd_
                 if (r == -EAGAIN) /* not realized yet? */
                         continue;
                 if (r < 0)
-                        return sd_bus_error_set(error, SD_BUS_ERROR_FAILED,
+                        return sd_bus_error_set(reterr_error, SD_BUS_ERROR_FAILED,
                                                 "Failed to look up a dynamic user.");
 
                 r = sd_bus_message_append(reply, "(us)", uid, d->name);
@@ -2073,17 +2217,17 @@ static int method_get_dynamic_users(sd_bus_message *message, void *userdata, sd_
         return sd_bus_message_send(reply);
 }
 
-static int method_enqueue_marked_jobs(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_enqueue_marked_jobs(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "start", error);
+        r = mac_selinux_access_check(message, "start", reterr_error);
         if (r < 0)
                 return r;
 
-        r = bus_verify_manage_units_async(m, message, error);
+        r = bus_verify_manage_units_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -2104,34 +2248,43 @@ static int method_enqueue_marked_jobs(sd_bus_message *message, void *userdata, s
         char *k;
         int ret = 0;
         HASHMAP_FOREACH_KEY(u, k, m->units) {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+
                 /* ignore aliases */
                 if (u->id != k)
                         continue;
 
                 BusUnitQueueFlags flags;
-                if (BIT_SET(u->markers, UNIT_MARKER_NEEDS_RESTART))
+                JobType job;
+                if (BIT_SET(u->markers, UNIT_MARKER_NEEDS_RESTART)) {
                         flags = 0;
-                else if (BIT_SET(u->markers, UNIT_MARKER_NEEDS_RELOAD))
+                        job = JOB_TRY_RESTART;
+                } else if (BIT_SET(u->markers, UNIT_MARKER_NEEDS_RELOAD)) {
                         flags = BUS_UNIT_QUEUE_RELOAD_IF_POSSIBLE;
-                else
+                        job = JOB_TRY_RESTART;
+                } else if (BIT_SET(u->markers, UNIT_MARKER_NEEDS_STOP)) {
+                        flags = 0;
+                        job = JOB_STOP;
+                } else if (BIT_SET(u->markers, UNIT_MARKER_NEEDS_START)) {
+                        flags = 0;
+                        job = JOB_START;
+                } else
                         continue;
 
-                r = mac_selinux_unit_access_check(u, message, "start", error);
+                r = mac_selinux_unit_access_check(u, message, job_type_to_access_method(job), &error);
                 if (r >= 0)
                         r = bus_unit_queue_job_one(message, u,
-                                                   JOB_TRY_RESTART, JOB_FAIL, flags,
-                                                   reply, error);
+                                                   job, JOB_FAIL, flags,
+                                                   reply, &error);
                 if (ERRNO_IS_NEG_RESOURCE(r))
                         return r;
-                if (r < 0) {
-                        if (ret >= 0)
-                                ret = r;
-                        sd_bus_error_free(error);
-                }
+                if (r < 0)
+                        RET_GATHER(ret, log_unit_warning_errno(u, r, "Failed to enqueue marked job: %s",
+                                                               bus_error_message(&error, r)));
         }
 
         if (ret < 0)
-                return sd_bus_error_set_errnof(error, ret,
+                return sd_bus_error_set_errnof(reterr_error, ret,
                                                "Failed to enqueue some jobs, see logs for details: %m");
 
         r = sd_bus_message_close_container(reply);
@@ -2141,7 +2294,7 @@ static int method_enqueue_marked_jobs(sd_bus_message *message, void *userdata, s
         return sd_bus_message_send(reply);
 }
 
-static int list_unit_files_by_patterns(sd_bus_message *message, void *userdata, sd_bus_error *error, char **states, char **patterns) {
+static int list_unit_files_by_patterns(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error, char **states, char **patterns) {
         Manager *m = ASSERT_PTR(userdata);
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_hashmap_free_ Hashmap *h = NULL;
@@ -2151,7 +2304,15 @@ static int list_unit_files_by_patterns(sd_bus_message *message, void *userdata, 
 
         /* Anyone can call this method */
 
-        r = mac_selinux_access_check(message, "status", error);
+        if (strv_length(states) > MANAGER_MAX_STATES_PER_CALL)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many states in a single query.");
+
+        if (strv_length(patterns) > MANAGER_MAX_PATTERNS_PER_CALL)
+                return sd_bus_error_set(reterr_error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many patterns in a single query.");
+
+        r = mac_selinux_access_check(message, "status", reterr_error);
         if (r < 0)
                 return r;
 
@@ -2159,7 +2320,7 @@ static int list_unit_files_by_patterns(sd_bus_message *message, void *userdata, 
         if (r < 0)
                 return r;
 
-        r = unit_file_get_list(m->runtime_scope, /* root_dir = */ NULL, states, patterns, &h);
+        r = unit_file_get_list(m->runtime_scope, /* root_dir= */ NULL, states, patterns, &h);
         if (r < 0)
                 return r;
 
@@ -2181,11 +2342,11 @@ static int list_unit_files_by_patterns(sd_bus_message *message, void *userdata, 
         return sd_bus_message_send(reply);
 }
 
-static int method_list_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return list_unit_files_by_patterns(message, userdata, error, NULL, NULL);
+static int method_list_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return list_unit_files_by_patterns(message, userdata, reterr_error, NULL, NULL);
 }
 
-static int method_list_unit_files_by_patterns(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_list_unit_files_by_patterns(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_strv_free_ char **states = NULL;
         _cleanup_strv_free_ char **patterns = NULL;
         int r;
@@ -2198,10 +2359,10 @@ static int method_list_unit_files_by_patterns(sd_bus_message *message, void *use
         if (r < 0)
                 return r;
 
-        return list_unit_files_by_patterns(message, userdata, error, states, patterns);
+        return list_unit_files_by_patterns(message, userdata, reterr_error, states, patterns);
 }
 
-static int method_get_unit_file_state(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_get_unit_file_state(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         const char *name;
         UnitFileState state;
@@ -2211,7 +2372,7 @@ static int method_get_unit_file_state(sd_bus_message *message, void *userdata, s
 
         /* Anyone can call this method */
 
-        r = mac_selinux_access_check(message, "status", error);
+        r = mac_selinux_access_check(message, "status", reterr_error);
         if (r < 0)
                 return r;
 
@@ -2226,7 +2387,7 @@ static int method_get_unit_file_state(sd_bus_message *message, void *userdata, s
         return sd_bus_reply_method_return(message, "s", unit_file_state_to_string(state));
 }
 
-static int method_get_default_target(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_get_default_target(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_free_ char *default_target = NULL;
         Manager *m = ASSERT_PTR(userdata);
         int r;
@@ -2235,13 +2396,13 @@ static int method_get_default_target(sd_bus_message *message, void *userdata, sd
 
         /* Anyone can call this method */
 
-        r = mac_selinux_access_check(message, "status", error);
+        r = mac_selinux_access_check(message, "status", reterr_error);
         if (r < 0)
                 return r;
 
         r = unit_file_get_default(m->runtime_scope, NULL, &default_target);
         if (r == -ERFKILL)
-                return sd_bus_error_set(error, BUS_ERROR_UNIT_MASKED, "Default target unit file is masked.");
+                return sd_bus_error_set(reterr_error, BUS_ERROR_UNIT_MASKED, "Default target unit file is masked.");
         if (r < 0)
                 return r;
 
@@ -2282,7 +2443,7 @@ static void manager_unit_files_changed(Manager *m, const InstallChange *changes,
 }
 
 static int install_error(
-                sd_bus_error *error,
+                sd_bus_error *reterr_error,
                 int c,
                 InstallChange *changes,
                 size_t n_changes) {
@@ -2307,9 +2468,9 @@ static int install_error(
                 if (r == -ENOMEM)
                         return r;
                 if (r < 0)
-                        return sd_bus_error_set_errnof(error, r, "File %s: %m", i->path);
+                        return sd_bus_error_set_errnof(reterr_error, r, "File %s: %m", i->path);
 
-                return sd_bus_error_set(error, bus_error, err_message);
+                return sd_bus_error_set(reterr_error, bus_error, err_message);
         }
 
         return c < 0 ? c : -EINVAL;
@@ -2321,7 +2482,7 @@ static int reply_install_changes_and_free(
                 int carries_install_info,
                 InstallChange *changes,
                 size_t n_changes,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         bool bad = false, good = false;
@@ -2363,7 +2524,7 @@ static int reply_install_changes_and_free(
         /* If there was a failed change, and no successful change, then return the first failure as proper
          * method call error. */
         if (bad && !good)
-                return install_error(error, 0, TAKE_PTR(changes), n_changes);
+                return install_error(reterr_error, 0, TAKE_PTR(changes), n_changes);
 
         r = sd_bus_message_close_container(reply);
         if (r < 0)
@@ -2377,7 +2538,7 @@ static int method_enable_unit_files_generic(
                 Manager *m,
                 int (*call)(RuntimeScope scope, UnitFileFlags flags, const char *root_dir, char * const *files, InstallChange **changes, size_t *n_changes),
                 bool carries_install_info,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         _cleanup_strv_free_ char **l = NULL;
         InstallChange *changes = NULL;
@@ -2410,7 +2571,7 @@ static int method_enable_unit_files_generic(
                 flags = unit_file_bools_to_flags(runtime, force);
         }
 
-        r = bus_verify_manage_unit_files_async(m, message, error);
+        r = bus_verify_manage_unit_files_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -2419,40 +2580,40 @@ static int method_enable_unit_files_generic(
         r = call(m->runtime_scope, flags, NULL, l, &changes, &n_changes);
         manager_unit_files_changed(m, changes, n_changes);
         if (r < 0)
-                return install_error(error, r, changes, n_changes);
+                return install_error(reterr_error, r, changes, n_changes);
 
-        return reply_install_changes_and_free(m, message, carries_install_info ? r : -1, changes, n_changes, error);
+        return reply_install_changes_and_free(m, message, carries_install_info ? r : -1, changes, n_changes, reterr_error);
 }
 
-static int method_enable_unit_files_with_flags(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_enable_unit_files_generic(message, userdata, unit_file_enable, /* carries_install_info = */ true, error);
+static int method_enable_unit_files_with_flags(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_enable_unit_files_generic(message, userdata, unit_file_enable, /* carries_install_info= */ true, reterr_error);
 }
 
-static int method_enable_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_enable_unit_files_generic(message, userdata, unit_file_enable, /* carries_install_info = */ true, error);
+static int method_enable_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_enable_unit_files_generic(message, userdata, unit_file_enable, /* carries_install_info= */ true, reterr_error);
 }
 
-static int method_reenable_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_enable_unit_files_generic(message, userdata, unit_file_reenable, /* carries_install_info = */ true, error);
+static int method_reenable_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_enable_unit_files_generic(message, userdata, unit_file_reenable, /* carries_install_info= */ true, reterr_error);
 }
 
-static int method_link_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_enable_unit_files_generic(message, userdata, unit_file_link, /* carries_install_info = */ false, error);
+static int method_link_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_enable_unit_files_generic(message, userdata, unit_file_link, /* carries_install_info= */ false, reterr_error);
 }
 
 static int unit_file_preset_without_mode(RuntimeScope scope, UnitFileFlags flags, const char *root_dir, char * const *files, InstallChange **changes, size_t *n_changes) {
         return unit_file_preset(scope, flags, root_dir, files, UNIT_FILE_PRESET_FULL, changes, n_changes);
 }
 
-static int method_preset_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_enable_unit_files_generic(message, userdata, unit_file_preset_without_mode, /* carries_install_info = */ true, error);
+static int method_preset_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_enable_unit_files_generic(message, userdata, unit_file_preset_without_mode, /* carries_install_info= */ true, reterr_error);
 }
 
-static int method_mask_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_enable_unit_files_generic(message, userdata, unit_file_mask, /* carries_install_info = */ false, error);
+static int method_mask_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_enable_unit_files_generic(message, userdata, unit_file_mask, /* carries_install_info= */ false, reterr_error);
 }
 
-static int method_preset_unit_files_with_mode(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_preset_unit_files_with_mode(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
 
         _cleanup_strv_free_ char **l = NULL;
         InstallChange *changes = NULL;
@@ -2483,7 +2644,7 @@ static int method_preset_unit_files_with_mode(sd_bus_message *message, void *use
                         return -EINVAL;
         }
 
-        r = bus_verify_manage_unit_files_async(m, message, error);
+        r = bus_verify_manage_unit_files_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -2492,9 +2653,9 @@ static int method_preset_unit_files_with_mode(sd_bus_message *message, void *use
         r = unit_file_preset(m->runtime_scope, flags, NULL, l, preset_mode, &changes, &n_changes);
         manager_unit_files_changed(m, changes, n_changes);
         if (r < 0)
-                return install_error(error, r, changes, n_changes);
+                return install_error(reterr_error, r, changes, n_changes);
 
-        return reply_install_changes_and_free(m, message, r, changes, n_changes, error);
+        return reply_install_changes_and_free(m, message, r, changes, n_changes, reterr_error);
 }
 
 static int method_disable_unit_files_generic(
@@ -2502,7 +2663,7 @@ static int method_disable_unit_files_generic(
                 Manager *m,
                 int (*call)(RuntimeScope scope, UnitFileFlags flags, const char *root_dir, char * const *files, InstallChange **changes, size_t *n_changes),
                 bool carries_install_info,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         _cleanup_strv_free_ char **l = NULL;
         InstallChange *changes = NULL;
@@ -2537,7 +2698,7 @@ static int method_disable_unit_files_generic(
                 flags = unit_file_bools_to_flags(runtime, false);
         }
 
-        r = bus_verify_manage_unit_files_async(m, message, error);
+        r = bus_verify_manage_unit_files_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -2546,28 +2707,28 @@ static int method_disable_unit_files_generic(
         r = call(m->runtime_scope, flags, NULL, l, &changes, &n_changes);
         manager_unit_files_changed(m, changes, n_changes);
         if (r < 0)
-                return install_error(error, r, changes, n_changes);
+                return install_error(reterr_error, r, changes, n_changes);
 
-        return reply_install_changes_and_free(m, message, carries_install_info ? r : -1, changes, n_changes, error);
+        return reply_install_changes_and_free(m, message, carries_install_info ? r : -1, changes, n_changes, reterr_error);
 }
 
-static int method_disable_unit_files_with_flags(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_disable_unit_files_generic(message, userdata, unit_file_disable, /* carries_install_info = */ false, error);
+static int method_disable_unit_files_with_flags(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_disable_unit_files_generic(message, userdata, unit_file_disable, /* carries_install_info= */ false, reterr_error);
 }
 
-static int method_disable_unit_files_with_flags_and_install_info(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_disable_unit_files_generic(message, userdata, unit_file_disable, /* carries_install_info = */ true, error);
+static int method_disable_unit_files_with_flags_and_install_info(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_disable_unit_files_generic(message, userdata, unit_file_disable, /* carries_install_info= */ true, reterr_error);
 }
 
-static int method_disable_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_disable_unit_files_generic(message, userdata, unit_file_disable, /* carries_install_info = */ false, error);
+static int method_disable_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_disable_unit_files_generic(message, userdata, unit_file_disable, /* carries_install_info= */ false, reterr_error);
 }
 
-static int method_unmask_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_disable_unit_files_generic(message, userdata, unit_file_unmask, /* carries_install_info = */ false, error);
+static int method_unmask_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_disable_unit_files_generic(message, userdata, unit_file_unmask, /* carries_install_info= */ false, reterr_error);
 }
 
-static int method_revert_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_revert_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_strv_free_ char **l = NULL;
         InstallChange *changes = NULL;
         size_t n_changes = 0;
@@ -2580,7 +2741,7 @@ static int method_revert_unit_files(sd_bus_message *message, void *userdata, sd_
         if (r < 0)
                 return r;
 
-        r = bus_verify_manage_unit_files_async(m, message, error);
+        r = bus_verify_manage_unit_files_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -2589,12 +2750,12 @@ static int method_revert_unit_files(sd_bus_message *message, void *userdata, sd_
         r = unit_file_revert(m->runtime_scope, NULL, l, &changes, &n_changes);
         manager_unit_files_changed(m, changes, n_changes);
         if (r < 0)
-                return install_error(error, r, changes, n_changes);
+                return install_error(reterr_error, r, changes, n_changes);
 
-        return reply_install_changes_and_free(m, message, -1, changes, n_changes, error);
+        return reply_install_changes_and_free(m, message, -1, changes, n_changes, reterr_error);
 }
 
-static int method_set_default_target(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_set_default_target(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         InstallChange *changes = NULL;
         size_t n_changes = 0;
         Manager *m = ASSERT_PTR(userdata);
@@ -2603,7 +2764,7 @@ static int method_set_default_target(sd_bus_message *message, void *userdata, sd
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "enable", error);
+        r = mac_selinux_access_check(message, "enable", reterr_error);
         if (r < 0)
                 return r;
 
@@ -2611,7 +2772,7 @@ static int method_set_default_target(sd_bus_message *message, void *userdata, sd
         if (r < 0)
                 return r;
 
-        r = bus_verify_manage_unit_files_async(m, message, error);
+        r = bus_verify_manage_unit_files_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -2620,12 +2781,12 @@ static int method_set_default_target(sd_bus_message *message, void *userdata, sd
         r = unit_file_set_default(m->runtime_scope, force ? UNIT_FILE_FORCE : 0, NULL, name, &changes, &n_changes);
         manager_unit_files_changed(m, changes, n_changes);
         if (r < 0)
-                return install_error(error, r, changes, n_changes);
+                return install_error(reterr_error, r, changes, n_changes);
 
-        return reply_install_changes_and_free(m, message, -1, changes, n_changes, error);
+        return reply_install_changes_and_free(m, message, -1, changes, n_changes, reterr_error);
 }
 
-static int method_preset_all_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_preset_all_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         InstallChange *changes = NULL;
         size_t n_changes = 0;
         Manager *m = ASSERT_PTR(userdata);
@@ -2636,7 +2797,7 @@ static int method_preset_all_unit_files(sd_bus_message *message, void *userdata,
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "enable", error);
+        r = mac_selinux_access_check(message, "enable", reterr_error);
         if (r < 0)
                 return r;
 
@@ -2654,7 +2815,7 @@ static int method_preset_all_unit_files(sd_bus_message *message, void *userdata,
                         return -EINVAL;
         }
 
-        r = bus_verify_manage_unit_files_async(m, message, error);
+        r = bus_verify_manage_unit_files_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -2663,12 +2824,12 @@ static int method_preset_all_unit_files(sd_bus_message *message, void *userdata,
         r = unit_file_preset_all(m->runtime_scope, flags, NULL, preset_mode, &changes, &n_changes);
         manager_unit_files_changed(m, changes, n_changes);
         if (r < 0)
-                return install_error(error, r, changes, n_changes);
+                return install_error(reterr_error, r, changes, n_changes);
 
-        return reply_install_changes_and_free(m, message, -1, changes, n_changes, error);
+        return reply_install_changes_and_free(m, message, -1, changes, n_changes, reterr_error);
 }
 
-static int method_add_dependency_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_add_dependency_unit_files(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_strv_free_ char **l = NULL;
         Manager *m = ASSERT_PTR(userdata);
         InstallChange *changes = NULL;
@@ -2680,7 +2841,7 @@ static int method_add_dependency_unit_files(sd_bus_message *message, void *userd
 
         assert(message);
 
-        r = bus_verify_manage_unit_files_async(m, message, error);
+        r = bus_verify_manage_unit_files_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -2703,12 +2864,12 @@ static int method_add_dependency_unit_files(sd_bus_message *message, void *userd
         r = unit_file_add_dependency(m->runtime_scope, flags, NULL, l, target, dep, &changes, &n_changes);
         manager_unit_files_changed(m, changes, n_changes);
         if (r < 0)
-                return install_error(error, r, changes, n_changes);
+                return install_error(reterr_error, r, changes, n_changes);
 
-        return reply_install_changes_and_free(m, message, -1, changes, n_changes, error);
+        return reply_install_changes_and_free(m, message, -1, changes, n_changes, reterr_error);
 }
 
-static int method_get_unit_file_links(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_get_unit_file_links(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Manager *m = ASSERT_PTR(userdata);
         InstallChange *changes = NULL;
@@ -2750,7 +2911,7 @@ static int method_get_unit_file_links(sd_bus_message *message, void *userdata, s
         return sd_bus_message_send(reply);
 }
 
-static int method_get_job_waiting(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_get_job_waiting(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         uint32_t id;
         Job *j;
@@ -2764,12 +2925,12 @@ static int method_get_job_waiting(sd_bus_message *message, void *userdata, sd_bu
 
         j = manager_get_job(m, id);
         if (!j)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_JOB, "Job %u does not exist.", (unsigned) id);
+                return sd_bus_error_setf(reterr_error, BUS_ERROR_NO_SUCH_JOB, "Job %u does not exist.", (unsigned) id);
 
-        return bus_job_method_get_waiting_jobs(message, j, error);
+        return bus_job_method_get_waiting_jobs(message, j, reterr_error);
 }
 
-static int method_abandon_scope(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_abandon_scope(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         const char *name;
         Unit *u;
@@ -2781,18 +2942,18 @@ static int method_abandon_scope(sd_bus_message *message, void *userdata, sd_bus_
         if (r < 0)
                 return r;
 
-        r = bus_get_unit_by_name(m, message, name, &u, error);
+        r = bus_get_unit_by_name(m, message, name, &u, reterr_error);
         if (r < 0)
                 return r;
 
         if (u->type != UNIT_SCOPE)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                          "Unit '%s' is not a scope unit, refusing.", name);
 
-        return bus_scope_method_abandon(message, u, error);
+        return bus_scope_method_abandon(message, u, reterr_error);
 }
 
-static int method_set_show_status(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int method_set_show_status(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = ASSERT_PTR(userdata);
         ShowStatus mode = _SHOW_STATUS_INVALID;
         const char *t;
@@ -2800,11 +2961,11 @@ static int method_set_show_status(sd_bus_message *message, void *userdata, sd_bu
 
         assert(message);
 
-        r = mac_selinux_access_check(message, "reload", error);
+        r = mac_selinux_access_check(message, "reload", reterr_error);
         if (r < 0)
                 return r;
 
-        r = bus_verify_set_environment_async(m, message, error);
+        r = bus_verify_set_environment_async(m, message, reterr_error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -2817,7 +2978,7 @@ static int method_set_show_status(sd_bus_message *message, void *userdata, sd_bu
         if (!isempty(t)) {
                 mode = show_status_from_string(t);
                 if (mode < 0)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                                  "Invalid show status '%s'", t);
         }
 
@@ -2826,12 +2987,12 @@ static int method_set_show_status(sd_bus_message *message, void *userdata, sd_bu
         return sd_bus_reply_method_return(message, NULL);
 }
 
-static int method_dump_unit_descriptor_store(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return method_generic_unit_operation(message, userdata, error, UNIT_SERVICE, bus_service_method_dump_file_descriptor_store, GENERIC_UNIT_VALIDATE_LOADED);
+static int method_dump_unit_descriptor_store(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return method_generic_unit_operation(message, userdata, reterr_error, UNIT_SERVICE, bus_service_method_dump_file_descriptor_store, GENERIC_UNIT_VALIDATE_LOADED);
 }
 
-static int method_start_aux_scope(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED, "StartAuxiliaryScope() method has been removed.");
+static int method_start_aux_scope(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return sd_bus_error_set(reterr_error, SD_BUS_ERROR_NOT_SUPPORTED, "StartAuxiliaryScope() method has been removed.");
 }
 
 const sd_bus_vtable bus_manager_vtable[] = {
@@ -2850,6 +3011,11 @@ const sd_bus_vtable bus_manager_vtable[] = {
         BUS_PROPERTY_DUAL_TIMESTAMP("UserspaceTimestamp", offsetof(Manager, timestamps[MANAGER_TIMESTAMP_USERSPACE]), SD_BUS_VTABLE_PROPERTY_CONST),
         BUS_PROPERTY_DUAL_TIMESTAMP("FinishTimestamp", offsetof(Manager, timestamps[MANAGER_TIMESTAMP_FINISH]), SD_BUS_VTABLE_PROPERTY_CONST),
         BUS_PROPERTY_DUAL_TIMESTAMP("ShutdownStartTimestamp", offsetof(Manager, timestamps[MANAGER_TIMESTAMP_SHUTDOWN_START]), SD_BUS_VTABLE_PROPERTY_CONST),
+        BUS_PROPERTY_DUAL_TIMESTAMP("ShutdownFinishTimestamp", offsetof(Manager, timestamps[MANAGER_TIMESTAMP_SHUTDOWN_FINISH]), SD_BUS_VTABLE_PROPERTY_CONST),
+        BUS_PROPERTY_DUAL_TIMESTAMP("PreviousShutdownStartTimestamp", offsetof(Manager, timestamps[MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_START]), SD_BUS_VTABLE_PROPERTY_CONST),
+        BUS_PROPERTY_DUAL_TIMESTAMP("PreviousShutdownFinishTimestamp", offsetof(Manager, timestamps[MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_FINISH]), SD_BUS_VTABLE_PROPERTY_CONST),
+        BUS_PROPERTY_DUAL_TIMESTAMP("PreviousShutdownLateStartTimestamp", offsetof(Manager, timestamps[MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_LATE_START]), SD_BUS_VTABLE_PROPERTY_CONST),
+        BUS_PROPERTY_DUAL_TIMESTAMP("PreviousShutdownLateFinishTimestamp", offsetof(Manager, timestamps[MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_LATE_FINISH]), SD_BUS_VTABLE_PROPERTY_CONST),
         BUS_PROPERTY_DUAL_TIMESTAMP("SecurityStartTimestamp", offsetof(Manager, timestamps[MANAGER_TIMESTAMP_SECURITY_START]), SD_BUS_VTABLE_PROPERTY_CONST),
         BUS_PROPERTY_DUAL_TIMESTAMP("SecurityFinishTimestamp", offsetof(Manager, timestamps[MANAGER_TIMESTAMP_SECURITY_FINISH]), SD_BUS_VTABLE_PROPERTY_CONST),
         BUS_PROPERTY_DUAL_TIMESTAMP("GeneratorsStartTimestamp", offsetof(Manager, timestamps[MANAGER_TIMESTAMP_GENERATORS_START]), SD_BUS_VTABLE_PROPERTY_CONST),
@@ -2870,6 +3036,7 @@ const sd_bus_vtable bus_manager_vtable[] = {
         SD_BUS_PROPERTY("NJobs", "u", property_get_hashmap_size, offsetof(Manager, jobs), 0),
         SD_BUS_PROPERTY("NInstalledJobs", "u", bus_property_get_unsigned, offsetof(Manager, n_installed_jobs), 0),
         SD_BUS_PROPERTY("NFailedJobs", "u", bus_property_get_unsigned, offsetof(Manager, n_failed_jobs), 0),
+        SD_BUS_PROPERTY("TransactionsWithOrderingCycle", "at", property_get_transactions_with_cycle, 0, 0),
         SD_BUS_PROPERTY("Progress", "d", property_get_progress, 0, 0),
         SD_BUS_PROPERTY("Environment", "as", property_get_environment, 0, 0),
         SD_BUS_PROPERTY("ConfirmSpawn", "b", bus_property_get_bool, offsetof(Manager, confirm_spawn), SD_BUS_VTABLE_PROPERTY_CONST),
@@ -2902,6 +3069,8 @@ const sd_bus_vtable bus_manager_vtable[] = {
         SD_BUS_PROPERTY("DefaultStartLimitIntervalSec", "t", bus_property_get_usec, offsetof(Manager, defaults.start_limit.interval), SD_BUS_VTABLE_PROPERTY_CONST|SD_BUS_VTABLE_HIDDEN),
         SD_BUS_PROPERTY("DefaultStartLimitInterval", "t", bus_property_get_usec, offsetof(Manager, defaults.start_limit.interval), SD_BUS_VTABLE_PROPERTY_CONST|SD_BUS_VTABLE_HIDDEN),
         SD_BUS_PROPERTY("DefaultStartLimitBurst", "u", bus_property_get_unsigned, offsetof(Manager, defaults.start_limit.burst), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("EventLoopRateLimitIntervalUSec", "t", bus_property_get_usec, offsetof(Manager, event_loop_ratelimit.interval), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("EventLoopRateLimitBurst", "u", bus_property_get_unsigned, offsetof(Manager, event_loop_ratelimit.burst), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultIOAccounting", "b", bus_property_get_bool, offsetof(Manager, defaults.io_accounting), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultIPAccounting", "b", bus_property_get_bool, offsetof(Manager, defaults.ip_accounting), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultMemoryAccounting", "b", bus_property_get_bool, offsetof(Manager, defaults.memory_accounting), SD_BUS_VTABLE_PROPERTY_CONST),
@@ -2939,14 +3108,21 @@ const sd_bus_vtable bus_manager_vtable[] = {
         SD_BUS_PROPERTY("DefaultLimitRTTIME", "t", bus_property_get_rlimit, offsetof(Manager, defaults.rlimit[RLIMIT_RTTIME]), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultLimitRTTIMESoft", "t", bus_property_get_rlimit, offsetof(Manager, defaults.rlimit[RLIMIT_RTTIME]), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultTasksMax", "t", bus_property_get_tasks_max, offsetof(Manager, defaults.tasks_max), 0),
-        SD_BUS_PROPERTY("DefaultMemoryPressureThresholdUSec", "t", bus_property_get_usec, offsetof(Manager, defaults.memory_pressure_threshold_usec), 0),
-        SD_BUS_PROPERTY("DefaultMemoryPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(Manager, defaults.memory_pressure_watch), 0),
+        SD_BUS_PROPERTY("DefaultMemoryPressureThresholdUSec", "t", bus_property_get_usec, offsetof(Manager, defaults.pressure[PRESSURE_MEMORY].threshold_usec), 0),
+        SD_BUS_PROPERTY("DefaultMemoryPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(Manager, defaults.pressure[PRESSURE_MEMORY].watch), 0),
+        SD_BUS_PROPERTY("DefaultCPUPressureThresholdUSec", "t", bus_property_get_usec, offsetof(Manager, defaults.pressure[PRESSURE_CPU].threshold_usec), 0),
+        SD_BUS_PROPERTY("DefaultCPUPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(Manager, defaults.pressure[PRESSURE_CPU].watch), 0),
+        SD_BUS_PROPERTY("DefaultIOPressureThresholdUSec", "t", bus_property_get_usec, offsetof(Manager, defaults.pressure[PRESSURE_IO].threshold_usec), 0),
+        SD_BUS_PROPERTY("DefaultIOPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(Manager, defaults.pressure[PRESSURE_IO].watch), 0),
         SD_BUS_PROPERTY("TimerSlackNSec", "t", property_get_timer_slack_nsec, 0, SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultOOMPolicy", "s", bus_property_get_oom_policy, offsetof(Manager, defaults.oom_policy), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultOOMScoreAdjust", "i", property_get_oom_score_adjust, 0, SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("DefaultRestrictSUIDSGID", "b", bus_property_get_bool, offsetof(Manager, defaults.restrict_suid_sgid), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("CtrlAltDelBurstAction", "s", bus_property_get_emergency_action, offsetof(Manager, cad_burst_action), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("SoftRebootsCount", "u", bus_property_get_unsigned, offsetof(Manager, soft_reboots_count), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("KExecCount", "u", bus_property_get_unsigned, offsetof(Manager, kexec_count), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("ReloadCount", "t", NULL, offsetof(Manager, reload_count), 0),
+        SD_BUS_PROPERTY("DefaultMemoryZSwapWriteback", "b", bus_property_get_bool, offsetof(Manager, defaults.memory_zswap_writeback), SD_BUS_VTABLE_PROPERTY_CONST),
 
         /* deprecated cgroup v1 property */
         SD_BUS_PROPERTY("DefaultBlockIOAccounting", "b", bus_property_get_bool_false, 0, SD_BUS_VTABLE_PROPERTY_CONST|SD_BUS_VTABLE_DEPRECATED|SD_BUS_VTABLE_HIDDEN),
@@ -3032,6 +3208,11 @@ const sd_bus_vtable bus_manager_vtable[] = {
                                 SD_BUS_ARGS("s", name, "s", job_type, "s", job_mode),
                                 SD_BUS_RESULT("u", job_id, "o", job_path, "s", unit_id, "o", unit_path, "s", job_type, "a(uosos)", affected_jobs),
                                 method_enqueue_unit_job,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("EnqueueUnitJobMany",
+                                SD_BUS_ARGS("as", units, "s", job_type, "s", job_mode, "t", flags),
+                                SD_BUS_RESULT("a(uosos)", jobs),
+                                method_enqueue_unit_job_many,
                                 SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD_WITH_ARGS("KillUnit",
                                 SD_BUS_ARGS("s", name, "s", whom, "i", signal),

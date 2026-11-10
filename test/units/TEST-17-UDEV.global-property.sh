@@ -16,7 +16,7 @@ test_property() {
     assert_eq "$(udevadm info --query property --property "$2" --value "$1")" "$3"
 }
 
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     set +e
 
@@ -31,7 +31,7 @@ trap cleanup EXIT
 rules="/run/udev/rules.d/99-test-17.global-property.rules"
 
 mkdir -p "${rules%/*}"
-cat > "$rules" <<'EOF'
+cat >"$rules" <<'EOF'
 ENV{FOO}=="?*", ENV{PROP_FOO}="$env{FOO}"
 ENV{BAR}=="?*", ENV{PROP_BAR}="$env{BAR}"
 EOF

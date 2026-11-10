@@ -16,7 +16,16 @@
   <varlistentry id='version'>
     <term><option>--version</option></term>
 
-    <listitem id='version-text'>
+    <listitem>
+      <para>Print a short version string and exit.</para>
+    </listitem>
+  </varlistentry>
+
+  <varlistentry id='version-V'>
+    <term><option>-V</option></term>
+    <term><option>--version</option></term>
+
+    <listitem>
       <para>Print a short version string and exit.</para>
     </listitem>
   </varlistentry>
@@ -137,7 +146,7 @@
 
     <listitem>
       <para>Path to the Extended Boot Loader partition, as defined in the
-      <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader Specification</ulink>.
+      <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">UAPI.1 Boot Loader Specification</ulink>.
       If not specified, <filename>/boot/</filename> is checked. It is recommended to mount the Extended Boot
       Loader partition to <filename>/boot/</filename>, if possible.</para>
     </listitem>

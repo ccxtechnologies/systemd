@@ -6,12 +6,11 @@
 #include "alloc-util.h"
 #include "env-file.h"
 #include "env-util.h"
-#include "errno-util.h"
 #include "escape.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "label.h"
+#include "label-util.h"
 #include "log.h"
 #include "string-util.h"
 #include "strv.h"
@@ -421,6 +420,40 @@ int parse_env_file_fd_sentinel(
         return r;
 }
 
+int parse_env_datav(
+                const char *data,
+                size_t size,
+                const char *fname, /* only used for logging */
+                va_list ap) {
+
+        assert(data);
+
+        if (size == SIZE_MAX)
+                size = strlen_ptr(data);
+
+        _cleanup_fclose_ FILE *f = fmemopen_unlocked((void*) data, size, "r");
+        if (!f)
+                return -ENOMEM;
+
+        return parse_env_filev(f, fname, ap);
+}
+
+int parse_env_data_sentinel(
+                const char *data,
+                size_t size,
+                const char *fname, /* only used for logging */
+                ...) {
+
+        va_list ap;
+        int r;
+
+        va_start(ap, fname);
+        r = parse_env_datav(data, size, fname, ap);
+        va_end(ap);
+
+        return r;
+}
+
 static int load_env_file_push(
                 const char *filename, unsigned line,
                 const char *key, char *value,
@@ -632,32 +665,37 @@ static void write_env_var(FILE *f, const char *v) {
         fputc_unlocked('\n', f);
 }
 
-int write_env_file(int dir_fd, const char *fname, char **headers, char **l, WriteEnvFileFlags flags) {
-        _cleanup_fclose_ FILE *f = NULL;
-        _cleanup_free_ char *p = NULL;
+int write_env_file_label(int dir_fd, const char *fname, char **headers, char **l, WriteEnvFileFlags flags, LabelContext *label_context) {
         int r;
 
         assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
         assert(fname);
 
-        bool call_label_ops_post = false;
         if (FLAGS_SET(flags, WRITE_ENV_FILE_LABEL)) {
-                r = label_ops_pre(dir_fd, fname, S_IFREG);
+                r = label_ops_pre(dir_fd, fname, S_IFREG, label_context);
                 if (r < 0)
                         return r;
-
-                call_label_ops_post = true;
         }
 
+        _cleanup_fclose_ FILE *f = NULL;
+        _cleanup_free_ char *p = NULL;
         r = fopen_tmpfile_linkable_at(dir_fd, fname, O_WRONLY|O_CLOEXEC, &p, &f);
-        if (call_label_ops_post)
-                RET_GATHER(r, label_ops_post(f ? fileno(f) : dir_fd, f ? NULL : fname, /* created= */ !!f));
-        if (r < 0)
+        if (r < 0) {
+                if (FLAGS_SET(flags, WRITE_ENV_FILE_LABEL))
+                        (void) label_ops_post(dir_fd, fname, /* created= */ false, label_context);
                 return r;
+        }
+        CLEANUP_TMPFILE_AT(dir_fd, p);
+
+        if (FLAGS_SET(flags, WRITE_ENV_FILE_LABEL)) {
+                r = label_ops_post(fileno(f), /* path= */ NULL, /* created= */ true, label_context);
+                if (r < 0)
+                        return r;
+        }
 
         r = fchmod_umask(fileno(f), 0644);
         if (r < 0)
-                goto fail;
+                return r;
 
         STRV_FOREACH(i, headers) {
                 assert(isempty(*i) || startswith(*i, "#"));
@@ -670,15 +708,11 @@ int write_env_file(int dir_fd, const char *fname, char **headers, char **l, Writ
 
         r = flink_tmpfile_at(f, dir_fd, p, fname, LINK_TMPFILE_REPLACE|LINK_TMPFILE_SYNC);
         if (r < 0)
-                goto fail;
+                return r;
+
+        p = mfree(p); /* disarm CLEANUP_TMPFILE_AT() */
 
         return 0;
-
-fail:
-        if (p)
-                (void) unlinkat(dir_fd, p, 0);
-
-        return r;
 }
 
 int write_vconsole_conf(int dir_fd, const char *fname, char **l) {
@@ -686,5 +720,5 @@ int write_vconsole_conf(int dir_fd, const char *fname, char **l) {
                 "# Written by systemd-localed(8) or systemd-firstboot(1), read by systemd-localed",
                 "# and systemd-vconsole-setup(8). Use localectl(1) to update this file.");
 
-        return write_env_file(dir_fd, fname, headers, l, WRITE_ENV_FILE_LABEL);
+        return write_env_file_label(dir_fd, fname, headers, l, WRITE_ENV_FILE_LABEL, /* label_context= */ NULL);
 }

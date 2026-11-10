@@ -101,6 +101,8 @@ int fmkostemp_safe(char *pattern, const char *mode, FILE **ret_f) {
         _cleanup_close_ int fd = -EBADF;
         FILE *f;
 
+        assert(ret_f);
+
         fd = mkostemp_safe(pattern);
         if (fd < 0)
                 return fd;
@@ -161,17 +163,12 @@ static int tempfn_build(const char *p, const char *pre, const char *post, bool c
                 if (!d)
                         return -ENOMEM;
         } else {
-                r = path_extract_directory(p, &d);
-                if (r < 0 && r != -EDESTADDRREQ) /* EDESTADDRREQ → No directory specified, just a filename */
-                        return r;
-
-                r = path_extract_filename(p, &fn);
+                r = path_split_prefix_filename(p, &d, &fn);
                 if (r < 0)
                         return r;
 
-                if (strlen(fn) > NAME_MAX - len_add)
-                        /* We cannot simply prepend and append strings to the filename. Let's truncate the filename. */
-                        fn[NAME_MAX - len_add] = '\0';
+                /* Truncate the filename if it would become too long after mangling. */
+                strshorten(fn, NAME_MAX - len_add);
         }
 
         nf = strjoin(".#", strempty(pre), strempty(fn), strempty(post));
@@ -202,7 +199,7 @@ int tempfn_xxxxxx(const char *p, const char *extra, char **ret) {
          *         /foo/bar/.#<extra>waldoXXXXXX
          */
 
-        return tempfn_build(p, extra, "XXXXXX", /* child = */ false, ret);
+        return tempfn_build(p, extra, "XXXXXX", /* child= */ false, ret);
 }
 
 int tempfn_random(const char *p, const char *extra, char **ret) {
@@ -222,7 +219,7 @@ int tempfn_random(const char *p, const char *extra, char **ret) {
         if (asprintf(&s, "%016" PRIx64, random_u64()) < 0)
                 return -ENOMEM;
 
-        return tempfn_build(p, extra, s, /* child = */ false, ret);
+        return tempfn_build(p, extra, s, /* child= */ false, ret);
 }
 
 int tempfn_random_child(const char *p, const char *extra, char **ret) {
@@ -246,12 +243,11 @@ int tempfn_random_child(const char *p, const char *extra, char **ret) {
         if (asprintf(&s, "%016" PRIx64, random_u64()) < 0)
                 return -ENOMEM;
 
-        return tempfn_build(p, extra, s, /* child = */ true, ret);
+        return tempfn_build(p, extra, s, /* child= */ true, ret);
 }
 
 int open_tmpfile_unlinkable(const char *directory, int flags) {
-        char *p;
-        int fd, r;
+        int r;
 
         if (!directory) {
                 r = tmp_dir(&directory);
@@ -263,12 +259,14 @@ int open_tmpfile_unlinkable(const char *directory, int flags) {
         /* Returns an unlinked temporary file that cannot be linked into the file system anymore */
 
         /* Try O_TMPFILE first, if it is supported */
-        fd = open(directory, flags|O_TMPFILE|O_EXCL, S_IRUSR|S_IWUSR);
+        int fd = open(directory, flags|O_TMPFILE|O_EXCL, S_IRUSR|S_IWUSR);
         if (fd >= 0)
                 return fd;
 
         /* Fall back to unguessable name + unlinking */
-        p = strjoina(directory, "/systemd-tmp-XXXXXX");
+        _cleanup_free_ char *p = path_join(directory, "/systemd-tmp-XXXXXX");
+        if (!p)
+                return -ENOMEM;
 
         fd = mkostemp_safe(p);
         if (fd < 0)
@@ -280,8 +278,7 @@ int open_tmpfile_unlinkable(const char *directory, int flags) {
 }
 
 int open_tmpfile_linkable_at(int dir_fd, const char *target, int flags, char **ret_path) {
-        _cleanup_free_ char *tmp = NULL;
-        int r, fd;
+        int r;
 
         assert(target);
         assert(ret_path);
@@ -293,14 +290,16 @@ int open_tmpfile_linkable_at(int dir_fd, const char *target, int flags, char **r
          * which case "ret_path" will be returned as NULL. If not possible the temporary path name used is returned in
          * "ret_path". Use link_tmpfile() below to rename the result after writing the file in full. */
 
-        fd = open_parent_at(dir_fd, target, O_TMPFILE|flags, 0640);
+        int fd = open_parent_at(dir_fd, target, O_TMPFILE|flags, 0640);
         if (fd >= 0) {
                 *ret_path = NULL;
                 return fd;
         }
 
-        log_debug_errno(fd, "Failed to use O_TMPFILE for %s: %m", target);
+        if (!ERRNO_IS_NEG_NOT_SUPPORTED(fd))
+                log_debug_errno(fd, "Failed to use O_TMPFILE for %s: %m", target);
 
+        _cleanup_free_ char *tmp = NULL;
         r = tempfn_random(target, NULL, &tmp);
         if (r < 0)
                 return r;
@@ -435,4 +434,20 @@ int mkdtemp_open(const char *template, int flags, char **ret) {
                 *ret = TAKE_PTR(p);
 
         return fd;
+}
+
+void cleanup_tmpfile_data_done(struct cleanup_tmpfile_data *d) {
+        assert(d);
+
+        if (!d->dir_fd ||
+            (*d->dir_fd < 0 && *d->dir_fd != AT_FDCWD) ||
+            !d->filename ||
+            !*d->filename)
+                return;
+
+        PROTECT_ERRNO;
+
+        (void) unlinkat(*d->dir_fd, *d->filename, /* flags= */ 0);
+        d->dir_fd = NULL;
+        d->filename = NULL;
 }

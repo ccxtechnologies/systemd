@@ -121,6 +121,7 @@ typedef struct Session {
         char *remote_host;
         char *service;
         char *desktop;
+        char **extra_device_access;
 
         char *scope;
         char *scope_job;
@@ -178,7 +179,7 @@ bool session_may_gc(Session *s, bool drop_not_started);
 void session_add_to_gc_queue(Session *s);
 int session_activate(Session *s);
 bool session_is_active(Session *s);
-int session_get_idle_hint(Session *s, dual_timestamp *t);
+bool session_get_idle_hint(Session *s, dual_timestamp *ret_timestamp);
 int session_set_idle_hint(Session *s, bool b);
 int session_get_locked_hint(Session *s);
 int session_set_locked_hint(Session *s, bool b);
@@ -194,22 +195,17 @@ int session_save(Session *s);
 int session_load(Session *s);
 int session_kill(Session *s, KillWhom whom, int signo, sd_bus_error *error);
 
-SessionState session_get_state(Session *u);
+SessionState session_get_state(Session *s);
 
-const char* session_state_to_string(SessionState t) _const_;
-SessionState session_state_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(session_state, SessionState);
 
-const char* session_type_to_string(SessionType t) _const_;
-SessionType session_type_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(session_type, SessionType);
 
-const char* session_class_to_string(SessionClass t) _const_;
-SessionClass session_class_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(session_class, SessionClass);
 
-const char* kill_whom_to_string(KillWhom k) _const_;
-KillWhom kill_whom_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(kill_whom, KillWhom);
 
-const char* tty_validity_to_string(TTYValidity t) _const_;
-TTYValidity tty_validity_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(tty_validity, TTYValidity);
 
 void session_leave_vt(Session *s);
 
@@ -223,3 +219,5 @@ int session_send_create_reply(Session *s, const sd_bus_error *error);
 
 bool session_is_self(const char *name);
 bool session_is_auto(const char *name);
+
+int session_build_json(Session *s, sd_json_variant **ret);

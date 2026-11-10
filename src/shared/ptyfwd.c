@@ -19,6 +19,7 @@
 #include "hostname-setup.h"
 #include "io-util.h"
 #include "log.h"
+#include "pretty-print.h"
 #include "ptyfwd.h"
 #include "stat-util.h"
 #include "string-util.h"
@@ -130,16 +131,6 @@ static void pty_forward_disconnect(PTYForward *f) {
                 if (f->saved_stdout)
                         (void) tcsetattr(f->output_fd, TCSANOW, &f->saved_stdout_attr);
 
-                /* STDIN/STDOUT should not be non-blocking normally, so let's reset it */
-                (void) fd_nonblock(f->output_fd, false);
-
-                if (colors_enabled()) {
-                        (void) loop_write(f->output_fd, ANSI_NORMAL ANSI_ERASE_TO_END_OF_SCREEN, SIZE_MAX);
-
-                        if (f->title)
-                                (void) loop_write(f->output_fd, ANSI_WINDOW_TITLE_POP, SIZE_MAX);
-                }
-
                 if (f->last_char_set && f->last_char != '\n') {
                         const char *s;
 
@@ -152,6 +143,16 @@ static void pty_forward_disconnect(PTYForward *f) {
                         f->last_char_set = true;
                         f->last_char = '\n';
                 }
+
+                if (colors_enabled()) {
+                        if (f->title)
+                                (void) loop_write(f->output_fd, ANSI_WINDOW_TITLE_POP, SIZE_MAX);
+
+                        terminal_reset_ansi_seq(f->output_fd);
+                }
+
+                /* STDIN/STDOUT should not be non-blocking normally, so let's reset it */
+                (void) fd_nonblock(f->output_fd, false);
 
                 if (f->close_output_fd)
                         f->output_fd = safe_close(f->output_fd);
@@ -318,6 +319,9 @@ static int insert_background_color(PTYForward *f, size_t offset) {
         if (!f->background_color)
                 return 0;
 
+        if (!shall_tint_background())
+                return 0;
+
         s = background_color_sequence(f);
         if (!s)
                 return -ENOMEM;
@@ -401,6 +405,9 @@ static int insert_background_fix(PTYForward *f, size_t offset) {
                 return 0;
 
         if (!f->background_color)
+                return 0;
+
+        if (!shall_tint_background())
                 return 0;
 
         if (!is_csi_background_reset_sequence(strempty(f->csi_sequence)))
@@ -605,7 +612,7 @@ static int do_shovel(PTYForward *f) {
                  * shovelling. Hence, possibly send some initial ANSI sequences. But do so only if we are
                  * talking to an actual TTY. */
 
-                if (f->background_color) {
+                if (f->background_color && shall_tint_background()) {
                         /* Erase the first line when we start */
                         f->out_buffer = background_color_sequence(f);
                         if (!f->out_buffer)
@@ -662,19 +669,22 @@ static int do_shovel(PTYForward *f) {
 
                                 f->stdin_event_source = sd_event_source_unref(f->stdin_event_source);
                         } else {
-                                /* Check if ^] has been pressed three times within one second. If we get this we quite
-                                 * immediately. */
-                                RequestOperation q = look_for_escape(f, f->in_buffer + f->in_buffer_full, k);
-                                f->in_buffer_full += (size_t) k;
-                                if (q < 0)
-                                        return q;
-                                if (q == REQUEST_EXIT)
-                                        return -ECANCELED;
-                                if (q >= REQUEST_HOTKEY_A && q <= REQUEST_HOTKEY_Z && f->hotkey_handler) {
-                                        r = f->hotkey_handler(f, q - REQUEST_HOTKEY_BASE, f->hotkey_userdata);
-                                        if (r < 0)
-                                                return r;
-                                }
+                                if (!FLAGS_SET(f->flags, PTY_FORWARD_TRANSPARENT)) {
+                                        /* Check if ^] has been pressed three times within one second. If we get this we quit
+                                         * immediately. */
+                                        RequestOperation q = look_for_escape(f, f->in_buffer + f->in_buffer_full, k);
+                                        f->in_buffer_full += (size_t) k;
+                                        if (q < 0)
+                                                return q;
+                                        if (q == REQUEST_EXIT)
+                                                return -ECANCELED;
+                                        if (q >= REQUEST_HOTKEY_A && q <= REQUEST_HOTKEY_Z && f->hotkey_handler) {
+                                                r = f->hotkey_handler(f, q - REQUEST_HOTKEY_BASE, f->hotkey_userdata);
+                                                if (r < 0)
+                                                        return r;
+                                        }
+                                } else
+                                        f->in_buffer_full += (size_t) k;
                         }
 
                         did_something = true;
@@ -879,19 +889,16 @@ static int on_sigwinch_event(sd_event_source *e, const struct signalfd_siginfo *
 
 static int on_exit_event(sd_event_source *e, void *userdata) {
         PTYForward *f = ASSERT_PTR(userdata);
-        int r;
 
         assert(e);
         assert(e == f->exit_event_source);
 
-        if (!pty_forward_drain(f)) {
-                /* If not drained, try to drain the buffer. */
-                r = shovel_force(f);
-                if (r < 0)
-                        return r;
-        }
-
-        return pty_forward_done(f, 0);
+        /* The event loop is exiting while the forwarder is still active. Force a final synchronous drain of
+         * whatever is still buffered. shovel() may complete the drain and call pty_forward_done(), which
+         * can free f via the hangup handler, so we must not touch f afterwards, only propagate the return
+         * value, exactly like on_master_event() does. */
+        f->drain = true;
+        return shovel_force(f);
 }
 
 static int on_defer_event(sd_event_source *s, void *userdata) {
@@ -924,6 +931,24 @@ int pty_forward_new(
         assert(master >= 0);
         assert(ret);
 
+        if (!FLAGS_SET(flags, PTY_FORWARD_READ_ONLY)) {
+                /* If stdin isn't actually opened for reading, or refers to the read end of a pipe (or
+                 * socket) whose peer has already hung up, then there's nothing for us to forward — imply
+                 * read-only mode. */
+                r = RET_NERRNO(fcntl(STDIN_FILENO, F_GETFL));
+                if (r < 0 && r != -EBADF)
+                        return log_debug_errno(errno, "Failed to query stdin flags: %m");
+                if (r == -EBADF || (r & O_ACCMODE_STRICT) == O_WRONLY)
+                        flags |= PTY_FORWARD_READ_ONLY;
+                else {
+                        r = pipe_eof(STDIN_FILENO);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to check whether stdin is at EOF, ignoring: %m");
+                        else if (r > 0)
+                                flags |= PTY_FORWARD_READ_ONLY;
+                }
+        }
+
         f = new(PTYForward, 1);
         if (!f)
                 return -ENOMEM;
@@ -952,13 +977,10 @@ int pty_forward_new(
                  * them. This has two advantages: when we are killed abruptly the stdin/stdout fds won't be
                  * left in O_NONBLOCK state for the next process using them. In addition, if some process
                  * running in the background wants to continue writing to our stdout it can do so without
-                 * being confused by O_NONBLOCK.
-                 * We keep O_APPEND (if present) on the output FD and (try to) keep current file position on
-                 * both input and output FD (principle of least surprise).
-                 */
+                 * being confused by O_NONBLOCK. Regular file output is dup'ed instead, to keep the file offset
+                 * shared with the caller. */
 
-                f->input_fd = fd_reopen_propagate_append_and_position(
-                                STDIN_FILENO, O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+                f->input_fd = fd_dup_or_reopen_stdio_nonblock(STDIN_FILENO, O_RDONLY);
                 if (f->input_fd < 0) {
                         /* Handle failures gracefully, after all certain fd types cannot be reopened
                          * (sockets, …) */
@@ -972,8 +994,7 @@ int pty_forward_new(
                 } else
                         f->close_input_fd = true;
 
-                f->output_fd = fd_reopen_propagate_append_and_position(
-                                STDOUT_FILENO, O_WRONLY|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+                f->output_fd = fd_dup_or_reopen_stdio_nonblock(STDOUT_FILENO, O_WRONLY);
                 if (f->output_fd < 0) {
                         log_debug_errno(f->output_fd, "Failed to reopen stdout, using original fd: %m");
 
@@ -1156,9 +1177,11 @@ int pty_forward_set_priority(PTYForward *f, int64_t priority) {
                         return r;
         }
 
-        r = sd_event_source_set_priority(f->stdout_event_source, priority);
-        if (r < 0)
-                return r;
+        if (f->stdout_event_source) {
+                r = sd_event_source_set_priority(f->stdout_event_source, priority);
+                if (r < 0)
+                        return r;
+        }
 
         r = sd_event_source_set_priority(f->master_event_source, priority);
         if (r < 0)

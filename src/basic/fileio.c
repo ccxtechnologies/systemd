@@ -7,13 +7,16 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "chase.h"
 #include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
 #include "hexdecoct.h"
-#include "label.h"
+#include "io-util.h"
+#include "iovec-util.h"
+#include "label-util.h"
 #include "log.h"
 #include "mkdir.h"
 #include "nulstr-util.h"
@@ -216,7 +219,8 @@ static int write_string_file_atomic_at(
                 const char *fn,
                 const char *line,
                 WriteStringFileFlags flags,
-                const struct timespec *ts) {
+                const struct timespec *ts,
+                LabelContext *label_context) {
 
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_free_ char *p = NULL;
@@ -232,7 +236,7 @@ static int write_string_file_atomic_at(
 
         bool call_label_ops_post = false;
         if (FLAGS_SET(flags, WRITE_STRING_FILE_LABEL)) {
-                r = label_ops_pre(dir_fd, fn, mode);
+                r = label_ops_pre(dir_fd, fn, mode, label_context);
                 if (r < 0)
                         return r;
 
@@ -240,24 +244,28 @@ static int write_string_file_atomic_at(
         }
 
         r = fopen_temporary_at(dir_fd, fn, &f, &p);
-        if (call_label_ops_post)
-                /* If fopen_temporary_at() failed in the above, propagate the error code, and ignore failures
-                 * in label_ops_post(). */
-                RET_GATHER(r, label_ops_post(f ? fileno(f) : dir_fd, f ? NULL : fn, /* created= */ !!f));
+        int k = call_label_ops_post ? label_ops_post(f ? fileno(f) : dir_fd, f ? NULL : fn, /* created= */ !!f, label_context) : 0;
+        /* If fopen_temporary_at() failed in the above, propagate the error code, and ignore failures in
+         * label_ops_post(). */
         if (r < 0)
-                goto fail;
+                return r;
+        CLEANUP_TMPFILE_AT(dir_fd, p);
+        if (k < 0)
+                return k;
 
         r = write_string_stream_full(f, line, flags, ts);
         if (r < 0)
-                goto fail;
+                return r;
 
         r = fchmod_umask(fileno(f), mode);
         if (r < 0)
-                goto fail;
+                return r;
 
         r = RET_NERRNO(renameat(dir_fd, p, dir_fd, fn));
         if (r < 0)
-                goto fail;
+                return r;
+
+        p = mfree(p); /* disarm CLEANUP_TMPFILE_AT() */
 
         if (FLAGS_SET(flags, WRITE_STRING_FILE_SYNC)) {
                 /* Sync the rename, too */
@@ -267,20 +275,16 @@ static int write_string_file_atomic_at(
         }
 
         return 0;
-
-fail:
-        if (f)
-                (void) unlinkat(dir_fd, p, 0);
-        return r;
 }
 
-int write_string_file_full(
+int write_string_file_full_label(
                 int dir_fd,
                 const char *fn,
                 const char *line,
                 WriteStringFileFlags flags,
                 const struct timespec *ts,
-                const char *label_fn) {
+                const char *label_fn,
+                LabelContext *label_context) {
 
         bool made_file = false;
         _cleanup_fclose_ FILE *f = NULL;
@@ -305,7 +309,7 @@ int write_string_file_full(
                 assert(fn);
                 assert(flags & WRITE_STRING_FILE_CREATE);
 
-                r = write_string_file_atomic_at(dir_fd, fn, line, flags, ts);
+                r = write_string_file_atomic_at(dir_fd, fn, line, flags, ts, label_context);
                 if (r < 0)
                         goto fail;
 
@@ -324,7 +328,7 @@ int write_string_file_full(
                 bool call_label_ops_post = false;
 
                 if (FLAGS_SET(flags, WRITE_STRING_FILE_LABEL|WRITE_STRING_FILE_CREATE)) {
-                        r = label_ops_pre(dir_fd, label_fn ?: fn, mode);
+                        r = label_ops_pre(dir_fd, label_fn ?: fn, mode, label_context);
                         if (r < 0)
                                 goto fail;
 
@@ -343,7 +347,7 @@ int write_string_file_full(
                 if (call_label_ops_post)
                         /* If openat_report_new() failed in the above, propagate the error code, and ignore
                          * failures in label_ops_post(). */
-                        RET_GATHER(r, label_ops_post(fd >= 0 ? fd : dir_fd, fd >= 0 ? NULL : fn, made_file));
+                        RET_GATHER(r, label_ops_post(fd >= 0 ? fd : dir_fd, fd >= 0 ? NULL : fn, made_file, label_context));
         }
         if (r < 0)
                 goto fail;
@@ -398,6 +402,26 @@ int write_string_filef(
         return write_string_file(fn, p, flags);
 }
 
+int write_string_filef_at(
+                int dir_fd,
+                const char *fn,
+                WriteStringFileFlags flags,
+                const char *format, ...) {
+
+        _cleanup_free_ char *p = NULL;
+        va_list ap;
+        int r;
+
+        va_start(ap, format);
+        r = vasprintf(&p, format, ap);
+        va_end(ap);
+
+        if (r < 0)
+                return -ENOMEM;
+
+        return write_string_file_at(dir_fd, fn, p, flags);
+}
+
 int write_base64_file_at(
                 int dir_fd,
                 const char *fn,
@@ -418,15 +442,29 @@ int read_one_line_file_at(int dir_fd, const char *filename, char **ret) {
         _cleanup_fclose_ FILE *f = NULL;
         int r;
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(filename);
         assert(ret);
 
-        r = fopen_unlocked_at(dir_fd, filename, "re", 0, &f);
+        r = fopen_unlocked_at(dir_fd, filename, "re", /* open_flags= */ 0, &f);
         if (r < 0)
                 return r;
 
         return read_line(f, LONG_LINE_MAX, ret);
+}
+
+int read_boolean_file_at(int dir_fd, const char *filename) {
+        _cleanup_free_ char *s = NULL;
+        int r;
+
+        assert(wildcard_fd_is_valid(dir_fd));
+        assert(filename);
+
+        r = read_one_line_file_at(dir_fd, filename, &s);
+        if (r < 0)
+                return r;
+
+        return parse_boolean(s);
 }
 
 int verify_file_at(int dir_fd, const char *fn, const char *blob, bool accept_extra_nl) {
@@ -665,6 +703,12 @@ int read_full_stream_full(
                 if (fstat(fd, &st) < 0)
                         return -errno;
 
+                if (FLAGS_SET(flags, READ_FULL_FILE_VERIFY_REGULAR)) {
+                        r = stat_verify_regular(&st);
+                        if (r < 0)
+                                return r;
+                }
+
                 if (S_ISREG(st.st_mode)) {
 
                         /* Try to start with the right file size if we shall read the file in full. Note
@@ -686,7 +730,8 @@ int read_full_stream_full(
                         if (flags & READ_FULL_FILE_WARN_WORLD_READABLE)
                                 (void) warn_file_is_world_accessible(filename, &st, NULL, 0);
                 }
-        }
+        } else if (FLAGS_SET(flags, READ_FULL_FILE_VERIFY_REGULAR))
+                return -EBADFD;
 
         /* If we don't know how much to read, figure it out now. If we shall read a part of the file, then
          * allocate the requested size. If we shall load the full file start with LINE_MAX. Note that if
@@ -745,7 +790,9 @@ int read_full_stream_full(
                 if (feof(f))
                         break;
 
-                if (size != SIZE_MAX && !FLAGS_SET(flags, READ_FULL_FILE_FAIL_WHEN_LARGER)) { /* If we got asked to read some specific size, we already sized the buffer right, hence leave */
+                if (size != SIZE_MAX && !FLAGS_SET(flags, READ_FULL_FILE_FAIL_WHEN_LARGER)) {
+                        /* If we got asked to read some specific size, we already sized the buffer right,
+                         * hence leave. */
                         assert(l == size);
                         break;
                 }
@@ -789,9 +836,9 @@ int read_full_stream_full(
         }
 
         if (!ret_size) {
-                /* Safety check: if the caller doesn't want to know the size of what we just read it will rely on the
-                 * trailing NUL byte. But if there's an embedded NUL byte, then we should refuse operation as otherwise
-                 * there'd be ambiguity about what we just read. */
+                /* Safety check: if the caller doesn't want to know the size of what we just read it will
+                 * rely on the trailing NUL byte. But if there's an embedded NUL byte, then we should refuse
+                 * operation as otherwise there'd be ambiguity about what we just read. */
 
                 if (memchr(buf, 0, l)) {
                         r = -EBADMSG;
@@ -828,7 +875,6 @@ int read_full_file_full(
         XfopenFlags xflags = XFOPEN_UNLOCKED;
         int r;
 
-        assert(filename);
         assert(ret_contents);
 
         if (FLAGS_SET(flags, READ_FULL_FILE_CONNECT_SOCKET) && /* If this is enabled, let's try to connect to it */
@@ -876,7 +922,7 @@ int script_get_shebang_interpreter(const char *path, char **ret) {
         _cleanup_free_ char *p = NULL;
         const char *s = line;
 
-        r = extract_first_word(&s, &p, /* separators = */ NULL, /* flags = */ 0);
+        r = extract_first_word(&s, &p, /* separators= */ NULL, /* flags= */ 0);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -929,17 +975,22 @@ int get_proc_field(const char *path, const char *key, char **ret) {
         }
 }
 
-DIR* xopendirat(int dir_fd, const char *name, int flags) {
+DIR* xopendirat(int dir_fd, const char *path, int flags) {
         _cleanup_close_ int fd = -EBADF;
 
         assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
-        assert(name);
         assert(!(flags & (O_CREAT|O_TMPFILE)));
 
-        if (dir_fd == AT_FDCWD && flags == 0)
-                return opendir(name);
+        if ((dir_fd == AT_FDCWD || path_is_absolute(path)) &&
+            (flags &~ O_DIRECTORY) == 0)
+                return opendir(path);
 
-        fd = openat(dir_fd, name, O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|flags);
+        if (isempty(path)) {
+                path = ".";
+                flags |= O_NOFOLLOW;
+        }
+
+        fd = openat(dir_fd, path, O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|flags);
         if (fd < 0)
                 return NULL;
 
@@ -997,14 +1048,19 @@ static int xfopenat_regular(int dir_fd, const char *path, const char *mode, int 
 
         /* A combination of fopen() with openat() */
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
-        assert(path);
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(mode);
         assert(ret);
 
-        if (dir_fd == AT_FDCWD && open_flags == 0)
+        if (dir_fd == AT_FDCWD && path && open_flags == 0)
                 f = fopen(path, mode);
-        else {
+        else if (dir_fd == XAT_FDROOT && path && open_flags == 0) {
+                _cleanup_free_ char *j = strjoin("/", path);
+                if (!j)
+                        return -ENOMEM;
+
+                f = fopen(j, mode);
+        } else {
                 _cleanup_close_ int fd = -EBADF;
                 int mode_flags;
 
@@ -1012,9 +1068,18 @@ static int xfopenat_regular(int dir_fd, const char *path, const char *mode, int 
                 if (mode_flags < 0)
                         return mode_flags;
 
-                fd = openat(dir_fd, path, mode_flags | open_flags);
-                if (fd < 0)
-                        return -errno;
+                if (path) {
+                        fd = openat(dir_fd, path, mode_flags | open_flags);
+                        if (fd < 0)
+                                return -errno;
+                } else {
+                        if (dir_fd == AT_FDCWD)
+                                return -EBADF;
+
+                        fd = fd_reopen(dir_fd, (mode_flags | open_flags) & ~O_NOFOLLOW);
+                        if (fd < 0)
+                                return fd;
+                }
 
                 f = take_fdopen(&fd, mode);
         }
@@ -1030,8 +1095,7 @@ static int xfopenat_unix_socket(int dir_fd, const char *path, const char *bind_n
         FILE *f;
         int r;
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
-        assert(path);
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(ret);
 
         sk = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
@@ -1079,8 +1143,7 @@ int xfopenat_full(
         FILE *f = NULL;  /* avoid false maybe-uninitialized warning */
         int r;
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
-        assert(path);
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(mode);
         assert(ret);
 
@@ -1212,7 +1275,7 @@ int search_and_open(
 
         assert(path);
 
-        copy = strv_copy((char**) search);
+        copy = strv_copy(search);
         if (!copy)
                 return -ENOMEM;
 
@@ -1234,7 +1297,7 @@ static int search_and_fopen_internal(
         assert(path);
         assert(mode || !ret_file);
 
-        r = search_and_open(
+        r = search_and_open_internal(
                         path,
                         mode ? fopen_mode_to_flags(mode) : 0,
                         root,
@@ -1350,6 +1413,8 @@ int read_timestamp_file(const char *fn, usec_t *ret) {
         _cleanup_free_ char *ln = NULL;
         uint64_t t;
         int r;
+
+        assert(ret);
 
         r = read_one_line_file(fn, &ln);
         if (r < 0)
@@ -1637,5 +1702,65 @@ int warn_file_is_world_accessible(const char *filename, struct stat *st, const c
         else
                 log_warning("%s has %04o mode that is too permissive, please adjust the ownership and access mode.",
                             filename, st->st_mode & 07777);
+        return 0;
+}
+
+int write_data_file_atomic_at(
+                int dir_fd,
+                const char *path,
+                const struct iovec *iovec,
+                WriteDataFileFlags flags) {
+
+        int r;
+
+        assert(wildcard_fd_is_valid(dir_fd));
+
+        /* This is a cousin of write_string_file_atomic(), but operates with arbitrary struct iovec binary
+         * data (rather than strings), works without FILE* streams, and does direct syscalls instead. */
+
+        _cleanup_free_ char *dn = NULL, *fn = NULL;
+        r = path_split_prefix_filename(path, &dn, &fn);
+        if (IN_SET(r, -EADDRNOTAVAIL, O_DIRECTORY))
+                return -EISDIR; /* path refers to "." or "/" (which are dirs, which we cannot write), or is suffixed with "/" */
+        if (r < 0)
+                return r;
+
+        _cleanup_close_ int mfd = -EBADF;
+        if (dn) {
+                /* If there's a directory component, readjust our position */
+                r = chaseat(XAT_FDROOT,
+                            dir_fd,
+                            dn,
+                            FLAGS_SET(flags, WRITE_DATA_FILE_MKDIR_0755) ? CHASE_MKDIR_0755 : 0,
+                            /* ret_path= */ NULL,
+                            &mfd);
+                if (r < 0)
+                        return r;
+
+                dir_fd = mfd;
+        }
+
+        _cleanup_free_ char *t = NULL;
+        _cleanup_close_ int fd = open_tmpfile_linkable_at(dir_fd, fn, O_WRONLY|O_CLOEXEC, &t);
+        if (fd < 0)
+                return fd;
+
+        CLEANUP_TMPFILE_AT(dir_fd, t);
+
+        if (iovec_is_set(iovec)) {
+                r = loop_write(fd, iovec->iov_base, iovec->iov_len);
+                if (r < 0)
+                        return r;
+        }
+
+        r = fchmod_umask(fd, FLAGS_SET(flags, WRITE_DATA_FILE_MODE_0400) ? 0400 : 0644);
+        if (r < 0)
+                return r;
+
+        r = link_tmpfile_at(fd, dir_fd, t, fn, LINK_TMPFILE_REPLACE);
+        if (r < 0)
+                return r;
+
+        t = mfree(t); /* disarm CLEANUP_TMPFILE_AT */
         return 0;
 }

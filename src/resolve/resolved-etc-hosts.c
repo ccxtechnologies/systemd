@@ -4,15 +4,15 @@
 #include "sd-event.h"
 
 #include "alloc-util.h"
+#include "dns-answer.h"
 #include "dns-domain.h"
+#include "dns-question.h"
+#include "dns-rr.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "hostname-util.h"
 #include "log.h"
-#include "resolved-dns-answer.h"
-#include "resolved-dns-question.h"
-#include "resolved-dns-rr.h"
 #include "resolved-etc-hosts.h"
 #include "resolved-manager.h"
 #include "set.h"
@@ -72,6 +72,8 @@ void etc_hosts_clear(EtcHosts *hosts) {
 void manager_etc_hosts_flush(Manager *m) {
         etc_hosts_clear(&m->etc_hosts);
         m->etc_hosts_stat = (struct stat) {};
+        /* NB: We do not reset m->etc_hosts_last here, because manager_etc_hosts_read() calls us and needs it
+         * to stay in effect for the reload suppression to work */
 }
 
 static int parse_line(EtcHosts *hosts, unsigned nr, const char *line) {

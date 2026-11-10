@@ -1,15 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <sys/epoll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "sd-daemon.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
 #include "daemon-util.h"
+#include "dlopen-note.h"
 #include "env-util.h"
 #include "errno-util.h"
 #include "escape.h"
@@ -17,12 +18,14 @@
 #include "format-util.h"
 #include "log.h"
 #include "main-func.h"
-#include "pretty-print.h"
+#include "pidfd-util.h"
+#include "pidref.h"
 #include "process-util.h"
 #include "socket-netlink.h"
 #include "socket-util.h"
 #include "string-util.h"
 #include "strv.h"
+#include "verbs.h"
 
 static char **arg_listen = NULL;
 static bool arg_accept = false;
@@ -31,6 +34,14 @@ static char **arg_setenv = NULL;
 static char **arg_fdnames = NULL;
 static bool arg_inetd = false;
 static bool arg_now = false;
+
+COMMAND(
+        "systemd-socket-activate\0",
+        "Listen on sockets and launch child on connection.",
+        .argspec = "COMMAND…\0",
+        .footer = "Note: file descriptors from sd_listen_fds() will be passed through.",
+        .man_pages = "systemd-socket-activate(1)\0",
+);
 
 static int add_epoll(int epoll_fd, int fd) {
         struct epoll_event ev = {
@@ -186,6 +197,13 @@ static int exec_process(char * const *argv, int start_fd, size_t n_fds) {
                 if (r < 0)
                         return r;
 
+                uint64_t pidfdid;
+                if (pidfd_get_inode_id_self_cached(&pidfdid) >= 0) {
+                        r = strv_extendf(&envp, "LISTEN_PIDFDID=%" PRIu64, pidfdid);
+                        if (r < 0)
+                                return r;
+                }
+
                 if (arg_fdnames) {
                         _cleanup_free_ char *names = NULL;
                         size_t len;
@@ -230,7 +248,6 @@ static int exec_process(char * const *argv, int start_fd, size_t n_fds) {
 
 static int fork_and_exec_process(char * const *argv, int fd) {
         _cleanup_free_ char *joined = NULL;
-        pid_t child_pid;
         int r;
 
         assert(!strv_isempty(argv));
@@ -240,9 +257,11 @@ static int fork_and_exec_process(char * const *argv, int fd) {
         if (!joined)
                 return log_oom();
 
-        r = safe_fork("(activate)",
-                      FORK_RESET_SIGNALS | FORK_DEATHSIG_SIGTERM | FORK_RLIMIT_NOFILE_SAFE | FORK_LOG,
-                      &child_pid);
+        _cleanup_(pidref_done) PidRef child_pidref = PIDREF_NULL;
+        r = pidref_safe_fork(
+                        "(activate)",
+                        FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG,
+                        &child_pidref);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -251,7 +270,7 @@ static int fork_and_exec_process(char * const *argv, int fd) {
                 _exit(EXIT_FAILURE);
         }
 
-        log_info("Spawned '%s' as PID " PID_FMT ".", joined, child_pid);
+        log_info("Spawned '%s' as PID " PID_FMT ".", joined, child_pidref.pid);
         return 0;
 }
 
@@ -308,85 +327,33 @@ static int install_chld_handler(void) {
         return 0;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-socket-activate", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...] COMMAND ...\n"
-               "\n%sListen on sockets and launch child on connection.%s\n"
-               "\nOptions:\n"
-               "  -h --help                  Show this help and exit\n"
-               "     --version               Print version string and exit\n"
-               "  -l --listen=ADDR           Listen for raw connections at ADDR\n"
-               "  -d --datagram              Listen on datagram instead of stream socket\n"
-               "     --seqpacket             Listen on SOCK_SEQPACKET instead of stream socket\n"
-               "  -a --accept                Spawn separate child for each connection\n"
-               "  -E --setenv=NAME[=VALUE]   Pass an environment variable to children\n"
-               "     --fdname=NAME[:NAME...] Specify names for file descriptors\n"
-               "     --inetd                 Enable inetd file descriptor passing protocol\n"
-               "     --now                   Start instantly instead of waiting for connection\n"
-               "\nNote: file descriptors from sd_listen_fds() will be passed through.\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               link);
-
-        return 0;
-}
-
-static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_FDNAME,
-                ARG_SEQPACKET,
-                ARG_INETD,
-                ARG_NOW,
-        };
-
-        static const struct option options[] = {
-                { "help",        no_argument,       NULL, 'h'           },
-                { "version",     no_argument,       NULL, ARG_VERSION   },
-                { "datagram",    no_argument,       NULL, 'd'           },
-                { "seqpacket",   no_argument,       NULL, ARG_SEQPACKET },
-                { "listen",      required_argument, NULL, 'l'           },
-                { "accept",      no_argument,       NULL, 'a'           },
-                { "setenv",      required_argument, NULL, 'E'           },
-                { "environment", required_argument, NULL, 'E'           }, /* legacy alias */
-                { "fdname",      required_argument, NULL, ARG_FDNAME    },
-                { "inetd",       no_argument,       NULL, ARG_INETD     },
-                { "now",         no_argument,       NULL, ARG_NOW       },
-                {}
-        };
-
-        int c, r;
-
+static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         assert(argc >= 0);
         assert(argv);
+        assert(remaining_args);
 
-        /* Resetting to 0 forces the invocation of an internal initialization routine of getopt_long()
-         * that checks for GNU extensions in optstring ('-' or '+' at the beginning). */
-        optind = 0;
-        while ((c = getopt_long(argc, argv, "+hl:aE:d", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv, OPTION_PARSER_STOP_AT_FIRST_NONOPTION };
+        int r;
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
-                case 'h':
-                        return help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case 'l':
-                        r = strv_extend(&arg_listen, optarg);
+                OPTION('l', "listen", "ADDR",
+                       "Listen for raw connections at ADDR"):
+                        r = strv_extend(&arg_listen, opts.arg);
                         if (r < 0)
                                 return log_oom();
 
                         break;
 
-                case 'd':
+                OPTION('d', "datagram", NULL,
+                       "Listen on datagram instead of stream socket"):
                         if (arg_socket_type == SOCK_SEQPACKET)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "--datagram may not be combined with --seqpacket.");
@@ -394,7 +361,8 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_socket_type = SOCK_DGRAM;
                         break;
 
-                case ARG_SEQPACKET:
+                OPTION_LONG("seqpacket", NULL,
+                            "Listen on SOCK_SEQPACKET instead of stream socket"):
                         if (arg_socket_type == SOCK_DGRAM)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "--seqpacket may not be combined with --datagram.");
@@ -402,20 +370,24 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_socket_type = SOCK_SEQPACKET;
                         break;
 
-                case 'a':
+                OPTION('a', "accept", NULL,
+                       "Spawn separate child for each connection"):
                         arg_accept = true;
                         break;
 
-                case 'E':
-                        r = strv_env_replace_strdup_passthrough(&arg_setenv, optarg);
+                OPTION('E', "setenv", "NAME[=VALUE]",
+                       "Pass an environment variable to children"): {}
+                OPTION_LONG("environment", "NAME[=VALUE]", /* help= */ NULL): /* legacy alias */
+                        r = strv_env_replace_strdup_passthrough(&arg_setenv, opts.arg);
                         if (r < 0)
-                                return log_error_errno(r, "Cannot assign environment variable %s: %m", optarg);
+                                return log_error_errno(r, "Cannot assign environment variable %s: %m", opts.arg);
                         break;
 
-                case ARG_FDNAME: {
+                OPTION_LONG("fdname", "NAME[:NAME...]",
+                            "Specify names for file descriptors"): {
                         _cleanup_strv_free_ char **names = NULL;
 
-                        names = strv_split(optarg, ":");
+                        names = strv_split(opts.arg, ":");
                         if (!names)
                                 return log_oom();
 
@@ -427,7 +399,7 @@ static int parse_argv(int argc, char *argv[]) {
                                         log_warning("File descriptor name \"%s\" is not valid.", esc);
                                 }
 
-                        /* Empty optargs means one empty name */
+                        /* Empty argument means one empty name */
                         r = strv_extend_strv(&arg_fdnames,
                                              strv_isempty(names) ? STRV_MAKE("") : names,
                                              false);
@@ -436,22 +408,22 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                case ARG_INETD:
+                OPTION_LONG("inetd", NULL,
+                            "Enable inetd file descriptor passing protocol"):
                         arg_inetd = true;
                         break;
 
-                case ARG_NOW:
+                OPTION_LONG("now", NULL,
+                            "Start instantly instead of waiting for connection"):
                         arg_now = true;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (optind == argc)
+        *remaining_args = option_parser_get_args(&opts);
+        if (strv_isempty(*remaining_args))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "%s: command to execute is missing.",
                                        program_invocation_short_name);
@@ -476,13 +448,16 @@ static int run(int argc, char **argv) {
         _cleanup_strv_free_ char **exec_argv = NULL;
         int r, n;
 
+        LIBSELINUX_NOTE(recommended);
+
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
-        exec_argv = strv_copy(argv + optind);
+        exec_argv = strv_copy(args);
         if (!exec_argv)
                 return log_oom();
 

@@ -9,6 +9,7 @@
 #include "device-filter.h"
 #include "device-util.h"
 #include "dirent-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "log.h"
 #include "path-util.h"
@@ -82,18 +83,13 @@ _public_ int sd_device_enumerator_new(sd_device_enumerator **ret) {
         return 0;
 }
 
-static void device_unref_many(sd_device **devices, size_t n) {
-        assert(devices || n == 0);
-
-        for (size_t i = 0; i < n; i++)
-                sd_device_unref(devices[i]);
-}
+static DEFINE_POINTER_ARRAY_CLEAR_FUNC(sd_device*, sd_device_unref);
 
 static void device_enumerator_unref_devices(sd_device_enumerator *enumerator) {
         assert(enumerator);
 
         hashmap_clear(enumerator->devices_by_syspath);
-        device_unref_many(enumerator->devices, enumerator->n_devices);
+        sd_device_unref_array_clear(enumerator->devices, enumerator->n_devices);
         enumerator->devices = mfree(enumerator->devices);
         enumerator->n_devices = 0;
 }
@@ -172,7 +168,7 @@ _public_ int sd_device_enumerator_add_match_sysattr(sd_device_enumerator *enumer
         else
                 hashmap = &enumerator->nomatch_sysattr;
 
-        r = update_match_strv(hashmap, sysattr, value, /* clear_on_null = */ true);
+        r = update_match_strv(hashmap, sysattr, value, /* clear_on_null= */ true);
         if (r <= 0)
                 return r;
 
@@ -187,7 +183,7 @@ _public_ int sd_device_enumerator_add_match_property(sd_device_enumerator *enume
         assert_return(enumerator, -EINVAL);
         assert_return(property, -EINVAL);
 
-        r = update_match_strv(&enumerator->match_property, property, value, /* clear_on_null = */ false);
+        r = update_match_strv(&enumerator->match_property, property, value, /* clear_on_null= */ false);
         if (r <= 0)
                 return r;
 
@@ -202,7 +198,7 @@ _public_ int sd_device_enumerator_add_match_property_required(sd_device_enumerat
         assert_return(enumerator, -EINVAL);
         assert_return(property, -EINVAL);
 
-        r = update_match_strv(&enumerator->match_property_required, property, value, /* clear_on_null = */ false);
+        r = update_match_strv(&enumerator->match_property_required, property, value, /* clear_on_null= */ false);
         if (r <= 0)
                 return r;
 
@@ -461,7 +457,7 @@ static int enumerator_sort_devices(sd_device_enumerator *enumerator) {
 
         typesafe_qsort(devices + n_sorted, n - n_sorted, device_compare);
 
-        device_unref_many(enumerator->devices, enumerator->n_devices);
+        sd_device_unref_array_clear(enumerator->devices, enumerator->n_devices);
 
         enumerator->n_devices = n;
         free_and_replace(enumerator->devices, devices);
@@ -470,7 +466,7 @@ static int enumerator_sort_devices(sd_device_enumerator *enumerator) {
         return 0;
 
 failed:
-        device_unref_many(devices, n);
+        sd_device_unref_array_clear(devices, n);
         free(devices);
         return r;
 }
@@ -645,10 +641,10 @@ static int test_matches(
                 if (r <= 0)
                         return r;
 
-                if (!match_property(enumerator->match_property, device, /* match_all = */ false))
+                if (!match_property(enumerator->match_property, device, /* match_all= */ false))
                         return false;
 
-                if (!match_property(enumerator->match_property_required, device, /* match_all = */ true))
+                if (!match_property(enumerator->match_property_required, device, /* match_all= */ true))
                         return false;
 
                 if (!device_match_sysattr(device, enumerator->match_sysattr, enumerator->nomatch_sysattr))
@@ -746,7 +742,7 @@ static int enumerator_scan_dir_and_add_devices(
 
                 k = sd_device_new_from_syspath(&device, syspath);
                 if (k < 0) {
-                        if (k != -ENODEV)
+                        if (!ERRNO_IS_NEG_DEVICE_ABSENT(k))
                                 /* this is necessarily racey, so ignore missing devices */
                                 r = k;
 
@@ -841,7 +837,7 @@ static int enumerator_scan_devices_tag(sd_device_enumerator *enumerator, const c
 
                 k = sd_device_new_from_device_id(&device, de->d_name);
                 if (k < 0) {
-                        if (k != -ENODEV)
+                        if (!ERRNO_IS_NEG_DEVICE_ABSENT(k))
                                 /* this is necessarily racy, so ignore missing devices */
                                 r = k;
 
@@ -887,7 +883,7 @@ static int parent_add_child(sd_device_enumerator *enumerator, const char *path, 
         int r;
 
         r = sd_device_new_from_syspath(&device, path);
-        if (r == -ENODEV)
+        if (ERRNO_IS_NEG_DEVICE_ABSENT(r))
                 /* this is necessarily racy, so ignore missing devices */
                 return 0;
         else if (r < 0)

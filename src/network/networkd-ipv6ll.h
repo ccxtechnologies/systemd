@@ -16,6 +16,7 @@ typedef enum IPv6LinkLocalAddressGenMode {
 
 bool link_ipv6ll_enabled(Link *link);
 bool link_ipv6ll_enabled_harder(Link *link);
+bool network_has_static_ipv6ll_address(const Network *network);
 
 IPv6LinkLocalAddressGenMode link_get_ipv6ll_addrgen_mode(Link *link);
 int ipv6ll_addrgen_mode_fill_message(sd_netlink_message *message, IPv6LinkLocalAddressGenMode mode);
@@ -24,7 +25,6 @@ int link_update_ipv6ll_addrgen_mode(Link *link, sd_netlink_message *message);
 int link_set_ipv6ll_stable_secret(Link *link);
 int link_set_ipv6ll_addrgen_mode(Link *link, IPv6LinkLocalAddressGenMode mode);
 
-const char* ipv6_link_local_address_gen_mode_to_string(IPv6LinkLocalAddressGenMode s) _const_;
-IPv6LinkLocalAddressGenMode ipv6_link_local_address_gen_mode_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(ipv6_link_local_address_gen_mode, IPv6LinkLocalAddressGenMode);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_ipv6_link_local_address_gen_mode);

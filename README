@@ -30,7 +30,7 @@ LICENSE:
 
 REQUIREMENTS:
         Linux kernel ≥ 3.15 for timerfd_create() CLOCK_BOOTTIME support
-                     ≥ 3.17 for memfd_create() and getrandom()
+                     ≥ 3.17 for memfd_create(), getrandom(), and kexec_file_load() (x86-64)
                      ≥ 4.3 for ambient capabilities
                      ≥ 4.5 for pids controller in cgroup v2
                      ≥ 4.6 for cgroup namespaces
@@ -40,40 +40,53 @@ REQUIREMENTS:
                      ≥ 4.13 for TIOCGPTPEER and SYNTH_UUID= property support in uevent
                      ≥ 4.15 for cgroup-bpf device hook and cpu controller in cgroup v2
                      ≥ 4.17 for cgroup-bpf socket address hooks, /sys/power/resume_offset,
-                            and FRA_PROTOCOL attribute for fib rules
+                                and FRA_PROTOCOL attribute for fib rules
                      ≥ 4.20 for PSI (used by systemd-oomd)
                      ≥ 5.1 for SO_BINDTOIFINDEX
                      ≥ 5.2 for cgroup freezer and new mount API
                      ≥ 5.3 for bounded loops in BPF program, keyring namespacing,
-                           and nexthop support
-                     ≥ 5.4 for pidfd and signed Verity images
-
-        ⛔ Kernel versions below 5.4 ("minimum baseline") are not supported at all,
-           and are missing required functionality as listed above.
-
-        Linux kernel ≥ 5.6 for getrandom() GRND_INSECURE
+                               and nexthop support
+                     ≥ 5.4 for pidfd, signed Verity images, and fscrypt v2 policies
+                     ≥ 5.6 for getrandom() GRND_INSECURE
                      ≥ 5.7 for CLONE_INTO_CGROUP, cgroup2fs memory_recursiveprot option,
                                BPF links and the BPF LSM hook
+                     ≥ 5.8 for LOOP_CONFIGURE, STATX_ATTR_MOUNT_ROOT, and procfs
+                               per-instance hidepid=/subset= options
+                     ≥ 5.9 for close_range()
+                     ≥ 5.10 for STATX_MNT_ID and MS_NOSYMFOLLOW mount option
 
-        ⚠️ Kernel versions below 5.7 ("recommended baseline") have significant gaps
+        ⛔ Kernel versions below 5.10 ("minimum baseline") are not supported at all,
+           and are missing required functionality as listed above.
+
+        Linux kernel ≥ 5.11 for epoll_pwait2()
+                     ≥ 5.12 for idmapped mount (mount_setattr())
+                     ≥ 5.14 for cgroup.kill, quotactl_fd(), and MOUNT_ATTR_NOSYMFOLLOW
+
+        ⚠️ Kernel versions below 5.14 ("recommended baseline") have significant gaps
            in functionality and are not recommended for use with this version
            of systemd. Taint flag 'old-kernel' will be set. systemd will most likely
            still function, but upstream support and testing are limited.
 
-        Linux kernel ≥ 5.8 for LOOP_CONFIGURE and STATX_ATTR_MOUNT_ROOT
-                     ≥ 5.9 for close_range()
-                     ≥ 5.12 for idmapped mount
-                     ≥ 5.14 for cgroup.kill
-                     ≥ 5.14 for quotactl_fd()
-                     ≥ 6.3 for MFD_EXEC/MFD_NOEXEC_SEAL and tmpfs noswap option
+        Linux kernel ≥ 5.15 for MPOL_PREFERRED_MANY NUMA policy
+                     ≥ 6.3 for MFD_EXEC/MFD_NOEXEC_SEAL, F_SEAL_EXEC, tmpfs noswap option,
+                               and nsfs ioctls from 32-bit userspace on 64-bit kernels
                      ≥ 6.5 for name_to_handle_at() AT_HANDLE_FID, SO_PEERPIDFD/SO_PASSPIDFD,
                                and MOVE_MOUNT_BENEATH
                      ≥ 6.6 for quota support on tmpfs
-                     ≥ 6.9 for pidfs
+                     ≥ 6.7 for cgroup2fs memory_hugetlb_accounting option
+                     ≥ 6.8 for STATX_MNT_ID_UNIQUE
+                     ≥ 6.9 for pidfs, PIDFD_THREAD flag for pidfd_open(), and
+                               MPOL_WEIGHTED_INTERLEAVE NUMA policy
                      ≥ 6.10 for fcntl(F_DUPFD_QUERY), unprivileged linkat(AT_EMPTY_PATH),
-                            and block device 'partscan' sysfs attribute
-                     ≥ 6.13 for PIDFD_GET_INFO and {set,remove}xattrat()
-                     ≥ 6.16 for coredump pattern '%F' (pidfd) specifier and SO_PASSRIGHTS
+                                and block device 'partscan' sysfs attribute
+                     ≥ 6.12 for AT_HANDLE_MNT_ID_UNIQUE
+                     ≥ 6.13 for PIDFD_GET_INFO, {set,remove}xattrat(), and
+                                FSCONFIG_SET_FD support for overlayfs layers
+                     ≥ 6.16 for coredump pattern '%F' (pidfd) specifier and SO_PASSRIGHTS,
+                                PIDFD_INFO_COREDUMP by ioctl(PIDFD_GET_INFO)
+                     ≥ 6.17 for coredump socket pattern ('@@' prefix)
+                     ≥ 6.19 for PIDFD_INFO_SUPPORTED_MASK and PIDFD_INFO_COREDUMP_SIGNAL
+                     ≥ 7.1 for PIDFD_INFO_COREDUMP_CODE
 
         ✅ systemd utilizes several new kernel APIs, but will fall back gracefully
            when unavailable.
@@ -123,7 +136,8 @@ REQUIREMENTS:
           CONFIG_SECCOMP
           CONFIG_SECCOMP_FILTER (required for seccomp support)
           CONFIG_KCMP (for the kcmp() syscall, used to be under
-                       CONFIG_CHECKPOINT_RESTORE before ~5.12)
+                       CONFIG_CHECKPOINT_RESTORE before ~5.12;
+                       not needed after 6.10)
           CONFIG_NET_SCHED
           CONFIG_NET_SCH_FQ_CODEL
 
@@ -135,7 +149,7 @@ REQUIREMENTS:
           CONFIG_CFS_BANDWIDTH
 
         Required for IPAddressDeny=, IPAddressAllow=, IPIngressFilterPath=,
-        IPEgressFilterPath= in resource control unit settings unit settings:
+        IPEgressFilterPath= in resource control unit settings:
           CONFIG_BPF
           CONFIG_BPF_SYSCALL
           CONFIG_BPF_JIT
@@ -191,41 +205,27 @@ REQUIREMENTS:
         This is shipped by default, see modprobe.d/systemd.conf.
 
         Required for systemd-nspawn:
-          CONFIG_DEVPTS_MULTIPLE_INSTANCES or Linux kernel >= 4.7
+          CONFIG_DEVPTS_MULTIPLE_INSTANCES (removed and unneeded since 4.7)
 
         Required for systemd-oomd:
           CONFIG_PSI
           CONFIG_MEMCG
 
-        Note that kernel auditing is broken when used with systemd's container
-        code. When using systemd in conjunction with containers, please make
-        sure to either turn off auditing at runtime using the kernel command
-        line option "audit=0", or turn it off at kernel compile time using:
-          CONFIG_AUDIT=n
-
-        If systemd is compiled with libseccomp support on architectures which do
-        not use socketcall() and where seccomp is supported (this effectively
-        means x86-64 and ARM, but excludes 32-bit x86!), then nspawn will now
-        install a work-around seccomp filter that makes containers boot even
-        with audit being enabled. This works correctly only on kernels 3.14 and
-        newer though. TL;DR: turn audit off, still.
-
-        glibc >= 2.31
-        libxcrypt or glibc (<= 2.38 built with --enable-crypt)
-        libcap
+        glibc >= 2.34
+        musl >= 1.2.6 (required when building systemd with -Dlibc=musl)
+        libxcrypt >= 4.4.0 (optional)
         libmount >= 2.30 (from util-linux)
                 (util-linux *must* be built without --enable-libmount-support-mtab)
-        libseccomp >= 2.3.1 (optional)
-        libblkid >= 2.24 (from util-linux) (optional)
+        libseccomp >= 2.4.0 (optional)
+        libblkid >= 2.37 (from util-linux) (optional)
         libkmod >= 15 (optional)
         PAM >= 1.1.2 (optional)
-        libcryptsetup >= 2.0.1 (optional),
-                      >= 2.3.0 is required for signed Verity images support
+        libcryptsetup >= 2.4.0 (optional),
         libaudit (optional)
         libacl (optional)
         libbpf >= 0.1.0 (optional),
                >= 1.4.0 is required for using GCC as a bpf compiler
-        libfdisk >= 2.32 (from util-linux) (optional)
+        libfdisk >= 2.35 (from util-linux) (optional)
         libselinux >= 2.1.9 (optional)
         libapparmor >= 2.13 (optional)
         libxenctrl >= 4.9 (optional)
@@ -237,24 +237,23 @@ REQUIREMENTS:
         libarchive >= 3.0 (optional)
         libxkbcommon >= 0.3.0 (optional)
         libpcre2 (optional)
-        libgcrypt (optional)
         libqrencode >= 3 (optional)
         libmicrohttpd >= 0.9.33 (optional)
         libcurl >= 7.32.0 (optional)
-        libidn2 or libidn (optional)
+        libidn2 (optional)
         gnutls >= 3.1.4 (optional)
-        openssl >= 1.1.0 (optional, required to support DNS-over-TLS)
+        openssl >= 3.0.0 (optional, required to support DNS-over-TLS)
         p11-kit >= 0.23.3 (optional)
         libfido2 (optional)
         tpm2-tss (optional)
-        elfutils >= 158 (optional)
+        elfutils >= 177 (optional)
         polkit (optional)
         tzdata >= 2014f (optional)
         pkg-config
         gperf
         docbook-xsl (optional, required for documentation)
         xsltproc    (optional, required for documentation)
-        python >= 3.7 (required by meson too, >= 3.9 is required for ukify)
+        python >= 3.9
         python-jinja2
         python-pefile (optional, required for ukify)
         python-lxml (optional, required to build the indices)
@@ -263,9 +262,10 @@ REQUIREMENTS:
         ninja
         gcc >= 8.4
             >= 13.1.0 is required to build BPF program by using GCC
+        binutils >= 2.35
         awk, sed, grep, and similar tools
-        clang >= 10.0, llvm >= 10.0 (optional, required to build BPF programs
-                from source code in C)
+        clang, llvm >= 10 (optional, required to build BPF programs)
+                    >= 13 (optional, required to build the entire project)
 
         During runtime, you need the following additional
         dependencies:
@@ -277,6 +277,8 @@ REQUIREMENTS:
                 NOTE: If using dbus < 1.9.18, you should override the default
                 policy directory (--with-dbuspolicydir=/etc/dbus-1/system.d).
         polkit (optional)
+        gnupg >= 2.4 (optional, for signature verification in: importctl,
+                      systemd-sysupdate)
 
         To build in directory build/:
           meson setup build/ && ninja -C build/
@@ -290,7 +292,7 @@ REQUIREMENTS:
 
         Useful commands:
           ninja -C build -v some/target
-          meson test -C build/
+          meson test -C build/ -q
           sudo meson install -C build/ --no-rebuild
           DESTDIR=... meson install -C build/
 
@@ -335,42 +337,49 @@ POLICY FOR SUPPORT OF DISTRIBUTIONS AND ARCHITECTURES:
         which support has been added. systemd will emit warnings when
         architecture-specific constants are not defined.
 
-STATIC COMPILATION AND "STANDALONE" BINARIES:
-        systemd provides a public shared libraries libsystemd.so and
-        libudev.so. The latter is deprecated, and the sd-device APIs in
-        libsystemd should be used instead for new code. In addition, systemd is
-        built with a private shared library, libsystemd-shared-<suffix>.so,
-        that also includes the libsystemd code, and by default most systemd
-        binaries are linked to it. Using shared libraries saves disk space and
-        memory at runtime, because only one copy of the code is needed.
+STATIC LIBRARIES AND "STANDALONE" BINARIES:
+        systemd provides public shared libraries libsystemd.so and libudev.so.
+        The latter is deprecated, and the sd-device APIs in libsystemd should
+        be used instead for new code. Normally systemd is built with a private
+        shared library, libsystemd-shared-<suffix>.so, that also includes the
+        libsystemd code, and by default most systemd binaries are linked to it.
+        Using shared libraries saves disk space and memory at runtime, because
+        only one copy of the code is needed.
 
         It is possible to build static versions of systemd public shared
         libraries (via the configuration options '-Dstatic-libsystemd' and
         '-Dstatic-libudev'). This allows the libsystemd and libudev code to be
         linked statically into programs. Note that mixing & matching different
         versions of libsystemd and systemd is generally not recommended, since
-        various of its APIs wrap internal state and protocols of systemd
-        (e.g. logind and udev databases), which are not considered
-        stable. Hence, using static libraries is not recommended since it
-        generally means that version of the static libsystemd linked into
-        applications and the host systemd are not in sync, and will thus create
-        compatibility problems.
+        various of its APIs wrap internal state and protocols of systemd (e.g.
+        logind and udev databases), which are not considered stable. Hence,
+        using static libraries is not recommended since it generally means that
+        version of the static libsystemd linked into applications and the host
+        systemd may get out of sync, creating compatibility problems.
 
         In addition, it is possible to disable the use of
         libsystemd-shared-<suffix>.so for various components (via the
         configuration options '-Dlink-*-shared'). In this mode, the libsystemd
-        and libsystemd-shared code is linked statically into selected
-        binaries. This option is intended for systems where some of the
-        components are intended to be delivered independently of the main
-        systemd package. Finally, some binaries can be compiled in a second
-        version (via the configuration option '-Dstandalone-binaries'). The
-        version suffixed with ".standalone" has the libsystemd and
-        libsystemd-shared code linked statically. Those binaries are intended
-        as replacements to be used in limited installations where the full
-        systemd suite is not installed. Yet another option is to rebuild
-        systemd with a different '-Dshared-lib-tag' setting, allowing different
-        systemd binaries to be linked to instances of the private shared
-        library that can be installed in parallel.
+        and libsystemd-shared code is linked statically into selected binaries.
+        This option is intended for systems where some of the components are
+        intended to be delivered independently of the main systemd package.
+
+        In addition, some binaries can be compiled in a second version (via the
+        configuration option '-Dstandalone-binaries'). The version suffixed
+        with ".standalone" has the libsystemd and libsystemd-shared code linked
+        statically. Those binaries are intended as replacements to be used in
+        limited installations where the full systemd suite is not installed. An
+        alternative approach is to rebuild systemd with a different
+        '-Dshared-lib-tag' setting, allowing different systemd binaries to be
+        linked to instances of the private shared library that can be installed
+        in parallel.
+
+        When compiled in one of the modes described in this section, the code
+        has identical functionality (apart from the potential compatibility
+        issues).
+
+        Finally, fully static compilation of systemd (the program) is possible,
+        see next section.
 
         Again: Using the default shared linking is recommended, building static
         or "standalone" versions is not. Mixing versions of systemd components
@@ -378,6 +387,17 @@ STATIC COMPILATION AND "STANDALONE" BINARIES:
         daemons and the manager) is not recommended: we do not test such
         combinations upstream and cannot provide support. Distributors making
         use of those options are responsible if things do not work as expected.
+
+STATIC BINARIES:
+        It is possible to compile systemd (the program) as a static binary with
+        the meson options:
+          --default-library=static --prefer-static -Dbuild-static=true -Dsystemd-multicall-binary=true
+        This results in a static 'systemd' binary that can be used as PID1 in a
+        container. This binary does not use dlopen(3), which means that it
+        cannot dynamically extend its functionality by loading other libraries,
+        even if they were available in the file system. It also does not
+        support NSS and instead uses simplified code that only supports static
+        passwd and group files to resolve users.
 
 USERS AND GROUPS:
         Default udev rules use the following standard system group names, which
@@ -434,17 +454,6 @@ GLIBC NSS:
                 shadow: files systemd
                 gshadow: files systemd
                 hosts: mymachines resolve [!UNAVAIL=return] files myhostname dns
-
-SYSV INIT.D SCRIPTS:
-        When calling "systemctl enable/disable/is-enabled" on a unit which is a
-        SysV init.d script, it calls /usr/lib/systemd/systemd-sysv-install;
-        this needs to translate the action into the distribution specific
-        mechanism such as chkconfig or update-rc.d. Packagers need to provide
-        this script if you need this functionality (you don't if you disabled
-        SysV init support).
-
-        Please see src/systemctl/systemd-sysv-install.SKELETON for how this
-        needs to look like, and provide an implementation at the marked places.
 
 WARNINGS and TAINT FLAGS:
         systemd requires that the /run mount point exists. systemd also

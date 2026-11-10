@@ -14,9 +14,9 @@
 #if BPF_FRAMEWORK
 /* libbpf, clang and llc compile time dependencies are satisfied */
 
-#include "bpf-dlopen.h"
+#include "bpf-util.h"
 #include "bpf-link.h"
-#include "bpf/restrict-ifaces/restrict-ifaces-skel.h"
+#include "restrict-ifaces-skel.h"
 
 static struct restrict_ifaces_bpf *restrict_ifaces_bpf_free(struct restrict_ifaces_bpf *obj) {
         restrict_ifaces_bpf__destroy(obj);
@@ -86,7 +86,7 @@ int bpf_restrict_ifaces_supported(void) {
         if (supported >= 0)
                 return supported;
 
-        if (dlopen_bpf_full(LOG_WARNING) < 0)
+        if (dlopen_bpf(LOG_WARNING) < 0)
                 return (supported = false);
 
         r = prepare_restrict_ifaces_bpf(NULL, true, NULL, &obj);
@@ -98,24 +98,19 @@ int bpf_restrict_ifaces_supported(void) {
         return (supported = bpf_can_link_program(obj->progs.sd_restrictif_i));
 }
 
-static int restrict_ifaces_install_impl(Unit *u) {
+static int restrict_ifaces_install_impl(Unit *u, CGroupRuntime *crt) {
         _cleanup_(bpf_link_freep) struct bpf_link *egress_link = NULL, *ingress_link = NULL;
         _cleanup_(restrict_ifaces_bpf_freep) struct restrict_ifaces_bpf *obj = NULL;
         _cleanup_free_ char *cgroup_path = NULL;
         _cleanup_close_ int cgroup_fd = -EBADF;
-        CGroupContext *cc;
-        CGroupRuntime *crt;
         int r;
 
-        cc = unit_get_cgroup_context(u);
-        if (!cc)
-                return 0;
+        assert(u);
+        assert(crt);
 
-        crt = unit_get_cgroup_runtime(u);
-        if (!crt)
-                return 0;
+        CGroupContext *cc = ASSERT_PTR(unit_get_cgroup_context(u));
 
-        r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, crt->cgroup_path, NULL, &cgroup_path);
+        r = cg_get_path(crt->cgroup_path, /* suffix= */ NULL, &cgroup_path);
         if (r < 0)
                 return log_unit_error_errno(u, r, "restrict-interfaces: Failed to get cgroup path: %m");
 
@@ -143,8 +138,8 @@ static int restrict_ifaces_install_impl(Unit *u) {
         if (r != 0)
                 return log_unit_error_errno(u, r, "restrict-interfaces: Failed to create egress cgroup link: %m");
 
-        crt->restrict_ifaces_ingress_bpf_link = TAKE_PTR(ingress_link);
-        crt->restrict_ifaces_egress_bpf_link = TAKE_PTR(egress_link);
+        free_and_replace_full(crt->restrict_ifaces_ingress_bpf_link, ingress_link, bpf_link_free);
+        free_and_replace_full(crt->restrict_ifaces_egress_bpf_link, egress_link, bpf_link_free);
 
         return 0;
 }
@@ -159,7 +154,7 @@ int bpf_restrict_ifaces_install(Unit *u) {
         if (!crt)
                 return 0;
 
-        r = restrict_ifaces_install_impl(u);
+        r = restrict_ifaces_install_impl(u, crt);
         fdset_close(crt->initial_restrict_ifaces_link_fds, /* async= */ false);
         return r;
 }

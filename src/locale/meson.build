@@ -7,7 +7,7 @@ endif
 systemd_localed_sources = files(
         'localed.c'
 )
-systemd_localed_extract_sources = files(
+systemd_localed_export_sources = files(
         'localed-util.c',
         'xkbcommon-util.c',
 )
@@ -18,8 +18,7 @@ localectl_sources = files('localectl.c')
 # specify where the headers are.
 if conf.get('HAVE_XKBCOMMON') == 1
         libxkbcommon_deps = [
-                libdl,
-                libxkbcommon.partial_dependency(compile_args: true),
+                libxkbcommon_cflags,
         ]
 else
         libxkbcommon_deps = []
@@ -29,8 +28,8 @@ executables += [
         libexec_template + {
                 'name' : 'systemd-localed',
                 'dbus' : true,
-                'sources' : systemd_localed_sources + systemd_localed_extract_sources,
-                'extract' : systemd_localed_extract_sources,
+                'sources' : systemd_localed_sources,
+                'export' : systemd_localed_export_sources,
                 'dependencies' : libxkbcommon_deps,
         },
         executable_template + {
@@ -40,7 +39,7 @@ executables += [
         },
         test_template + {
                 'sources' : files('test-localed-util.c'),
-                'objects' : ['systemd-localed'],
+                'import' : ['systemd-localed'],
                 'dependencies' : libxkbcommon_deps,
         },
 ]

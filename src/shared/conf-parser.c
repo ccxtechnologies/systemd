@@ -189,6 +189,9 @@ static int parse_line(
         assert(line > 0);
         assert(lookup);
         assert(l);
+        assert(section);
+        assert(section_line);
+        assert(section_ignored);
 
         l = strstrip(l);
         if (isempty(l))
@@ -214,8 +217,8 @@ static int parse_line(
                 if (!n)
                         return log_oom();
 
-                if (!string_is_safe(n))
-                        return log_syntax(unit, LOG_ERR, filename, line, SYNTHETIC_ERRNO(EBADMSG), "Bad characters in section header '%s'", l);
+                if (!string_is_safe(n, /* flags= */ 0))
+                        return log_syntax(unit, LOG_ERR, filename, line, SYNTHETIC_ERRNO(EBADMSG), "Section header invalid '%s'", l);
 
                 if (sections && !nulstr_contains(sections, n)) {
                         bool ignore;
@@ -481,6 +484,7 @@ int hashmap_put_stats_by_path(Hashmap **stats_by_path, const char *path, const s
 
 static int config_parse_many_files(
                 const char *root,
+                int root_fd,
                 const char* const* conf_files,
                 char **files,
                 const char *sections,
@@ -502,17 +506,17 @@ static int config_parse_many_files(
                         return log_oom_full(level);
         }
 
+        /* Pin and stat() all dropins */
         STRV_FOREACH(fn, files) {
                 _cleanup_fclose_ FILE *f = NULL;
-                _cleanup_free_ char *fname = NULL;
-
-                r = chase_and_fopen_unlocked(*fn, root, CHASE_AT_RESOLVE_IN_ROOT, "re", &fname, &f);
+                r = chase_and_fopenat_unlocked(root_fd, root_fd, *fn, CHASE_MUST_BE_REGULAR, "re", /* ret_path= */ NULL, &f);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)
                         return log_full_errno(level, r, "Failed to open %s: %m", *fn);
 
                 int fd = fileno(f);
+                assert(fd >= 0);
 
                 r = ordered_hashmap_ensure_put(&dropins, &config_file_hash_ops_fclose, *fn, f);
                 if (r < 0) {
@@ -537,11 +541,10 @@ static int config_parse_many_files(
                         return log_oom_full(level);
         }
 
-        /* First read the first found main config file. */
+        /* First process the first found main config file. */
         STRV_FOREACH(fn, conf_files) {
                 _cleanup_fclose_ FILE *f = NULL;
-
-                r = chase_and_fopen_unlocked(*fn, root, CHASE_AT_RESOLVE_IN_ROOT, "re", NULL, &f);
+                r = chase_and_fopenat_unlocked(root_fd, root_fd, *fn, CHASE_MUST_BE_REGULAR, "re", /* ret_path= */ NULL, &f);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)
@@ -572,7 +575,6 @@ static int config_parse_many_files(
         }
 
         /* Then read all the drop-ins. */
-
         const char *path_dropin;
         FILE *f_dropin;
         ORDERED_HASHMAP_FOREACH_KEY(f_dropin, path_dropin, dropins) {
@@ -594,12 +596,39 @@ static int config_parse_many_files(
         return 0;
 }
 
+static int normalize_root_fd(const char *root, int *root_fd, int *ret_opened_fd) {
+        assert(root_fd);
+        assert(ret_opened_fd);
+
+        /* Normalizes a root dir specification: if root_fd is already valid, keep it. Otherwise, we open the
+         * specified dir */
+
+        if (wildcard_fd_is_valid(*root_fd)) {
+                *ret_opened_fd = -EBADF;
+                return 0;
+        }
+
+        if (empty_or_root(root)) {
+                *root_fd = XAT_FDROOT;
+                *ret_opened_fd = -EBADF;
+                return 0;
+        }
+
+        int fd = open(root, O_CLOEXEC|O_PATH|O_DIRECTORY);
+        if (fd < 0)
+                return log_error_errno(errno, "Failed to open root directory '%s': %m", root);
+
+        *ret_opened_fd = *root_fd = fd;
+        return 0;
+}
+
 /* Parse each config file in the directories specified as strv. */
-int config_parse_many(
+int config_parse_many_full(
                 const char* const* conf_files,
                 const char* const* conf_file_dirs,
                 const char *dropin_dirname,
                 const char *root,
+                int root_fd,
                 const char *sections,
                 ConfigItemLookup lookup,
                 const void *table,
@@ -615,12 +644,33 @@ int config_parse_many(
         assert(dropin_dirname);
         assert(table);
 
-        r = conf_files_list_dropins(&files, dropin_dirname, root, conf_file_dirs);
+        _cleanup_close_ int opened_root_fd = -EBADF;
+        r = normalize_root_fd(root, &root_fd, &opened_root_fd);
+        if (r < 0)
+                return r;
+
+        r = conf_files_list_dropins(
+                        &files,
+                        dropin_dirname,
+                        root,
+                        root_fd,
+                        FLAGS_SET(flags, CONFIG_PARSE_WARN) ? CONF_FILES_WARN : 0,
+                        conf_file_dirs);
         if (r < 0)
                 return log_full_errno(FLAGS_SET(flags, CONFIG_PARSE_WARN) ? LOG_WARNING : LOG_DEBUG, r,
                                       "Failed to list drop-ins in %s: %m", dropin_dirname);
 
-        r = config_parse_many_files(root, conf_files, files, sections, lookup, table, flags, userdata, ret_stats_by_path);
+        r = config_parse_many_files(
+                        root,
+                        root_fd,
+                        conf_files,
+                        files,
+                        sections,
+                        lookup,
+                        table,
+                        flags,
+                        userdata,
+                        ret_stats_by_path);
         if (r < 0)
                 return r; /* config_parse_many_files() logs internally. */
 
@@ -632,6 +682,7 @@ int config_parse_many(
 
 int config_parse_standard_file_with_dropins_full(
                 const char *root,
+                int root_fd,
                 const char *main_file,    /* A path like "systemd/frobnicator.conf" */
                 const char *sections,
                 ConfigItemLookup lookup,
@@ -641,12 +692,15 @@ int config_parse_standard_file_with_dropins_full(
                 Hashmap **ret_stats_by_path,
                 char ***ret_dropin_files) {
 
-        const char* const *conf_paths = (const char* const*) CONF_PATHS_STRV("");
-        _cleanup_strv_free_ char **configs = NULL;
+        const char* const *conf_file_dirs = (const char* const*) CONF_PATHS_STRV("");
+        _cleanup_strv_free_ char **conf_files = NULL;
         int r, level = FLAGS_SET(flags, CONFIG_PARSE_WARN) ? LOG_WARNING : LOG_DEBUG;
 
         /* Build the list of main config files */
-        r = strv_extend_strv_biconcat(&configs, root, conf_paths, main_file);
+        r = strv_extend_strv_concat(
+                        &conf_files,
+                        conf_file_dirs,
+                        main_file);
         if (r < 0)
                 return log_oom_full(level);
 
@@ -654,11 +708,12 @@ int config_parse_standard_file_with_dropins_full(
         if (!dropin_dirname)
                 return log_oom_full(level);
 
-        return config_parse_many(
-                        (const char* const*) configs,
-                        conf_paths,
+        return config_parse_many_full(
+                        (const char* const*) conf_files,
+                        conf_file_dirs,
                         dropin_dirname,
                         root,
+                        root_fd,
                         sections,
                         lookup,
                         table,
@@ -690,7 +745,13 @@ static int dropins_get_stats_by_path(
         if (!strextend(&dropin_dirname, ".d"))
                 return -ENOMEM;
 
-        r = conf_files_list_dropins(&files, dropin_dirname, /* root = */ NULL, conf_file_dirs);
+        r = conf_files_list_dropins(
+                        &files,
+                        dropin_dirname,
+                        /* root= */ NULL,
+                        /* root_fd= */ XAT_FDROOT,
+                        /* flags= */ 0,
+                        conf_file_dirs);
         if (r < 0)
                 return r;
 
@@ -715,7 +776,7 @@ static int dropins_get_stats_by_path(
 int config_get_stats_by_path(
                 const char *suffix,
                 const char *root,
-                unsigned flags,
+                ConfFilesFlags flags,
                 const char* const* dirs,
                 bool check_dropins,
                 Hashmap **ret) {
@@ -860,6 +921,8 @@ static int _hashmap_by_section_find_unused_line(
         unsigned n = 0;
         void *entry;
 
+        assert(ret);
+
         HASHMAP_BASE_FOREACH_KEY(entry, cs, entries_by_section) {
                 if (filename && !streq(cs->filename, filename))
                         continue;
@@ -929,12 +992,42 @@ int config_parse_iec_size(
         assert(rvalue);
 
         r = parse_size(rvalue, 1024, &v);
-        if (r >= 0 && (uint64_t) (size_t) v != v)
+        if (r >= 0 && v > SIZE_MAX)
                 r = -ERANGE;
         if (r < 0)
                 return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         *sz = (size_t) v;
+        return 1;
+}
+
+int config_parse_iec_size_long(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        long *sz = ASSERT_PTR(data);
+        uint64_t v;
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        r = parse_size(rvalue, 1024, &v);
+        if (r >= 0 && v > LONG_MAX)
+                r = -ERANGE;
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
+
+        *sz = (long) v;
         return 1;
 }
 
@@ -1181,7 +1274,7 @@ int config_parse_string(
                 return 1;
         }
 
-        if (FLAGS_SET(ltype, CONFIG_PARSE_STRING_SAFE) && !string_is_safe(rvalue)) {
+        if (FLAGS_SET(ltype, CONFIG_PARSE_STRING_SAFE) && !string_is_safe(rvalue, STRING_ALLOW_GLOBS)) {
                 _cleanup_free_ char *escaped = NULL;
 
                 escaped = cescape(rvalue);
@@ -1359,7 +1452,7 @@ int config_parse_strv(
                         return log_oom();
         }
 
-        r = strv_extend_strv_consume(sv, TAKE_PTR(strv), /* filter_duplicates = */ ltype);
+        r = strv_extend_strv_consume(sv, TAKE_PTR(strv), /* filter_duplicates= */ ltype);
         if (r < 0)
                 return log_oom();
 
@@ -2083,7 +2176,7 @@ int config_parse_unsigned_bounded(
                 return ignoring ? 0 : r;
         }
         if (r < 0)
-                return log_syntax_parse_error_full(unit, filename, line, r, /* critical = */ !ignoring, lvalue, rvalue);
+                return log_syntax_parse_error_full(unit, filename, line, r, /* critical= */ !ignoring, lvalue, rvalue);
 
         return 1;  /* Return 1 if something was set */
 }

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
 #include "dirent-util.h"
@@ -15,6 +16,9 @@
 #define DEFAULT_RECURSION_MAX 100
 
 static int sort_func(struct dirent * const *a, struct dirent * const *b) {
+        assert(a);
+        assert(b);
+
         return strcmp((*a)->d_name, (*b)->d_name);
 }
 
@@ -22,6 +26,35 @@ static bool ignore_dirent(const struct dirent *de, RecurseDirFlags flags) {
         assert(de);
 
         /* Depending on flag either ignore everything starting with ".", or just "." itself and ".." */
+
+        if ((flags & _RECURSE_DIR_MUST_BE_MASK) != 0) {
+                RecurseDirFlags f;
+
+                switch (de->d_type) {
+
+                case DT_DIR:
+                        f = RECURSE_DIR_MUST_BE_DIRECTORY;
+                        break;
+
+                case DT_REG:
+                        f = RECURSE_DIR_MUST_BE_REGULAR;
+                        break;
+
+                case DT_LNK:
+                        f = RECURSE_DIR_MUST_BE_SYMLINK;
+                        break;
+
+                case DT_SOCK:
+                        f = RECURSE_DIR_MUST_BE_SOCKET;
+                        break;
+
+                default:
+                        return true;
+                }
+
+                if (!FLAGS_SET(flags, f))
+                        return true;
+        }
 
         return FLAGS_SET(flags, RECURSE_DIR_IGNORE_DOT) ?
                 de->d_name[0] == '.' :
@@ -35,12 +68,16 @@ int readdir_all(int dir_fd, RecurseDirFlags flags, DirectoryEntries **ret) {
 
         assert(dir_fd >= 0);
 
-        /* Returns an array with pointers to "struct dirent" directory entries, optionally sorted. Free the
-         * array with readdir_all_freep().
+        if ((flags & _RECURSE_DIR_MUST_BE_MASK) != 0) /* We need the type to validate it */
+                flags |= RECURSE_DIR_ENSURE_TYPE;
+
+        /* Returns an array with pointers to "struct dirent" directory entries, optionally sorted.
          *
          * Start with space for up to 8 directory entries. We expect at least 2 ("." + ".."), hence hopefully
          * 8 will cover most cases comprehensively. (Note that most likely a lot more entries will actually
          * fit in the buffer, given we calculate maximum file name length here.) */
+        /* Silence static analyzers */
+        assert_cc(offsetof(DirectoryEntries, buffer) <= SIZE_MAX - DIRENT_SIZE_MAX * 8);
         de = malloc(offsetof(DirectoryEntries, buffer) + DIRENT_SIZE_MAX * 8);
         if (!de)
                 return -ENOMEM;
@@ -50,6 +87,8 @@ int readdir_all(int dir_fd, RecurseDirFlags flags, DirectoryEntries **ret) {
                 size_t bs;
                 ssize_t n;
 
+                /* Silence static analyzers, MALLOC_SIZEOF_SAFE is at least as large as the allocation */
+                assert(MALLOC_SIZEOF_SAFE(de) >= offsetof(DirectoryEntries, buffer));
                 bs = MIN(MALLOC_SIZEOF_SAFE(de) - offsetof(DirectoryEntries, buffer), (size_t) SSIZE_MAX);
                 assert(bs > de->buffer_size);
 
@@ -80,9 +119,6 @@ int readdir_all(int dir_fd, RecurseDirFlags flags, DirectoryEntries **ret) {
         de->n_entries = 0;
         struct dirent *entry;
         FOREACH_DIRENT_IN_BUFFER(entry, de->buffer, de->buffer_size) {
-                if (ignore_dirent(entry, flags))
-                        continue;
-
                 if (FLAGS_SET(flags, RECURSE_DIR_ENSURE_TYPE)) {
                         r = dirent_ensure_type(dir_fd, entry);
                         if (r == -ENOENT)
@@ -91,6 +127,9 @@ int readdir_all(int dir_fd, RecurseDirFlags flags, DirectoryEntries **ret) {
                         if (r < 0)
                                 return r;
                 }
+
+                if (ignore_dirent(entry, flags))
+                        continue;
 
                 de->n_entries++;
         }
@@ -110,12 +149,12 @@ int readdir_all(int dir_fd, RecurseDirFlags flags, DirectoryEntries **ret) {
 
         j = 0;
         FOREACH_DIRENT_IN_BUFFER(entry, de->buffer, de->buffer_size) {
-                if (ignore_dirent(entry, flags))
-                        continue;
-
                 /* If d_type == DT_UNKNOWN that means we failed to ensure the type in the earlier loop and
                  * didn't include the dentry in de->n_entries and as such should skip it here as well. */
                 if (FLAGS_SET(flags, RECURSE_DIR_ENSURE_TYPE) && entry->d_type == DT_UNKNOWN)
+                        continue;
+
+                if (ignore_dirent(entry, flags))
                         continue;
 
                 de->entries[j++] = entry;
@@ -158,6 +197,9 @@ int recurse_dir(
 
         assert(dir_fd >= 0);
         assert(func);
+
+        /* We cannot descend into dirs if we are supposed to ignore them */
+        assert((flags & _RECURSE_DIR_MUST_BE_MASK) == 0 || FLAGS_SET(flags, RECURSE_DIR_MUST_BE_DIRECTORY));
 
         /* This is a lot like ftw()/nftw(), but a lot more modern, i.e. built around openat()/statx()/O_PATH,
          * and under the assumption that fds are not as 'expensive' as they used to be. */
@@ -230,9 +272,9 @@ int recurse_dir(
                                         r = func(RECURSE_DIR_SKIP_OPEN_DIR_ERROR_BASE + errno,
                                                  p,
                                                  dir_fd,
-                                                 /* inode_fd = */ -EBADF,
+                                                 /* inode_fd= */ -EBADF,
                                                  i,
-                                                 /* sx = */ NULL,
+                                                 /* sx= */ NULL,
                                                  userdata);
                                         if (r == RECURSE_DIR_LEAVE_DIRECTORY)
                                                 break;
@@ -274,9 +316,9 @@ int recurse_dir(
                                         r = func(RECURSE_DIR_SKIP_OPEN_INODE_ERROR_BASE + errno,
                                                  p,
                                                  dir_fd,
-                                                 /* inode_fd = */ -EBADF,
+                                                 /* inode_fd= */ -EBADF,
                                                  i,
-                                                 /* sx = */ NULL,
+                                                 /* sx= */ NULL,
                                                  userdata);
                                         if (r == RECURSE_DIR_LEAVE_DIRECTORY)
                                                 break;
@@ -322,9 +364,9 @@ int recurse_dir(
                                         r = func(RECURSE_DIR_SKIP_STAT_INODE_ERROR_BASE + errno,
                                                  p,
                                                  dir_fd,
-                                                 /* inode_fd = */ -EBADF,
+                                                 /* inode_fd= */ -EBADF,
                                                  i,
-                                                 /* sx = */ NULL,
+                                                 /* sx= */ NULL,
                                                  userdata);
                                         if (r == RECURSE_DIR_LEAVE_DIRECTORY)
                                                 break;
@@ -352,9 +394,9 @@ int recurse_dir(
                                         r = func(RECURSE_DIR_SKIP_STAT_INODE_ERROR_BASE + EISDIR,
                                                  p,
                                                  dir_fd,
-                                                 /* inode_fd = */ -EBADF,
+                                                 /* inode_fd= */ -EBADF,
                                                  i,
-                                                 /* sx = */ NULL,
+                                                 /* sx= */ NULL,
                                                  userdata);
                                         if (r == RECURSE_DIR_LEAVE_DIRECTORY)
                                                 break;
@@ -384,7 +426,7 @@ int recurse_dir(
                                 if (sx_valid && FLAGS_SET(sx.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT))
                                         is_mount = FLAGS_SET(sx.stx_attributes, STATX_ATTR_MOUNT_ROOT);
                                 else {
-                                        r = is_mount_point_at(dir_fd, i->d_name, /* flags = */ 0);
+                                        r = is_mount_point_at(dir_fd, i->d_name, /* flags= */ 0);
                                         if (r < 0)
                                                 log_debug_errno(r, "Failed to determine whether %s is a submount, assuming not: %m", p);
 
@@ -433,30 +475,25 @@ int recurse_dir(
                                  i,
                                  statx_mask != 0 ? &sx : NULL, /* only pass sx if user asked for it */
                                  userdata);
-                        if (r == RECURSE_DIR_LEAVE_DIRECTORY)
-                                break;
-                        if (r == RECURSE_DIR_SKIP_ENTRY)
-                                continue;
-                        if (r != RECURSE_DIR_CONTINUE)
-                                return r;
+                        if (r == RECURSE_DIR_CONTINUE) {
+                                r = recurse_dir(subdir_fd,
+                                                p,
+                                                statx_mask,
+                                                n_depth_max - 1,
+                                                flags & ~RECURSE_DIR_TOPLEVEL, /* we already called the callback for this entry */
+                                                func,
+                                                userdata);
+                                if (r != 0)
+                                        return r;
 
-                        r = recurse_dir(subdir_fd,
-                                        p,
-                                        statx_mask,
-                                        n_depth_max - 1,
-                                        flags & ~RECURSE_DIR_TOPLEVEL, /* we already called the callback for this entry */
-                                        func,
-                                        userdata);
-                        if (r != 0)
-                                return r;
-
-                        r = func(RECURSE_DIR_LEAVE,
-                                 p,
-                                 dir_fd,
-                                 subdir_fd,
-                                 i,
-                                 statx_mask != 0 ? &sx : NULL, /* only pass sx if user asked for it */
-                                 userdata);
+                                r = func(RECURSE_DIR_LEAVE,
+                                         p,
+                                         dir_fd,
+                                         subdir_fd,
+                                         i,
+                                         statx_mask != 0 ? &sx : NULL, /* only pass sx if user asked for it */
+                                         userdata);
+                        }
                 } else
                         /* Non-directory inode */
                         r = func(RECURSE_DIR_ENTRY,
@@ -469,7 +506,21 @@ int recurse_dir(
 
                 if (r == RECURSE_DIR_LEAVE_DIRECTORY)
                         break;
-                if (!IN_SET(r, RECURSE_DIR_SKIP_ENTRY, RECURSE_DIR_CONTINUE))
+
+                if (IN_SET(r, RECURSE_DIR_UNLINK, RECURSE_DIR_UNLINK_GRACEFUL)) {
+                        int f = subdir_fd >= 0 ? AT_REMOVEDIR : 0;
+
+                        /* Close inodes before we try to delete them */
+                        subdir_fd = safe_close(subdir_fd);
+                        inode_fd = safe_close(inode_fd);
+
+                        if (unlinkat(dir_fd, i->d_name, f) < 0) {
+                                if (r != RECURSE_DIR_UNLINK_GRACEFUL)
+                                        return -errno;
+
+                                log_debug_errno(errno, "Unable to remove '%s', ignoring: %m", p);
+                        }
+                } else if (!IN_SET(r, RECURSE_DIR_SKIP_ENTRY, RECURSE_DIR_CONTINUE))
                         return r;
         }
 

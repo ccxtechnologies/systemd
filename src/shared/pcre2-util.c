@@ -6,8 +6,6 @@
 #include "pcre2-util.h"
 
 #if HAVE_PCRE2
-static void *pcre2_dl = NULL;
-
 DLSYM_PROTOTYPE(pcre2_match_data_create) = NULL;
 DLSYM_PROTOTYPE(pcre2_match_data_free) = NULL;
 DLSYM_PROTOTYPE(pcre2_code_free) = NULL;
@@ -26,12 +24,11 @@ DEFINE_HASH_OPS_WITH_KEY_DESTRUCTOR(
 const struct hash_ops pcre2_code_hash_ops_free = {};
 #endif
 
-int dlopen_pcre2(void) {
+int dlopen_pcre2(int log_level) {
 #if HAVE_PCRE2
-        ELF_NOTE_DLOPEN("pcre2",
-                        "Support for regular expressions",
-                        ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
-                        "libpcre2-8.so.0");
+        static void *pcre2_dl = NULL;
+
+        LIBPCRE2_NOTE(suggested);
 
         /* So here's something weird: PCRE2 actually renames the symbols exported by the library via C
          * macros, so that the exported symbols carry a suffix "_8" but when used from C the suffix is
@@ -42,7 +39,7 @@ int dlopen_pcre2(void) {
          * manually anymore. C is weird. 🤯 */
 
         return dlopen_many_sym_or_warn(
-                        &pcre2_dl, "libpcre2-8.so.0", LOG_ERR,
+                        &pcre2_dl, "libpcre2-8.so.0", log_level,
                         DLSYM_ARG(pcre2_match_data_create),
                         DLSYM_ARG(pcre2_match_data_free),
                         DLSYM_ARG(pcre2_code_free),
@@ -51,29 +48,30 @@ int dlopen_pcre2(void) {
                         DLSYM_ARG(pcre2_match),
                         DLSYM_ARG(pcre2_get_ovector_pointer));
 #else
-        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "PCRE2 support is not compiled in.");
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "PCRE2 support is not compiled in.");
 #endif
 }
 
 int pattern_compile_and_log(const char *pattern, PatternCompileCase case_, pcre2_code **ret) {
 #if HAVE_PCRE2
         PCRE2_SIZE erroroffset;
-        _cleanup_(sym_pcre2_code_freep) pcre2_code *p = NULL;
+        _cleanup_(pcre2_code_freep) pcre2_code *p = NULL;
         unsigned flags = 0;
         int errorcode, r;
 
         assert(pattern);
 
-        r = dlopen_pcre2();
+        r = dlopen_pcre2(LOG_ERR);
         if (r < 0)
                 return r;
 
         if (case_ == PATTERN_COMPILE_CASE_INSENSITIVE)
                 flags = PCRE2_CASELESS;
         else if (case_ == PATTERN_COMPILE_CASE_AUTO) {
-                _cleanup_(sym_pcre2_match_data_freep) pcre2_match_data *md = NULL;
+                _cleanup_(pcre2_match_data_freep) pcre2_match_data *md = NULL;
                 bool has_case;
-                _cleanup_(sym_pcre2_code_freep) pcre2_code *cs = NULL;
+                _cleanup_(pcre2_code_freep) pcre2_code *cs = NULL;
 
                 md = sym_pcre2_match_data_create(1, NULL);
                 if (!md)
@@ -116,14 +114,14 @@ int pattern_compile_and_log(const char *pattern, PatternCompileCase case_, pcre2
 
 int pattern_matches_and_log(pcre2_code *compiled_pattern, const char *message, size_t size, size_t *ret_ovec) {
 #if HAVE_PCRE2
-        _cleanup_(sym_pcre2_match_data_freep) pcre2_match_data *md = NULL;
+        _cleanup_(pcre2_match_data_freep) pcre2_match_data *md = NULL;
         int r;
 
         assert(compiled_pattern);
         assert(message);
         /* pattern_compile_and_log() must be called before this function is called and that function already
          * dlopens pcre2 so we can assert on it being available here. */
-        assert(pcre2_dl);
+        assert(sym_pcre2_match);
 
         md = sym_pcre2_match_data_create(1, NULL);
         if (!md)
@@ -154,19 +152,5 @@ int pattern_matches_and_log(pcre2_code *compiled_pattern, const char *message, s
         return true;
 #else
         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "PCRE2 support is not compiled in.");
-#endif
-}
-
-void *pattern_free(pcre2_code *p) {
-#if HAVE_PCRE2
-        if (!p)
-                return NULL;
-
-        assert(pcre2_dl);
-        sym_pcre2_code_free(p);
-        return NULL;
-#else
-        assert(p == NULL);
-        return NULL;
 #endif
 }

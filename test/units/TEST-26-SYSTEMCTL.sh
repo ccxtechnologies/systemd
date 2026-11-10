@@ -258,7 +258,7 @@ systemctl revert "$UNIT_NAME"
 (! grep -r "CPUQuota=" "/run/systemd/system.control/${UNIT_NAME}.d/")
 
 # Failed-unit related tests
-(! systemd-run --wait --unit "failed.service" /bin/false)
+(! systemd-run --wait --unit "failed.service" false)
 systemctl is-failed failed.service
 systemctl --state=failed | grep failed.service
 systemctl --failed | grep failed.service
@@ -287,6 +287,59 @@ for value in pretty us µs utc us+utc µs+utc; do
     systemctl show -P KernelTimestamp --timestamp="$value"
 done
 
+# --timestamp with timer properties (issue #39282)
+TIMER1="timestamp-test1-$RANDOM.timer"
+SERVICE1="${TIMER1%.timer}.service"
+cat >"/run/systemd/system/$SERVICE1" <<EOF
+[Service]
+Type=oneshot
+ExecStart=true
+EOF
+
+cat >"/run/systemd/system/$TIMER1" <<EOF
+[Timer]
+OnCalendar=*-*-* 00:00:00
+EOF
+
+systemctl daemon-reload
+systemctl start "$TIMER1"
+
+output=$(systemctl show -P NextElapseUSecRealtime --timestamp=unix "$TIMER1")
+if [[ ! "$output" =~ ^@[0-9]+$ ]]; then
+    echo "NextElapseUSecRealtime: expected @<number> with --timestamp=unix, got: $output" >&2
+    exit 1
+fi
+
+systemctl stop "$TIMER1"
+rm -f "/run/systemd/system/$TIMER1" "/run/systemd/system/$SERVICE1"
+
+TIMER2="timestamp-test2-$RANDOM.timer"
+SERVICE2="${TIMER2%.timer}.service"
+cat >"/run/systemd/system/$SERVICE2" <<EOF
+[Service]
+Type=oneshot
+ExecStart=true
+EOF
+
+cat >"/run/systemd/system/$TIMER2" <<EOF
+[Timer]
+OnActiveSec=100ms
+EOF
+
+systemctl daemon-reload
+systemctl start "$TIMER2"
+sleep 0.5
+
+output=$(systemctl show -P LastTriggerUSec --timestamp=unix "$TIMER2")
+if [[ ! "$output" =~ ^@[0-9]+$ ]]; then
+    echo "LastTriggerUSec: expected @<number> with --timestamp=unix, got: $output" >&2
+    exit 1
+fi
+
+systemctl stop "$TIMER2"
+rm -f "/run/systemd/system/$TIMER2" "/run/systemd/system/$SERVICE2"
+systemctl daemon-reload
+
 # set-default/get-default
 test_get_set_default() {
     target="$(systemctl get-default "$@")"
@@ -306,19 +359,173 @@ systemctl show systemd-logind.service
 systemctl status
 # Ignore the exit code in this case, as it might try to load non-existing units
 systemctl status -a >/dev/null || :
-systemctl status -a --state active,running,plugged >/dev/null
+# Ditto - there is a window between the first ListUnitsByByPatterns and the querying of individual units in
+# which some units might change their state (e.g. running -> stop-sigterm), which then causes systemctl to
+# return EC > 0
+systemctl status -a --state active,running,plugged >/dev/null || :
 systemctl status "systemd-*.timer"
 systemctl status "systemd-journald*.socket"
 systemctl status "sys-devices-*-ttyS0.device"
 systemctl status -- -.mount
 systemctl status 1
 
+# Exited commands are shown with argument boundaries preserved (#43938)
+systemd-run --unit=status-quoting-test.service -p Type=oneshot -p RemainAfterExit=yes \
+            --expand-environment=no true "foo bar" "" "a\$b"
+output="$(systemctl status --full --no-pager --lines=0 status-quoting-test.service)"
+systemctl stop status-quoting-test.service
+# shellcheck disable=SC2016
+grep -F ' "foo bar" "" "a\$b" (code=exited, status=0/SUCCESS)' <<<"$output"
+
 # --marked
 systemctl restart "$UNIT_NAME"
-systemctl set-property "$UNIT_NAME" Markers=needs-restart
+systemctl set-property "$UNIT_NAME" "Markers=needs-reload needs-restart"
 systemctl show -P Markers "$UNIT_NAME" | grep needs-restart
+systemctl show -P Markers "$UNIT_NAME" | grep -v needs-reload
 systemctl reload-or-restart --marked
 (! systemctl show -P Markers "$UNIT_NAME" | grep needs-restart)
+systemctl is-active "$UNIT_NAME"
+systemctl set-property "$UNIT_NAME" "Markers=needs-reload needs-stop"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-stop
+systemctl show -P Markers "$UNIT_NAME" | grep -v needs-reload
+systemctl reload-or-restart --marked
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-stop)
+(! systemctl is-active "$UNIT_NAME")
+systemctl set-property "$UNIT_NAME" "Markers=needs-start"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-start
+systemctl show -P Markers "$UNIT_NAME" | grep -v needs-stop
+systemctl reload-or-restart --marked
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-start)
+systemctl is-active "$UNIT_NAME"
+systemctl set-property "$UNIT_NAME" "Markers=needs-start needs-stop"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-stop
+systemctl show -P Markers "$UNIT_NAME" | grep -v needs-start
+systemctl reload-or-restart --marked
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-stop)
+(! systemctl is-active "$UNIT_NAME")
+
+# Test marker normalization with incremental (+) syntax
+
+# needs-start + +needs-restart → needs-restart (restart wins against start)
+systemctl set-property "$UNIT_NAME" "Markers=needs-start"
+systemctl set-property "$UNIT_NAME" "Markers=+needs-restart"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-restart
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-start)
+systemctl set-property "$UNIT_NAME" "Markers="
+
+# needs-restart + +needs-start → needs-restart (restart wins against start)
+systemctl set-property "$UNIT_NAME" "Markers=needs-restart"
+systemctl set-property "$UNIT_NAME" "Markers=+needs-start"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-restart
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-start)
+systemctl set-property "$UNIT_NAME" "Markers="
+
+# needs-restart + +needs-reload → needs-restart (reload loses against restart)
+systemctl set-property "$UNIT_NAME" "Markers=needs-restart"
+systemctl set-property "$UNIT_NAME" "Markers=+needs-reload"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-restart
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-reload)
+systemctl set-property "$UNIT_NAME" "Markers="
+
+# needs-stop + +needs-start → needs-start (start overrides stop)
+systemctl set-property "$UNIT_NAME" "Markers=needs-stop"
+systemctl set-property "$UNIT_NAME" "Markers=+needs-start"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-start
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-stop)
+systemctl set-property "$UNIT_NAME" "Markers="
+
+# anything + +needs-stop → needs-stop (stop wins against everything)
+for marker in needs-start needs-restart needs-reload; do
+    systemctl set-property "$UNIT_NAME" "Markers=$marker"
+    systemctl set-property "$UNIT_NAME" "Markers=+needs-stop"
+    systemctl show -P Markers "$UNIT_NAME" | grep needs-stop
+    (! systemctl show -P Markers "$UNIT_NAME" | grep "$marker")
+    systemctl set-property "$UNIT_NAME" "Markers="
+done
+
+# needs-stop + +needs-reload → needs-stop (stop wins against reload)
+systemctl set-property "$UNIT_NAME" "Markers=needs-stop"
+systemctl set-property "$UNIT_NAME" "Markers=+needs-reload"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-stop
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-reload)
+systemctl set-property "$UNIT_NAME" "Markers="
+
+# again, but with varlinkctl instead
+systemctl restart "$UNIT_NAME"
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"needs-reload\", \"needs-restart\"]}}"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-restart
+systemctl show -P Markers "$UNIT_NAME" | grep -v needs-reload
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Manager.EnqueueMarkedJobs '{}'
+timeout 30 bash -c "until systemctl list-jobs $UNIT_NAME | grep \"No jobs\" 2>/dev/null; do sleep 1; done"
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-restart)
+systemctl is-active "$UNIT_NAME"
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"needs-reload\", \"needs-stop\"]}}"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-stop
+systemctl show -P Markers "$UNIT_NAME" | grep -v needs-reload
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Manager.EnqueueMarkedJobs '{}'
+timeout 30 bash -c "until systemctl list-jobs $UNIT_NAME | grep \"No jobs\" 2>/dev/null; do sleep 1; done"
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-stop)
+(! systemctl is-active "$UNIT_NAME")
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"needs-start\"]}}"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-start
+systemctl show -P Markers "$UNIT_NAME" | grep -v needs-stop
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Manager.EnqueueMarkedJobs '{}'
+timeout 30 bash -c "until systemctl list-jobs $UNIT_NAME | grep \"No jobs\" 2>/dev/null; do sleep 1; done"
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-start)
+systemctl is-active "$UNIT_NAME"
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"needs-start\", \"needs-stop\"]}}"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-stop
+systemctl show -P Markers "$UNIT_NAME" | grep -v needs-start
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Manager.EnqueueMarkedJobs '{}'
+timeout 30 bash -c "until systemctl list-jobs $UNIT_NAME | grep \"No jobs\" 2>/dev/null; do sleep 1; done"
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-stop)
+(! systemctl is-active "$UNIT_NAME")
+
+# Test marker normalization with incremental (+) syntax via varlinkctl
+
+# needs-start + +needs-restart → needs-restart (restart wins against start)
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"needs-start\"]}}"
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"+needs-restart\"]}}"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-restart
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-start)
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": []}}"
+
+# needs-restart + +needs-start → needs-restart (restart wins against start)
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"needs-restart\"]}}"
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"+needs-start\"]}}"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-restart
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-start)
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": []}}"
+
+# needs-restart + +needs-reload → needs-restart (reload loses against restart)
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"needs-restart\"]}}"
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"+needs-reload\"]}}"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-restart
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-reload)
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": []}}"
+
+# needs-stop + +needs-start → needs-start (start overrides stop)
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"needs-stop\"]}}"
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"+needs-start\"]}}"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-start
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-stop)
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": []}}"
+
+# anything + +needs-stop → needs-stop (stop wins against everything)
+for marker in needs-start needs-restart needs-reload; do
+    varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"$marker\"]}}"
+    varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"+needs-stop\"]}}"
+    systemctl show -P Markers "$UNIT_NAME" | grep needs-stop
+    (! systemctl show -P Markers "$UNIT_NAME" | grep "$marker")
+    varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": []}}"
+done
+
+# needs-stop + +needs-reload → needs-stop (stop wins against reload)
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"needs-stop\"]}}"
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": [\"+needs-reload\"]}}"
+systemctl show -P Markers "$UNIT_NAME" | grep needs-stop
+(! systemctl show -P Markers "$UNIT_NAME" | grep needs-reload)
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties "{\"runtime\": true, \"name\": \"$UNIT_NAME\", \"properties\": {\"Markers\": []}}"
 
 # --dry-run with destructive verbs
 # kexec is skipped intentionally, as it requires a bit more involved setup
@@ -365,24 +572,24 @@ systemctl disable "$UNIT_NAME"
 
 # show/set-environment
 # Make sure PATH is set
-systemctl show-environment | grep -q '^PATH='
+systemctl show-environment | grep '^PATH=' >/dev/null
 # Let's add an entry and override a built-in one
 systemctl set-environment PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/testaddition FOO=BAR
 # Check that both are set
-systemctl show-environment | grep -q '^PATH=.*testaddition$'
-systemctl show-environment | grep -q '^FOO=BAR$'
+systemctl show-environment | grep '^PATH=.*testaddition$' >/dev/null
+systemctl show-environment | grep '^FOO=BAR$' >/dev/null
 systemctl daemon-reload
 # Check again after the reload
-systemctl show-environment | grep -q '^PATH=.*testaddition$'
-systemctl show-environment | grep -q '^FOO=BAR$'
+systemctl show-environment | grep '^PATH=.*testaddition$' >/dev/null
+systemctl show-environment | grep '^FOO=BAR$' >/dev/null
 # Check that JSON output is supported
-systemctl show-environment --output=json | grep -q '^{.*"FOO":"BAR".*}$'
+systemctl show-environment --output=json | grep '^{.*"FOO":"BAR".*}$' >/dev/null
 # Drop both
 systemctl unset-environment FOO PATH
 # Check that one is gone and the other reverted to the built-in
 systemctl show-environment | grep '^FOO=$' && exit 1
 systemctl show-environment | grep '^PATH=.*testaddition$' && exit 1
-systemctl show-environment | grep -q '^PATH='
+systemctl show-environment | grep '^PATH=' >/dev/null
 # Check import-environment
 export IMPORT_THIS=hello
 export IMPORT_THIS_TOO=world
@@ -392,118 +599,6 @@ systemctl show-environment | grep "^IMPORT_THIS_TOO=$IMPORT_THIS_TOO"
 systemctl unset-environment IMPORT_THIS IMPORT_THIS_TOO
 (! systemctl show-environment | grep "^IMPORT_THIS=")
 (! systemctl show-environment | grep "^IMPORT_THIS_TOO=")
-
-# test for sysv-generator (issue #24990)
-if [[ -x /usr/lib/systemd/system-generators/systemd-sysv-generator ]]; then
-    # This is configurable via -Dsysvinit-path=, but we can't get the value
-    # at runtime, so let's just support the two most common paths for now.
-    [[ -d /etc/rc.d/init.d ]] && SYSVINIT_PATH="/etc/rc.d/init.d" || SYSVINIT_PATH="/etc/init.d"
-
-    # OpenSUSE leaves sysvinit-path enabled, which means systemd-sysv-generator is built
-    # but may not create the directory if there's no services that use it.
-    mkdir -p "$SYSVINIT_PATH"
-
-    # invalid dependency
-    cat >"${SYSVINIT_PATH:?}/issue-24990" <<\EOF
-#!/bin/bash
-
-### BEGIN INIT INFO
-# Provides:test1 test2
-# Required-Start:test1 $remote_fs $network
-# Required-Stop:test1 $remote_fs $network
-# Description:Test
-# Short-Description: Test
-### END INIT INFO
-
-case "$1" in
-    start)
-        echo "Starting issue-24990.service"
-        sleep 1000 &
-        ;;
-    stop)
-        echo "Stopping issue-24990.service"
-        sleep 10 &
-        ;;
-    *)
-        echo "Usage: service test {start|stop|restart|status}"
-        ;;
-esac
-EOF
-
-    chmod +x "$SYSVINIT_PATH/issue-24990"
-    systemctl daemon-reload
-    [[ -L /run/systemd/generator.late/test1.service ]]
-    [[ -L /run/systemd/generator.late/test2.service ]]
-    assert_eq "$(readlink -f /run/systemd/generator.late/test1.service)" "/run/systemd/generator.late/issue-24990.service"
-    assert_eq "$(readlink -f /run/systemd/generator.late/test2.service)" "/run/systemd/generator.late/issue-24990.service"
-    output=$(systemctl cat issue-24990)
-    assert_in "SourcePath=$SYSVINIT_PATH/issue-24990" "$output"
-    assert_in "Description=LSB: Test" "$output"
-    assert_in "After=test1.service" "$output"
-    assert_in "After=remote-fs.target" "$output"
-    assert_in "After=network-online.target" "$output"
-    assert_in "Wants=network-online.target" "$output"
-    assert_in "ExecStart=$SYSVINIT_PATH/issue-24990 start" "$output"
-    assert_in "ExecStop=$SYSVINIT_PATH/issue-24990 stop" "$output"
-    systemctl status issue-24990 || :
-    systemctl show issue-24990
-    assert_not_in "issue-24990.service" "$(systemctl show --property=After --value)"
-    assert_not_in "issue-24990.service" "$(systemctl show --property=Before --value)"
-
-    if ! systemctl is-active network-online.target; then
-        systemctl start network-online.target
-    fi
-
-    systemctl restart issue-24990
-    systemctl stop issue-24990
-
-    # valid dependency
-    cat >"$SYSVINIT_PATH/issue-24990" <<\EOF
-#!/bin/bash
-
-### BEGIN INIT INFO
-# Provides:test1 test2
-# Required-Start:$remote_fs
-# Required-Stop:$remote_fs
-# Description:Test
-# Short-Description: Test
-### END INIT INFO
-
-case "$1" in
-    start)
-        echo "Starting issue-24990.service"
-        sleep 1000 &
-        ;;
-    stop)
-        echo "Stopping issue-24990.service"
-        sleep 10 &
-        ;;
-    *)
-        echo "Usage: service test {start|stop|restart|status}"
-        ;;
-esac
-EOF
-
-    chmod +x "$SYSVINIT_PATH/issue-24990"
-    systemctl daemon-reload
-    [[ -L /run/systemd/generator.late/test1.service ]]
-    [[ -L /run/systemd/generator.late/test2.service ]]
-    assert_eq "$(readlink -f /run/systemd/generator.late/test1.service)" "/run/systemd/generator.late/issue-24990.service"
-    assert_eq "$(readlink -f /run/systemd/generator.late/test2.service)" "/run/systemd/generator.late/issue-24990.service"
-    output=$(systemctl cat issue-24990)
-    assert_in "SourcePath=$SYSVINIT_PATH/issue-24990" "$output"
-    assert_in "Description=LSB: Test" "$output"
-    assert_in "After=remote-fs.target" "$output"
-    assert_in "ExecStart=$SYSVINIT_PATH/issue-24990 start" "$output"
-    assert_in "ExecStop=$SYSVINIT_PATH/issue-24990 stop" "$output"
-    systemctl status issue-24990 || :
-    systemctl show issue-24990
-    assert_not_in "issue-24990.service" "$(systemctl show --property=After --value)"
-    assert_not_in "issue-24990.service" "$(systemctl show --property=Before --value)"
-
-    systemctl restart issue-24990
-    systemctl stop issue-24990
-fi
 
 # %J in WantedBy= causes ABRT (#26467)
 cat >/run/systemd/system/test-WantedBy.service <<EOF
@@ -516,5 +611,49 @@ EOF
 systemctl daemon-reload
 systemctl enable --now test-WantedBy.service || :
 systemctl daemon-reload
+
+# Test systemctl edit --global and systemctl cat --global (issue #31272)
+GLOBAL_UNIT_NAME="systemctl-test-$RANDOM.service"
+GLOBAL_MASKED_UNIT="systemctl-test-masked-$RANDOM.service"
+
+# Test 1: Create a new global user unit with --force and --runtime
+systemctl edit --global --runtime --stdin --full --force "$GLOBAL_UNIT_NAME" <<EOF
+[Unit]
+Description=Test global unit
+
+[Service]
+ExecStart=/bin/true
+EOF
+
+# Verify the unit file was created in /run/systemd/user/
+test -f "/run/systemd/user/$GLOBAL_UNIT_NAME"
+
+# Test 2: Read the global unit with systemctl cat --global
+systemctl cat --global "$GLOBAL_UNIT_NAME" | grep "ExecStart=/bin/true" >/dev/null
+
+# Test 3: Edit existing global unit (add a drop-in)
+systemctl edit --global --runtime --stdin "$GLOBAL_UNIT_NAME" <<EOF
+[Service]
+Environment=TEST=value
+EOF
+
+# Verify drop-in was created
+test -f "/run/systemd/user/$GLOBAL_UNIT_NAME.d/override.conf"
+systemctl cat --global "$GLOBAL_UNIT_NAME" | grep "Environment=TEST=value" >/dev/null
+
+# Test 4: Create a masked global unit in /run/
+mkdir -p /run/systemd/user
+ln -sf /dev/null "/run/systemd/user/$GLOBAL_MASKED_UNIT"
+
+# Test 5: Verify cat shows it's masked
+systemctl cat --global "$GLOBAL_MASKED_UNIT" 2>&1 | grep "masked" >/dev/null
+
+# Test 6: Verify edit refuses to edit masked unit
+(! systemctl edit --global --runtime --stdin --full "$GLOBAL_MASKED_UNIT" </dev/null 2>&1) | grep "masked" >/dev/null
+
+# Cleanup global test units
+rm -f "/run/systemd/user/$GLOBAL_UNIT_NAME"
+rm -rf "/run/systemd/user/$GLOBAL_UNIT_NAME.d"
+rm -f "/run/systemd/user/$GLOBAL_MASKED_UNIT"
 
 touch /testok

@@ -1,17 +1,17 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
+#include "sd-json.h"
 
-#include "alloc-util.h"
 #include "build.h"
 #include "confidential-virt.h"
 #include "log.h"
 #include "main-func.h"
-#include "pretty-print.h"
 #include "string-table.h"
+#include "verbs.h"
 #include "virt.h"
 
 static bool arg_quiet = false;
+
 static enum {
         ANY_VIRTUALIZATION,
         ONLY_VM,
@@ -21,113 +21,61 @@ static enum {
         ONLY_CVM,
 } arg_mode = ANY_VIRTUALIZATION;
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-detect-virt", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...]\n\n"
-               "Detect execution in a virtualized environment.\n\n"
-               "  -h --help             Show this help\n"
-               "     --version          Show package version\n"
-               "  -c --container        Only detect whether we are run in a container\n"
-               "  -v --vm               Only detect whether we are run in a VM\n"
-               "  -r --chroot           Detect whether we are run in a chroot() environment\n"
-               "     --private-users    Only detect whether we are running in a user namespace\n"
-               "     --cvm              Only detect whether we are run in a confidential VM\n"
-               "  -q --quiet            Don't output anything, just set return value\n"
-               "     --list             List all known and detectable types of virtualization\n"
-               "     --list-cvm         List all known and detectable types of confidential \n"
-               "                        virtualization\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               link);
-
-        return 0;
-}
+COMMAND(
+        "systemd-detect-virt\0",
+        "Detect execution in a virtualized environment.",
+        .man_pages = "systemd-detect-virt(1)\0",
+);
 
 static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_PRIVATE_USERS,
-                ARG_LIST,
-                ARG_CVM,
-                ARG_LIST_CVM,
-        };
-
-        static const struct option options[] = {
-                { "help",          no_argument, NULL, 'h'               },
-                { "version",       no_argument, NULL, ARG_VERSION       },
-                { "container",     no_argument, NULL, 'c'               },
-                { "vm",            no_argument, NULL, 'v'               },
-                { "chroot",        no_argument, NULL, 'r'               },
-                { "private-users", no_argument, NULL, ARG_PRIVATE_USERS },
-                { "quiet",         no_argument, NULL, 'q'               },
-                { "cvm",           no_argument, NULL, ARG_CVM           },
-                { "list",          no_argument, NULL, ARG_LIST          },
-                { "list-cvm",      no_argument, NULL, ARG_LIST_CVM      },
-                {}
-        };
-
-        int c;
-
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hqcvr", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case 'h':
-                        return help();
-
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case 'q':
+                OPTION('q', "quiet", NULL, "Don't output anything, just set return value"):
                         arg_quiet = true;
                         break;
 
-                case 'c':
+                OPTION('c', "container", NULL, "Only detect whether we are run in a container"):
                         arg_mode = ONLY_CONTAINER;
                         break;
 
-                case ARG_PRIVATE_USERS:
+                OPTION_LONG("private-users", NULL, "Only detect whether we are running in a user namespace"):
                         arg_mode = ONLY_PRIVATE_USERS;
                         break;
 
-                case 'v':
+                OPTION('v', "vm", NULL, "Only detect whether we are run in a VM"):
                         arg_mode = ONLY_VM;
                         break;
 
-                case 'r':
+                OPTION('r', "chroot", NULL, "Detect whether we are run in a chroot() environment"):
                         arg_mode = ONLY_CHROOT;
                         break;
 
-                case ARG_LIST:
-                        DUMP_STRING_TABLE(virtualization, Virtualization, _VIRTUALIZATION_MAX);
-                        return 0;
+                OPTION_LONG("list", NULL, "List all known and detectable types of virtualization"):
+                        return DUMP_STRING_TABLE(virtualization, Virtualization, _VIRTUALIZATION_MAX);
 
-                case ARG_CVM:
+                OPTION_LONG("cvm", NULL, "Only detect whether we are run in a confidential VM"):
                         arg_mode = ONLY_CVM;
-                        return 1;
+                        break;
 
-                case ARG_LIST_CVM:
-                        DUMP_STRING_TABLE(confidential_virtualization, ConfidentialVirtualization, _CONFIDENTIAL_VIRTUALIZATION_MAX);
-                        return 0;
+                OPTION_LONG("list-cvm", NULL, "List all known and detectable types of confidential virtualization"):
+                        return DUMP_STRING_TABLE(confidential_virtualization, ConfidentialVirtualization, _CONFIDENTIAL_VIRTUALIZATION_MAX);
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (optind < argc)
+        if (option_parser_get_n_args(&opts) > 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "%s takes no arguments.",
                                        program_invocation_short_name);

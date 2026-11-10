@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
+#include "sd-varlink.h"
 
+#include "ansi-color.h"
 #include "ask-password-api.h"
 #include "bitfield.h"
 #include "build.h"
@@ -16,13 +17,16 @@
 #include "capability-util.h"
 #include "cgroup-util.h"
 #include "creds-util.h"
+#include "crypto-util.h"
 #include "dirent-util.h"
+#include "dlopen-note.h"
 #include "dns-domain.h"
 #include "env-util.h"
 #include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "firstboot-util.h"
 #include "format-table.h"
 #include "format-util.h"
 #include "fs-util.h"
@@ -32,27 +36,30 @@
 #include "home-util.h"
 #include "homectl-fido2.h"
 #include "homectl-pkcs11.h"
+#include "homectl-prompts.h"
 #include "homectl-recovery-key.h"
 #include "json-util.h"
 #include "libfido2-util.h"
 #include "locale-util.h"
 #include "main-func.h"
-#include "openssl-util.h"
+#include "options.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
 #include "password-quality-util.h"
 #include "path-util.h"
 #include "percent-util.h"
+#include "pidref.h"
 #include "pkcs11-util.h"
+#include "plymouth-util.h"
 #include "polkit-agent.h"
-#include "pretty-print.h"
-#include "proc-cmdline.h"
 #include "process-util.h"
+#include "prompt-util.h"
 #include "recurse-dir.h"
 #include "rlimit-util.h"
 #include "runtime-scope.h"
 #include "stat-util.h"
+#include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
@@ -65,6 +72,14 @@
 #include "user-util.h"
 #include "userdb.h"
 #include "verbs.h"
+
+typedef enum {
+        EXPORT_FORMAT_FULL,          /* export the full record */
+        EXPORT_FORMAT_STRIPPED,      /* strip "state" + "binding", but leave signature in place */
+        EXPORT_FORMAT_MINIMAL,       /* also strip signature */
+        _EXPORT_FORMAT_MAX,
+        _EXPORT_FORMAT_INVALID = -EINVAL,
+} ExportFormat;
 
 static PagerFlags arg_pager_flags = 0;
 static bool arg_legend = true;
@@ -91,23 +106,22 @@ static int arg_fido2_cred_alg = COSE_ES256;
 static int arg_fido2_cred_alg = 0;
 #endif
 static bool arg_recovery_key = false;
+static char *arg_recovery_key_file = NULL;
 static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
-static bool arg_and_resize = false;
-static bool arg_and_change_password = false;
-static enum {
-        EXPORT_FORMAT_FULL,          /* export the full record */
-        EXPORT_FORMAT_STRIPPED,      /* strip "state" + "binding", but leave signature in place */
-        EXPORT_FORMAT_MINIMAL,       /* also strip signature */
-} arg_export_format = EXPORT_FORMAT_FULL;
-static uint64_t arg_capability_bounding_set = UINT64_MAX;
-static uint64_t arg_capability_ambient_set = UINT64_MAX;
-static bool arg_prompt_new_user = false;
+static ExportFormat arg_export_format = EXPORT_FORMAT_FULL;
+static uint64_t arg_capability_bounding_set = CAP_MASK_UNSET;
+static uint64_t arg_capability_ambient_set = CAP_MASK_UNSET;
 static char *arg_blob_dir = NULL;
 static bool arg_blob_clear = false;
 static Hashmap *arg_blob_files = NULL;
 static char *arg_key_name = NULL;
 static bool arg_dry_run = false;
 static bool arg_seize = true;
+static bool arg_prompt_new_user = false;
+static bool arg_prompt_shell = true;
+static bool arg_prompt_groups = true;
+static bool arg_chrome = true;
+static bool arg_mute_console = false;
 
 STATIC_DESTRUCTOR_REGISTER(arg_identity_extra, sd_json_variant_unrefp);
 STATIC_DESTRUCTOR_REGISTER(arg_identity_extra_this_machine, sd_json_variant_unrefp);
@@ -118,11 +132,20 @@ STATIC_DESTRUCTOR_REGISTER(arg_identity_filter, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_identity_filter_rlimits, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_pkcs11_token_uri, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_fido2_device, strv_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_recovery_key_file, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_blob_dir, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_blob_files, hashmap_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_key_name, freep);
 
 static const BusLocator *bus_mgr;
+
+static const char *export_format_table[_EXPORT_FORMAT_MAX] = {
+        [EXPORT_FORMAT_FULL]     = "full",
+        [EXPORT_FORMAT_STRIPPED] = "stripped",
+        [EXPORT_FORMAT_MINIMAL]  = "minimal",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP(export_format, ExportFormat);
 
 static bool identity_properties_specified(void) {
         return
@@ -136,6 +159,7 @@ static bool identity_properties_specified(void) {
                 !strv_isempty(arg_identity_filter_rlimits) ||
                 !strv_isempty(arg_pkcs11_token_uri) ||
                 !strv_isempty(arg_fido2_device) ||
+                arg_recovery_key ||
                 arg_blob_dir ||
                 arg_blob_clear ||
                 !hashmap_isempty(arg_blob_files);
@@ -158,7 +182,18 @@ static int acquire_bus(sd_bus **bus) {
         return 0;
 }
 
-static int list_homes(int argc, char *argv[], void *userdata) {
+COMMAND(
+        "homectl\0",
+        "Create, manipulate or inspect home directories.",
+        .man_pages = "homectl(1)\0",
+        .pager_flags = &arg_pager_flags,
+        .flags = COMMAND_HELP_SEPARATE,  /* the option table is very wide */
+);
+
+VERB_GROUP("Basic User Manipulation Commands");
+VERB(verb_list_homes, "list", /* argspec= */ NULL, VERB_ANY, 1, VERB_DEFAULT,
+     "List home areas");
+static int verb_list_homes(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -584,7 +619,7 @@ static int acquire_passed_secrets(const char *user_name, UserRecord **ret) {
         r = acquire_existing_password(
                         user_name,
                         secret,
-                        /* emphasize_current_password = */ false,
+                        /* emphasize_current_password= */ false,
                         ASK_PASSWORD_ACCEPT_CACHED | ASK_PASSWORD_NO_TTY | ASK_PASSWORD_NO_AGENT);
         if (r < 0)
                 return r;
@@ -605,85 +640,6 @@ static int acquire_passed_secrets(const char *user_name, UserRecord **ret) {
 
         *ret = TAKE_PTR(secret);
         return 0;
-}
-
-static int activate_home(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        int r, ret = 0;
-
-        r = acquire_bus(&bus);
-        if (r < 0)
-                return r;
-
-        STRV_FOREACH(i, strv_skip(argv, 1)) {
-                _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
-
-                r = acquire_passed_secrets(*i, &secret);
-                if (r < 0)
-                        return r;
-
-                for (;;) {
-                        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-                        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-
-                        r = bus_message_new_method_call(bus, &m, bus_mgr, "ActivateHome");
-                        if (r < 0)
-                                return bus_log_create_error(r);
-
-                        r = sd_bus_message_append(m, "s", *i);
-                        if (r < 0)
-                                return bus_log_create_error(r);
-
-                        r = bus_message_append_secret(m, secret);
-                        if (r < 0)
-                                return bus_log_create_error(r);
-
-                        r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
-                        if (r < 0) {
-                                r = handle_generic_user_record_error(*i, secret, &error, r, /* emphasize_current_password= */ false);
-                                if (r < 0) {
-                                        if (ret == 0)
-                                                ret = r;
-
-                                        break;
-                                }
-                        } else
-                                break;
-                }
-        }
-
-        return ret;
-}
-
-static int deactivate_home(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        int r, ret = 0;
-
-        r = acquire_bus(&bus);
-        if (r < 0)
-                return r;
-
-        STRV_FOREACH(i, strv_skip(argv, 1)) {
-                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-
-                r = bus_message_new_method_call(bus, &m, bus_mgr, "DeactivateHome");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(m, "s", *i);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to deactivate user home: %s", bus_error_message(&error, r));
-                        if (ret == 0)
-                                ret = r;
-                }
-        }
-
-        return ret;
 }
 
 static void dump_home_record(UserRecord *hr) {
@@ -738,7 +694,7 @@ static int inspect_home(sd_bus *bus, const char *name) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        r = sd_json_parse(json, SD_JSON_PARSE_SENSITIVE, &v, NULL, NULL);
+        r = sd_json_parse(json, SD_JSON_PARSE_SENSITIVE|SD_JSON_PARSE_MUST_BE_OBJECT, &v, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse JSON identity: %m");
 
@@ -755,7 +711,9 @@ static int inspect_home(sd_bus *bus, const char *name) {
         return 0;
 }
 
-static int inspect_homes(int argc, char *argv[], void *userdata) {
+VERB(verb_inspect_homes, "inspect", "USER…\0", VERB_ANY, VERB_ANY, 0,
+     "Inspect a home area");
+static int verb_inspect_homes(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
@@ -776,65 +734,6 @@ static int inspect_homes(int argc, char *argv[], void *userdata) {
                         return log_oom();
 
                 return inspect_home(bus, myself);
-        }
-}
-
-static int authenticate_home(sd_bus *bus, const char *name) {
-        _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
-        int r;
-
-        r = acquire_passed_secrets(name, &secret);
-        if (r < 0)
-                return r;
-
-        for (;;) {
-                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-
-                r = bus_message_new_method_call(bus, &m, bus_mgr, "AuthenticateHome");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(m, "s", name);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = bus_message_append_secret(m, secret);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
-                if (r < 0) {
-                        r = handle_generic_user_record_error(name, secret, &error, r, false);
-                        if (r >= 0)
-                                continue;
-                }
-                return r;
-        }
-}
-
-static int authenticate_homes(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        int r;
-
-        r = acquire_bus(&bus);
-        if (r < 0)
-                return r;
-
-        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
-
-        char **args = strv_skip(argv, 1);
-        if (args) {
-                STRV_FOREACH(arg, args)
-                        RET_GATHER(r, authenticate_home(bus, *arg));
-
-                return r;
-        } else {
-                _cleanup_free_ char *myself = getusername_malloc();
-                if (!myself)
-                        return log_oom();
-
-                return authenticate_home(bus, myself);
         }
 }
 
@@ -1018,8 +917,7 @@ static int apply_identity_changes(sd_json_variant **_v) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to allocate new perMachine array: %m");
 
-                        sd_json_variant_unref(per_machine);
-                        per_machine = TAKE_PTR(npm);
+                        json_variant_unref_and_replace(per_machine, npm);
                 } else {
                         _cleanup_(sd_json_variant_unrefp) sd_json_variant *positive = sd_json_variant_ref(arg_identity_extra_this_machine),
                                 *negative = sd_json_variant_ref(arg_identity_extra_other_machines);
@@ -1102,10 +1000,7 @@ static int apply_identity_changes(sd_json_variant **_v) {
                 }
         }
 
-        sd_json_variant_unref(*_v);
-        *_v = TAKE_PTR(v);
-
-        return 0;
+        return json_variant_unref_and_replace(*_v, v);
 }
 
 static int add_disposition(sd_json_variant **v) {
@@ -1124,12 +1019,14 @@ static int add_disposition(sd_json_variant **v) {
         return 1;
 }
 
-static int acquire_new_home_record(sd_json_variant *input, UserRecord **ret) {
+static int acquire_new_home_record(sd_json_variant *input, UserRecord **ret, char **ret_recovery_key) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        _cleanup_(erase_and_freep) char *recovery_key = NULL;
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
         int r;
 
         assert(ret);
+        assert(ret_recovery_key);
 
         if (arg_identity) {
                 unsigned line = 0, column = 0;
@@ -1139,7 +1036,11 @@ static int acquire_new_home_record(sd_json_variant *input, UserRecord **ret) {
 
                 r = sd_json_parse_file(
                                 streq(arg_identity, "-") ? stdin : NULL,
-                                streq(arg_identity, "-") ? "<stdin>" : arg_identity, SD_JSON_PARSE_SENSITIVE, &v, &line, &column);
+                                streq(arg_identity, "-") ? "<stdin>" : arg_identity,
+                                SD_JSON_PARSE_MUST_BE_OBJECT|SD_JSON_PARSE_SENSITIVE,
+                                &v,
+                                &line,
+                                &column);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse identity at %u:%u: %m", line, column);
         } else
@@ -1166,7 +1067,7 @@ static int acquire_new_home_record(sd_json_variant *input, UserRecord **ret) {
         }
 
         if (arg_recovery_key) {
-                r = identity_add_recovery_key(&v);
+                r = identity_add_recovery_key(&v, &recovery_key);
                 if (r < 0)
                         return r;
         }
@@ -1198,6 +1099,7 @@ static int acquire_new_home_record(sd_json_variant *input, UserRecord **ret) {
                 return r;
 
         *ret = TAKE_PTR(hr);
+        *ret_recovery_key = TAKE_PTR(recovery_key);
         return 0;
 }
 
@@ -1220,7 +1122,7 @@ static int acquire_new_password(
         if (r > 0) {
                 /* As above, this is not for use, just for testing */
 
-                r = user_record_set_password(hr, STRV_MAKE(envpw), /* prepend = */ true);
+                r = user_record_set_password(hr, STRV_MAKE(envpw), /* prepend= */ true);
                 if (r < 0)
                         return log_error_errno(r, "Failed to store password: %m");
 
@@ -1284,7 +1186,7 @@ static int acquire_new_password(
                                         return log_oom();
                         }
 
-                        r = user_record_set_password(hr, first, /* prepend = */ true);
+                        r = user_record_set_password(hr, first, /* prepend= */ true);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to store password: %m");
 
@@ -1420,13 +1322,31 @@ static int bus_message_append_blobs(sd_bus_message *m, Hashmap *blobs) {
         return sd_bus_message_close_container(m);
 }
 
+static void finalize_recovery_key(const char *recovery_key, const char *recovery_key_file) {
+        int r;
+
+        if (!recovery_key)
+                return;
+
+        if (recovery_key_file) {
+                r = recovery_key_file_write(recovery_key_file, recovery_key);
+                if (r < 0)
+                        log_warning_errno(r,
+                                          "Failed to write recovery key file '%s', ignoring: %m",
+                                          recovery_key_file);
+        }
+
+        show_recovery_key(recovery_key);
+}
+
 static int create_home_common(sd_json_variant *input, bool show_enforce_password_policy_hint) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
         _cleanup_hashmap_free_ Hashmap *blobs = NULL;
+        _cleanup_(erase_and_freep) char *recovery_key = NULL;
         int r;
 
-        r = acquire_new_home_record(input, &hr);
+        r = acquire_new_home_record(input, &hr, &recovery_key);
         if (r < 0)
                 return r;
 
@@ -1442,11 +1362,11 @@ static int create_home_common(sd_json_variant *input, bool show_enforce_password
                         _cleanup_(erase_and_freep) char *new_password = NULL;
 
                         /* No regular (i.e. non-PKCS#11) hashed passwords set in the record, let's fix that. */
-                        r = acquire_new_password(hr->user_name, hr, /* suggest = */ true, &new_password);
+                        r = acquire_new_password(hr->user_name, hr, /* suggest= */ true, &new_password);
                         if (r < 0)
                                 return r;
 
-                        r = user_record_make_hashed_password(hr, STRV_MAKE(new_password), /* extend = */ false);
+                        r = user_record_make_hashed_password(hr, STRV_MAKE(new_password), /* extend= */ false);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to hash password: %m");
                 } else {
@@ -1473,6 +1393,7 @@ static int create_home_common(sd_json_variant *input, bool show_enforce_password
 
         if (arg_dry_run) {
                 sd_json_variant_dump(hr->json, SD_JSON_FORMAT_COLOR_AUTO|SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_NEWLINE, stderr, /* prefix= */ NULL);
+                finalize_recovery_key(recovery_key, /* recovery_key_file= */ NULL);
                 return 0;
         }
 
@@ -1487,7 +1408,7 @@ static int create_home_common(sd_json_variant *input, bool show_enforce_password
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
                 _cleanup_(erase_and_freep) char *formatted = NULL;
 
-                r = sd_json_variant_format(hr->json, 0, &formatted);
+                r = sd_json_variant_format(hr->json, /* flags= */ 0, &formatted);
                 if (r < 0)
                         return log_error_errno(r, "Failed to format user record: %m");
 
@@ -1518,11 +1439,11 @@ static int create_home_common(sd_json_variant *input, bool show_enforce_password
                                 if (show_enforce_password_policy_hint)
                                         log_info("(Use --enforce-password-policy=no to turn off password quality checks for this account.)");
 
-                                r = acquire_new_password(hr->user_name, hr, /* suggest = */ false, &new_password);
+                                r = acquire_new_password(hr->user_name, hr, /* suggest= */ false, &new_password);
                                 if (r < 0)
                                         return r;
 
-                                r = user_record_make_hashed_password(hr, STRV_MAKE(new_password), /* extend = */ false);
+                                r = user_record_make_hashed_password(hr, STRV_MAKE(new_password), /* extend= */ false);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to hash passwords: %m");
                         } else {
@@ -1534,16 +1455,19 @@ static int create_home_common(sd_json_variant *input, bool show_enforce_password
                         break; /* done */
         }
 
+        finalize_recovery_key(recovery_key, arg_recovery_key_file);
         return 0;
 }
 
-static int create_home(int argc, char *argv[], void *userdata) {
+VERB(verb_create_home, "create", "USER\0", VERB_ANY, 2, 0,
+     "Create a home area");
+static int verb_create_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
         if (argc >= 2) {
                 /* If a username was specified, use it */
 
-                if (valid_user_group_name(argv[1], 0))
+                if (valid_user_group_name(argv[1], /* flags= */ 0))
                         r = sd_json_variant_set_field_string(&arg_identity_extra, "userName", argv[1]);
                 else {
                         _cleanup_free_ char *un = NULL, *rr = NULL;
@@ -1572,7 +1496,868 @@ static int create_home(int argc, char *argv[], void *userdata) {
         return create_home_common(/* input= */ NULL, /* show_enforce_password_policy_hint= */ true);
 }
 
-static int verb_adopt_home(int argc, char *argv[], void *userdata) {
+static int acquire_updated_home_record(
+                sd_bus *bus,
+                const char *username,
+                UserRecord **ret,
+                char **ret_recovery_key) {
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
+        _cleanup_(erase_and_freep) char *recovery_key = NULL;
+        _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
+        int r;
+
+        assert(ret);
+        assert(ret_recovery_key);
+
+        if (arg_identity) {
+                unsigned line = 0, column = 0;
+                sd_json_variant *un;
+
+                r = sd_json_parse_file(
+                                streq(arg_identity, "-") ? stdin : NULL,
+                                streq(arg_identity, "-") ? "<stdin>" : arg_identity,
+                                SD_JSON_PARSE_MUST_BE_OBJECT|SD_JSON_PARSE_SENSITIVE,
+                                &json,
+                                &line,
+                                &column);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse identity at %u:%u: %m", line, column);
+
+                un = sd_json_variant_by_key(json, "userName");
+                if (un) {
+                        if (!sd_json_variant_is_string(un) || (username && !streq(sd_json_variant_string(un), username)))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "User name specified on command line and in JSON record do not match.");
+                } else {
+                        if (!username)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No username specified.");
+
+                        r = sd_json_variant_set_field_string(&arg_identity_extra, "userName", username);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to set userName field: %m");
+                }
+
+        } else {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+                int incomplete;
+                const char *text;
+
+                if (!identity_properties_specified())
+                        return log_error_errno(SYNTHETIC_ERRNO(EALREADY), "No field to change specified.");
+
+                r = bus_call_method(bus, bus_mgr, "GetUserRecordByName", &error, &reply, "s", username);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to acquire user home record: %s", bus_error_message(&error, r));
+
+                r = sd_bus_message_read(reply, "sbo", &text, &incomplete, NULL);
+                if (r < 0)
+                        return bus_log_parse_error(r);
+
+                if (incomplete)
+                        return log_error_errno(SYNTHETIC_ERRNO(EACCES), "Lacking rights to acquire user record including privileged metadata, can't update record.");
+
+                r = sd_json_parse(
+                                text,
+                                SD_JSON_PARSE_MUST_BE_OBJECT|SD_JSON_PARSE_SENSITIVE,
+                                &json,
+                                /* reterr_line= */ NULL,
+                                /* reterr_column= */ NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse JSON identity: %m");
+
+                reply = sd_bus_message_unref(reply);
+
+                r = sd_json_variant_filter(&json, STRV_MAKE("binding", "status", "signature", "blobManifest"));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to strip binding and status from record to update: %m");
+        }
+
+        r = apply_identity_changes(&json);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(i, arg_pkcs11_token_uri) {
+                r = identity_add_pkcs11_key_data(&json, *i);
+                if (r < 0)
+                        return r;
+        }
+
+        STRV_FOREACH(i, arg_fido2_device) {
+                r = identity_add_fido2_parameters(&json, *i, arg_fido2_lock_with, arg_fido2_cred_alg);
+                if (r < 0)
+                        return r;
+        }
+
+        if (arg_recovery_key) {
+                r = identity_add_recovery_key(&json, &recovery_key);
+                if (r < 0)
+                        return r;
+        }
+
+        /* If the user supplied a full record, then add in lastChange, but do not override. Otherwise always
+         * override. */
+        r = update_last_change(&json, arg_pkcs11_token_uri || arg_fido2_device || arg_recovery_key, !arg_identity);
+        if (r < 0)
+                return r;
+
+        if (DEBUG_LOGGING)
+                sd_json_variant_dump(json, SD_JSON_FORMAT_PRETTY, NULL, NULL);
+
+        hr = user_record_new();
+        if (!hr)
+                return log_oom();
+
+        r = user_record_load(hr, json, USER_RECORD_REQUIRE_REGULAR|USER_RECORD_ALLOW_PRIVILEGED|USER_RECORD_ALLOW_PER_MACHINE|USER_RECORD_ALLOW_SECRET|USER_RECORD_ALLOW_SIGNATURE|USER_RECORD_LOG|USER_RECORD_PERMISSIVE);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(hr);
+        *ret_recovery_key = TAKE_PTR(recovery_key);
+        return 0;
+}
+
+static int home_record_reset_human_interaction_permission(UserRecord *hr) {
+        int r;
+
+        assert(hr);
+
+        /* When we execute multiple operations one after the other, let's reset the permission to ask the
+         * user each time, so that if interaction is necessary we will be told so again and thus can print a
+         * nice message to the user, telling the user so. */
+
+        r = user_record_set_pkcs11_protected_authentication_path_permitted(hr, -1);
+        if (r < 0)
+                return log_error_errno(r, "Failed to reset PKCS#11 protected authentication path permission flag: %m");
+
+        r = user_record_set_fido2_user_presence_permitted(hr, -1);
+        if (r < 0)
+                return log_error_errno(r, "Failed to reset FIDO2 user presence permission flag: %m");
+
+        r = user_record_set_fido2_user_verification_permitted(hr, -1);
+        if (r < 0)
+                return log_error_errno(r, "Failed to reset FIDO2 user verification permission flag: %m");
+
+        return 0;
+}
+
+VERB(verb_update_home, "update", "USER\0", VERB_ANY, 2, 0,
+     "Update a home area");
+static int verb_update_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(user_record_unrefp) UserRecord *hr = NULL, *secret = NULL;
+        _cleanup_free_ char *buffer = NULL;
+        _cleanup_(erase_and_freep) char *recovery_key = NULL;
+        _cleanup_hashmap_free_ Hashmap *blobs = NULL;
+        const char *username;
+        uint64_t flags = 0;
+        int r;
+
+        if (argc >= 2)
+                username = argv[1];
+        else if (!arg_identity) {
+                buffer = getusername_malloc();
+                if (!buffer)
+                        return log_oom();
+
+                username = buffer;
+        } else
+                username = NULL;
+
+        bool and_change_password = !strv_isempty(arg_pkcs11_token_uri) || !strv_isempty(arg_fido2_device);
+        bool and_resize = arg_disk_size != UINT64_MAX || arg_disk_size_relative != UINT64_MAX;
+
+        r = acquire_bus(&bus);
+        if (r < 0)
+                return r;
+
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+
+        r = acquire_updated_home_record(bus, username, &hr, &recovery_key);
+        if (r < 0)
+                return r;
+
+        /* Add in all secrets we can acquire cheaply */
+        r = acquire_passed_secrets(username, &secret);
+        if (r < 0)
+                return r;
+
+        r = user_record_merge_secret(hr, secret);
+        if (r < 0)
+                return r;
+
+        r = acquire_merged_blob_dir(hr, true, &blobs);
+        if (r < 0)
+                return r;
+
+        if (arg_dry_run) {
+                sd_json_variant_dump(hr->json, SD_JSON_FORMAT_COLOR_AUTO|SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_NEWLINE, stderr, /* prefix= */ NULL);
+                finalize_recovery_key(recovery_key, /* recovery_key_file= */ NULL);
+                return 0;
+        }
+
+        /* If we do multiple operations, let's output things more verbosely, since otherwise the repeated
+         * authentication might be confusing. */
+
+        if (and_resize || and_change_password)
+                log_info("Updating home directory.");
+
+        if (arg_offline)
+                flags |= SD_HOMED_UPDATE_OFFLINE;
+
+        for (;;) {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+                _cleanup_free_ char *formatted = NULL;
+
+                r = bus_message_new_method_call(bus, &m, bus_mgr, "UpdateHomeEx");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_json_variant_format(hr->json, /* flags= */ 0, &formatted);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to format user record: %m");
+
+                (void) sd_bus_message_sensitive(m);
+
+                r = sd_bus_message_append(m, "s", formatted);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = bus_message_append_blobs(m, blobs);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(m, "t", flags);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                if (r < 0) {
+                        if (and_change_password &&
+                            sd_bus_error_has_name(&error, BUS_ERROR_BAD_PASSWORD_AND_NO_TOKEN))
+                                /* In the generic handler we'd ask for a password in this case, but when
+                                 * changing passwords that's not sufficient, as we need to acquire all keys
+                                 * first. */
+                                return log_error_errno(r, "Security token not inserted, refusing.");
+
+                        r = handle_generic_user_record_error(hr->user_name, hr, &error, r, false);
+                        if (r < 0)
+                                return r;
+                } else
+                        break;
+        }
+
+        finalize_recovery_key(recovery_key, arg_recovery_key_file);
+
+        if (and_resize)
+                log_info("Resizing home.");
+
+        (void) home_record_reset_human_interaction_permission(hr);
+
+        /* Also sync down disk size to underlying LUKS/fscrypt/quota */
+        while (and_resize) {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+
+                r = bus_message_new_method_call(bus, &m, bus_mgr, "ResizeHome");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                /* Specify UINT64_MAX as size, in which case the underlying disk size will just be synced */
+                r = sd_bus_message_append(m, "st", hr->user_name, UINT64_MAX);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = bus_message_append_secret(m, hr);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                if (r < 0) {
+                        if (and_change_password &&
+                            sd_bus_error_has_name(&error, BUS_ERROR_BAD_PASSWORD_AND_NO_TOKEN))
+                                return log_error_errno(r, "Security token not inserted, refusing.");
+
+                        r = handle_generic_user_record_error(hr->user_name, hr, &error, r, false);
+                        if (r < 0)
+                                return r;
+                } else
+                        break;
+        }
+
+        if (and_change_password)
+                log_info("Synchronizing passwords and encryption keys.");
+
+        (void) home_record_reset_human_interaction_permission(hr);
+
+        /* Also sync down passwords to underlying LUKS/fscrypt */
+        while (and_change_password) {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+
+                r = bus_message_new_method_call(bus, &m, bus_mgr, "ChangePasswordHome");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                /* Specify an empty new secret, in which case the underlying LUKS/fscrypt password will just be synced */
+                r = sd_bus_message_append(m, "ss", hr->user_name, "{}");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = bus_message_append_secret(m, hr);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                if (r < 0) {
+                        if (sd_bus_error_has_name(&error, BUS_ERROR_BAD_PASSWORD_AND_NO_TOKEN))
+                                return log_error_errno(r, "Security token not inserted, refusing.");
+
+                        r = handle_generic_user_record_error(hr->user_name, hr, &error, r, false);
+                        if (r < 0)
+                                return r;
+                } else
+                        break;
+        }
+
+        return 0;
+}
+
+VERB(verb_passwd_home, "passwd", "USER\0", VERB_ANY, 2, 0,
+     "Change password of a home area");
+static int verb_passwd_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(user_record_unrefp) UserRecord *old_secret = NULL, *new_secret = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_free_ char *buffer = NULL;
+        const char *username;
+        int r;
+
+        if (arg_pkcs11_token_uri)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "To change the PKCS#11 security token use 'homectl update --pkcs11-token-uri=%s'.",
+                                       glyph(GLYPH_ELLIPSIS));
+        if (arg_fido2_device)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "To change the FIDO2 security token use 'homectl update --fido2-device=%s'.",
+                                       glyph(GLYPH_ELLIPSIS));
+        if (identity_properties_specified())
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The 'passwd' verb does not permit changing other record properties at the same time.");
+
+        if (argc >= 2)
+                username = argv[1];
+        else {
+                buffer = getusername_malloc();
+                if (!buffer)
+                        return log_oom();
+
+                username = buffer;
+        }
+
+        r = acquire_bus(&bus);
+        if (r < 0)
+                return r;
+
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+
+        r = acquire_passed_secrets(username, &old_secret);
+        if (r < 0)
+                return r;
+
+        new_secret = user_record_new();
+        if (!new_secret)
+                return log_oom();
+
+        r = acquire_new_password(username, new_secret, /* suggest= */ true, NULL);
+        if (r < 0)
+                return r;
+
+        for (;;) {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+
+                r = bus_message_new_method_call(bus, &m, bus_mgr, "ChangePasswordHome");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(m, "s", username);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = bus_message_append_secret(m, new_secret);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = bus_message_append_secret(m, old_secret);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                if (r < 0) {
+                        if (sd_bus_error_has_name(&error, BUS_ERROR_LOW_PASSWORD_QUALITY)) {
+
+                                log_error_errno(r, "%s", bus_error_message(&error, r));
+
+                                r = acquire_new_password(username, new_secret, /* suggest= */ false, NULL);
+
+                        } else if (sd_bus_error_has_name(&error, BUS_ERROR_BAD_PASSWORD_AND_NO_TOKEN))
+
+                                /* In the generic handler we'd ask for a password in this case, but when
+                                 * changing passwords that's not sufficeint, as we need to acquire all keys
+                                 * first. */
+                                return log_error_errno(r, "Security token not inserted, refusing.");
+                        else
+                                r = handle_generic_user_record_error(username, old_secret, &error, r, true);
+                        if (r < 0)
+                                return r;
+                } else
+                        break;
+        }
+
+        return 0;
+}
+
+static int parse_disk_size(const char *t, uint64_t *ret) {
+        int r;
+
+        assert(t);
+        assert(ret);
+
+        if (streq(t, "min"))
+                *ret = 0;
+        else if (streq(t, "max"))
+                *ret = UINT64_MAX-1;  /* Largest size that isn't UINT64_MAX special marker */
+        else {
+                uint64_t ds;
+
+                r = parse_size(t, 1024, &ds);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse disk size parameter: %s", t);
+
+                if (ds >= UINT64_MAX) /* UINT64_MAX has special meaning for us ("dont change"), refuse */
+                        return log_error_errno(SYNTHETIC_ERRNO(ERANGE), "Disk size out of range: %s", t);
+
+                *ret = ds;
+        }
+
+        return 0;
+}
+
+VERB(verb_resize_home, "resize", "USER SIZE\0", 2, 3, 0,
+     "Resize a home area");
+static int verb_resize_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
+        uint64_t ds = UINT64_MAX;
+        int r;
+
+        r = acquire_bus(&bus);
+        if (r < 0)
+                return r;
+
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+
+        if (arg_disk_size_relative != UINT64_MAX ||
+            (argc > 2 && parse_permyriad(argv[2]) >= 0))
+                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                               "Relative disk size specification currently not supported when resizing.");
+
+        if (argc > 2) {
+                r = parse_disk_size(argv[2], &ds);
+                if (r < 0)
+                        return r;
+        }
+
+        if (arg_disk_size != UINT64_MAX) {
+                if (ds != UINT64_MAX && ds != arg_disk_size)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Disk size specified twice and doesn't match, refusing.");
+
+                ds = arg_disk_size;
+        }
+
+        r = acquire_passed_secrets(argv[1], &secret);
+        if (r < 0)
+                return r;
+
+        for (;;) {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+
+                r = bus_message_new_method_call(bus, &m, bus_mgr, "ResizeHome");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(m, "st", argv[1], ds);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = bus_message_append_secret(m, secret);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                if (r < 0) {
+                        r = handle_generic_user_record_error(argv[1], secret, &error, r, false);
+                        if (r < 0)
+                                return r;
+                } else
+                        break;
+        }
+
+        return 0;
+}
+
+VERB(verb_remove_home, "remove", "USER…\0", 2, VERB_ANY, 0,
+     "Remove a home area");
+static int verb_remove_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        int r, ret = 0;
+
+        r = acquire_bus(&bus);
+        if (r < 0)
+                return r;
+
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+
+        STRV_FOREACH(i, strv_skip(argv, 1)) {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+
+                r = bus_message_new_method_call(bus, &m, bus_mgr, "RemoveHome");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(m, "s", *i);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to remove home: %s", bus_error_message(&error, r));
+                        if (ret == 0)
+                                ret = r;
+                }
+        }
+
+        return ret;
+}
+
+VERB_GROUP("Advanced User Manipulation Commands");
+VERB(verb_activate_home, "activate", "USER…\0", 2, VERB_ANY, 0,
+     "Activate a home area");
+static int verb_activate_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        int r, ret = 0;
+
+        r = acquire_bus(&bus);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(i, strv_skip(argv, 1)) {
+                _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
+
+                r = acquire_passed_secrets(*i, &secret);
+                if (r < 0)
+                        return r;
+
+                for (;;) {
+                        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+
+                        r = bus_message_new_method_call(bus, &m, bus_mgr, "ActivateHome");
+                        if (r < 0)
+                                return bus_log_create_error(r);
+
+                        r = sd_bus_message_append(m, "s", *i);
+                        if (r < 0)
+                                return bus_log_create_error(r);
+
+                        r = bus_message_append_secret(m, secret);
+                        if (r < 0)
+                                return bus_log_create_error(r);
+
+                        r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                        if (r < 0) {
+                                r = handle_generic_user_record_error(*i, secret, &error, r, /* emphasize_current_password= */ false);
+                                if (r < 0) {
+                                        if (ret == 0)
+                                                ret = r;
+
+                                        break;
+                                }
+                        } else
+                                break;
+                }
+        }
+
+        return ret;
+}
+
+VERB(verb_deactivate_home, "deactivate", "USER…\0", 2, VERB_ANY, 0,
+     "Deactivate a home area");
+static int verb_deactivate_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        int r, ret = 0;
+
+        r = acquire_bus(&bus);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(i, strv_skip(argv, 1)) {
+                /* The home directory might still be busy for a brief moment after a preceding operation
+                 * (e.g. a concurrent inspect/deactivate, or a stray reference holding the mount busy at
+                 * unmount time). homed will transition the home into "lingering" state and retry
+                 * deactivation internally after some time, but rather than failing immediately let's just
+                 * retry the bus call here for a while, so callers don't need to deal with this transient
+                 * condition themselves. Use double the time homed waits to avoid racing with it. */
+                usec_t end = usec_add(now(CLOCK_MONOTONIC), 2 * HOME_RETRY_DEACTIVATE_USEC);
+
+                for (;;) {
+                        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+
+                        r = bus_message_new_method_call(bus, &m, bus_mgr, "DeactivateHome");
+                        if (r < 0)
+                                return bus_log_create_error(r);
+
+                        r = sd_bus_message_append(m, "s", *i);
+                        if (r < 0)
+                                return bus_log_create_error(r);
+
+                        r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, /* ret_reply= */ NULL);
+                        if (r >= 0)
+                                break;
+
+                        if (sd_bus_error_has_name(&error, BUS_ERROR_HOME_BUSY) &&
+                            now(CLOCK_MONOTONIC) < end) {
+                                log_info("Home of user %s is currently busy, retrying deactivation.", *i);
+                                (void) usleep_safe(1 * USEC_PER_SEC);
+                                continue;
+                        }
+
+                        log_error_errno(r, "Failed to deactivate user home: %s", bus_error_message(&error, r));
+                        if (ret == 0)
+                                ret = r;
+                        break;
+                }
+        }
+
+        return ret;
+}
+
+VERB_NOARG(verb_deactivate_all_homes, "deactivate-all",
+           "Deactivate all active home areas");
+static int verb_deactivate_all_homes(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        int r;
+
+        r = acquire_bus(&bus);
+        if (r < 0)
+                return r;
+
+        r = bus_message_new_method_call(bus, &m, bus_mgr, "DeactivateAllHomes");
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to deactivate all homes: %s", bus_error_message(&error, r));
+
+        return 0;
+}
+
+VERB(verb_with_home, "with", "USER [COMMAND…]\0", 2, VERB_ANY, 0,
+     "Run shell or command with access to a home area");
+static int verb_with_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
+        _cleanup_close_ int acquired_fd = -EBADF;
+        _cleanup_strv_free_ char **cmdline  = NULL;
+        const char *home;
+        int r, ret;
+
+        r = acquire_bus(&bus);
+        if (r < 0)
+                return r;
+
+        if (argc < 3) {
+                _cleanup_free_ char *shell = NULL;
+
+                /* If no command is specified, spawn a shell */
+                r = get_shell(&shell);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to acquire shell: %m");
+
+                cmdline = strv_new(shell);
+        } else
+                cmdline = strv_copy(argv + 2);
+        if (!cmdline)
+                return log_oom();
+
+        r = acquire_passed_secrets(argv[1], &secret);
+        if (r < 0)
+                return r;
+
+        for (;;) {
+                r = bus_message_new_method_call(bus, &m, bus_mgr, "AcquireHome");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(m, "s", argv[1]);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = bus_message_append_secret(m, secret);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(m, "b", /* please_suspend= */ getenv_bool("SYSTEMD_PLEASE_SUSPEND_HOME") > 0);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, &reply);
+                m = sd_bus_message_unref(m);
+                if (r < 0) {
+                        r = handle_generic_user_record_error(argv[1], secret, &error, r, false);
+                        if (r < 0)
+                                return r;
+
+                        sd_bus_error_free(&error);
+                } else {
+                        int fd;
+
+                        r = sd_bus_message_read(reply, "h", &fd);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        acquired_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+                        if (acquired_fd < 0)
+                                return log_error_errno(errno, "Failed to duplicate acquired fd: %m");
+
+                        reply = sd_bus_message_unref(reply);
+                        break;
+                }
+        }
+
+        r = bus_call_method(bus, bus_mgr, "GetHomeByName", &error, &reply, "s", argv[1]);
+        if (r < 0)
+                return log_error_errno(r, "Failed to inspect home: %s", bus_error_message(&error, r));
+
+        r = sd_bus_message_read(reply, "usussso", NULL, NULL, NULL, NULL, &home, NULL, NULL);
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = pidref_safe_fork(
+                        "(with)",
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE|FORK_REOPEN_LOG,
+                        &pidref);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                if (chdir(home) < 0) {
+                        log_error_errno(errno, "Failed to change to directory %s: %m", home);
+                        _exit(255);
+                }
+
+                execvp(cmdline[0], cmdline);
+                log_error_errno(errno, "Failed to execute %s: %m", cmdline[0]);
+                _exit(255);
+        }
+
+        ret = pidref_wait_for_terminate_and_check(cmdline[0], &pidref, WAIT_LOG_ABNORMAL);
+
+        /* Close the fd that pings the home now. */
+        acquired_fd = safe_close(acquired_fd);
+
+        r = bus_message_new_method_call(bus, &m, bus_mgr, "ReleaseHome");
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_append(m, "s", argv[1]);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+        if (r < 0) {
+                if (sd_bus_error_has_name(&error, BUS_ERROR_HOME_BUSY))
+                        log_notice("Not deactivating home directory of %s, as it is still used.", argv[1]);
+                else
+                        return log_error_errno(r, "Failed to release user home: %s", bus_error_message(&error, r));
+        }
+
+        return ret;
+}
+
+static int authenticate_home(sd_bus *bus, const char *name) {
+        _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
+        int r;
+
+        r = acquire_passed_secrets(name, &secret);
+        if (r < 0)
+                return r;
+
+        for (;;) {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+
+                r = bus_message_new_method_call(bus, &m, bus_mgr, "AuthenticateHome");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(m, "s", name);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = bus_message_append_secret(m, secret);
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                if (r < 0) {
+                        r = handle_generic_user_record_error(name, secret, &error, r, false);
+                        if (r >= 0)
+                                continue;
+                }
+                return r;
+        }
+}
+
+VERB(verb_authenticate_homes, "authenticate", "USER…\0", VERB_ANY, VERB_ANY, 0,
+     "Authenticate a home area");
+static int verb_authenticate_homes(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        int r;
+
+        r = acquire_bus(&bus);
+        if (r < 0)
+                return r;
+
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+
+        char **args = strv_skip(argv, 1);
+        if (args) {
+                STRV_FOREACH(arg, args)
+                        RET_GATHER(r, authenticate_home(bus, *arg));
+
+                return r;
+        } else {
+                _cleanup_free_ char *myself = getusername_malloc();
+                if (!myself)
+                        return log_oom();
+
+                return authenticate_home(bus, myself);
+        }
+}
+
+VERB_GROUP("User Migration Commands");
+VERB(verb_adopt_home, "adopt", "PATH…\0", VERB_ANY, VERB_ANY, 0,
+     "Add an existing home area on this system");
+static int verb_adopt_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r, ret = 0;
 
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -1647,14 +2432,16 @@ static int register_home_one(sd_bus *bus, FILE *f, const char *path) {
 
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         unsigned line = 0, column = 0;
-        r = sd_json_parse_file(f, path, SD_JSON_PARSE_SENSITIVE, &v, &line, &column);
+        r = sd_json_parse_file(f, path, SD_JSON_PARSE_MUST_BE_OBJECT|SD_JSON_PARSE_SENSITIVE, &v, &line, &column);
         if (r < 0)
                 return log_error_errno(r, "[%s:%u:%u] Failed to parse user record: %m", path, line, column);
 
         return register_home_common(bus, v);
 }
 
-static int verb_register_home(int argc, char *argv[], void *userdata) {
+VERB(verb_register_home, "register", "PATH…\0", VERB_ANY, VERB_ANY, 0,
+     "Register a user record locally");
+static int verb_register_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -1685,7 +2472,9 @@ static int verb_register_home(int argc, char *argv[], void *userdata) {
         return r;
 }
 
-static int verb_unregister_home(int argc, char *argv[], void *userdata) {
+VERB(verb_unregister_home, "unregister", "USER…\0", 2, VERB_ANY, 0,
+     "Unregister a user record locally");
+static int verb_unregister_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -1715,519 +2504,287 @@ static int verb_unregister_home(int argc, char *argv[], void *userdata) {
         return ret;
 }
 
-static int remove_home(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        int r, ret = 0;
+VERB_GROUP("Signing Keys Commands");
+VERB_NOARG(verb_list_signing_keys, "list-signing-keys",
+           "List home signing keys");
+static int verb_list_signing_keys(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        int r;
 
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         r = acquire_bus(&bus);
         if (r < 0)
                 return r;
 
-        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        r = bus_call_method(bus, bus_mgr, "ListSigningKeys", &error, &reply, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to list signing keys: %s", bus_error_message(&error, r));
 
-        STRV_FOREACH(i, strv_skip(argv, 1)) {
+        _cleanup_(table_unrefp) Table *table = table_new("name", "key");
+        if (!table)
+                return log_oom();
+
+        r = sd_bus_message_enter_container(reply, 'a', "(sst)");
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        for (;;) {
+                const char *name, *pem;
+
+                r = sd_bus_message_read(reply, "(sst)", &name, &pem, NULL);
+                if (r < 0)
+                        return bus_log_parse_error(r);
+                if (r == 0)
+                        break;
+
+                _cleanup_free_ char *h = NULL;
+                if (!sd_json_format_enabled(arg_json_format_flags)) {
+                        /* Let's decode the PEM key to DER (so that we lose prefix/suffix), then truncate it
+                         * for display reasons. */
+
+                        r = dlopen_libcrypto(LOG_DEBUG);
+                        if (r < 0)
+                                return r;
+
+                        _cleanup_(EVP_PKEY_freep) EVP_PKEY *key = NULL;
+                        r = openssl_pubkey_from_pem(pem, SIZE_MAX, &key);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse PEM: %m");
+
+                        _cleanup_free_ void *der = NULL;
+                        int n = sym_i2d_PUBKEY(key, (unsigned char**) &der);
+                        if (n < 0)
+                                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to encode key as DER.");
+
+                        ssize_t m = base64mem(der, MIN(n, 64), &h);
+                        if (m < 0)
+                                return log_oom();
+                        if (n > 64) /* check if we truncated the original version */
+                                if (!strextend(&h, glyph(GLYPH_ELLIPSIS)))
+                                        return log_oom();
+                }
+
+                r = table_add_many(
+                                table,
+                                TABLE_STRING, name,
+                                TABLE_STRING, h ?: pem);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
+        r = sd_bus_message_exit_container(reply);
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        if (!table_isempty(table) || sd_json_format_enabled(arg_json_format_flags)) {
+                r = table_set_sort(table, (size_t) 0);
+                if (r < 0)
+                        return table_log_sort_error(r);
+
+                r = table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, arg_legend);
+                if (r < 0)
+                        return r;
+        }
+
+        if (arg_legend && !sd_json_format_enabled(arg_json_format_flags)) {
+                if (table_isempty(table))
+                        printf("No signing keys.\n");
+                else
+                        printf("\n%zu signing keys listed.\n", table_get_rows(table) - 1);
+        }
+
+        return 0;
+}
+
+VERB(verb_get_signing_key, "get-signing-key", "[NAME…]\0", VERB_ANY, VERB_ANY, 0,
+     "Get a named home signing key");
+static int verb_get_signing_key(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        int r;
+
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        r = acquire_bus(&bus);
+        if (r < 0)
+                return r;
+
+        char **keys = argc >= 2 ? strv_skip(argv, 1) : STRV_MAKE("local.public");
+        int ret = 0;
+        STRV_FOREACH(k, keys) {
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-
-                r = bus_message_new_method_call(bus, &m, bus_mgr, "RemoveHome");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(m, "s", *i);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+                r = bus_call_method(bus, bus_mgr, "GetSigningKey", &error, &reply, "s", *k);
                 if (r < 0) {
-                        log_error_errno(r, "Failed to remove home: %s", bus_error_message(&error, r));
-                        if (ret == 0)
-                                ret = r;
+                        RET_GATHER(ret, log_error_errno(r, "Failed to get signing key '%s': %s", *k, bus_error_message(&error, r)));
+                        continue;
+                }
+
+                const char *pem;
+                r = sd_bus_message_read(reply, "st", &pem, NULL);
+                if (r < 0) {
+                        RET_GATHER(ret, bus_log_parse_error(r));
+                        continue;
+                }
+
+                fputs(pem, stdout);
+                if (!endswith(pem, "\n"))
+                        fputc('\n', stdout);
+
+                fflush(stdout);
+        }
+
+        return ret;
+}
+
+static int add_signing_key_one(sd_bus *bus, const char *fn, FILE *key) {
+        int r;
+
+        assert_se(bus);
+        assert_se(fn);
+        assert_se(key);
+
+        _cleanup_free_ char *pem = NULL;
+        r = read_full_stream(key, &pem, /* ret_size= */ NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to read key '%s': %m", fn);
+
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        r = bus_call_method(bus, bus_mgr, "AddSigningKey", &error, /* ret_reply= */ NULL, "sst", fn, pem, UINT64_C(0));
+        if (r < 0)
+                return log_error_errno(r, "Failed to add signing key '%s': %s", fn, bus_error_message(&error, r));
+
+        return 0;
+}
+
+VERB(verb_add_signing_key, "add-signing-key", "FILE…\0", VERB_ANY, VERB_ANY, 0,
+     "Add home signing key");
+static int verb_add_signing_key(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        int r;
+
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        r = acquire_bus(&bus);
+        if (r < 0)
+                return r;
+
+        int ret = EXIT_SUCCESS;
+        if (argc < 2 || streq(argv[1], "-")) {
+                if (!arg_key_name)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Key name must be specified via --key-name= when reading key from standard input, refusing.");
+
+                RET_GATHER(ret, add_signing_key_one(bus, arg_key_name, stdin));
+        } else {
+                /* Refuse if more han one key is specified in combination with --key-name= */
+                if (argc >= 3 && arg_key_name)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--key-name= is not supported if multiple signing keys are specified, refusing.");
+
+                STRV_FOREACH(k, strv_skip(argv, 1)) {
+
+                        if (streq(*k, "-"))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Refusing to read from standard input if multiple keys are specified.");
+
+                        _cleanup_free_ char *fn = NULL;
+                        if (!arg_key_name) {
+                                r = path_extract_filename(*k, &fn);
+                                if (r < 0) {
+                                        RET_GATHER(ret, log_error_errno(r, "Failed to extract filename from path '%s': %m", *k));
+                                        continue;
+                                }
+                        }
+
+                        _cleanup_fclose_ FILE *f = fopen(*k, "re");
+                        if (!f) {
+                                RET_GATHER(ret, log_error_errno(errno, "Failed to open '%s': %m", *k));
+                                continue;
+                        }
+
+                        RET_GATHER(ret, add_signing_key_one(bus, fn ?: arg_key_name, f));
                 }
         }
 
         return ret;
 }
 
-static int acquire_updated_home_record(
-                sd_bus *bus,
-                const char *username,
-                UserRecord **ret) {
-
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
-        _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
+static int add_signing_keys_from_credentials(void) {
         int r;
 
-        assert(ret);
+        _cleanup_close_ int fd = open_credentials_dir();
+        if (IN_SET(fd, -ENXIO, -ENOENT)) /* Credential env var not set, or dir doesn't exist. */
+                return 0;
+        if (fd < 0)
+                return log_error_errno(fd, "Failed to open credentials directory: %m");
 
-        if (arg_identity) {
-                unsigned line = 0, column = 0;
-                sd_json_variant *un;
+        _cleanup_free_ DirectoryEntries *des = NULL;
+        r = readdir_all(fd, RECURSE_DIR_SORT|RECURSE_DIR_IGNORE_DOT|RECURSE_DIR_ENSURE_TYPE, &des);
+        if (r < 0)
+                return log_error_errno(r, "Failed to enumerate credentials: %m");
 
-                r = sd_json_parse_file(
-                                streq(arg_identity, "-") ? stdin : NULL,
-                                streq(arg_identity, "-") ? "<stdin>" : arg_identity, SD_JSON_PARSE_SENSITIVE, &json, &line, &column);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to parse identity at %u:%u: %m", line, column);
+        int ret = 0;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        FOREACH_ARRAY(i, des->entries, des->n_entries) {
+                struct dirent *de = *i;
+                if (de->d_type != DT_REG)
+                        continue;
 
-                un = sd_json_variant_by_key(json, "userName");
-                if (un) {
-                        if (!sd_json_variant_is_string(un) || (username && !streq(sd_json_variant_string(un), username)))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "User name specified on command line and in JSON record do not match.");
-                } else {
-                        if (!username)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No username specified.");
+                const char *e = startswith(de->d_name, "home.add-signing-key.");
+                if (!e)
+                        continue;
 
-                        r = sd_json_variant_set_field_string(&arg_identity_extra, "userName", username);
+                if (!filename_is_valid(e))
+                        continue;
+
+                if (!bus) {
+                        r = acquire_bus(&bus);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to set userName field: %m");
+                                return r;
                 }
 
-        } else {
-                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-                _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-                int incomplete;
-                const char *text;
+                _cleanup_fclose_ FILE *f = NULL;
+                r = xfopenat(fd, de->d_name, "re", O_NOFOLLOW, &f);
+                if (r < 0) {
+                        RET_GATHER(ret, log_error_errno(r, "Failed to open credential '%s': %m", de->d_name));
+                        continue;
+                }
 
-                if (!identity_properties_specified())
-                        return log_error_errno(SYNTHETIC_ERRNO(EALREADY), "No field to change specified.");
-
-                r = bus_call_method(bus, bus_mgr, "GetUserRecordByName", &error, &reply, "s", username);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to acquire user home record: %s", bus_error_message(&error, r));
-
-                r = sd_bus_message_read(reply, "sbo", &text, &incomplete, NULL);
-                if (r < 0)
-                        return bus_log_parse_error(r);
-
-                if (incomplete)
-                        return log_error_errno(SYNTHETIC_ERRNO(EACCES), "Lacking rights to acquire user record including privileged metadata, can't update record.");
-
-                r = sd_json_parse(text, SD_JSON_PARSE_SENSITIVE, &json, NULL, NULL);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to parse JSON identity: %m");
-
-                reply = sd_bus_message_unref(reply);
-
-                r = sd_json_variant_filter(&json, STRV_MAKE("binding", "status", "signature", "blobManifest"));
-                if (r < 0)
-                        return log_error_errno(r, "Failed to strip binding and status from record to update: %m");
+                RET_GATHER(ret, add_signing_key_one(bus, e, f));
         }
 
-        r = apply_identity_changes(&json);
-        if (r < 0)
-                return r;
-
-        STRV_FOREACH(i, arg_pkcs11_token_uri) {
-                r = identity_add_pkcs11_key_data(&json, *i);
-                if (r < 0)
-                        return r;
-        }
-
-        STRV_FOREACH(i, arg_fido2_device) {
-                r = identity_add_fido2_parameters(&json, *i, arg_fido2_lock_with, arg_fido2_cred_alg);
-                if (r < 0)
-                        return r;
-        }
-
-        /* If the user supplied a full record, then add in lastChange, but do not override. Otherwise always
-         * override. */
-        r = update_last_change(&json, arg_pkcs11_token_uri || arg_fido2_device, !arg_identity);
-        if (r < 0)
-                return r;
-
-        if (DEBUG_LOGGING)
-                sd_json_variant_dump(json, SD_JSON_FORMAT_PRETTY, NULL, NULL);
-
-        hr = user_record_new();
-        if (!hr)
-                return log_oom();
-
-        r = user_record_load(hr, json, USER_RECORD_REQUIRE_REGULAR|USER_RECORD_ALLOW_PRIVILEGED|USER_RECORD_ALLOW_PER_MACHINE|USER_RECORD_ALLOW_SECRET|USER_RECORD_ALLOW_SIGNATURE|USER_RECORD_LOG|USER_RECORD_PERMISSIVE);
-        if (r < 0)
-                return r;
-
-        *ret = TAKE_PTR(hr);
-        return 0;
+        return ret;
 }
 
-static int home_record_reset_human_interaction_permission(UserRecord *hr) {
+static int remove_signing_key_one(sd_bus *bus, const char *fn) {
         int r;
 
-        assert(hr);
+        assert_se(bus);
+        assert_se(fn);
 
-        /* When we execute multiple operations one after the other, let's reset the permission to ask the
-         * user each time, so that if interaction is necessary we will be told so again and thus can print a
-         * nice message to the user, telling the user so. */
-
-        r = user_record_set_pkcs11_protected_authentication_path_permitted(hr, -1);
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        r = bus_call_method(bus, bus_mgr, "RemoveSigningKey", &error, /* ret_reply= */ NULL, "st", fn, UINT64_C(0));
         if (r < 0)
-                return log_error_errno(r, "Failed to reset PKCS#11 protected authentication path permission flag: %m");
-
-        r = user_record_set_fido2_user_presence_permitted(hr, -1);
-        if (r < 0)
-                return log_error_errno(r, "Failed to reset FIDO2 user presence permission flag: %m");
-
-        r = user_record_set_fido2_user_verification_permitted(hr, -1);
-        if (r < 0)
-                return log_error_errno(r, "Failed to reset FIDO2 user verification permission flag: %m");
+                return log_error_errno(r, "Failed to remove signing key '%s': %s", fn, bus_error_message(&error, r));
 
         return 0;
 }
 
-static int update_home(int argc, char *argv[], void *userdata) {
+VERB(verb_remove_signing_key, "remove-signing-key", "NAME…\0", 2, VERB_ANY, 0,
+     "Remove home signing key");
+static int verb_remove_signing_key(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        int r;
+
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_(user_record_unrefp) UserRecord *hr = NULL, *secret = NULL;
-        _cleanup_free_ char *buffer = NULL;
-        _cleanup_hashmap_free_ Hashmap *blobs = NULL;
-        const char *username;
-        uint64_t flags = 0;
-        int r;
-
-        if (argc >= 2)
-                username = argv[1];
-        else if (!arg_identity) {
-                buffer = getusername_malloc();
-                if (!buffer)
-                        return log_oom();
-
-                username = buffer;
-        } else
-                username = NULL;
-
         r = acquire_bus(&bus);
         if (r < 0)
                 return r;
 
-        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        r = EXIT_SUCCESS;
+        STRV_FOREACH(k, strv_skip(argv, 1))
+                RET_GATHER(r, remove_signing_key_one(bus, *k));
 
-        r = acquire_updated_home_record(bus, username, &hr);
-        if (r < 0)
-                return r;
-
-        /* Add in all secrets we can acquire cheaply */
-        r = acquire_passed_secrets(username, &secret);
-        if (r < 0)
-                return r;
-
-        r = user_record_merge_secret(hr, secret);
-        if (r < 0)
-                return r;
-
-        r = acquire_merged_blob_dir(hr, true, &blobs);
-        if (r < 0)
-                return r;
-
-        if (arg_dry_run) {
-                sd_json_variant_dump(hr->json, SD_JSON_FORMAT_COLOR_AUTO|SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_NEWLINE, stderr, /* prefix= */ NULL);
-                return 0;
-        }
-
-        /* If we do multiple operations, let's output things more verbosely, since otherwise the repeated
-         * authentication might be confusing. */
-
-        if (arg_and_resize || arg_and_change_password)
-                log_info("Updating home directory.");
-
-        if (arg_offline)
-                flags |= SD_HOMED_UPDATE_OFFLINE;
-
-        for (;;) {
-                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-                _cleanup_free_ char *formatted = NULL;
-
-                r = bus_message_new_method_call(bus, &m, bus_mgr, "UpdateHomeEx");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_json_variant_format(hr->json, 0, &formatted);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to format user record: %m");
-
-                (void) sd_bus_message_sensitive(m);
-
-                r = sd_bus_message_append(m, "s", formatted);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = bus_message_append_blobs(m, blobs);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(m, "t", flags);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
-                if (r < 0) {
-                        if (arg_and_change_password &&
-                            sd_bus_error_has_name(&error, BUS_ERROR_BAD_PASSWORD_AND_NO_TOKEN))
-                                /* In the generic handler we'd ask for a password in this case, but when
-                                 * changing passwords that's not sufficient, as we need to acquire all keys
-                                 * first. */
-                                return log_error_errno(r, "Security token not inserted, refusing.");
-
-                        r = handle_generic_user_record_error(hr->user_name, hr, &error, r, false);
-                        if (r < 0)
-                                return r;
-                } else
-                        break;
-        }
-
-        if (arg_and_resize)
-                log_info("Resizing home.");
-
-        (void) home_record_reset_human_interaction_permission(hr);
-
-        /* Also sync down disk size to underlying LUKS/fscrypt/quota */
-        while (arg_and_resize) {
-                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-
-                r = bus_message_new_method_call(bus, &m, bus_mgr, "ResizeHome");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                /* Specify UINT64_MAX as size, in which case the underlying disk size will just be synced */
-                r = sd_bus_message_append(m, "st", hr->user_name, UINT64_MAX);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = bus_message_append_secret(m, hr);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
-                if (r < 0) {
-                        if (arg_and_change_password &&
-                            sd_bus_error_has_name(&error, BUS_ERROR_BAD_PASSWORD_AND_NO_TOKEN))
-                                return log_error_errno(r, "Security token not inserted, refusing.");
-
-                        r = handle_generic_user_record_error(hr->user_name, hr, &error, r, false);
-                        if (r < 0)
-                                return r;
-                } else
-                        break;
-        }
-
-        if (arg_and_change_password)
-                log_info("Synchronizing passwords and encryption keys.");
-
-        (void) home_record_reset_human_interaction_permission(hr);
-
-        /* Also sync down passwords to underlying LUKS/fscrypt */
-        while (arg_and_change_password) {
-                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-
-                r = bus_message_new_method_call(bus, &m, bus_mgr, "ChangePasswordHome");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                /* Specify an empty new secret, in which case the underlying LUKS/fscrypt password will just be synced */
-                r = sd_bus_message_append(m, "ss", hr->user_name, "{}");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = bus_message_append_secret(m, hr);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
-                if (r < 0) {
-                        if (sd_bus_error_has_name(&error, BUS_ERROR_BAD_PASSWORD_AND_NO_TOKEN))
-                                return log_error_errno(r, "Security token not inserted, refusing.");
-
-                        r = handle_generic_user_record_error(hr->user_name, hr, &error, r, false);
-                        if (r < 0)
-                                return r;
-                } else
-                        break;
-        }
-
-        return 0;
+        return r;
 }
 
-static int passwd_home(int argc, char *argv[], void *userdata) {
-        _cleanup_(user_record_unrefp) UserRecord *old_secret = NULL, *new_secret = NULL;
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_free_ char *buffer = NULL;
-        const char *username;
-        int r;
-
-        if (arg_pkcs11_token_uri)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "To change the PKCS#11 security token use 'homectl update --pkcs11-token-uri=%s'.",
-                                       glyph(GLYPH_ELLIPSIS));
-        if (arg_fido2_device)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "To change the FIDO2 security token use 'homectl update --fido2-device=%s'.",
-                                       glyph(GLYPH_ELLIPSIS));
-        if (identity_properties_specified())
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The 'passwd' verb does not permit changing other record properties at the same time.");
-
-        if (argc >= 2)
-                username = argv[1];
-        else {
-                buffer = getusername_malloc();
-                if (!buffer)
-                        return log_oom();
-
-                username = buffer;
-        }
-
-        r = acquire_bus(&bus);
-        if (r < 0)
-                return r;
-
-        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
-
-        r = acquire_passed_secrets(username, &old_secret);
-        if (r < 0)
-                return r;
-
-        new_secret = user_record_new();
-        if (!new_secret)
-                return log_oom();
-
-        r = acquire_new_password(username, new_secret, /* suggest = */ true, NULL);
-        if (r < 0)
-                return r;
-
-        for (;;) {
-                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-
-                r = bus_message_new_method_call(bus, &m, bus_mgr, "ChangePasswordHome");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(m, "s", username);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = bus_message_append_secret(m, new_secret);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = bus_message_append_secret(m, old_secret);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
-                if (r < 0) {
-                        if (sd_bus_error_has_name(&error, BUS_ERROR_LOW_PASSWORD_QUALITY)) {
-
-                                log_error_errno(r, "%s", bus_error_message(&error, r));
-
-                                r = acquire_new_password(username, new_secret, /* suggest = */ false, NULL);
-
-                        } else if (sd_bus_error_has_name(&error, BUS_ERROR_BAD_PASSWORD_AND_NO_TOKEN))
-
-                                /* In the generic handler we'd ask for a password in this case, but when
-                                 * changing passwords that's not sufficeint, as we need to acquire all keys
-                                 * first. */
-                                return log_error_errno(r, "Security token not inserted, refusing.");
-                        else
-                                r = handle_generic_user_record_error(username, old_secret, &error, r, true);
-                        if (r < 0)
-                                return r;
-                } else
-                        break;
-        }
-
-        return 0;
-}
-
-static int parse_disk_size(const char *t, uint64_t *ret) {
-        int r;
-
-        assert(t);
-        assert(ret);
-
-        if (streq(t, "min"))
-                *ret = 0;
-        else if (streq(t, "max"))
-                *ret = UINT64_MAX-1;  /* Largest size that isn't UINT64_MAX special marker */
-        else {
-                uint64_t ds;
-
-                r = parse_size(t, 1024, &ds);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to parse disk size parameter: %s", t);
-
-                if (ds >= UINT64_MAX) /* UINT64_MAX has special meaning for us ("dont change"), refuse */
-                        return log_error_errno(SYNTHETIC_ERRNO(ERANGE), "Disk size out of range: %s", t);
-
-                *ret = ds;
-        }
-
-        return 0;
-}
-
-static int resize_home(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
-        uint64_t ds = UINT64_MAX;
-        int r;
-
-        r = acquire_bus(&bus);
-        if (r < 0)
-                return r;
-
-        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
-
-        if (arg_disk_size_relative != UINT64_MAX ||
-            (argc > 2 && parse_permyriad(argv[2]) >= 0))
-                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                               "Relative disk size specification currently not supported when resizing.");
-
-        if (argc > 2) {
-                r = parse_disk_size(argv[2], &ds);
-                if (r < 0)
-                        return r;
-        }
-
-        if (arg_disk_size != UINT64_MAX) {
-                if (ds != UINT64_MAX && ds != arg_disk_size)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Disk size specified twice and doesn't match, refusing.");
-
-                ds = arg_disk_size;
-        }
-
-        r = acquire_passed_secrets(argv[1], &secret);
-        if (r < 0)
-                return r;
-
-        for (;;) {
-                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-                _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-
-                r = bus_message_new_method_call(bus, &m, bus_mgr, "ResizeHome");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(m, "st", argv[1], ds);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = bus_message_append_secret(m, secret);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
-                if (r < 0) {
-                        r = handle_generic_user_record_error(argv[1], secret, &error, r, false);
-                        if (r < 0)
-                                return r;
-                } else
-                        break;
-        }
-
-        return 0;
-}
-
-static int lock_home(int argc, char *argv[], void *userdata) {
+VERB_GROUP("Lock/Unlock Commands");
+VERB(verb_lock_home, "lock", "USER…\0", 2, VERB_ANY, 0,
+     "Temporarily lock an active home area");
+static int verb_lock_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r, ret = 0;
 
@@ -2258,7 +2815,9 @@ static int lock_home(int argc, char *argv[], void *userdata) {
         return ret;
 }
 
-static int unlock_home(int argc, char *argv[], void *userdata) {
+VERB(verb_unlock_home, "unlock", "USER…\0", 2, VERB_ANY, 0,
+     "Unlock a temporarily locked home area");
+static int verb_unlock_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r, ret = 0;
 
@@ -2291,7 +2850,7 @@ static int unlock_home(int argc, char *argv[], void *userdata) {
 
                         r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
                         if (r < 0) {
-                                r = handle_generic_user_record_error(argv[1], secret, &error, r, false);
+                                r = handle_generic_user_record_error(*i, secret, &error, r, false);
                                 if (r < 0) {
                                         if (ret == 0)
                                                 ret = r;
@@ -2306,127 +2865,9 @@ static int unlock_home(int argc, char *argv[], void *userdata) {
         return ret;
 }
 
-static int with_home(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_(user_record_unrefp) UserRecord *secret = NULL;
-        _cleanup_close_ int acquired_fd = -EBADF;
-        _cleanup_strv_free_ char **cmdline  = NULL;
-        const char *home;
-        int r, ret;
-        pid_t pid;
-
-        r = acquire_bus(&bus);
-        if (r < 0)
-                return r;
-
-        if (argc < 3) {
-                _cleanup_free_ char *shell = NULL;
-
-                /* If no command is specified, spawn a shell */
-                r = get_shell(&shell);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to acquire shell: %m");
-
-                cmdline = strv_new(shell);
-        } else
-                cmdline = strv_copy(argv + 2);
-        if (!cmdline)
-                return log_oom();
-
-        r = acquire_passed_secrets(argv[1], &secret);
-        if (r < 0)
-                return r;
-
-        for (;;) {
-                r = bus_message_new_method_call(bus, &m, bus_mgr, "AcquireHome");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(m, "s", argv[1]);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = bus_message_append_secret(m, secret);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(m, "b", /* please_suspend = */ getenv_bool("SYSTEMD_PLEASE_SUSPEND_HOME") > 0);
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, &reply);
-                m = sd_bus_message_unref(m);
-                if (r < 0) {
-                        r = handle_generic_user_record_error(argv[1], secret, &error, r, false);
-                        if (r < 0)
-                                return r;
-
-                        sd_bus_error_free(&error);
-                } else {
-                        int fd;
-
-                        r = sd_bus_message_read(reply, "h", &fd);
-                        if (r < 0)
-                                return bus_log_parse_error(r);
-
-                        acquired_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
-                        if (acquired_fd < 0)
-                                return log_error_errno(errno, "Failed to duplicate acquired fd: %m");
-
-                        reply = sd_bus_message_unref(reply);
-                        break;
-                }
-        }
-
-        r = bus_call_method(bus, bus_mgr, "GetHomeByName", &error, &reply, "s", argv[1]);
-        if (r < 0)
-                return log_error_errno(r, "Failed to inspect home: %s", bus_error_message(&error, r));
-
-        r = sd_bus_message_read(reply, "usussso", NULL, NULL, NULL, NULL, &home, NULL, NULL);
-        if (r < 0)
-                return bus_log_parse_error(r);
-
-        r = safe_fork("(with)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE|FORK_REOPEN_LOG, &pid);
-        if (r < 0)
-                return r;
-        if (r == 0) {
-                if (chdir(home) < 0) {
-                        log_error_errno(errno, "Failed to change to directory %s: %m", home);
-                        _exit(255);
-                }
-
-                execvp(cmdline[0], cmdline);
-                log_error_errno(errno, "Failed to execute %s: %m", cmdline[0]);
-                _exit(255);
-        }
-
-        ret = wait_for_terminate_and_check(cmdline[0], pid, WAIT_LOG_ABNORMAL);
-
-        /* Close the fd that pings the home now. */
-        acquired_fd = safe_close(acquired_fd);
-
-        r = bus_message_new_method_call(bus, &m, bus_mgr, "ReleaseHome");
-        if (r < 0)
-                return bus_log_create_error(r);
-
-        r = sd_bus_message_append(m, "s", argv[1]);
-        if (r < 0)
-                return bus_log_create_error(r);
-
-        r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
-        if (r < 0) {
-                if (sd_bus_error_has_name(&error, BUS_ERROR_HOME_BUSY))
-                        log_notice("Not deactivating home directory of %s, as it is still used.", argv[1]);
-                else
-                        return log_error_errno(r, "Failed to release user home: %s", bus_error_message(&error, r));
-        }
-
-        return ret;
-}
-
-static int lock_all_homes(int argc, char *argv[], void *userdata) {
+VERB_NOARG(verb_lock_all_homes, "lock-all",
+           "Lock all suitable home areas");
+static int verb_lock_all_homes(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -2447,28 +2888,10 @@ static int lock_all_homes(int argc, char *argv[], void *userdata) {
         return 0;
 }
 
-static int deactivate_all_homes(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        int r;
-
-        r = acquire_bus(&bus);
-        if (r < 0)
-                return r;
-
-        r = bus_message_new_method_call(bus, &m, bus_mgr, "DeactivateAllHomes");
-        if (r < 0)
-                return bus_log_create_error(r);
-
-        r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to deactivate all homes: %s", bus_error_message(&error, r));
-
-        return 0;
-}
-
-static int rebalance(int argc, char *argv[], void *userdata) {
+VERB_GROUP("Other Commands");
+VERB_NOARG(verb_rebalance, "rebalance",
+           "Rebalance free space between home areas");
+static int verb_rebalance(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -2526,7 +2949,7 @@ static int create_or_register_from_credentials(void) {
                 else
                         continue;
 
-                if (!valid_user_group_name(e, 0)) {
+                if (!valid_user_group_name(e, /* flags= */ 0)) {
                         log_notice("Skipping over credential with name that is not a suitable user name: %s", de->d_name);
                         continue;
                 }
@@ -2537,7 +2960,7 @@ static int create_or_register_from_credentials(void) {
                                 /* f= */ NULL,
                                 fd,
                                 de->d_name,
-                                /* flags= */ 0,
+                                /* flags= */ SD_JSON_PARSE_MUST_BE_OBJECT,
                                 &identity,
                                 &line,
                                 &column);
@@ -2598,80 +3021,29 @@ static int has_regular_user(void) {
         return true;
 }
 
-static int acquire_group_list(char ***ret) {
-        _cleanup_(userdb_iterator_freep) UserDBIterator *iterator = NULL;
-        _cleanup_strv_free_ char **groups = NULL;
-        UserDBMatch match = USERDB_MATCH_NULL;
+static int username_is_ok(const char *name, void *userdata) {
         int r;
 
-        assert(ret);
+        assert(name);
 
-        match.disposition_mask = INDEXES_TO_MASK(uint64_t, USER_REGULAR, USER_SYSTEM);
-
-        r = groupdb_all(&match, USERDB_SUPPRESS_SHADOW, &iterator);
-        if (r == -ENOLINK)
-                log_debug_errno(r, "No groups found. (Didn't check via Varlink.)");
-        else if (r == -ESRCH)
-                log_debug_errno(r, "No groups found.");
-        else if (r < 0)
-                return log_debug_errno(r, "Failed to enumerate groups, ignoring: %m");
-        else
-                for (;;) {
-                        _cleanup_(group_record_unrefp) GroupRecord *gr = NULL;
-
-                        r = groupdb_iterator_get(iterator, &match, &gr);
-                        if (r == -ESRCH)
-                                break;
-                        if (r < 0)
-                                return log_debug_errno(r, "Failed to acquire next group: %m");
-
-                        if (group_record_disposition(gr) == USER_REGULAR) {
-                                _cleanup_(user_record_unrefp) UserRecord *ur = NULL;
-
-                                /* Filter groups here that belong to a specific user, and are named like them */
-
-                                UserDBMatch user_match = USERDB_MATCH_NULL;
-                                user_match.disposition_mask = INDEX_TO_MASK(uint64_t, USER_REGULAR);
-
-                                r = userdb_by_name(gr->group_name, &user_match, USERDB_SUPPRESS_SHADOW, &ur);
-                                if (r < 0 && r != -ESRCH)
-                                        return log_debug_errno(r, "Failed to check if matching user exists for group '%s': %m", gr->group_name);
-
-                                if (r >= 0 && user_record_gid(ur) == gr->gid)
-                                        continue;
-                        }
-
-                        r = strv_extend(&groups, gr->group_name);
-                        if (r < 0)
-                                return log_oom();
-                }
-
-        strv_sort(groups);
-
-        *ret = TAKE_PTR(groups);
-        return !!*ret;
-}
-
-static int group_completion_callback(const char *key, char ***ret_list, void *userdata) {
-        char ***available = userdata;
-        int r;
-
-        if (!*available) {
-                r = acquire_group_list(available);
-                if (r < 0)
-                        log_debug_errno(r, "Failed to enumerate available groups, ignoring: %m");
+        if (!valid_user_group_name(name, /* flags= */ 0)) {
+                log_notice("Specified user name is not a valid UNIX user name, try again: %s", name);
+                return false;
         }
 
-        _cleanup_strv_free_ char **l = strv_copy(*available);
-        if (!l)
-                return -ENOMEM;
-
-        r = strv_extend(&l, "list");
+        r = userdb_by_name(name, /* match= */ NULL, USERDB_SUPPRESS_SHADOW, /* ret= */ NULL);
+        if (r == -ESRCH)
+                return true;
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to check if specified user '%s' already exists: %m", name);
 
-        *ret_list = TAKE_PTR(l);
-        return 0;
+        log_notice("Specified user '%s' exists already, try again.", name);
+        return false;
+}
+
+static void end_marker(void) {
+        printf("\n%sExiting user account creation tool.%s\n\n", ansi_grey(), ansi_normal());
+        fflush(stdout);
 }
 
 static int create_interactively(void) {
@@ -2683,47 +3055,44 @@ static int create_interactively(void) {
                 return 0;
         }
 
-        putchar('\n');
+        /* Needs to be called before mute_console or it will garble the screen */
+        (void) plymouth_hide_splash();
+
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *mute_console_link = NULL;
+        if (arg_mute_console)
+                (void) mute_console(&mute_console_link);
+
+        (void) terminal_reset_defensive_locked(STDOUT_FILENO, /* flags= */ 0);
+
+        if (arg_chrome)
+                chrome_show("Create a User Account", /* bottom= */ NULL);
+
+        DEFER_VOID_CALL(end_marker);
+        DEFER_VOID_CALL(chrome_hide);
+
         if (emoji_enabled()) {
                 fputs(glyph(GLYPH_HOME), stdout);
                 putchar(' ');
         }
-        printf("Please create your user account!\n");
+        printf("Please create your user account!\n\n");
 
-        if (!any_key_to_proceed()) {
-                log_notice("Skipping.");
+        r = prompt_loop("Please enter user name to create",
+                        GLYPH_IDCARD,
+                        /* prefill= */ NULL,
+                        /* menu= */ NULL,
+                        /* accepted= */ NULL,
+                        /* ellipsize_percentage= */ 60,
+                        /* n_columns= */ 3,
+                        /* column_width= */ 20,
+                        username_is_ok,
+                        /* refresh= */ NULL,
+                        /* userdata= */ NULL,
+                        PROMPT_MAY_SKIP|PROMPT_SILENT_VALIDATE,
+                        &username);
+        if (r < 0)
+                return r;
+        if (isempty(username))
                 return 0;
-        }
-
-        (void) terminal_reset_defensive_locked(STDOUT_FILENO, /* flags= */ 0);
-
-        for (;;) {
-                username = mfree(username);
-
-                r = ask_string(&username,
-                               "%s Please enter user name to create (empty to skip): ",
-                               glyph(GLYPH_TRIANGULAR_BULLET));
-                if (r < 0)
-                        return log_error_errno(r, "Failed to query user for username: %m");
-
-                if (isempty(username)) {
-                        log_info("No data entered, skipping.");
-                        return 0;
-                }
-
-                if (!valid_user_group_name(username, /* flags= */ 0)) {
-                        log_notice("Specified user name is not a valid UNIX user name, try again: %s", username);
-                        continue;
-                }
-
-                r = userdb_by_name(username, /* match= */ NULL, USERDB_SUPPRESS_SHADOW, /* ret= */ NULL);
-                if (r == -ESRCH)
-                        break;
-                if (r < 0)
-                        return log_error_errno(r, "Failed to check if specified user '%s' already exists: %m", username);
-
-                log_notice("Specified user '%s' exists already, try again.", username);
-        }
 
         r = sd_json_variant_set_field_string(&arg_identity_extra, "userName", username);
         if (r < 0)
@@ -2741,157 +3110,67 @@ static int create_interactively(void) {
         if (r < 0)
                 return log_error_errno(r, "Failed to set enforcePasswordPolicy field: %m");
 
-        _cleanup_strv_free_ char **available = NULL, **groups = NULL;
-        for (;;) {
-                _cleanup_free_ char *s = NULL;
+        if (arg_prompt_groups) {
+                _cleanup_strv_free_ char **groups = NULL;
 
-                strv_sort_uniq(groups);
+                putchar('\n');
+
+                r = prompt_groups(username, &groups);
+                if (r < 0)
+                        return r;
 
                 if (!strv_isempty(groups)) {
-                        _cleanup_free_ char *j = strv_join(groups, ", ");
-                        if (!j)
-                                return log_oom();
-
-                        log_info("Currently selected groups: %s", j);
-                }
-
-                r = ask_string_full(&s,
-                               group_completion_callback, &available,
-                               "%s Please enter an auxiliary group for user %s (empty to continue, \"list\" to list available groups): ",
-                               glyph(GLYPH_TRIANGULAR_BULLET), username);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to query user for auxiliary group: %m");
-
-                if (isempty(s))
-                        break;
-
-                if (streq(s, "list")) {
-                        if (!available) {
-                                r = acquire_group_list(&available);
-                                if (r < 0)
-                                        log_warning_errno(r, "Failed to enumerate available groups, ignoring: %m");
-                                if (r == 0)
-                                        log_notice("Did not find any available groups");
-                                if (r <= 0)
-                                        continue;
-                        }
-
-                        r = show_menu(available,
-                                      /* n_columns= */ 3,
-                                      /* column_width= */ 20,
-                                      /* ellipsize_percentage= */ 60,
-                                      /* grey_prefix= */ NULL,
-                                      /* with_numbers= */ true);
+                        r = sd_json_variant_set_field_strv(&arg_identity_extra, "memberOf", groups);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to show menu: %m");
-
-                        putchar('\n');
-                        continue;
-                };
-
-                if (!strv_isempty(available)) {
-                        unsigned u;
-                        r = safe_atou(s, &u);
-                        if (r >= 0) {
-                                if (u <= 0 || u > strv_length(available)) {
-                                        log_error("Specified entry number out of range.");
-                                        continue;
-                                }
-
-                                log_info("Selected '%s'.", available[u-1]);
-
-                                r = strv_extend(&groups, available[u-1]);
-                                if (r < 0)
-                                        return log_oom();
-
-                                continue;
-                        }
+                                return log_error_errno(r, "Failed to set memberOf field: %m");
                 }
-
-                if (!valid_user_group_name(s, /* flags= */ 0)) {
-                        log_notice("Specified group name is not a valid UNIX group name, try again: %s", s);
-                        continue;
-                }
-
-                r = groupdb_by_name(s, /* match= */ NULL, USERDB_SUPPRESS_SHADOW|USERDB_EXCLUDE_DYNAMIC_USER, /*ret=*/ NULL);
-                if (r == -ESRCH) {
-                        log_notice("Specified auxiliary group does not exist, try again: %s", s);
-                        continue;
-                }
-                if (r < 0)
-                        return log_error_errno(r, "Failed to check if specified group '%s' already exists: %m", s);
-
-                log_info("Selected '%s'.", s);
-
-                r = strv_extend(&groups, s);
-                if (r < 0)
-                        return log_oom();
         }
 
-        if (!strv_isempty(groups)) {
-                strv_sort_uniq(groups);
+        if (arg_prompt_shell) {
+                _cleanup_free_ char *shell = NULL;
 
-                r = sd_json_variant_set_field_strv(&arg_identity_extra, "memberOf", groups);
+                putchar('\n');
+
+                r = prompt_shell(username, &shell);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to set memberOf field: %m");
-        }
+                        return r;
 
-        _cleanup_free_ char *shell = NULL;
+                if (!isempty(shell)) {
+                        log_info("Selected %s as the shell for user %s", shell, username);
 
-        for (;;) {
-                shell = mfree(shell);
-
-                r = ask_string(&shell,
-                               "%s Please enter the shell to use for user %s (empty for default): ",
-                               glyph(GLYPH_TRIANGULAR_BULLET), username);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to query user for username: %m");
-
-                if (isempty(shell)) {
-                        log_info("No data entered, leaving at default.");
-                        break;
+                        r = sd_json_variant_set_field_string(&arg_identity_extra, "shell", shell);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to set shell field: %m");
                 }
-
-                if (!valid_shell(shell)) {
-                        log_notice("Specified shell is not a valid UNIX shell path, try again: %s", shell);
-                        continue;
-                }
-
-                r = RET_NERRNO(access(shell, X_OK));
-                if (r >= 0)
-                        break;
-
-                if (r != -ENOENT)
-                        return log_error_errno(r, "Failed to check if shell %s exists: %m", shell);
-
-                log_notice("Specified shell '%s' is not installed, try another one.", shell);
         }
 
-        if (!isempty(shell)) {
-                log_info("Selected %s as the shell for user %s", shell, username);
+        putchar('\n');
 
-                r = sd_json_variant_set_field_string(&arg_identity_extra, "shell", shell);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to set shell field: %m");
-        }
+        r = create_home_common(/* input= */ NULL, /* show_enforce_password_policy_hint= */ false);
+        if (r < 0)
+                return r;
 
-        return create_home_common(/* input= */ NULL, /* show_enforce_password_policy_hint= */ false);
+        log_info("Successfully created account '%s'.", username);
+        return 0;
 }
 
-static int add_signing_keys_from_credentials(void);
-
-static int verb_firstboot(int argc, char *argv[], void *userdata) {
+VERB_NOARG(verb_firstboot, "firstboot",
+           "Run first-boot home area creation wizard");
+static int verb_firstboot(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
         /* Let's honour the systemd.firstboot kernel command line option, just like the systemd-firstboot
          * tool. */
 
-        bool enabled;
-        r = proc_cmdline_get_bool("systemd.firstboot", /* flags = */ 0, &enabled);
+        FirstBootMode mode;
+        _cleanup_free_ char *bad = NULL;
+        r = firstboot_mode_from_cmdline(&mode, &bad);
         if (r < 0)
-                return log_error_errno(r, "Failed to parse systemd.firstboot= kernel command line argument, ignoring: %m");
-        if (r > 0 && !enabled) {
-                log_debug("Found systemd.firstboot=no kernel command line argument, turning off all prompts.");
+                return log_error_errno(r, "Failed to parse systemd.firstboot= kernel command line argument%s: %m",
+                                       bad ? strjoina(" (invalid value '", bad, "')") : "");
+        if (IN_SET(mode, FIRSTBOOT_NO, FIRSTBOOT_HEADLESS)) {
+                log_debug("Found systemd.firstboot=%s kernel command line argument, turning off all prompts.",
+                          firstboot_mode_to_string(mode));
                 arg_prompt_new_user = false;
         }
 
@@ -2927,444 +3206,847 @@ static int verb_firstboot(int argc, char *argv[], void *userdata) {
         return ret;
 }
 
-static int drop_from_identity(const char *field) {
-        int r;
+#define drop_from_identity(...) _drop_from_identity(STRV_MAKE(__VA_ARGS__))
 
-        assert(field);
+static int _drop_from_identity(char **fields) {
+        int r;
 
         /* If we are called to update an identity record and drop some field, let's keep track of what to
          * remove from the old record */
-        r = strv_extend(&arg_identity_filter, field);
+        r = strv_extend_strv(&arg_identity_filter, fields, /* filter_duplicates= */ true);
         if (r < 0)
                 return log_oom();
 
         /* Let's also drop the field if it was previously set to a new value on the same command line */
-        r = sd_json_variant_filter(&arg_identity_extra, STRV_MAKE(field));
+        r = sd_json_variant_filter(&arg_identity_extra, fields);
         if (r < 0)
                 return log_error_errno(r, "Failed to filter JSON identity data: %m");
 
-        r = sd_json_variant_filter(&arg_identity_extra_this_machine, STRV_MAKE(field));
+        r = sd_json_variant_filter(&arg_identity_extra_this_machine, fields);
         if (r < 0)
                 return log_error_errno(r, "Failed to filter JSON identity data: %m");
 
-        r = sd_json_variant_filter(&arg_identity_extra_privileged, STRV_MAKE(field));
+        r = sd_json_variant_filter(&arg_identity_extra_privileged, fields);
         if (r < 0)
                 return log_error_errno(r, "Failed to filter JSON identity data: %m");
 
         return 0;
 }
 
-static int help(int argc, char *argv[], void *userdata) {
-        _cleanup_free_ char *link = NULL;
+static int parse_ssh_authorized_keys(sd_json_variant **identity, const char *field, const char *arg) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        _cleanup_strv_free_ char **l = NULL, **add = NULL;
         int r;
 
-        pager_open(arg_pager_flags);
+        assert(identity);
+        assert(field);
 
-        r = terminal_urlify_man("homectl", "1", &link);
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        if (arg[0] == '@') {
+                /* If prefixed with '@', read from a file */
+
+                _cleanup_fclose_ FILE *f = fopen(arg + 1, "re");
+                if (!f)
+                        return log_error_errno(errno, "Failed to open '%s': %m", arg + 1);
+
+                for (;;) {
+                        _cleanup_free_ char *line = NULL;
+
+                        r = read_line(f, LONG_LINE_MAX, &line);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to read from '%s': %m", arg + 1);
+                        if (r == 0)
+                                break;
+
+                        if (isempty(line) || line[0] == '#')
+                                continue;
+
+                        r = strv_consume(&add, TAKE_PTR(line));
+                        if (r < 0)
+                                return log_oom();
+                }
+        } else {
+                /* Otherwise, assume it's a literal key. Let's do some superficial checks
+                 * before accepting it though. */
+
+                if (string_has_cc(arg, NULL))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Authorized key contains control characters, refusing.");
+                if (arg[0] == '#')
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Specified key is a comment?");
+
+                add = strv_new(arg);
+                if (!add)
+                        return log_oom();
+        }
+
+        v = sd_json_variant_ref(sd_json_variant_by_key(*identity, field));
+        if (v) {
+                r = sd_json_variant_strv(v, &l);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse %s list: %m", field);
+        }
+
+        r = strv_extend_strv_consume(&l, TAKE_PTR(add), /* filter_duplicates= */ true);
         if (r < 0)
                 return log_oom();
 
-        printf("%1$s [OPTIONS...] COMMAND ...\n\n"
-               "%2$sCreate, manipulate or inspect home directories.%3$s\n"
-               "\n%4$sBasic User Manipulation Commands:%5$s\n"
-               "  list                         List home areas\n"
-               "  inspect USER…                Inspect a home area\n"
-               "  create USER                  Create a home area\n"
-               "  update USER                  Update a home area\n"
-               "  passwd USER                  Change password of a home area\n"
-               "  resize USER SIZE             Resize a home area\n"
-               "  remove USER…                 Remove a home area\n"
-               "\n%4$sAdvanced User Manipulation Commands:%5$s\n"
-               "  activate USER…               Activate a home area\n"
-               "  deactivate USER…             Deactivate a home area\n"
-               "  deactivate-all               Deactivate all active home areas\n"
-               "  with USER [COMMAND…]         Run shell or command with access to a home area\n"
-               "  authenticate USER…           Authenticate a home area\n"
-               "\n%4$sUser Migration Commands:%5$s\n"
-               "  adopt PATH…                  Add an existing home area on this system\n"
-               "  register PATH…               Register a user record locally\n"
-               "  unregister USER…             Unregister a user record locally\n"
-               "\n%4$sSigning Keys Commands:%5$s\n"
-               "  list-signing-keys            List home signing keys\n"
-               "  get-signing-key [NAME…]      Get a named home signing key\n"
-               "  add-signing-key FILE…        Add home signing key\n"
-               "  remove-signing-key NAME…     Remove home signing key\n"
-               "\n%4$sLock/Unlock Commands:%5$s\n"
-               "  lock USER…                   Temporarily lock an active home area\n"
-               "  unlock USER…                 Unlock a temporarily locked home area\n"
-               "  lock-all                     Lock all suitable home areas\n"
-               "\n%4$sOther Commands:%5$s\n"
-               "  rebalance                    Rebalance free space between home areas\n"
-               "  firstboot                    Run first-boot home area creation wizard\n"
-               "\n%4$sOptions:%5$s\n"
-               "  -h --help                    Show this help\n"
-               "     --version                 Show package version\n"
-               "     --no-pager                Do not pipe output into a pager\n"
-               "     --no-legend               Do not show the headers and footers\n"
-               "     --no-ask-password         Do not ask for system passwords\n"
-               "     --offline                 Don't update record embedded in home directory\n"
-               "  -H --host=[USER@]HOST        Operate on remote host\n"
-               "  -M --machine=CONTAINER       Operate on local container\n"
-               "     --identity=PATH           Read JSON identity from file\n"
-               "     --json=FORMAT             Output inspection data in JSON (takes one of\n"
-               "                               pretty, short, off)\n"
-               "  -j                           Equivalent to --json=pretty (on TTY) or\n"
-               "                               --json=short (otherwise)\n"
-               "     --export-format=          Strip JSON inspection data (full, stripped,\n"
-               "                               minimal)\n"
-               "  -E                           When specified once equals -j --export-format=\n"
-               "                               stripped, when specified twice equals\n"
-               "                               -j --export-format=minimal\n"
-               "     --prompt-new-user         firstboot: Query user interactively for user\n"
-               "                               to create\n"
-               "     --key-name=NAME           Key name when adding a signing key\n"
-               "     --seize=no                Do not strip existing signatures of user record\n"
-               "                               when creating\n"
-               "\n%4$sGeneral User Record Properties:%5$s\n"
-               "  -c --real-name=REALNAME      Real name for user\n"
-               "     --realm=REALM             Realm to create user in\n"
-               "     --alias=ALIAS             Define alias usernames for this account\n"
-               "     --email-address=EMAIL     Email address for user\n"
-               "     --location=LOCATION       Set location of user on earth\n"
-               "     --icon-name=NAME          Icon name for user\n"
-               "  -d --home-dir=PATH           Home directory\n"
-               "  -u --uid=UID                 Numeric UID for user\n"
-               "  -G --member-of=GROUP         Add user to group\n"
-               "     --capability-bounding-set=CAPS\n"
-               "                               Bounding POSIX capability set\n"
-               "     --capability-ambient-set=CAPS\n"
-               "                               Ambient POSIX capability set\n"
-               "     --access-mode=MODE        User home directory access mode\n"
-               "     --umask=MODE              Umask for user when logging in\n"
-               "     --skel=PATH               Skeleton directory to use\n"
-               "     --shell=PATH              Shell for account\n"
-               "     --setenv=VARIABLE[=VALUE] Set an environment variable at log-in\n"
-               "     --timezone=TIMEZONE       Set a time-zone\n"
-               "     --language=LOCALE         Set preferred languages\n"
-               "     --default-area=AREA       Select default area\n"
-               "\n%4$sAuthentication User Record Properties:%5$s\n"
-               "     --ssh-authorized-keys=KEYS\n"
-               "                               Specify SSH public keys\n"
-               "     --pkcs11-token-uri=URI    URI to PKCS#11 security token containing\n"
-               "                               private key and matching X.509 certificate\n"
-               "     --fido2-device=PATH       Path to FIDO2 hidraw device with hmac-secret\n"
-               "                               extension\n"
-               "     --fido2-with-client-pin=BOOL\n"
-               "                               Whether to require entering a PIN to unlock the\n"
-               "                               account\n"
-               "     --fido2-with-user-presence=BOOL\n"
-               "                               Whether to require user presence to unlock the\n"
-               "                               account\n"
-               "     --fido2-with-user-verification=BOOL\n"
-               "                               Whether to require user verification to unlock\n"
-               "                               the account\n"
-               "     --recovery-key=BOOL       Add a recovery key\n"
-               "\n%4$sBlob Directory User Record Properties:%5$s\n"
-               "  -b --blob=[FILENAME=]PATH\n"
-               "                               Path to a replacement blob directory, or replace\n"
-               "                               an individual files in the blob directory.\n"
-               "     --avatar=PATH             Path to user avatar picture\n"
-               "     --login-background=PATH   Path to user login background picture\n"
-               "\n%4$sAccount Management User Record Properties:%5$s\n"
-               "     --locked=BOOL             Set locked account state\n"
-               "     --not-before=TIMESTAMP    Do not allow logins before\n"
-               "     --not-after=TIMESTAMP     Do not allow logins after\n"
-               "     --rate-limit-interval=SECS\n"
-               "                               Login rate-limit interval in seconds\n"
-               "     --rate-limit-burst=NUMBER\n"
-               "                               Login rate-limit attempts per interval\n"
-               "\n%4$sPassword Policy User Record Properties:%5$s\n"
-               "     --password-hint=HINT      Set Password hint\n"
-               "     --enforce-password-policy=BOOL\n"
-               "                               Control whether to enforce system's password\n"
-               "                               policy for this user\n"
-               "  -P                           Same as --enforce-password-policy=no\n"
-               "     --password-change-now=BOOL\n"
-               "                               Require the password to be changed on next login\n"
-               "     --password-change-min=TIME\n"
-               "                               Require minimum time between password changes\n"
-               "     --password-change-max=TIME\n"
-               "                               Require maximum time between password changes\n"
-               "     --password-change-warn=TIME\n"
-               "                               How much time to warn before password expiry\n"
-               "     --password-change-inactive=TIME\n"
-               "                               How much time to block password after expiry\n"
-               "\n%4$sResource Management User Record Properties:%5$s\n"
-               "     --disk-size=BYTES         Size to assign the user on disk\n"
-               "     --nice=NICE               Nice level for user\n"
-               "     --rlimit=LIMIT=VALUE[:VALUE]\n"
-               "                               Set resource limits\n"
-               "     --tasks-max=MAX           Set maximum number of per-user tasks\n"
-               "     --memory-high=BYTES       Set high memory threshold in bytes\n"
-               "     --memory-max=BYTES        Set maximum memory limit\n"
-               "     --cpu-weight=WEIGHT       Set CPU weight\n"
-               "     --io-weight=WEIGHT        Set IO weight\n"
-               "     --tmp-limit=BYTES|PERCENT Set limit on /tmp/\n"
-               "     --dev-shm-limit=BYTES|PERCENT\n"
-               "                               Set limit on /dev/shm/\n"
-               "\n%4$sStorage User Record Properties:%5$s\n"
-               "     --storage=STORAGE         Storage type to use (luks, fscrypt, directory,\n"
-               "                               subvolume, cifs)\n"
-               "     --image-path=PATH         Path to image file/directory\n"
-               "     --drop-caches=BOOL        Whether to automatically drop caches on logout\n"
-               "\n%4$sLUKS Storage User Record Properties:%5$s\n"
-               "     --fs-type=TYPE            File system type to use in case of luks\n"
-               "                               storage (btrfs, ext4, xfs)\n"
-               "     --luks-discard=BOOL       Whether to use 'discard' feature of file system\n"
-               "                               when activated (mounted)\n"
-               "     --luks-offline-discard=BOOL\n"
-               "                               Whether to trim file on logout\n"
-               "     --luks-cipher=CIPHER      Cipher to use for LUKS encryption\n"
-               "     --luks-cipher-mode=MODE   Cipher mode to use for LUKS encryption\n"
-               "     --luks-volume-key-size=BITS\n"
-               "                               Volume key size to use for LUKS encryption\n"
-               "     --luks-pbkdf-type=TYPE    Password-based Key Derivation Function to use\n"
-               "     --luks-pbkdf-hash-algorithm=ALGORITHM\n"
-               "                               PBKDF hash algorithm to use\n"
-               "     --luks-pbkdf-time-cost=SECS\n"
-               "                               Time cost for PBKDF in seconds\n"
-               "     --luks-pbkdf-memory-cost=BYTES\n"
-               "                               Memory cost for PBKDF in bytes\n"
-               "     --luks-pbkdf-parallel-threads=NUMBER\n"
-               "                               Number of parallel threads for PKBDF\n"
-               "     --luks-sector-size=BYTES\n"
-               "                               Sector size for LUKS encryption in bytes\n"
-               "     --luks-extra-mount-options=OPTIONS\n"
-               "                               LUKS extra mount options\n"
-               "     --auto-resize-mode=MODE   Automatically grow/shrink home on login/logout\n"
-               "     --rebalance-weight=WEIGHT Weight while rebalancing\n"
-               "\n%4$sMounting User Record Properties:%5$s\n"
-               "     --nosuid=BOOL             Control the 'nosuid' flag of the home mount\n"
-               "     --nodev=BOOL              Control the 'nodev' flag of the home mount\n"
-               "     --noexec=BOOL             Control the 'noexec' flag of the home mount\n"
-               "\n%4$sCIFS User Record Properties:%5$s\n"
-               "     --cifs-domain=DOMAIN      CIFS (Windows) domain\n"
-               "     --cifs-user-name=USER     CIFS (Windows) user name\n"
-               "     --cifs-service=SERVICE    CIFS (Windows) service to mount as home area\n"
-               "     --cifs-extra-mount-options=OPTIONS\n"
-               "                               CIFS (Windows) extra mount options\n"
-               "\n%4$sLogin Behaviour User Record Properties:%5$s\n"
-               "     --stop-delay=SECS         How long to leave user services running after\n"
-               "                               logout\n"
-               "     --kill-processes=BOOL     Whether to kill user processes when sessions\n"
-               "                               terminate\n"
-               "     --auto-login=BOOL         Try to log this user in automatically\n"
-               "     --session-launcher=LAUNCHER\n"
-               "                               Preferred session launcher file\n"
-               "     --session-type=TYPE       Preferred session type\n"
-               "\nSee the %6$s for details.\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               ansi_underline(),
-               ansi_normal(),
-               link);
+        v = sd_json_variant_unref(v);
+
+        r = sd_json_variant_new_array_strv(&v, l);
+        if (r < 0)
+                return log_oom();
+
+        r = sd_json_variant_set_field(identity, field, v);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
 
         return 0;
 }
 
-static int parse_argv(int argc, char *argv[]) {
+static int parse_string_field(sd_json_variant **identity, const char *field, const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        r = sd_json_variant_set_field_string(identity, field, arg);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_home_directory_field(sd_json_variant **identity, const char *field, const char *arg) {
+        _cleanup_free_ char *hd = NULL;
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (!isempty(arg)) {
+                r = parse_path_argument(arg, /* suppress_root= */ false, &hd);
+                if (r < 0)
+                        return r;
+
+                if (!valid_home(hd))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Home directory '%s' not valid.", hd);
+        }
+
+        return parse_string_field(identity, field, hd);
+}
+
+static int parse_realm_field(sd_json_variant **identity, const char *field, const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (!isempty(arg)) {
+                r = dns_name_is_valid(arg);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to determine whether realm '%s' is a valid DNS domain: %m", arg);
+                if (r == 0)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Realm '%s' is not a valid DNS domain.", arg);
+        }
+
+        return parse_string_field(identity, field, arg);
+}
+
+static int parse_path_field(sd_json_variant **identity, const char *field, const char *arg) {
+        _cleanup_free_ char *v = NULL;
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (!isempty(arg)) {
+                r = parse_path_argument(arg, /* suppress_root= */ false, &v);
+                if (r < 0)
+                        return r;
+        }
+
+        return parse_string_field(identity, field, v);
+}
+
+static int parse_filename_field(sd_json_variant **identity, const char *field, const char *arg) {
+        assert(identity);
+        assert(field);
+
+        if (!isempty(arg) && !filename_is_valid(arg))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Parameter for %s field not a valid filename: %s", field, arg);
+
+        return parse_string_field(identity, field, arg);
+}
+
+static int parse_unsigned_field(sd_json_variant **identity, const char *field, const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        unsigned n;
+        r = safe_atou(arg, &n);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse %s parameter: %s", field, arg);
+
+        r = sd_json_variant_set_field_unsigned(identity, field, n);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_u64_field(sd_json_variant **identity, const char *field, const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        uint64_t n;
+        r = safe_atou64(arg, &n);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse %s parameter: %s", field, arg);
+
+        r = sd_json_variant_set_field_unsigned(identity, field, n);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_size_field(sd_json_variant **identity, const char *field, const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        uint64_t n;
+        r = parse_size(arg, 1024, &n);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse %s parameter: %s", field, arg);
+
+        r = sd_json_variant_set_field_unsigned(identity, field, n);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_boolean_field(sd_json_variant **identity, const char *field, const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        r = parse_boolean(arg);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse boolean parameter %s: %s", field, arg);
+
+        r = sd_json_variant_set_field_boolean(identity, field, r > 0);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_mode_field(sd_json_variant **identity, const char *field, const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        mode_t mode;
+        r = parse_mode(arg, &mode);
+        if (r < 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Access mode '%s' not valid.", arg);
+
+        r = sd_json_variant_set_field_unsigned(identity, field, mode);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_timestamp_field(sd_json_variant **identity, const char *field, const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        usec_t n;
+        r = parse_timestamp(arg, &n);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse %s parameter: %s", field, arg);
+
+        r = sd_json_variant_set_field_unsigned(identity, field, n);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_time_field(sd_json_variant **identity, const char *field, const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        usec_t n;
+        r = parse_sec(arg, &n);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse %s parameter: %s", field, arg);
+
+        r = sd_json_variant_set_field_unsigned(identity, field, n);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_uid_field(sd_json_variant **identity, const char *field, const char *arg) {
+        uid_t uid;
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        r = parse_uid(arg, &uid);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse UID '%s'.", arg);
+
+        const char *bad_range =
+                uid_is_system(uid) ? "in system range" :
+                uid_is_greeter(uid) ? "in greeter range" :
+                uid_is_dynamic(uid) ? "in dynamic ragne" :
+                uid == UID_NOBODY ? "nobody UID" : NULL;
+        if (bad_range)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "UID "UID_FMT" is %s, refusing.", uid, bad_range);
+
+        r = sd_json_variant_set_field_unsigned(identity, field, uid);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_nice_field(sd_json_variant **identity, const char *field, const char *arg) {
+        int nc, r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        r = parse_nice(arg, &nc);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse nice level '%s': %m", arg);
+
+        r = sd_json_variant_set_field_integer(identity, field, nc);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_auto_resize_mode_field(sd_json_variant **identity, const char *field, const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (!isempty(arg)) {
+                r = auto_resize_mode_from_string(arg);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse %s parameter: %s", field, arg);
+                arg = auto_resize_mode_to_string(r);
+        }
+
+        return parse_string_field(identity, field, arg);
+}
+
+static int parse_rebalance_weight(sd_json_variant **identity, const char *field, const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        uint64_t u;
+        if (streq(arg, "off"))
+                u = REBALANCE_WEIGHT_OFF;
+        else {
+                r = safe_atou64(arg, &u);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse rebalance weight parameter: %s", arg);
+
+                if (u < REBALANCE_WEIGHT_MIN || u > REBALANCE_WEIGHT_MAX)
+                        return log_error_errno(SYNTHETIC_ERRNO(ERANGE),
+                                               "Rebalancing weight out of valid range %" PRIu64 "%s%" PRIu64 ": %s",
+                                               REBALANCE_WEIGHT_MIN, glyph(GLYPH_ELLIPSIS), REBALANCE_WEIGHT_MAX,
+                                               arg);
+        }
+
+        /* Drop from per machine stuff and everywhere */
+        r = drop_from_identity(field);
+        if (r < 0)
+                return r;
+
+        r = sd_json_variant_set_field_unsigned(identity, field, u);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_rlimit_field(sd_json_variant **identity, const char *field, const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg)) {
+                /* Remove all resource limits */
+
+                r = drop_from_identity(field);
+                if (r < 0)
+                        return r;
+
+                arg_identity_filter_rlimits = strv_free(arg_identity_filter_rlimits);
+                *identity = sd_json_variant_unref(*identity);
+                return 0;
+        }
+
+        const char *eq = strchr(arg, '=');
+        if (!eq)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Can't parse resource limit assignment: %s", arg);
+
+        _cleanup_free_ char *s = strndup(arg, eq - arg);
+        if (!s)
+                return log_oom();
+
+        int limit = rlimit_from_string_harder(s);
+        if (limit < 0)
+                return log_error_errno(limit, "Unknown resource limit type: %s", s);
+
+        const char *rlimit_field = strjoina("RLIMIT_", rlimit_to_string(limit));
+
+        if (isempty(eq + 1)) {
+                /* Remove only the specific rlimit */
+
+                r = strv_extend(&arg_identity_filter_rlimits, rlimit_field);
+                if (r < 0)
+                        return r;
+
+                r = sd_json_variant_filter(identity, STRV_MAKE(rlimit_field));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to filter JSON identity data: %m");
+                return 0;
+        }
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *jcur = NULL, *jmax = NULL;
+        struct rlimit rl;
+
+        r = rlimit_parse(limit, eq + 1, &rl);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse resource limit value: %s", eq + 1);
+
+        r = rl.rlim_cur == RLIM_INFINITY ? sd_json_variant_new_null(&jcur) : sd_json_variant_new_unsigned(&jcur, rl.rlim_cur);
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate json variant: %m");
+
+        r = rl.rlim_max == RLIM_INFINITY ? sd_json_variant_new_null(&jmax) : sd_json_variant_new_unsigned(&jmax, rl.rlim_max);
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate json variant: %m");
+
+        r = sd_json_variant_set_fieldbo(identity, rlimit_field,
+                                        SD_JSON_BUILD_PAIR_VARIANT("cur", jcur),
+                                        SD_JSON_BUILD_PAIR_VARIANT("max", jmax));
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", rlimit_field);
+        return 0;
+}
+
+static int parse_disk_size_field(sd_json_variant **identity, const char *arg) {
+        int r;
+
+        assert(identity);
+
+        if (isempty(arg)) {
+                r = drop_from_identity("diskSize", "diskSizeRelative", "rebalanceWeight");
+                if (r < 0)
+                        return r;
+
+                arg_disk_size = arg_disk_size_relative = UINT64_MAX;
+                return 0;
+        }
+
+        r = parse_permyriad(arg);
+        if (r < 0) {
+                r = parse_disk_size(arg, &arg_disk_size);
+                if (r < 0)
+                        return r;
+
+                r = drop_from_identity("diskSizeRelative");
+                if (r < 0)
+                        return r;
+
+                r = sd_json_variant_set_field_unsigned(identity, "diskSize", arg_disk_size);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to set %s field: %m", "diskSize");
+
+                arg_disk_size_relative = UINT64_MAX;
+        } else {
+                /* Normalize to UINT32_MAX == 100% */
+                arg_disk_size_relative = UINT32_SCALE_FROM_PERMYRIAD(r);
+
+                r = drop_from_identity("diskSize");
+                if (r < 0)
+                        return r;
+
+                r = sd_json_variant_set_field_unsigned(identity, "diskSizeRelative", arg_disk_size_relative);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to set %s field: %m", "diskSizeRelative");
+
+                arg_disk_size = UINT64_MAX;
+        }
+
+        /* Automatically turn off the rebalance logic if user configured a size explicitly */
+        r = sd_json_variant_set_field_unsigned(identity, "rebalanceWeight", REBALANCE_WEIGHT_OFF);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", "rebalanceWeight");
+        return 0;
+}
+
+static int parse_sector_size_field(sd_json_variant **identity, const char *field, const char *arg) {
+        uint64_t ss;
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        r = parse_sector_size(arg, &ss);
+        if (r < 0)
+                return r;
+
+        r = sd_json_variant_set_field_unsigned(identity, field, ss);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_weight_field(sd_json_variant **identity, const char *field, const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        uint64_t u;
+        r = safe_atou64(arg, &u);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse %s parameter: %s", field, arg);
+
+        if (!CGROUP_WEIGHT_IS_OK(u))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Weight %" PRIu64 " is out of valid range for field %s.", u, field);
+
+        r = sd_json_variant_set_field_unsigned(identity, field, u);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_environment_field(sd_json_variant **identity, const char *field, const char *arg) {
+        _cleanup_strv_free_ char **l = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *ne = NULL;
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        sd_json_variant *e = sd_json_variant_by_key(*identity, field);
+        if (e) {
+                r = sd_json_variant_strv(e, &l);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse JSON environment field: %m");
+        }
+
+        r = strv_env_replace_strdup_passthrough(&l, arg);
+        if (r < 0)
+                return log_error_errno(r, "Cannot assign environment variable %s: %m", arg);
+
+        strv_sort(l);
+
+        r = sd_json_variant_new_array_strv(&ne, l);
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate json list: %m");
+
+        r = sd_json_variant_set_field(identity, field, ne);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_language_field(char ***languages, const char *arg) {
+        int r;
+
+        assert(languages);
+
+        if (isempty(arg)) {
+                r = drop_from_identity("preferredLanguage", "additionalLanguages");
+                if (r < 0)
+                        return r;
+
+                strv_freep(languages);
+                return 0;
+        }
+
+        for (const char *p = arg;;) {
+                _cleanup_free_ char *word = NULL;
+
+                r = extract_first_word(&p, &word, ",:", /* flags= */ 0);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse locale list: %m");
+                if (r == 0)
+                        return 0;
+
+                if (!locale_is_valid(word))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Locale '%s' is not valid.", word);
+
+                if (locale_is_installed(word) <= 0)
+                        log_warning("Locale '%s' is not installed, accepting anyway.", word);
+
+                r = strv_consume(languages, TAKE_PTR(word));
+                if (r < 0)
+                        return log_oom();
+
+                strv_uniq(*languages);
+        }
+}
+
+static int parse_group_field(
+                sd_json_variant **identity,
+                const char *field,
+                const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+
+        if (isempty(arg))
+                return drop_from_identity(field);
+
+        for (const char *p = arg;;) {
+                _cleanup_free_ char *word = NULL;
+                _cleanup_strv_free_ char **list = NULL;
+
+                r = extract_first_word(&p, &word, ",", /* flags= */ 0);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse group list: %m");
+                if (r == 0)
+                        return 0;
+
+                if (!valid_user_group_name(word, /* flags= */ 0))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid group name %s.", word);
+
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *mo =
+                        sd_json_variant_ref(sd_json_variant_by_key(*identity, field));
+
+                r = sd_json_variant_strv(mo, &list);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse group list: %m");
+
+                r = strv_extend(&list, word);
+                if (r < 0)
+                        return log_oom();
+
+                strv_sort_uniq(list);
+
+                mo = sd_json_variant_unref(mo);
+                r = sd_json_variant_new_array_strv(&mo, list);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to allocate json list: %m");
+
+                r = sd_json_variant_set_field(identity, field, mo);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to set %s field: %m", field);
+        }
+}
+
+static int parse_capability_set_field(
+                sd_json_variant **identity,
+                uint64_t *capability_set,
+                const char *field,
+                const char *arg) {
+
+        _cleanup_strv_free_ char **l = NULL;
+        int r;
+
+        assert(identity);
+        assert(capability_set);
+        assert(field);
+        assert(arg);
+
+        r = parse_capability_set(arg, CAP_MASK_UNSET, capability_set);
+        if (r == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid capabilities in capability string '%s'.", arg);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse capability string '%s': %m", arg);
+
+        if (*capability_set == CAP_MASK_UNSET)
+                return drop_from_identity(field);
+
+        if (capability_set_to_strv(*capability_set, &l) < 0)
+                return log_oom();
+
+        r = sd_json_variant_set_field_strv(identity, field, l);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field);
+        return 0;
+}
+
+static int parse_tmpfs_limit_field(
+                sd_json_variant **identity,
+                const char *field,
+                const char *field_scale,
+                const char *arg) {
+        int r;
+
+        assert(identity);
+        assert(field);
+        assert(field_scale);
+
+        if (isempty(arg))
+                return drop_from_identity(field, field_scale);
+
+        r = parse_permyriad(arg);
+        if (r < 0) {
+                uint64_t u;
+
+                r = parse_size(arg, 1024, &u);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse %s/%s parameter: %s", field, field_scale, arg);
+
+                r = sd_json_variant_set_field_unsigned(identity, field, u);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to set %s field: %m", field);
+
+                return drop_from_identity(field_scale);
+        }
+
+        r = sd_json_variant_set_field_unsigned(identity, field_scale, UINT32_SCALE_FROM_PERMYRIAD(r));
+        if (r < 0)
+                return log_error_errno(r, "Failed to set %s field: %m", field_scale);
+
+        return drop_from_identity(field);
+}
+
+static int parse_pkcs11_token_uri_field(const char *arg) {
+        int r;
+
+        assert(arg);
+
+        if (streq(arg, "list"))
+                return pkcs11_list_tokens();
+
+        /* If --pkcs11-token-uri= is specified we always drop everything old */
+        r = drop_from_identity("pkcs11TokenUri", "pkcs11EncryptedKey");
+        if (r < 0)
+                return r;
+
+        if (isempty(arg)) {
+                arg_pkcs11_token_uri = strv_free(arg_pkcs11_token_uri);
+                return 1;
+        }
+
+        if (streq(arg, "auto")) {
+                char *found;
+                r = pkcs11_find_token_auto(&found);
+                if (r < 0)
+                        return r;
+
+                r = strv_consume(&arg_pkcs11_token_uri, found);
+        } else {
+                if (!pkcs11_uri_valid(arg))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Not a valid PKCS#11 URI: %s", arg);
+
+                r = strv_extend(&arg_pkcs11_token_uri, arg);
+        }
+        if (r < 0)
+                return r;
+
+        strv_uniq(arg_pkcs11_token_uri);
+        return 1;
+}
+
+static int parse_fido2_device_field(const char *arg) {
+        int r;
+
+        assert(arg);
+
+        if (streq(arg, "list"))
+                return fido2_list_devices();
+
+        r = drop_from_identity("fido2HmacCredential", "fido2HmacSalt");
+        if (r < 0)
+                return r;
+
+        if (isempty(arg)) {
+                arg_fido2_device = strv_free(arg_fido2_device);
+                return 1;
+        }
+
+        if (streq(arg, "auto")) {
+                char *found;
+                r = fido2_find_device_auto(&found);
+                if (r < 0)
+                        return r;
+
+                r = strv_consume(&arg_fido2_device, found);
+        } else
+                r = strv_extend(&arg_fido2_device, arg);
+        if (r < 0)
+                return r;
+
+        strv_uniq(arg_fido2_device);
+        return 1;
+}
+
+VERB_COMMON_HELP_AUTO_HIDDEN();
+
+static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         _cleanup_strv_free_ char **arg_languages = NULL;
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_NO_PAGER,
-                ARG_NO_LEGEND,
-                ARG_NO_ASK_PASSWORD,
-                ARG_OFFLINE,
-                ARG_REALM,
-                ARG_ALIAS,
-                ARG_EMAIL_ADDRESS,
-                ARG_DISK_SIZE,
-                ARG_ACCESS_MODE,
-                ARG_STORAGE,
-                ARG_FS_TYPE,
-                ARG_IMAGE_PATH,
-                ARG_UMASK,
-                ARG_LUKS_DISCARD,
-                ARG_LUKS_OFFLINE_DISCARD,
-                ARG_JSON,
-                ARG_SETENV,
-                ARG_TIMEZONE,
-                ARG_LANGUAGE,
-                ARG_LOCKED,
-                ARG_SSH_AUTHORIZED_KEYS,
-                ARG_LOCATION,
-                ARG_ICON_NAME,
-                ARG_PASSWORD_HINT,
-                ARG_NICE,
-                ARG_RLIMIT,
-                ARG_NOT_BEFORE,
-                ARG_NOT_AFTER,
-                ARG_LUKS_CIPHER,
-                ARG_LUKS_CIPHER_MODE,
-                ARG_LUKS_VOLUME_KEY_SIZE,
-                ARG_NOSUID,
-                ARG_NODEV,
-                ARG_NOEXEC,
-                ARG_CIFS_DOMAIN,
-                ARG_CIFS_USER_NAME,
-                ARG_CIFS_SERVICE,
-                ARG_CIFS_EXTRA_MOUNT_OPTIONS,
-                ARG_TASKS_MAX,
-                ARG_MEMORY_HIGH,
-                ARG_MEMORY_MAX,
-                ARG_CPU_WEIGHT,
-                ARG_IO_WEIGHT,
-                ARG_LUKS_PBKDF_TYPE,
-                ARG_LUKS_PBKDF_HASH_ALGORITHM,
-                ARG_LUKS_PBKDF_FORCE_ITERATIONS,
-                ARG_LUKS_PBKDF_TIME_COST,
-                ARG_LUKS_PBKDF_MEMORY_COST,
-                ARG_LUKS_PBKDF_PARALLEL_THREADS,
-                ARG_LUKS_SECTOR_SIZE,
-                ARG_RATE_LIMIT_INTERVAL,
-                ARG_RATE_LIMIT_BURST,
-                ARG_STOP_DELAY,
-                ARG_KILL_PROCESSES,
-                ARG_ENFORCE_PASSWORD_POLICY,
-                ARG_PASSWORD_CHANGE_NOW,
-                ARG_PASSWORD_CHANGE_MIN,
-                ARG_PASSWORD_CHANGE_MAX,
-                ARG_PASSWORD_CHANGE_WARN,
-                ARG_PASSWORD_CHANGE_INACTIVE,
-                ARG_EXPORT_FORMAT,
-                ARG_AUTO_LOGIN,
-                ARG_SESSION_LAUNCHER,
-                ARG_SESSION_TYPE,
-                ARG_PKCS11_TOKEN_URI,
-                ARG_FIDO2_DEVICE,
-                ARG_FIDO2_WITH_PIN,
-                ARG_FIDO2_WITH_UP,
-                ARG_FIDO2_WITH_UV,
-                ARG_RECOVERY_KEY,
-                ARG_AND_RESIZE,
-                ARG_AND_CHANGE_PASSWORD,
-                ARG_DROP_CACHES,
-                ARG_LUKS_EXTRA_MOUNT_OPTIONS,
-                ARG_AUTO_RESIZE_MODE,
-                ARG_REBALANCE_WEIGHT,
-                ARG_FIDO2_CRED_ALG,
-                ARG_CAPABILITY_BOUNDING_SET,
-                ARG_CAPABILITY_AMBIENT_SET,
-                ARG_PROMPT_NEW_USER,
-                ARG_AVATAR,
-                ARG_LOGIN_BACKGROUND,
-                ARG_TMP_LIMIT,
-                ARG_DEV_SHM_LIMIT,
-                ARG_DEFAULT_AREA,
-                ARG_KEY_NAME,
-                ARG_SEIZE,
-                ARG_MATCH,
-        };
-
-        static const struct option options[] = {
-                { "help",                         no_argument,       NULL, 'h'                             },
-                { "version",                      no_argument,       NULL, ARG_VERSION                     },
-                { "no-pager",                     no_argument,       NULL, ARG_NO_PAGER                    },
-                { "no-legend",                    no_argument,       NULL, ARG_NO_LEGEND                   },
-                { "no-ask-password",              no_argument,       NULL, ARG_NO_ASK_PASSWORD             },
-                { "offline",                      no_argument,       NULL, ARG_OFFLINE                     },
-                { "host",                         required_argument, NULL, 'H'                             },
-                { "machine",                      required_argument, NULL, 'M'                             },
-                { "identity",                     required_argument, NULL, 'I'                             },
-                { "real-name",                    required_argument, NULL, 'c'                             },
-                { "comment",                      required_argument, NULL, 'c'                             }, /* Compat alias to keep thing in sync with useradd(8) */
-                { "realm",                        required_argument, NULL, ARG_REALM                       },
-                { "alias",                        required_argument, NULL, ARG_ALIAS                       },
-                { "email-address",                required_argument, NULL, ARG_EMAIL_ADDRESS               },
-                { "location",                     required_argument, NULL, ARG_LOCATION                    },
-                { "password-hint",                required_argument, NULL, ARG_PASSWORD_HINT               },
-                { "icon-name",                    required_argument, NULL, ARG_ICON_NAME                   },
-                { "home-dir",                     required_argument, NULL, 'd'                             }, /* Compatible with useradd(8) */
-                { "uid",                          required_argument, NULL, 'u'                             }, /* Compatible with useradd(8) */
-                { "member-of",                    required_argument, NULL, 'G'                             },
-                { "groups",                       required_argument, NULL, 'G'                             }, /* Compat alias to keep thing in sync with useradd(8) */
-                { "skel",                         required_argument, NULL, 'k'                             }, /* Compatible with useradd(8) */
-                { "shell",                        required_argument, NULL, 's'                             }, /* Compatible with useradd(8) */
-                { "setenv",                       required_argument, NULL, ARG_SETENV                      },
-                { "timezone",                     required_argument, NULL, ARG_TIMEZONE                    },
-                { "language",                     required_argument, NULL, ARG_LANGUAGE                    },
-                { "locked",                       required_argument, NULL, ARG_LOCKED                      },
-                { "not-before",                   required_argument, NULL, ARG_NOT_BEFORE                  },
-                { "not-after",                    required_argument, NULL, ARG_NOT_AFTER                   },
-                { "expiredate",                   required_argument, NULL, 'e'                             }, /* Compat alias to keep thing in sync with useradd(8) */
-                { "ssh-authorized-keys",          required_argument, NULL, ARG_SSH_AUTHORIZED_KEYS         },
-                { "disk-size",                    required_argument, NULL, ARG_DISK_SIZE                   },
-                { "access-mode",                  required_argument, NULL, ARG_ACCESS_MODE                 },
-                { "umask",                        required_argument, NULL, ARG_UMASK                       },
-                { "nice",                         required_argument, NULL, ARG_NICE                        },
-                { "rlimit",                       required_argument, NULL, ARG_RLIMIT                      },
-                { "tasks-max",                    required_argument, NULL, ARG_TASKS_MAX                   },
-                { "memory-high",                  required_argument, NULL, ARG_MEMORY_HIGH                 },
-                { "memory-max",                   required_argument, NULL, ARG_MEMORY_MAX                  },
-                { "cpu-weight",                   required_argument, NULL, ARG_CPU_WEIGHT                  },
-                { "io-weight",                    required_argument, NULL, ARG_IO_WEIGHT                   },
-                { "storage",                      required_argument, NULL, ARG_STORAGE                     },
-                { "image-path",                   required_argument, NULL, ARG_IMAGE_PATH                  },
-                { "fs-type",                      required_argument, NULL, ARG_FS_TYPE                     },
-                { "luks-discard",                 required_argument, NULL, ARG_LUKS_DISCARD                },
-                { "luks-offline-discard",         required_argument, NULL, ARG_LUKS_OFFLINE_DISCARD        },
-                { "luks-cipher",                  required_argument, NULL, ARG_LUKS_CIPHER                 },
-                { "luks-cipher-mode",             required_argument, NULL, ARG_LUKS_CIPHER_MODE            },
-                { "luks-volume-key-size",         required_argument, NULL, ARG_LUKS_VOLUME_KEY_SIZE        },
-                { "luks-pbkdf-type",              required_argument, NULL, ARG_LUKS_PBKDF_TYPE             },
-                { "luks-pbkdf-hash-algorithm",    required_argument, NULL, ARG_LUKS_PBKDF_HASH_ALGORITHM   },
-                { "luks-pbkdf-force-iterations",  required_argument, NULL, ARG_LUKS_PBKDF_FORCE_ITERATIONS },
-                { "luks-pbkdf-time-cost",         required_argument, NULL, ARG_LUKS_PBKDF_TIME_COST        },
-                { "luks-pbkdf-memory-cost",       required_argument, NULL, ARG_LUKS_PBKDF_MEMORY_COST      },
-                { "luks-pbkdf-parallel-threads",  required_argument, NULL, ARG_LUKS_PBKDF_PARALLEL_THREADS },
-                { "luks-sector-size",             required_argument, NULL, ARG_LUKS_SECTOR_SIZE            },
-                { "nosuid",                       required_argument, NULL, ARG_NOSUID                      },
-                { "nodev",                        required_argument, NULL, ARG_NODEV                       },
-                { "noexec",                       required_argument, NULL, ARG_NOEXEC                      },
-                { "cifs-user-name",               required_argument, NULL, ARG_CIFS_USER_NAME              },
-                { "cifs-domain",                  required_argument, NULL, ARG_CIFS_DOMAIN                 },
-                { "cifs-service",                 required_argument, NULL, ARG_CIFS_SERVICE                },
-                { "cifs-extra-mount-options",     required_argument, NULL, ARG_CIFS_EXTRA_MOUNT_OPTIONS    },
-                { "rate-limit-interval",          required_argument, NULL, ARG_RATE_LIMIT_INTERVAL         },
-                { "rate-limit-burst",             required_argument, NULL, ARG_RATE_LIMIT_BURST            },
-                { "stop-delay",                   required_argument, NULL, ARG_STOP_DELAY                  },
-                { "kill-processes",               required_argument, NULL, ARG_KILL_PROCESSES              },
-                { "enforce-password-policy",      required_argument, NULL, ARG_ENFORCE_PASSWORD_POLICY     },
-                { "password-change-now",          required_argument, NULL, ARG_PASSWORD_CHANGE_NOW         },
-                { "password-change-min",          required_argument, NULL, ARG_PASSWORD_CHANGE_MIN         },
-                { "password-change-max",          required_argument, NULL, ARG_PASSWORD_CHANGE_MAX         },
-                { "password-change-warn",         required_argument, NULL, ARG_PASSWORD_CHANGE_WARN        },
-                { "password-change-inactive",     required_argument, NULL, ARG_PASSWORD_CHANGE_INACTIVE    },
-                { "auto-login",                   required_argument, NULL, ARG_AUTO_LOGIN                  },
-                { "session-launcher",             required_argument, NULL, ARG_SESSION_LAUNCHER,           },
-                { "session-type",                 required_argument, NULL, ARG_SESSION_TYPE,               },
-                { "json",                         required_argument, NULL, ARG_JSON                        },
-                { "export-format",                required_argument, NULL, ARG_EXPORT_FORMAT               },
-                { "pkcs11-token-uri",             required_argument, NULL, ARG_PKCS11_TOKEN_URI            },
-                { "fido2-credential-algorithm",   required_argument, NULL, ARG_FIDO2_CRED_ALG              },
-                { "fido2-device",                 required_argument, NULL, ARG_FIDO2_DEVICE                },
-                { "fido2-with-client-pin",        required_argument, NULL, ARG_FIDO2_WITH_PIN              },
-                { "fido2-with-user-presence",     required_argument, NULL, ARG_FIDO2_WITH_UP               },
-                { "fido2-with-user-verification", required_argument, NULL, ARG_FIDO2_WITH_UV               },
-                { "recovery-key",                 required_argument, NULL, ARG_RECOVERY_KEY                },
-                { "and-resize",                   required_argument, NULL, ARG_AND_RESIZE                  },
-                { "and-change-password",          required_argument, NULL, ARG_AND_CHANGE_PASSWORD         },
-                { "drop-caches",                  required_argument, NULL, ARG_DROP_CACHES                 },
-                { "luks-extra-mount-options",     required_argument, NULL, ARG_LUKS_EXTRA_MOUNT_OPTIONS    },
-                { "auto-resize-mode",             required_argument, NULL, ARG_AUTO_RESIZE_MODE            },
-                { "rebalance-weight",             required_argument, NULL, ARG_REBALANCE_WEIGHT            },
-                { "capability-bounding-set",      required_argument, NULL, ARG_CAPABILITY_BOUNDING_SET     },
-                { "capability-ambient-set",       required_argument, NULL, ARG_CAPABILITY_AMBIENT_SET      },
-                { "prompt-new-user",              no_argument,       NULL, ARG_PROMPT_NEW_USER             },
-                { "blob",                         required_argument, NULL, 'b'                             },
-                { "avatar",                       required_argument, NULL, ARG_AVATAR                      },
-                { "login-background",             required_argument, NULL, ARG_LOGIN_BACKGROUND            },
-                { "tmp-limit",                    required_argument, NULL, ARG_TMP_LIMIT                   },
-                { "dev-shm-limit",                required_argument, NULL, ARG_DEV_SHM_LIMIT               },
-                { "default-area",                 required_argument, NULL, ARG_DEFAULT_AREA                },
-                { "key-name",                     required_argument, NULL, ARG_KEY_NAME                    },
-                { "seize",                        required_argument, NULL, ARG_SEIZE                       },
-                { "match",                        required_argument, NULL, ARG_MATCH                       },
-                {}
-        };
-
         int r;
 
         /* This points to one of arg_identity_extra, arg_identity_extra_this_machine,
@@ -3374,1255 +4056,69 @@ static int parse_argv(int argc, char *argv[]) {
 
         assert(argc >= 0);
         assert(argv);
+        assert(remaining_args);
 
-        /* Eventually we should probably turn this into a proper --dry-run option, but as long as it is not hooked up everywhere let's make it an environment variable only. */
+        /* Eventually we should probably turn this into a proper --dry-run option, but as long as it is not
+         * hooked up everywhere let's make it an environment variable only. */
         r = getenv_bool("SYSTEMD_HOME_DRY_RUN");
         if (r >= 0)
                 arg_dry_run = r;
         else if (r != -ENXIO)
                 log_debug_errno(r, "Unable to parse $SYSTEMD_HOME_DRY_RUN, ignoring: %m");
 
-        for (;;) {
-                int c;
+        OptionParser opts = { argc, argv };
 
-                c = getopt_long(argc, argv, "hH:M:I:c:d:u:G:k:s:e:b:jPENAT", options, NULL);
-                if (c < 0)
-                        break;
-
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help(0, NULL, NULL);
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_NO_PAGER:
-                        arg_pager_flags |= PAGER_DISABLE;
-                        break;
-
-                case ARG_NO_LEGEND:
-                        arg_legend = false;
-                        break;
-
-                case ARG_NO_ASK_PASSWORD:
-                        arg_ask_password = false;
-                        break;
-
-                case ARG_OFFLINE:
+                OPTION_LONG("offline", NULL, "Don't update record embedded in home directory"):
                         arg_offline = true;
                         break;
 
-                case 'H':
+                OPTION_COMMON_HOST:
                         arg_transport = BUS_TRANSPORT_REMOTE;
-                        arg_host = optarg;
+                        arg_host = opts.arg;
                         break;
 
-                case 'M':
-                        r = parse_machine_argument(optarg, &arg_host, &arg_transport);
+                OPTION_COMMON_MACHINE:
+                        r = parse_machine_argument(opts.arg, &arg_host, &arg_transport);
                         if (r < 0)
                                 return r;
                         break;
 
-                case 'I':
-                        arg_identity = optarg;
+                OPTION('I', "identity", "PATH", "Read JSON identity from file"):
+                        arg_identity = opts.arg;
                         break;
 
-                case 'c':
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("realName");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        if (!valid_gecos(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Real name '%s' not a valid GECOS field.", optarg);
-
-                        r = sd_json_variant_set_field_string(match_identity ?: &arg_identity_extra, "realName", optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set realName field: %m");
-
-                        break;
-
-                case ARG_ALIAS: {
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("aliases");
-                                if (r < 0)
-                                        return r;
-                                break;
-                        }
-
-                        for (const char *p = optarg;;) {
-                                _cleanup_free_ char *word = NULL;
-
-                                r = extract_first_word(&p, &word, ",", 0);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to parse alias list: %m");
-                                if (r == 0)
-                                        break;
-
-                                if (!valid_user_group_name(word, 0))
-                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid alias user name %s.", word);
-
-                                _cleanup_(sd_json_variant_unrefp) sd_json_variant *av =
-                                        sd_json_variant_ref(sd_json_variant_by_key(arg_identity_extra, "aliases"));
-
-                                _cleanup_strv_free_ char **list = NULL;
-                                r = sd_json_variant_strv(av, &list);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to parse group list: %m");
-
-                                r = strv_extend(&list, word);
-                                if (r < 0)
-                                        return log_oom();
-
-                                strv_sort_uniq(list);
-
-                                av = sd_json_variant_unref(av);
-                                r = sd_json_variant_new_array_strv(&av, list);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to create alias list JSON: %m");
-
-                                r = sd_json_variant_set_field(&arg_identity_extra, "aliases", av);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to update alias list: %m");
-                        }
-
-                        break;
-                }
-
-                case 'd': {
-                        _cleanup_free_ char *hd = NULL;
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("homeDirectory");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = parse_path_argument(optarg, false, &hd);
-                        if (r < 0)
+                OPTION_COMMON_JSON:
+                        r = parse_json_argument(opts.arg, &arg_json_format_flags);
+                        if (r <= 0)
                                 return r;
-
-                        if (!valid_home(hd))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Home directory '%s' not valid.", hd);
-
-                        r = sd_json_variant_set_field_string(&arg_identity_extra, "homeDirectory", hd);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set homeDirectory field: %m");
-
-                        break;
-                }
-
-                case ARG_REALM:
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("realm");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = dns_name_is_valid(optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to determine whether realm '%s' is a valid DNS domain: %m", optarg);
-                        if (r == 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Realm '%s' is not a valid DNS domain.", optarg);
-
-                        r = sd_json_variant_set_field_string(&arg_identity_extra, "realm", optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set realm field: %m");
                         break;
 
-                case ARG_EMAIL_ADDRESS:
-                case ARG_LOCATION:
-                case ARG_ICON_NAME:
-                case ARG_CIFS_USER_NAME:
-                case ARG_CIFS_DOMAIN:
-                case ARG_CIFS_EXTRA_MOUNT_OPTIONS:
-                case ARG_LUKS_EXTRA_MOUNT_OPTIONS:
-                case ARG_SESSION_LAUNCHER:
-                case ARG_SESSION_TYPE: {
-
-                        const char *field =
-                                           c == ARG_EMAIL_ADDRESS ? "emailAddress" :
-                                                c == ARG_LOCATION ? "location" :
-                                               c == ARG_ICON_NAME ? "iconName" :
-                                          c == ARG_CIFS_USER_NAME ? "cifsUserName" :
-                                             c == ARG_CIFS_DOMAIN ? "cifsDomain" :
-                                c == ARG_CIFS_EXTRA_MOUNT_OPTIONS ? "cifsExtraMountOptions" :
-                                c == ARG_LUKS_EXTRA_MOUNT_OPTIONS ? "luksExtraMountOptions" :
-                                        c == ARG_SESSION_LAUNCHER ? "preferredSessionLauncher" :
-                                            c == ARG_SESSION_TYPE ? "preferredSessionType" :
-                                                                    NULL;
-
-                        assert(field);
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity(field);
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = sd_json_variant_set_field_string(match_identity ?: &arg_identity_extra, field, optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set %s field: %m", field);
-
-                        break;
-                }
-
-                case ARG_CIFS_SERVICE:
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("cifsService");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = parse_cifs_service(optarg, NULL, NULL, NULL);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to validate CIFS service name: %s", optarg);
-
-                        r = sd_json_variant_set_field_string(match_identity ?: &arg_identity_extra, "cifsService", optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set cifsService field: %m");
-
-                        break;
-
-                case ARG_PASSWORD_HINT:
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("passwordHint");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = sd_json_variant_set_field_string(&arg_identity_extra_privileged, "passwordHint", optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set passwordHint field: %m");
-
-                        string_erase(optarg);
-                        break;
-
-                case ARG_NICE: {
-                        int nc;
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("niceLevel");
-                                if (r < 0)
-                                        return r;
-                                break;
-                        }
-
-                        r = parse_nice(optarg, &nc);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse nice level: %s", optarg);
-
-                        r = sd_json_variant_set_field_integer(match_identity ?: &arg_identity_extra, "niceLevel", nc);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set niceLevel field: %m");
-
-                        break;
-                }
-
-                case ARG_RLIMIT: {
-                        _cleanup_(sd_json_variant_unrefp) sd_json_variant *jcur = NULL, *jmax = NULL;
-                        _cleanup_free_ char *field = NULL, *t = NULL;
-                        const char *eq;
-                        struct rlimit rl;
-                        int l;
-
-                        if (isempty(optarg)) {
-                                /* Remove all resource limits */
-
-                                r = drop_from_identity("resourceLimits");
-                                if (r < 0)
-                                        return r;
-
-                                arg_identity_filter_rlimits = strv_free(arg_identity_filter_rlimits);
-                                arg_identity_extra_rlimits = sd_json_variant_unref(arg_identity_extra_rlimits);
-                                break;
-                        }
-
-                        eq = strchr(optarg, '=');
-                        if (!eq)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Can't parse resource limit assignment: %s", optarg);
-
-                        field = strndup(optarg, eq - optarg);
-                        if (!field)
-                                return log_oom();
-
-                        l = rlimit_from_string_harder(field);
-                        if (l < 0)
-                                return log_error_errno(l, "Unknown resource limit type: %s", field);
-
-                        if (isempty(eq + 1)) {
-                                /* Remove only the specific rlimit */
-
-                                r = strv_extend(&arg_identity_filter_rlimits, rlimit_to_string(l));
-                                if (r < 0)
-                                        return r;
-
-                                r = sd_json_variant_filter(&arg_identity_extra_rlimits, STRV_MAKE(field));
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to filter JSON identity data: %m");
-
-                                break;
-                        }
-
-                        r = rlimit_parse(l, eq + 1, &rl);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse resource limit value: %s", eq + 1);
-
-                        r = rl.rlim_cur == RLIM_INFINITY ? sd_json_variant_new_null(&jcur) : sd_json_variant_new_unsigned(&jcur, rl.rlim_cur);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to allocate current integer: %m");
-
-                        r = rl.rlim_max == RLIM_INFINITY ? sd_json_variant_new_null(&jmax) : sd_json_variant_new_unsigned(&jmax, rl.rlim_max);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to allocate maximum integer: %m");
-
-                        t = strjoin("RLIMIT_", rlimit_to_string(l));
-                        if (!t)
-                                return log_oom();
-
-                        r = sd_json_variant_set_fieldbo(
-                                        &arg_identity_extra_rlimits, t,
-                                        SD_JSON_BUILD_PAIR("cur", SD_JSON_BUILD_VARIANT(jcur)),
-                                        SD_JSON_BUILD_PAIR("max", SD_JSON_BUILD_VARIANT(jmax)));
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set %s field: %m", rlimit_to_string(l));
-
-                        break;
-                }
-
-                case 'u': {
-                        uid_t uid;
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("uid");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = parse_uid(optarg, &uid);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse UID '%s'.", optarg);
-
-                        if (uid_is_system(uid))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "UID " UID_FMT " is in system range, refusing.", uid);
-                        if (uid_is_greeter(uid))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "UID " UID_FMT " is in greeter range, refusing.", uid);
-                        if (uid_is_dynamic(uid))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "UID " UID_FMT " is in dynamic range, refusing.", uid);
-                        if (uid == UID_NOBODY)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "UID " UID_FMT " is nobody UID, refusing.", uid);
-
-                        r = sd_json_variant_set_field_unsigned(&arg_identity_extra, "uid", uid);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set realm field: %m");
-
-                        break;
-                }
-
-                case 'k':
-                case ARG_IMAGE_PATH: {
-                        const char *field = c == 'k' ? "skeletonDirectory" : "imagePath";
-                        _cleanup_free_ char *v = NULL;
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity(field);
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = parse_path_argument(optarg, false, &v);
-                        if (r < 0)
-                                return r;
-
-                        r = sd_json_variant_set_field_string(match_identity ?: &arg_identity_extra_this_machine, field, v);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set %s field: %m", v);
-
-                        break;
-                }
-
-                case 's':
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("shell");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        if (!valid_shell(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Shell '%s' not valid.", optarg);
-
-                        r = sd_json_variant_set_field_string(match_identity ?: &arg_identity_extra, "shell", optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set shell field: %m");
-
-                        break;
-
-                case ARG_SETENV: {
-                        _cleanup_free_ char **l = NULL;
-                        _cleanup_(sd_json_variant_unrefp) sd_json_variant *ne = NULL;
-                        sd_json_variant *e;
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("environment");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        e = sd_json_variant_by_key(match_identity ? *match_identity: arg_identity_extra, "environment");
-                        if (e) {
-                                r = sd_json_variant_strv(e, &l);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to parse JSON environment field: %m");
-                        }
-
-                        r = strv_env_replace_strdup_passthrough(&l, optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Cannot assign environment variable %s: %m", optarg);
-
-                        strv_sort(l);
-
-                        r = sd_json_variant_new_array_strv(&ne, l);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to allocate environment list JSON: %m");
-
-                        r = sd_json_variant_set_field(match_identity ?: &arg_identity_extra, "environment", ne);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set environment list: %m");
-
-                        break;
-                }
-
-                case ARG_TIMEZONE:
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("timeZone");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        if (!timezone_is_valid(optarg, LOG_DEBUG))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Timezone '%s' is not valid.", optarg);
-
-                        r = sd_json_variant_set_field_string(match_identity ?: &arg_identity_extra, "timeZone", optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set timezone field: %m");
-
-                        break;
-
-                case ARG_LANGUAGE: {
-                        const char *p = optarg;
-
-                        if (isempty(p)) {
-                                r = drop_from_identity("preferredLanguage");
-                                if (r < 0)
-                                        return r;
-
-                                r = drop_from_identity("additionalLanguages");
-                                if (r < 0)
-                                        return r;
-
-                                arg_languages = strv_free(arg_languages);
-                                break;
-                        }
-
-                        for (;;) {
-                                _cleanup_free_ char *word = NULL;
-
-                                r = extract_first_word(&p, &word, ",:", 0);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to parse locale list: %m");
-                                if (r == 0)
-                                        break;
-
-                                if (!locale_is_valid(word))
-                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Locale '%s' is not valid.", word);
-
-                                if (locale_is_installed(word) <= 0)
-                                        log_warning("Locale '%s' is not installed, accepting anyway.", word);
-
-                                r = strv_consume(&arg_languages, TAKE_PTR(word));
-                                if (r < 0)
-                                        return log_oom();
-
-                                strv_uniq(arg_languages);
-                        }
-
-                        break;
-                }
-
-                case ARG_NOSUID:
-                case ARG_NODEV:
-                case ARG_NOEXEC:
-                case ARG_LOCKED:
-                case ARG_KILL_PROCESSES:
-                case ARG_ENFORCE_PASSWORD_POLICY:
-                case ARG_AUTO_LOGIN:
-                case ARG_PASSWORD_CHANGE_NOW: {
-                        const char *field =
-                                                 c == ARG_LOCKED ? "locked" :
-                                                 c == ARG_NOSUID ? "mountNoSuid" :
-                                                  c == ARG_NODEV ? "mountNoDevices" :
-                                                 c == ARG_NOEXEC ? "mountNoExecute" :
-                                         c == ARG_KILL_PROCESSES ? "killProcesses" :
-                                c == ARG_ENFORCE_PASSWORD_POLICY ? "enforcePasswordPolicy" :
-                                             c == ARG_AUTO_LOGIN ? "autoLogin" :
-                                    c == ARG_PASSWORD_CHANGE_NOW ? "passwordChangeNow" :
-                                                                   NULL;
-
-                        assert(field);
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity(field);
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = parse_boolean(optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse %s boolean: %m", field);
-
-                        r = sd_json_variant_set_field_boolean(match_identity ?: &arg_identity_extra, field, r > 0);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set %s field: %m", field);
-
-                        break;
-                }
-
-                case 'P':
-                        r = sd_json_variant_set_field_boolean(&arg_identity_extra, "enforcePasswordPolicy", false);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set enforcePasswordPolicy field: %m");
-
-                        break;
-
-                case ARG_DISK_SIZE:
-                        if (isempty(optarg)) {
-                                FOREACH_STRING(prop, "diskSize", "diskSizeRelative", "rebalanceWeight") {
-                                        r = drop_from_identity(prop);
-                                        if (r < 0)
-                                                return r;
-                                }
-
-                                arg_disk_size = arg_disk_size_relative = UINT64_MAX;
-                                break;
-                        }
-
-                        r = parse_permyriad(optarg);
-                        if (r < 0) {
-                                r = parse_disk_size(optarg, &arg_disk_size);
-                                if (r < 0)
-                                        return r;
-
-                                r = drop_from_identity("diskSizeRelative");
-                                if (r < 0)
-                                        return r;
-
-                                r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra_this_machine, "diskSize", arg_disk_size);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to set diskSize field: %m");
-
-                                arg_disk_size_relative = UINT64_MAX;
-                        } else {
-                                /* Normalize to UINT32_MAX == 100% */
-                                arg_disk_size_relative = UINT32_SCALE_FROM_PERMYRIAD(r);
-
-                                r = drop_from_identity("diskSize");
-                                if (r < 0)
-                                        return r;
-
-                                r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra_this_machine, "diskSizeRelative", arg_disk_size_relative);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to set diskSizeRelative field: %m");
-
-                                arg_disk_size = UINT64_MAX;
-                        }
-
-                        /* Automatically turn off the rebalance logic if user configured a size explicitly */
-                        r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra_this_machine, "rebalanceWeight", REBALANCE_WEIGHT_OFF);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set rebalanceWeight field: %m");
-
-                        break;
-
-                case ARG_ACCESS_MODE: {
-                        mode_t mode;
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("accessMode");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = parse_mode(optarg, &mode);
-                        if (r < 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Access mode '%s' not valid.", optarg);
-
-                        r = sd_json_variant_set_field_unsigned(&arg_identity_extra, "accessMode", mode);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set access mode field: %m");
-
-                        break;
-                }
-
-                case ARG_LUKS_DISCARD:
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("luksDiscard");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = parse_boolean(optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse --luks-discard= parameter: %s", optarg);
-
-                        r = sd_json_variant_set_field_boolean(match_identity ?: &arg_identity_extra, "luksDiscard", r);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set discard field: %m");
-
-                        break;
-
-                case ARG_LUKS_OFFLINE_DISCARD:
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("luksOfflineDiscard");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = parse_boolean(optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse --luks-offline-discard= parameter: %s", optarg);
-
-                        r = sd_json_variant_set_field_boolean(match_identity ?: &arg_identity_extra, "luksOfflineDiscard", r);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set offline discard field: %m");
-
-                        break;
-
-                case ARG_LUKS_VOLUME_KEY_SIZE:
-                case ARG_LUKS_PBKDF_FORCE_ITERATIONS:
-                case ARG_LUKS_PBKDF_PARALLEL_THREADS:
-                case ARG_RATE_LIMIT_BURST: {
-                        const char *field =
-                                       c == ARG_LUKS_VOLUME_KEY_SIZE ? "luksVolumeKeySize" :
-                                c == ARG_LUKS_PBKDF_FORCE_ITERATIONS ? "luksPbkdfForceIterations" :
-                                c == ARG_LUKS_PBKDF_PARALLEL_THREADS ? "luksPbkdfParallelThreads" :
-                                           c == ARG_RATE_LIMIT_BURST ? "rateLimitBurst" : NULL;
-                        unsigned n;
-
-                        assert(field);
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity(field);
-                                if (r < 0)
-                                        return r;
-                        }
-
-                        r = safe_atou(optarg, &n);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse %s parameter: %s", field, optarg);
-
-                        r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra, field, n);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set %s field: %m", field);
-
-                        break;
-                }
-
-                case ARG_LUKS_SECTOR_SIZE: {
-                        uint64_t ss;
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("luksSectorSize");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = parse_sector_size(optarg, &ss);
-                        if (r < 0)
-                                return r;
-
-                        r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra, "luksSectorSize", ss);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set sector size field: %m");
-
-                        break;
-                }
-
-                case ARG_UMASK: {
-                        mode_t m;
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("umask");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = parse_mode(optarg, &m);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse umask: %m");
-
-                        r = sd_json_variant_set_field_integer(match_identity ?: &arg_identity_extra, "umask", m);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set umask field: %m");
-
-                        break;
-                }
-
-                case ARG_SSH_AUTHORIZED_KEYS: {
-                        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
-                        _cleanup_strv_free_ char **l = NULL, **add = NULL;
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("sshAuthorizedKeys");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        if (optarg[0] == '@') {
-                                _cleanup_fclose_ FILE *f = NULL;
-
-                                /* If prefixed with '@' read from a file */
-
-                                f = fopen(optarg+1, "re");
-                                if (!f)
-                                        return log_error_errno(errno, "Failed to open '%s': %m", optarg+1);
-
-                                for (;;) {
-                                        _cleanup_free_ char *line = NULL;
-
-                                        r = read_line(f, LONG_LINE_MAX, &line);
-                                        if (r < 0)
-                                                return log_error_errno(r, "Failed to read from '%s': %m", optarg+1);
-                                        if (r == 0)
-                                                break;
-
-                                        if (isempty(line))
-                                                continue;
-
-                                        if (line[0] == '#')
-                                                continue;
-
-                                        r = strv_consume(&add, TAKE_PTR(line));
-                                        if (r < 0)
-                                                return log_oom();
-                                }
-                        } else {
-                                /* Otherwise, assume it's a literal key. Let's do some superficial checks
-                                 * before accept it though. */
-
-                                if (string_has_cc(optarg, NULL))
-                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Authorized key contains control characters, refusing.");
-                                if (optarg[0] == '#')
-                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Specified key is a comment?");
-
-                                add = strv_new(optarg);
-                                if (!add)
-                                        return log_oom();
-                        }
-
-                        v = sd_json_variant_ref(sd_json_variant_by_key(arg_identity_extra_privileged, "sshAuthorizedKeys"));
-                        if (v) {
-                                r = sd_json_variant_strv(v, &l);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to parse SSH authorized keys list: %m");
-                        }
-
-                        r = strv_extend_strv_consume(&l, TAKE_PTR(add), /* filter_duplicates = */ true);
-                        if (r < 0)
-                                return log_oom();
-
-                        v = sd_json_variant_unref(v);
-
-                        r = sd_json_variant_new_array_strv(&v, l);
-                        if (r < 0)
-                                return log_oom();
-
-                        r = sd_json_variant_set_field(&arg_identity_extra_privileged, "sshAuthorizedKeys", v);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set authorized keys: %m");
-
-                        break;
-                }
-
-                case ARG_NOT_BEFORE:
-                case ARG_NOT_AFTER:
-                case 'e': {
-                        const char *field;
-                        usec_t n;
-
-                        field =           c == ARG_NOT_BEFORE ? "notBeforeUSec" :
-                                IN_SET(c, ARG_NOT_AFTER, 'e') ? "notAfterUSec" : NULL;
-
-                        assert(field);
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity(field);
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        /* Note the minor discrepancy regarding -e parsing here: we support that for compat
-                         * reasons, and in the original useradd(8) implementation it accepts dates in the
-                         * format YYYY-MM-DD. Coincidentally, we accept dates formatted like that too, but
-                         * with greater precision. */
-                        r = parse_timestamp(optarg, &n);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse %s parameter: %m", field);
-
-                        r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra, field, n);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set %s field: %m", field);
-                        break;
-                }
-
-                case ARG_PASSWORD_CHANGE_MIN:
-                case ARG_PASSWORD_CHANGE_MAX:
-                case ARG_PASSWORD_CHANGE_WARN:
-                case ARG_PASSWORD_CHANGE_INACTIVE: {
-                        const char *field;
-                        usec_t n;
-
-                        field =      c == ARG_PASSWORD_CHANGE_MIN ? "passwordChangeMinUSec" :
-                                     c == ARG_PASSWORD_CHANGE_MAX ? "passwordChangeMaxUSec" :
-                                    c == ARG_PASSWORD_CHANGE_WARN ? "passwordChangeWarnUSec" :
-                                c == ARG_PASSWORD_CHANGE_INACTIVE ? "passwordChangeInactiveUSec" :
-                                                                    NULL;
-
-                        assert(field);
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity(field);
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = parse_sec(optarg, &n);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse %s parameter: %m", field);
-
-                        r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra, field, n);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set %s field: %m", field);
-                        break;
-                }
-
-                case ARG_STORAGE:
-                case ARG_FS_TYPE:
-                case ARG_LUKS_CIPHER:
-                case ARG_LUKS_CIPHER_MODE:
-                case ARG_LUKS_PBKDF_TYPE:
-                case ARG_LUKS_PBKDF_HASH_ALGORITHM: {
-
-                        const char *field =
-                                                  c == ARG_STORAGE ? "storage" :
-                                                  c == ARG_FS_TYPE ? "fileSystemType" :
-                                              c == ARG_LUKS_CIPHER ? "luksCipher" :
-                                         c == ARG_LUKS_CIPHER_MODE ? "luksCipherMode" :
-                                          c == ARG_LUKS_PBKDF_TYPE ? "luksPbkdfType" :
-                                c == ARG_LUKS_PBKDF_HASH_ALGORITHM ? "luksPbkdfHashAlgorithm" : NULL;
-
-                        assert(field);
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity(field);
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        if (!string_is_safe(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Parameter for %s field not valid: %s", field, optarg);
-
-                        r = sd_json_variant_set_field_string(
-                                        match_identity ?: (IN_SET(c, ARG_STORAGE, ARG_FS_TYPE) ?
-                                                           &arg_identity_extra_this_machine :
-                                                           &arg_identity_extra), field, optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set %s field: %m", field);
-
-                        break;
-                }
-
-                case ARG_LUKS_PBKDF_TIME_COST:
-                case ARG_RATE_LIMIT_INTERVAL:
-                case ARG_STOP_DELAY: {
-                        const char *field =
-                                c == ARG_LUKS_PBKDF_TIME_COST ? "luksPbkdfTimeCostUSec" :
-                                 c == ARG_RATE_LIMIT_INTERVAL ? "rateLimitIntervalUSec" :
-                                          c == ARG_STOP_DELAY ? "stopDelayUSec" :
-                                                                NULL;
-                        usec_t t;
-
-                        assert(field);
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity(field);
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = parse_sec(optarg, &t);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse %s field: %s", field, optarg);
-
-                        r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra, field, t);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set %s field: %m", field);
-
-                        break;
-                }
-
-                case 'G': {
-                        const char *p = optarg;
-
-                        if (isempty(p)) {
-                                r = drop_from_identity("memberOf");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        for (;;) {
-                                _cleanup_(sd_json_variant_unrefp) sd_json_variant *mo = NULL;
-                                _cleanup_strv_free_ char **list = NULL;
-                                _cleanup_free_ char *word = NULL;
-
-                                r = extract_first_word(&p, &word, ",", 0);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to parse group list: %m");
-                                if (r == 0)
-                                        break;
-
-                                if (!valid_user_group_name(word, 0))
-                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid group name %s.", word);
-
-                                mo = sd_json_variant_ref(sd_json_variant_by_key(arg_identity_extra, "memberOf"));
-
-                                r = sd_json_variant_strv(mo, &list);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to parse group list: %m");
-
-                                r = strv_extend(&list, word);
-                                if (r < 0)
-                                        return log_oom();
-
-                                strv_sort_uniq(list);
-
-                                mo = sd_json_variant_unref(mo);
-                                r = sd_json_variant_new_array_strv(&mo, list);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to create group list JSON: %m");
-
-                                r = sd_json_variant_set_field(match_identity ?: &arg_identity_extra, "memberOf", mo);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to update group list: %m");
-                        }
-
-                        break;
-                }
-
-                case ARG_TASKS_MAX: {
-                        uint64_t u;
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("tasksMax");
-                                if (r < 0)
-                                        return r;
-                                break;
-                        }
-
-                        r = safe_atou64(optarg, &u);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse --tasks-max= parameter: %s", optarg);
-
-                        r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra, "tasksMax", u);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set tasksMax field: %m");
-
-                        break;
-                }
-
-                case ARG_MEMORY_MAX:
-                case ARG_MEMORY_HIGH:
-                case ARG_LUKS_PBKDF_MEMORY_COST: {
-                        const char *field =
-                                            c == ARG_MEMORY_MAX ? "memoryMax" :
-                                           c == ARG_MEMORY_HIGH ? "memoryHigh" :
-                                c == ARG_LUKS_PBKDF_MEMORY_COST ? "luksPbkdfMemoryCost" : NULL;
-
-                        uint64_t u;
-
-                        assert(field);
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity(field);
-                                if (r < 0)
-                                        return r;
-                                break;
-                        }
-
-                        r = parse_size(optarg, 1024, &u);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse %s parameter: %s", field, optarg);
-
-                        r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra_this_machine, field, u);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set %s field: %m", field);
-
-                        break;
-                }
-
-                case ARG_CPU_WEIGHT:
-                case ARG_IO_WEIGHT: {
-                        const char *field = c == ARG_CPU_WEIGHT ? "cpuWeight" :
-                                            c == ARG_IO_WEIGHT ? "ioWeight" : NULL;
-                        uint64_t u;
-
-                        assert(field);
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity(field);
-                                if (r < 0)
-                                        return r;
-                                break;
-                        }
-
-                        r = safe_atou64(optarg, &u);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse --cpu-weight=/--io-weight= parameter: %s", optarg);
-
-                        if (!CGROUP_WEIGHT_IS_OK(u))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Weight %" PRIu64 " is out of valid weight range.", u);
-
-                        r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra, field, u);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set %s field: %m", field);
-
-                        break;
-                }
-
-                case ARG_PKCS11_TOKEN_URI:
-                        if (streq(optarg, "list"))
-                                return pkcs11_list_tokens();
-
-                        /* If --pkcs11-token-uri= is specified we always drop everything old */
-                        FOREACH_STRING(p, "pkcs11TokenUri", "pkcs11EncryptedKey") {
-                                r = drop_from_identity(p);
-                                if (r < 0)
-                                        return r;
-                        }
-
-                        if (isempty(optarg)) {
-                                arg_pkcs11_token_uri = strv_free(arg_pkcs11_token_uri);
-                                break;
-                        }
-
-                        if (streq(optarg, "auto")) {
-                                _cleanup_free_ char *found = NULL;
-
-                                r = pkcs11_find_token_auto(&found);
-                                if (r < 0)
-                                        return r;
-                                r = strv_consume(&arg_pkcs11_token_uri, TAKE_PTR(found));
-                        } else {
-                                if (!pkcs11_uri_valid(optarg))
-                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Not a valid PKCS#11 URI: %s", optarg);
-
-                                r = strv_extend(&arg_pkcs11_token_uri, optarg);
-                        }
-                        if (r < 0)
-                                return r;
-
-                        strv_uniq(arg_pkcs11_token_uri);
-                        break;
-
-                case ARG_FIDO2_CRED_ALG:
-                        r = parse_fido2_algorithm(optarg, &arg_fido2_cred_alg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse COSE algorithm: %s", optarg);
-                        break;
-
-                case ARG_FIDO2_DEVICE:
-                        if (streq(optarg, "list"))
-                                return fido2_list_devices();
-
-                        FOREACH_STRING(p, "fido2HmacCredential", "fido2HmacSalt") {
-                                r = drop_from_identity(p);
-                                if (r < 0)
-                                        return r;
-                        }
-
-                        if (isempty(optarg)) {
-                                arg_fido2_device = strv_free(arg_fido2_device);
-                                break;
-                        }
-
-                        if (streq(optarg, "auto")) {
-                                _cleanup_free_ char *found = NULL;
-
-                                r = fido2_find_device_auto(&found);
-                                if (r < 0)
-                                        return r;
-
-                                r = strv_consume(&arg_fido2_device, TAKE_PTR(found));
-                        } else
-                                r = strv_extend(&arg_fido2_device, optarg);
-                        if (r < 0)
-                                return r;
-
-                        strv_uniq(arg_fido2_device);
-                        break;
-
-                case ARG_FIDO2_WITH_PIN:
-                        r = parse_boolean_argument("--fido2-with-client-pin=", optarg, NULL);
-                        if (r < 0)
-                                return r;
-
-                        SET_FLAG(arg_fido2_lock_with, FIDO2ENROLL_PIN, r);
-                        break;
-
-                case ARG_FIDO2_WITH_UP:
-                        r = parse_boolean_argument("--fido2-with-user-presence=", optarg, NULL);
-                        if (r < 0)
-                                return r;
-
-                        SET_FLAG(arg_fido2_lock_with, FIDO2ENROLL_UP, r);
-                        break;
-
-                case ARG_FIDO2_WITH_UV:
-                        r = parse_boolean_argument("--fido2-with-user-verification=", optarg, NULL);
-                        if (r < 0)
-                                return r;
-
-                        SET_FLAG(arg_fido2_lock_with, FIDO2ENROLL_UV, r);
-                        break;
-
-                case ARG_RECOVERY_KEY:
-                        r = parse_boolean(optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse --recovery-key= argument: %s", optarg);
-
-                        arg_recovery_key = r;
-
-                        FOREACH_STRING(p, "recoveryKey", "recoveryKeyType") {
-                                r = drop_from_identity(p);
-                                if (r < 0)
-                                        return r;
-                        }
-
-                        break;
-
-                case ARG_AUTO_RESIZE_MODE:
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("autoResizeMode");
-                                if (r < 0)
-                                        return r;
-
-                                break;
-                        }
-
-                        r = auto_resize_mode_from_string(optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse --auto-resize-mode= argument: %s", optarg);
-
-                        r = sd_json_variant_set_field_string(match_identity ?: &arg_identity_extra, "autoResizeMode", auto_resize_mode_to_string(r));
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set autoResizeMode field: %m");
-
-                        break;
-
-                case ARG_REBALANCE_WEIGHT: {
-                        uint64_t u;
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("rebalanceWeight");
-                                if (r < 0)
-                                        return r;
-                                break;
-                        }
-
-                        if (streq(optarg, "off"))
-                                u = REBALANCE_WEIGHT_OFF;
-                        else {
-                                r = safe_atou64(optarg, &u);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to parse --rebalance-weight= argument: %s", optarg);
-
-                                if (u < REBALANCE_WEIGHT_MIN || u > REBALANCE_WEIGHT_MAX)
-                                        return log_error_errno(SYNTHETIC_ERRNO(ERANGE), "Rebalancing weight out of valid range %" PRIu64 "%s%" PRIu64 ": %s",
-                                                               REBALANCE_WEIGHT_MIN, glyph(GLYPH_ELLIPSIS), REBALANCE_WEIGHT_MAX, optarg);
-                        }
-
-                        /* Drop from per machine stuff and everywhere */
-                        r = drop_from_identity("rebalanceWeight");
-                        if (r < 0)
-                                return r;
-
-                        /* Add to main identity */
-                        r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra, "rebalanceWeight", u);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set rebalanceWeight field: %m");
-
-                        break;
-                }
-
-                case 'j':
+                OPTION_COMMON_LOWERCASE_J:
                         arg_json_format_flags = SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO;
                         break;
 
-                case ARG_JSON:
-                        r = parse_json_argument(optarg, &arg_json_format_flags);
-                        if (r <= 0)
-                                return r;
+                OPTION_LONG("export-format", "FORMAT",
+                            "Strip JSON inspection data (full, stripped, minimal)"):
+                        if (streq(opts.arg, "help"))
+                                return DUMP_STRING_TABLE(export_format, ExportFormat, _EXPORT_FORMAT_MAX);
+
+                        arg_export_format = export_format_from_string(opts.arg);
+                        if (arg_export_format < 0)
+                                return log_error_errno(arg_export_format, "Invalid export format: %s", opts.arg);
 
                         break;
 
-                case 'E':
+                OPTION_SHORT('E', NULL, "Same as -j --export-format=stripped"): {}
+                OPTION_HELP_VERBATIM("-EE", "Same as -j --export-format=minimal"):
                         if (arg_export_format == EXPORT_FORMAT_FULL)
                                 arg_export_format = EXPORT_FORMAT_STRIPPED;
                         else if (arg_export_format == EXPORT_FORMAT_STRIPPED)
@@ -4635,159 +4131,334 @@ static int parse_argv(int argc, char *argv[]) {
                                 arg_json_format_flags = SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO;
                         break;
 
-                case ARG_EXPORT_FORMAT:
-                        if (streq(optarg, "full"))
-                                arg_export_format = EXPORT_FORMAT_FULL;
-                        else if (streq(optarg, "stripped"))
-                                arg_export_format = EXPORT_FORMAT_STRIPPED;
-                        else if (streq(optarg, "minimal"))
-                                arg_export_format = EXPORT_FORMAT_MINIMAL;
-                        else if (streq(optarg, "help")) {
-                                puts("full\n"
-                                     "stripped\n"
-                                     "minimal");
-                                return 0;
-                        }
+                OPTION_LONG("key-name", "NAME", "Key name when adding a signing key"):
+                        if (!isempty(opts.arg) && !filename_is_valid(opts.arg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Parameter for --key-name= not a valid filename: %s", opts.arg);
 
-                        break;
-
-                case ARG_AND_RESIZE:
-                        arg_and_resize = true;
-                        break;
-
-                case ARG_AND_CHANGE_PASSWORD:
-                        arg_and_change_password = true;
-                        break;
-
-                case ARG_DROP_CACHES: {
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("dropCaches");
-                                if (r < 0)
-                                        return r;
-                                break;
-                        }
-
-                        r = parse_boolean_argument("--drop-caches=", optarg, NULL);
+                        r = free_and_strdup_warn(&arg_key_name, empty_to_null(opts.arg));
                         if (r < 0)
                                 return r;
-
-                        r = sd_json_variant_set_field_boolean(match_identity ?: &arg_identity_extra, "dropCaches", r);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set drop caches field: %m");
-
                         break;
-                }
 
-                case ARG_CAPABILITY_AMBIENT_SET:
-                case ARG_CAPABILITY_BOUNDING_SET: {
-                        _cleanup_strv_free_ char **l = NULL;
-                        bool subtract = false;
-                        uint64_t parsed, *which, updated;
-                        const char *p, *field;
-
-                        if (c == ARG_CAPABILITY_AMBIENT_SET) {
-                                which = &arg_capability_ambient_set;
-                                field = "capabilityAmbientSet";
-                        } else {
-                                assert(c == ARG_CAPABILITY_BOUNDING_SET);
-                                which = &arg_capability_bounding_set;
-                                field = "capabilityBoundingSet";
-                        }
-
-                        if (isempty(optarg)) {
-                                r = drop_from_identity(field);
-                                if (r < 0)
-                                        return r;
-
-                                *which = UINT64_MAX;
-                                break;
-                        }
-
-                        p = optarg;
-                        if (*p == '~') {
-                                subtract = true;
-                                p++;
-                        }
-
-                        r = capability_set_from_string(p, &parsed);
-                        if (r == 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid capabilities in capability string '%s'.", p);
+                OPTION_LONG("seize", "BOOL",
+                            "Whether to strip existing signatures of user record when creating"):
+                        r = parse_boolean_argument("--seize=", opts.arg, &arg_seize);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse capability string '%s': %m", p);
-
-                        if (*which == UINT64_MAX)
-                                updated = subtract ? all_capabilities() & ~parsed : parsed;
-                        else if (subtract)
-                                updated = *which & ~parsed;
-                        else
-                                updated = *which | parsed;
-
-                        if (capability_set_to_strv(updated, &l) < 0)
-                                return log_oom();
-
-                        r = sd_json_variant_set_field_strv(match_identity ?: &arg_identity_extra, field, l);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set %s field: %m", field);
-
-                        *which = updated;
+                                return r;
                         break;
-                }
 
-                case ARG_PROMPT_NEW_USER:
+                OPTION_LONG("prompt-new-user", NULL,
+                            "firstboot: Query user interactively for user to create"):
                         arg_prompt_new_user = true;
                         break;
 
-                case 'b':
-                case ARG_AVATAR:
-                case ARG_LOGIN_BACKGROUND: {
+                OPTION_LONG("prompt-groups", "BOOL",
+                            "In first-boot mode, don't prompt for auxiliary group memberships"):
+                        r = parse_boolean_argument("--prompt-groups=", opts.arg, &arg_prompt_groups);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("prompt-shell", "BOOL",
+                            "In first-boot mode, don't prompt for shells"):
+                        r = parse_boolean_argument("--prompt-shell=", opts.arg, &arg_prompt_shell);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("chrome", "BOOL",
+                            "In first-boot mode, don't show colour bar at top and bottom of terminal"):
+                        r = parse_boolean_argument("--chrome=", opts.arg, &arg_chrome);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("mute-console", "BOOL",
+                            "In first-boot mode, tell kernel/PID 1 to not write to the console while running"):
+                        r = parse_boolean_argument("--mute-console=", opts.arg, &arg_mute_console);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_COMMON_NO_PAGER:
+                        arg_pager_flags |= PAGER_DISABLE;
+                        break;
+
+                OPTION_COMMON_NO_LEGEND:
+                        arg_legend = false;
+                        break;
+
+                OPTION_COMMON_NO_ASK_PASSWORD:
+                        arg_ask_password = false;
+                        break;
+
+                OPTION_GROUP("General User Record Properties"): {}
+
+                OPTION('c', "real-name", "REALNAME", "Real name for user"): {}
+                OPTION_LONG("comment", "REALNAME", /* help= */ NULL): /* Compat alias to keep things in sync with useradd(8) */
+                        if (!isempty(opts.arg) && !valid_gecos(opts.arg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Invalid GECOS field '%s'.", opts.arg);
+
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "realName", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("realm", "REALM", "Realm to create user in"):
+                        r = parse_realm_field(&arg_identity_extra, "realm", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("alias", "ALIAS", "Define alias usernames for this account"):
+                        r = parse_group_field(&arg_identity_extra, "aliases", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("email-address", "EMAIL", "Email address for user"):
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "emailAddress", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("location", "LOCATION", "Set location of user on earth"):
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "location", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG_FLAGS(OPTION_OPTIONAL_ARG, "birth-date", "DATE",
+                                  "Set user birth date (YYYY-MM-DD)"):
+                        if (isempty(opts.arg)) {
+                                r = drop_from_identity("birthDate");
+                                if (r < 0)
+                                        return r;
+                        } else {
+                                r = parse_birth_date(opts.arg, /* ret= */ NULL);
+                                if (r < 0)
+                                        return log_error_errno(r, "Invalid birth date (expected YYYY-MM-DD): %s", opts.arg);
+
+                                r = parse_string_field(&arg_identity_extra, "birthDate", opts.arg);
+                                if (r < 0)
+                                        return r;
+                        }
+                        break;
+
+                OPTION_LONG("icon-name", "NAME", "Icon name for user"):
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "iconName", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION('d', "home-dir", "PATH", "Home directory"): /* Compatible with useradd(8) */
+                        r = parse_home_directory_field(&arg_identity_extra, "homeDirectory", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION('u', "uid", "UID", "Numeric UID for user"): /* Compatible with useradd(8) */
+                        r = parse_uid_field(&arg_identity_extra, "uid", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION('G', "member-of", "GROUP", "Add user to group"): {}
+                OPTION_LONG("groups", "GROUP", /* help= */ NULL): /* Compat alias to keep things in sync with useradd(8) */
+                        r = parse_group_field(match_identity ?: &arg_identity_extra, "memberOf", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("capability-bounding-set", "CAPS", "Bounding POSIX capability set"):
+                        r = parse_capability_set_field(match_identity ?: &arg_identity_extra,
+                                                       &arg_capability_bounding_set,
+                                                       "capabilityBoundingSet", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("capability-ambient-set", "CAPS", "Ambient POSIX capability set"):
+                        r = parse_capability_set_field(match_identity ?: &arg_identity_extra,
+                                                       &arg_capability_ambient_set,
+                                                       "capabilityAmbientSet", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("access-mode", "MODE", "User home directory access mode"):
+                        r = parse_mode_field(&arg_identity_extra, "accessMode", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("umask", "MODE", "Umask for user when logging in"):
+                        r = parse_mode_field(match_identity ?: &arg_identity_extra, "umask", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION('k', "skel", "PATH", "Skeleton directory to use"): /* Compatible with useradd(8) */
+                        r = parse_path_field(match_identity ?: &arg_identity_extra_this_machine, "skeletonDirectory", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION('s', "shell", "PATH", "Shell for account"): /* Compatible with useradd(8) */
+                        if (!isempty(opts.arg) && !valid_shell(opts.arg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Shell '%s' not valid.", opts.arg);
+
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "shell", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("setenv", "VARIABLE[=VALUE]", "Set an environment variable at log-in"):
+                        r = parse_environment_field(match_identity ?: &arg_identity_extra, "environment", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("timezone", "TIMEZONE", "Set a time-zone"):
+                        if (!isempty(opts.arg) && !timezone_is_valid(opts.arg, LOG_DEBUG))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Timezone '%s' is not valid.", opts.arg);
+
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "timeZone", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("language", "LOCALE", "Set preferred languages"):
+                        r = parse_language_field(&arg_languages, opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("default-area", "AREA", "Select default area"):
+                        r = parse_filename_field(match_identity ?: &arg_identity_extra, "defaultArea", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_GROUP("Authentication User Record Properties"): {}
+
+                OPTION_LONG("ssh-authorized-keys", "KEYS", "Specify SSH public keys"):
+                        r = parse_ssh_authorized_keys(&arg_identity_extra_privileged, "sshAuthorizedKeys", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("pkcs11-token-uri", "URI",
+                            "URI to PKCS#11 security token containing private key and matching X.509 certificate"):
+                        r = parse_pkcs11_token_uri_field(opts.arg);
+                        if (r <= 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("fido2-device", "PATH",
+                            "Path to FIDO2 hidraw device with hmac-secret extension"):
+                        r = parse_fido2_device_field(opts.arg);
+                        if (r <= 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("fido2-with-client-pin", "BOOL",
+                            "Whether to require entering a PIN to unlock the account"):
+                        r = parse_boolean_argument("--fido2-with-client-pin=", opts.arg, NULL);
+                        if (r < 0)
+                                return r;
+
+                        SET_FLAG(arg_fido2_lock_with, FIDO2ENROLL_PIN, r);
+                        break;
+
+                OPTION_LONG("fido2-with-user-presence", "BOOL",
+                            "Whether to require user presence to unlock the account"):
+                        r = parse_boolean_argument("--fido2-with-user-presence=", opts.arg, NULL);
+                        if (r < 0)
+                                return r;
+
+                        SET_FLAG(arg_fido2_lock_with, FIDO2ENROLL_UP, r);
+                        break;
+
+                OPTION_LONG("fido2-with-user-verification", "BOOL",
+                            "Whether to require user verification to unlock the account"):
+                        r = parse_boolean_argument("--fido2-with-user-verification=", opts.arg, NULL);
+                        if (r < 0)
+                                return r;
+
+                        SET_FLAG(arg_fido2_lock_with, FIDO2ENROLL_UV, r);
+                        break;
+
+                OPTION_LONG("recovery-key", "BOOL", "Add a recovery key"):
+                        r = parse_boolean(opts.arg);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse --recovery-key= argument: %s", opts.arg);
+                        arg_recovery_key = r;
+
+                        r = drop_from_identity("recoveryKey", "recoveryKeyType");
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("recovery-key-file", "PATH", "Write the generated recovery key to a file"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_recovery_key_file);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_GROUP("Blob Directory User Record Properties"): {}
+
+                OPTION('b', "blob", "[FILENAME=]PATH",
+                       "Path to a replacement blob directory, or replace an individual files in the blob directory"): {}
+                OPTION_LONG("avatar", "PATH", "Path to user avatar picture"): {}
+                OPTION_LONG("login-background", "PATH", "Path to user login background picture"): {
                         _cleanup_close_ int fd = -EBADF;
                         _cleanup_free_ char *path = NULL, *filename = NULL;
+                        const char *long_code = opts.opt->long_code;
 
-                        if (c == 'b') {
-                                char *eq;
+                        if (streq(long_code, "blob")) {
+                                const char *eq;
 
-                                if (isempty(optarg)) { /* --blob= deletes everything, including existing blob dirs */
+                                if (isempty(opts.arg)) { /* --blob= deletes everything, including existing blob dirs */
                                         hashmap_clear(arg_blob_files);
                                         arg_blob_dir = mfree(arg_blob_dir);
                                         arg_blob_clear = true;
                                         break;
                                 }
 
-                                eq = strrchr(optarg, '=');
+                                eq = strrchr(opts.arg, '=');
                                 if (!eq) { /* --blob=/some/path replaces the blob dir */
-                                        r = parse_path_argument(optarg, false, &arg_blob_dir);
+                                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_blob_dir);
                                         if (r < 0)
-                                                return log_error_errno(r, "Failed to parse path %s: %m", optarg);
+                                                return r;
                                         break;
                                 }
 
                                 /* --blob=filename=/some/path replaces the file "filename" with /some/path */
-                                filename = strndup(optarg, eq - optarg);
+                                filename = strndup(opts.arg, eq - opts.arg);
                                 if (!filename)
                                         return log_oom();
 
                                 if (isempty(filename))
-                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Can't parse blob file assignment: %s", optarg);
+                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Can't parse blob file assignment: %s", opts.arg);
                                 if (!suitable_blob_filename(filename))
                                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid blob filename: %s", filename);
 
-                                r = parse_path_argument(eq + 1, false, &path);
+                                r = parse_path_argument(eq + 1, /* suppress_root= */ false, &path);
                                 if (r < 0)
-                                        return log_error_errno(r, "Failed to parse path %s: %m", eq + 1);
+                                        return r;
                         } else {
-                                const char *well_known_filename =
-                                                  c == ARG_AVATAR ? "avatar" :
-                                        c == ARG_LOGIN_BACKGROUND ? "login-background" :
-                                                                    NULL;
-                                assert(well_known_filename);
-
-                                filename = strdup(well_known_filename);
+                                filename = strdup(long_code);
                                 if (!filename)
                                         return log_oom();
 
-                                r = parse_path_argument(optarg, false, &path);
+                                r = parse_path_argument(opts.arg, /* suppress_root= */ false, &path);
                                 if (r < 0)
-                                        return log_error_errno(r, "Failed to parse path %s: %m", optarg);
+                                        return r;
                         }
 
                         if (path) {
@@ -4809,131 +4480,423 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                case ARG_TMP_LIMIT:
-                case ARG_DEV_SHM_LIMIT: {
-                        const char *field =
-                                    c == ARG_TMP_LIMIT ? "tmpLimit" :
-                                c == ARG_DEV_SHM_LIMIT ? "devShmLimit" : NULL;
-                        const char *field_scale =
-                                    c == ARG_TMP_LIMIT ? "tmpLimitScale" :
-                                c == ARG_DEV_SHM_LIMIT ? "devShmLimitScale" : NULL;
+                OPTION_GROUP("Account Management User Record Properties"): {}
 
-                        assert(field);
-                        assert(field_scale);
+                OPTION_LONG("locked", "BOOL", "Set locked account state"):
+                        r = parse_boolean_field(match_identity ?: &arg_identity_extra, "locked", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
 
-                        if (isempty(optarg)) {
-                                r = drop_from_identity(field);
-                                if (r < 0)
-                                        return r;
-                                r = drop_from_identity(field_scale);
-                                if (r < 0)
-                                        return r;
-                                break;
-                        }
+                OPTION_LONG("not-before", "TIMESTAMP", "Do not allow logins before"): {}
+                OPTION_LONG("not-after", "TIMESTAMP", "Do not allow logins after"): {}
+                OPTION_LONG("expiredate", "TIMESTAMP", /* help= */ NULL): /* Compat alias for -e to keep things in sync with useradd(8) */ {
+                        const char *field = streq(opts.opt->long_code, "not-before") ? "notBeforeUSec" : "notAfterUSec";
 
-                        r = parse_permyriad(optarg);
-                        if (r < 0) {
-                                uint64_t u;
-
-                                r = parse_size(optarg, 1024, &u);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to parse %s/%s parameter: %s", field, field_scale, optarg);
-
-                                r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra, field, u);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to set %s field: %m", field);
-
-                                r = drop_from_identity(field_scale);
-                                if (r < 0)
-                                        return r;
-                        } else {
-                                r = sd_json_variant_set_field_unsigned(match_identity ?: &arg_identity_extra, field_scale, UINT32_SCALE_FROM_PERMYRIAD(r));
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to set %s field: %m", field_scale);
-
-                                r = drop_from_identity(field);
-                                if (r < 0)
-                                        return r;
-                        }
-
+                        r = parse_timestamp_field(match_identity ?: &arg_identity_extra, field, opts.arg);
+                        if (r < 0)
+                                return r;
                         break;
                 }
 
-                case ARG_DEFAULT_AREA:
-                        if (isempty(optarg)) {
-                                r = drop_from_identity("defaultArea");
+                OPTION_SHORT('e', "TIMESTAMP", /* help= */ NULL): /* -e alias for --expiredate */
+                        r = parse_timestamp_field(match_identity ?: &arg_identity_extra, "notAfterUSec", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("rate-limit-interval", "SECS", "Login rate-limit interval in seconds"):
+                        r = parse_time_field(match_identity ?: &arg_identity_extra, "rateLimitIntervalUSec", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("rate-limit-burst", "NUMBER", "Login rate-limit attempts per interval"):
+                        r = parse_unsigned_field(match_identity ?: &arg_identity_extra, "rateLimitBurst", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_GROUP("Password Policy User Record Properties"): {}
+
+                OPTION_LONG("password-hint", "HINT", "Set Password hint"):
+                        r = parse_string_field(&arg_identity_extra_privileged, "passwordHint", opts.arg);
+                        if (r < 0)
+                                return r;
+
+                        string_erase((char *) opts.arg);
+                        break;
+
+                OPTION_LONG("enforce-password-policy", "BOOL",
+                            "Control whether to enforce system's password policy for this user"):
+                        r = parse_boolean_field(match_identity ?: &arg_identity_extra, "enforcePasswordPolicy", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_SHORT('P', NULL, "Same as --enforce-password-policy=no"):
+                        r = sd_json_variant_set_field_boolean(&arg_identity_extra, "enforcePasswordPolicy", false);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to set %s field: %m", "enforcePasswordPolicy");
+                        break;
+
+                OPTION_LONG("password-change-now", "BOOL",
+                            "Require the password to be changed on next login"):
+                        r = parse_boolean_field(match_identity ?: &arg_identity_extra, "passwordChangeNow", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("password-change-min", "TIME", "Require minimum time between password changes"): {}
+                OPTION_LONG("password-change-max", "TIME", "Require maximum time between password changes"): {}
+                OPTION_LONG("password-change-warn", "TIME", "How much time to warn before password expiry"): {}
+                OPTION_LONG("password-change-inactive", "TIME", "How much time to block password after expiry"): {
+                        const char *lc = opts.opt->long_code;
+                        const char *field =
+                                streq(lc, "password-change-min")      ? "passwordChangeMinUSec" :
+                                streq(lc, "password-change-max")      ? "passwordChangeMaxUSec" :
+                                streq(lc, "password-change-warn")     ? "passwordChangeWarnUSec" :
+                                streq(lc, "password-change-inactive") ? "passwordChangeInactiveUSec" :
+                                                                        NULL;
+                        assert(field);
+
+                        r = parse_time_field(match_identity ?: &arg_identity_extra, field, opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+                }
+
+                OPTION_GROUP("Resource Management User Record Properties"): {}
+
+                OPTION_LONG("disk-size", "BYTES", "Size to assign the user on disk"):
+                        r = parse_disk_size_field(match_identity ?: &arg_identity_extra_this_machine, opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("nice", "NICE", "Nice level for user"):
+                        r = parse_nice_field(match_identity ?: &arg_identity_extra, "niceLevel", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("rlimit", "LIMIT=VALUE[:VALUE]", "Set resource limits"):
+                        r = parse_rlimit_field(&arg_identity_extra_rlimits, "resourceLimits", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("tasks-max", "MAX", "Set maximum number of per-user tasks"):
+                        r = parse_u64_field(match_identity ?: &arg_identity_extra, "tasksMax", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("memory-high", "BYTES", "Set high memory threshold in bytes"):
+                        r = parse_size_field(match_identity ?: &arg_identity_extra_this_machine, "memoryHigh", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("memory-max", "BYTES", "Set maximum memory limit"):
+                        r = parse_size_field(match_identity ?: &arg_identity_extra_this_machine, "memoryMax", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("cpu-weight", "WEIGHT", "Set CPU weight"): {}
+                OPTION_LONG("io-weight", "WEIGHT", "Set IO weight"): {
+                        const char *field = streq(opts.opt->long_code, "cpu-weight") ? "cpuWeight" : "ioWeight";
+
+                        r = parse_weight_field(match_identity ?: &arg_identity_extra, field, opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+                }
+
+                OPTION_LONG("tmp-limit", "BYTES|PERCENT", "Set limit on /tmp/"): {}
+                OPTION_LONG("dev-shm-limit", "BYTES|PERCENT", "Set limit on /dev/shm/"): {
+                        bool is_tmp = streq(opts.opt->long_code, "tmp-limit");
+                        const char *field = is_tmp ? "tmpLimit" : "devShmLimit";
+                        const char *field_scale = is_tmp ? "tmpLimitScale" : "devShmLimitScale";
+
+                        r = parse_tmpfs_limit_field(match_identity ?: &arg_identity_extra,
+                                                    field, field_scale, opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+                }
+
+                OPTION_GROUP("Storage User Record Properties"): {}
+
+                OPTION_LONG("storage", "STORAGE",
+                            "Storage type to use (luks, fscrypt, directory, subvolume, cifs)"):
+                        if (!string_is_safe(opts.arg, STRING_ALLOW_GLOBS))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Parameter for field %s not valid: %s", "storage", opts.arg);
+
+                        r = parse_string_field(match_identity ?: &arg_identity_extra_this_machine, "storage", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("image-path", "PATH", "Path to image file/directory"):
+                        r = parse_path_field(match_identity ?: &arg_identity_extra_this_machine, "imagePath", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("drop-caches", "BOOL", "Whether to automatically drop caches on logout"):
+                        r = parse_boolean_field(match_identity ?: &arg_identity_extra, "dropCaches", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_GROUP("LUKS Storage User Record Properties"): {}
+
+                OPTION_LONG("fs-type", "TYPE",
+                            "File system type to use in case of luks storage (btrfs, ext4, xfs)"):
+                        if (!string_is_safe(opts.arg, STRING_ALLOW_GLOBS))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Parameter for field %s not valid: %s", "fileSystemType", opts.arg);
+
+                        r = parse_string_field(match_identity ?: &arg_identity_extra_this_machine, "fileSystemType", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("luks-discard", "BOOL",
+                            "Whether to use 'discard' feature of file system when activated (mounted)"): {}
+                OPTION_LONG("luks-offline-discard", "BOOL", "Whether to trim file on logout"): {
+                        const char *field = streq(opts.opt->long_code, "luks-discard") ? "luksDiscard" : "luksOfflineDiscard";
+
+                        r = parse_boolean_field(match_identity ?: &arg_identity_extra, field, opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+                }
+
+                OPTION_LONG("luks-cipher", "CIPHER", "Cipher to use for LUKS encryption"):
+                        if (!string_is_safe(opts.arg, STRING_ALLOW_GLOBS))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Parameter for field %s not valid: %s", "luksCipher", opts.arg);
+
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "luksCipher", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("luks-cipher-mode", "MODE", "Cipher mode to use for LUKS encryption"):
+                        if (!string_is_safe(opts.arg, STRING_ALLOW_GLOBS))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Parameter for field %s not valid: %s", "luksCipherMode", opts.arg);
+
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "luksCipherMode", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("luks-volume-key-size", "BITS", "Volume key size to use for LUKS encryption"):
+                        r = parse_unsigned_field(match_identity ?: &arg_identity_extra, "luksVolumeKeySize", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("luks-pbkdf-type", "TYPE", "Password-based Key Derivation Function to use"):
+                        if (!string_is_safe(opts.arg, STRING_ALLOW_GLOBS))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Parameter for field %s not valid: %s", "luksPbkdfType", opts.arg);
+
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "luksPbkdfType", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("luks-pbkdf-hash-algorithm", "ALG", "PBKDF hash algorithm to use"):
+                        if (!string_is_safe(opts.arg, STRING_ALLOW_GLOBS))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Parameter for field %s not valid: %s", "luksPbkdfHashAlgorithm", opts.arg);
+
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "luksPbkdfHashAlgorithm", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("luks-pbkdf-time-cost", "SECS", "Time cost for PBKDF in seconds"):
+                        r = parse_time_field(match_identity ?: &arg_identity_extra, "luksPbkdfTimeCostUSec", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("luks-pbkdf-memory-cost", "BYTES", "Memory cost for PBKDF in bytes"):
+                        r = parse_size_field(match_identity ?: &arg_identity_extra_this_machine, "luksPbkdfMemoryCost", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("luks-pbkdf-parallel-threads", "N", "Number of parallel threads for PKBDF"):
+                        r = parse_unsigned_field(match_identity ?: &arg_identity_extra, "luksPbkdfParallelThreads", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("luks-sector-size", "BYTES", "Sector size for LUKS encryption in bytes"):
+                        r = parse_sector_size_field(match_identity ?: &arg_identity_extra, "luksSectorSize", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("luks-extra-mount-options", "…", "LUKS extra mount options"):
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "luksExtraMountOptions", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("luks-pbkdf-force-iterations", "NUMBER", /* help= */ NULL):
+                        r = parse_unsigned_field(match_identity ?: &arg_identity_extra, "luksPbkdfForceIterations", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("auto-resize-mode", "MODE",
+                            "Automatically grow/shrink home on login/logout"):
+                        r = parse_auto_resize_mode_field(match_identity ?: &arg_identity_extra,
+                                                         "autoResizeMode", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("rebalance-weight", "WEIGHT", "Weight while rebalancing"):
+                        r = parse_rebalance_weight(match_identity ?: &arg_identity_extra,
+                                                   "rebalanceWeight", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_GROUP("Mounting User Record Properties"): {}
+
+                OPTION_LONG("nosuid", "BOOL", "Control the 'nosuid' flag of the home mount"):
+                        r = parse_boolean_field(match_identity ?: &arg_identity_extra, "mountNoSuid", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("nodev", "BOOL", "Control the 'nodev' flag of the home mount"):
+                        r = parse_boolean_field(match_identity ?: &arg_identity_extra, "mountNoDevices", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("noexec", "BOOL", "Control the 'noexec' flag of the home mount"):
+                        r = parse_boolean_field(match_identity ?: &arg_identity_extra, "mountNoExecute", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_GROUP("CIFS User Record Properties"): {}
+
+                OPTION_LONG("cifs-domain", "DOMAIN", "CIFS (Windows) domain"):
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "cifsDomain", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("cifs-user-name", "USER", "CIFS (Windows) user name"):
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "cifsUserName", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("cifs-service", "SERVICE",
+                            "CIFS (Windows) service to mount as home area"):
+                        if (!isempty(opts.arg)) {
+                                r = parse_cifs_service(opts.arg, /* ret_host= */ NULL, /* ret_service= */ NULL, /* ret_path= */ NULL);
                                 if (r < 0)
-                                        return r;
-
-                                break;
+                                        return log_error_errno(r, "Failed to validate CIFS service name: %s", opts.arg);
                         }
 
-                        if (!filename_is_valid(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Parameter for default area field not valid: %s", optarg);
-
-                        r = sd_json_variant_set_field_string(match_identity ?: &arg_identity_extra, "defaultArea", optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set default area field: %m");
-
-                        break;
-
-                case ARG_KEY_NAME:
-                        if (isempty(optarg)) {
-                                arg_key_name = mfree(arg_key_name);
-                                return 0;
-                        }
-
-                        if (!filename_is_valid(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Specified key name not valid: %s", optarg);
-
-                        r = free_and_strdup_warn(&arg_key_name, optarg);
-                        if (r < 0)
-                                return r;
-
-                        break;
-
-                case ARG_SEIZE:
-                        r = parse_boolean_argument("--seize=", optarg, &arg_seize);
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "cifsService", opts.arg);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_MATCH:
-                        if (streq(optarg, "any"))
+                OPTION_LONG("cifs-extra-mount-options", "…",
+                            "CIFS (Windows) extra mount options"):
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "cifsExtraMountOptions", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_GROUP("Login Behaviour User Record Properties"): {}
+
+                OPTION_LONG("stop-delay", "SECS",
+                            "How long to leave user services running after logout"):
+                        r = parse_time_field(match_identity ?: &arg_identity_extra, "stopDelayUSec", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("kill-processes", "BOOL",
+                            "Whether to kill user processes when sessions terminate"):
+                        r = parse_boolean_field(match_identity ?: &arg_identity_extra, "killProcesses", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("auto-login", "BOOL", "Try to log this user in automatically"):
+                        r = parse_boolean_field(match_identity ?: &arg_identity_extra, "autoLogin", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("session-launcher", "LAUNCHER", "Preferred session launcher file"):
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "preferredSessionLauncher", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("session-type", "TYPE", "Preferred session type"):
+                        r = parse_string_field(match_identity ?: &arg_identity_extra, "preferredSessionType", opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                /* Hidden options below */
+
+                OPTION_LONG("fido2-credential-algorithm", "ALG", /* help= */ NULL):
+                        r = parse_fido2_algorithm(opts.arg, &arg_fido2_cred_alg);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse COSE algorithm: %s", opts.arg);
+                        break;
+
+                OPTION_LONG("match", "any|this|other|auto", /* help= */ NULL):
+                        if (streq(opts.arg, "any"))
                                 match_identity = &arg_identity_extra;
-                        else if (streq(optarg, "this"))
+                        else if (streq(opts.arg, "this"))
                                 match_identity = &arg_identity_extra_this_machine;
-                        else if (streq(optarg, "other"))
+                        else if (streq(opts.arg, "other"))
                                 match_identity = &arg_identity_extra_other_machines;
-                        else if (streq(optarg, "auto"))
+                        else if (streq(opts.arg, "auto"))
                                 match_identity = NULL;
                         else
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--machine= argument not understood. Refusing.");
                         break;
 
-                case 'A':
+                OPTION_SHORT('A', NULL, /* help= */ NULL):
                         match_identity = &arg_identity_extra;
                         break;
-                case 'T':
+
+                OPTION_SHORT('T', NULL, /* help= */ NULL):
                         match_identity = &arg_identity_extra_this_machine;
                         break;
-                case 'N':
+
+                OPTION_SHORT('N', NULL, /* help= */ NULL):
                         match_identity = &arg_identity_extra_other_machines;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(arg_json_format_flags);
                 }
-        }
-
-        if (!strv_isempty(arg_pkcs11_token_uri) || !strv_isempty(arg_fido2_device))
-                arg_and_change_password = true;
-
-        if (arg_disk_size != UINT64_MAX || arg_disk_size_relative != UINT64_MAX)
-                arg_and_resize = true;
 
         if (!strv_isempty(arg_languages)) {
                 char **additional;
@@ -4954,6 +4917,10 @@ static int parse_argv(int argc, char *argv[]) {
                 }
         }
 
+        if (arg_recovery_key_file && !arg_recovery_key)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--recovery-key-file= requires --recovery-key=yes.");
+
+        *remaining_args = option_parser_get_args(&opts);
         return 1;
 }
 
@@ -5050,7 +5017,7 @@ static int fallback_shell(int argc, char *argv[]) {
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = sd_json_parse(json, SD_JSON_PARSE_SENSITIVE, &v, NULL, NULL);
+                r = sd_json_parse(json, SD_JSON_PARSE_SENSITIVE|SD_JSON_PARSE_MUST_BE_OBJECT, &v, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse JSON identity: %m");
 
@@ -5183,301 +5150,16 @@ static int fallback_shell(int argc, char *argv[]) {
         return log_error_errno(errno, "Failed to execute shell '%s': %m", shell);
 }
 
-static int verb_list_signing_keys(int argc, char *argv[], void *userdata) {
-        int r;
-
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        r = acquire_bus(&bus);
-        if (r < 0)
-                return r;
-
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        r = bus_call_method(bus, bus_mgr, "ListSigningKeys", &error, &reply, NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to list signing keys: %s", bus_error_message(&error, r));
-
-        _cleanup_(table_unrefp) Table *table = table_new("name", "key");
-        if (!table)
-                return log_oom();
-
-        r = sd_bus_message_enter_container(reply, 'a', "(sst)");
-        if (r < 0)
-                return bus_log_parse_error(r);
-
-        for (;;) {
-                const char *name, *pem;
-
-                r = sd_bus_message_read(reply, "(sst)", &name, &pem, NULL);
-                if (r < 0)
-                        return bus_log_parse_error(r);
-                if (r == 0)
-                        break;
-
-                _cleanup_free_ char *h = NULL;
-                if (!sd_json_format_enabled(arg_json_format_flags)) {
-                        /* Let's decode the PEM key to DER (so that we lose prefix/suffix), then truncate it
-                         * for display reasons. */
-
-                        _cleanup_(EVP_PKEY_freep) EVP_PKEY *key = NULL;
-                        r = openssl_pubkey_from_pem(pem, SIZE_MAX, &key);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse PEM: %m");
-
-                        _cleanup_free_ void *der = NULL;
-                        int n = i2d_PUBKEY(key, (unsigned char**) &der);
-                        if (n < 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to encode key as DER.");
-
-                        ssize_t m = base64mem(der, MIN(n, 64), &h);
-                        if (m < 0)
-                                return log_oom();
-                        if (n > 64) /* check if we truncated the original version */
-                                if (!strextend(&h, glyph(GLYPH_ELLIPSIS)))
-                                        return log_oom();
-                }
-
-                r = table_add_many(
-                                table,
-                                TABLE_STRING, name,
-                                TABLE_STRING, h ?: pem);
-                if (r < 0)
-                        return table_log_add_error(r);
-        }
-
-        r = sd_bus_message_exit_container(reply);
-        if (r < 0)
-                return bus_log_parse_error(r);
-
-        if (!table_isempty(table) || sd_json_format_enabled(arg_json_format_flags)) {
-                r = table_set_sort(table, (size_t) 0);
-                if (r < 0)
-                        return table_log_sort_error(r);
-
-                r = table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, arg_legend);
-                if (r < 0)
-                        return r;
-        }
-
-        if (arg_legend && !sd_json_format_enabled(arg_json_format_flags)) {
-                if (table_isempty(table))
-                        printf("No signing keys.\n");
-                else
-                        printf("\n%zu signing keys listed.\n", table_get_rows(table) - 1);
-        }
-
-        return 0;
-}
-
-static int verb_get_signing_key(int argc, char *argv[], void *userdata) {
-        int r;
-
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        r = acquire_bus(&bus);
-        if (r < 0)
-                return r;
-
-        char **keys = argc >= 2 ? strv_skip(argv, 1) : STRV_MAKE("local.public");
-        int ret = 0;
-        STRV_FOREACH(k, keys) {
-                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-                _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-                r = bus_call_method(bus, bus_mgr, "GetSigningKey", &error, &reply, "s", *k);
-                if (r < 0) {
-                        RET_GATHER(ret, log_error_errno(r, "Failed to get signing key '%s': %s", *k, bus_error_message(&error, r)));
-                        continue;
-                }
-
-                const char *pem;
-                r = sd_bus_message_read(reply, "st", &pem, NULL);
-                if (r < 0) {
-                        RET_GATHER(ret, bus_log_parse_error(r));
-                        continue;
-                }
-
-                fputs(pem, stdout);
-                if (!endswith(pem, "\n"))
-                        fputc('\n', stdout);
-
-                fflush(stdout);
-        }
-
-        return ret;
-}
-
-static int add_signing_key_one(sd_bus *bus, const char *fn, FILE *key) {
-        int r;
-
-        assert_se(bus);
-        assert_se(fn);
-        assert_se(key);
-
-        _cleanup_free_ char *pem = NULL;
-        r = read_full_stream(key, &pem, /* ret_size= */ NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to read key '%s': %m", fn);
-
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        r = bus_call_method(bus, bus_mgr, "AddSigningKey", &error, /* ret_reply= */ NULL, "sst", fn, pem, UINT64_C(0));
-        if (r < 0)
-                return log_error_errno(r, "Failed to add signing key '%s': %s", fn, bus_error_message(&error, r));
-
-        return 0;
-}
-
-static int verb_add_signing_key(int argc, char *argv[], void *userdata) {
-        int r;
-
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        r = acquire_bus(&bus);
-        if (r < 0)
-                return r;
-
-        int ret = EXIT_SUCCESS;
-        if (argc < 2 || streq(argv[1], "-")) {
-                if (!arg_key_name)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Key name must be specified via --key-name= when reading key from standard input, refusing.");
-
-                RET_GATHER(ret, add_signing_key_one(bus, arg_key_name, stdin));
-        } else {
-                /* Refuse if more han one key is specified in combination with --key-name= */
-                if (argc >= 3 && arg_key_name)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--key-name= is not supported if multiple signing keys are specified, refusing.");
-
-                STRV_FOREACH(k, strv_skip(argv, 1)) {
-
-                        if (streq(*k, "-"))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Refusing to read from standard input if multiple keys are specified.");
-
-                        _cleanup_free_ char *fn = NULL;
-                        if (!arg_key_name) {
-                                r = path_extract_filename(*k, &fn);
-                                if (r < 0) {
-                                        RET_GATHER(ret, log_error_errno(r, "Failed to extract filename from path '%s': %m", *k));
-                                        continue;
-                                }
-                        }
-
-                        _cleanup_fclose_ FILE *f = fopen(*k, "re");
-                        if (!f) {
-                                RET_GATHER(ret, log_error_errno(errno, "Failed to open '%s': %m", *k));
-                                continue;
-                        }
-
-                        RET_GATHER(ret, add_signing_key_one(bus, fn ?: arg_key_name, f));
-                }
-        }
-
-        return ret;
-}
-
-static int add_signing_keys_from_credentials(void) {
-        int r;
-
-        _cleanup_close_ int fd = open_credentials_dir();
-        if (IN_SET(fd, -ENXIO, -ENOENT)) /* Credential env var not set, or dir doesn't exist. */
-                return 0;
-        if (fd < 0)
-                return log_error_errno(fd, "Failed to open credentials directory: %m");
-
-        _cleanup_free_ DirectoryEntries *des = NULL;
-        r = readdir_all(fd, RECURSE_DIR_SORT|RECURSE_DIR_IGNORE_DOT|RECURSE_DIR_ENSURE_TYPE, &des);
-        if (r < 0)
-                return log_error_errno(r, "Failed to enumerate credentials: %m");
-
-        int ret = 0;
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        FOREACH_ARRAY(i, des->entries, des->n_entries) {
-                struct dirent *de = *i;
-                if (de->d_type != DT_REG)
-                        continue;
-
-                const char *e = startswith(de->d_name, "home.add-signing-key.");
-                if (!e)
-                        continue;
-
-                if (!filename_is_valid(e))
-                        continue;
-
-                if (!bus) {
-                        r = acquire_bus(&bus);
-                        if (r < 0)
-                                return r;
-                }
-
-                _cleanup_fclose_ FILE *f = NULL;
-                r = xfopenat(fd, de->d_name, "re", O_NOFOLLOW, &f);
-                if (r < 0) {
-                        RET_GATHER(ret, log_error_errno(r, "Failed to open credential '%s': %m", de->d_name));
-                        continue;
-                }
-
-                RET_GATHER(ret, add_signing_key_one(bus, e, f));
-        }
-
-        return ret;
-}
-
-static int remove_signing_key_one(sd_bus *bus, const char *fn) {
-        int r;
-
-        assert_se(bus);
-        assert_se(fn);
-
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        r = bus_call_method(bus, bus_mgr, "RemoveSigningKey", &error, /* ret_reply= */ NULL, "st", fn, UINT64_C(0));
-        if (r < 0)
-                return log_error_errno(r, "Failed to remove signing key '%s': %s", fn, bus_error_message(&error, r));
-
-        return 0;
-}
-
-static int verb_remove_signing_key(int argc, char *argv[], void *userdata) {
-        int r;
-
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        r = acquire_bus(&bus);
-        if (r < 0)
-                return r;
-
-        r = EXIT_SUCCESS;
-        STRV_FOREACH(k, strv_skip(argv, 1))
-                RET_GATHER(r, remove_signing_key_one(bus, *k));
-
-        return r;
-}
-
 static int run(int argc, char *argv[]) {
-        static const Verb verbs[] = {
-                { "help",               VERB_ANY, VERB_ANY, 0,            help                     },
-                { "list",               VERB_ANY, 1,        VERB_DEFAULT, list_homes               },
-                { "activate",           2,        VERB_ANY, 0,            activate_home            },
-                { "deactivate",         2,        VERB_ANY, 0,            deactivate_home          },
-                { "inspect",            VERB_ANY, VERB_ANY, 0,            inspect_homes            },
-                { "authenticate",       VERB_ANY, VERB_ANY, 0,            authenticate_homes       },
-                { "create",             VERB_ANY, 2,        0,            create_home              },
-                { "adopt",              VERB_ANY, VERB_ANY, 0,            verb_adopt_home          },
-                { "register",           VERB_ANY, VERB_ANY, 0,            verb_register_home       },
-                { "unregister",         2,        VERB_ANY, 0,            verb_unregister_home     },
-                { "remove",             2,        VERB_ANY, 0,            remove_home              },
-                { "update",             VERB_ANY, 2,        0,            update_home              },
-                { "passwd",             VERB_ANY, 2,        0,            passwd_home              },
-                { "resize",             2,        3,        0,            resize_home              },
-                { "lock",               2,        VERB_ANY, 0,            lock_home                },
-                { "unlock",             2,        VERB_ANY, 0,            unlock_home              },
-                { "with",               2,        VERB_ANY, 0,            with_home                },
-                { "lock-all",           VERB_ANY, 1,        0,            lock_all_homes           },
-                { "deactivate-all",     VERB_ANY, 1,        0,            deactivate_all_homes     },
-                { "rebalance",          VERB_ANY, 1,        0,            rebalance                },
-                { "firstboot",          VERB_ANY, 1,        0,            verb_firstboot           },
-                { "list-signing-keys",  VERB_ANY, 1,        0,            verb_list_signing_keys   },
-                { "get-signing-key",    VERB_ANY, VERB_ANY, 0,            verb_get_signing_key     },
-                { "add-signing-key",    VERB_ANY, VERB_ANY, 0,            verb_add_signing_key     },
-                { "remove-signing-key", 2,        VERB_ANY, 0,            verb_remove_signing_key  },
-                {}
-        };
-
+        char **args = NULL;
         int r;
+
+        LIBCRYPT_NOTE(recommended);
+        LIBCRYPTO_NOTE(recommended);
+        LIBFIDO2_NOTE(suggested);
+        LIBP11KIT_NOTE(suggested);
+        LIBQRENCODE_NOTE(suggested);
+        PASSWORD_NOTE(suggested);
 
         log_setup();
 
@@ -5488,11 +5170,11 @@ static int run(int argc, char *argv[]) {
         if (is_fallback_shell(argv[0]))
                 return fallback_shell(argc, argv);
 
-        r = parse_argv(argc, argv);
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
-        return dispatch_verb(argc, argv, verbs, NULL);
+        return dispatch_verb(args, /* userdata= */ NULL);
 }
 
 DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);

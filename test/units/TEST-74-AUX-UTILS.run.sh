@@ -72,6 +72,8 @@ systemctl cat "$UNIT"
 grep -q "^Type=oneshot" "/run/systemd/transient/$UNIT.service"
 systemctl stop "$UNIT"
 (! systemctl cat "$UNIT")
+(! systemd-run --wait --remain-after-exit true)
+(! systemd-run --pipe --remain-after-exit true)
 
 : "Transient service (user daemon)"
 systemd-run --wait --pipe --user --machine=testuser@ \
@@ -80,6 +82,11 @@ systemd-run --wait --pipe --user --machine=testuser@ \
             bash -xec '[[ "$(id -nu)" == testuser && "$(id -ng)" == testuser ]]'
 systemd-run --wait --pipe --user --machine=testuser@ \
             bash -xec '[[ "$PWD" == /home/testuser && -n "$INVOCATION_ID" ]]'
+
+# https://github.com/systemd/systemd/issues/39038
+systemd-run --wait --machine=testuser@ --user -p User=testuser true
+systemd-run --wait --machine=testuser@ --user -p Group=testuser true
+(! systemd-run --wait --machine=testuser@ --user -p Group=testuser -p SupplementaryGroups=root true)
 
 # PrivateTmp=yes implies PrivateUsers=yes for user manager, so skip this if we
 # don't have unprivileged user namespaces.
@@ -106,10 +113,16 @@ systemd-run --scope --slice-inherit --slice=foo \
             bash -xec '[[ "$(</proc/self/cgroup)" =~ /system\.slice/system-foo\.slice/run-.+\.scope$ ]]'
 # We should inherit caller's environment
 systemd-run --scope bash -xec '[[ "$PARENT_FOO" == bar ]]'
+systemd-run --scope --uid=testuser \
+            bash -xec '[[ " $(id -G) " != *" 0 "* ]]'
+systemd-run --scope --gid=testuser \
+            bash -xec '[[ " $(id -G) " != *" 0 "* ]]'
 systemd-run --scope \
             --property=RuntimeMaxSec=10 \
             --property=RuntimeMaxSec=infinity \
             true
+(! systemd-run --scope --ignore-failure false)
+(! systemd-run --scope --json=short true)
 
 : "Transient scope (user daemon)"
 # FIXME: https://github.com/systemd/systemd/issues/27883
@@ -126,7 +139,7 @@ systemd-run --remain-after-exit \
             true
 systemctl cat "$UNIT.service" "$UNIT.timer"
 grep -q "^OnUnitInactiveSec=16h$" "/run/systemd/transient/$UNIT.timer"
-grep -qE "^ExecStart=.*/bin/true.*$" "/run/systemd/transient/$UNIT.service"
+grep -qE "^ExecStart=.*true.*$" "/run/systemd/transient/$UNIT.service"
 systemctl stop "$UNIT.timer" "$UNIT.service" || :
 
 UNIT="timer-1-$RANDOM"
@@ -162,7 +175,7 @@ grep -q "^OnTimezoneChange=yes$" "/run/systemd/transient/$UNIT.timer"
 grep -q "^After=systemd-journald.service$" "/run/systemd/transient/$UNIT.timer"
 grep -q "^Description=My Fancy Timer$" "/run/systemd/transient/$UNIT.service"
 grep -q "^RemainAfterExit=yes$" "/run/systemd/transient/$UNIT.service"
-grep -qE "^ExecStart=.*/bin/true.*$" "/run/systemd/transient/$UNIT.service"
+grep -qE "^ExecStart=.*true.*$" "/run/systemd/transient/$UNIT.service"
 (! grep -q "^After=systemd-journald.service$" "/run/systemd/transient/$UNIT.service")
 systemctl stop "$UNIT.timer" "$UNIT.service" || :
 
@@ -180,8 +193,19 @@ systemd-analyze verify --recursive-errors=no "/run/systemd/transient/$UNIT.path"
 grep -q "^PathExists=/tmp$" "/run/systemd/transient/$UNIT.path"
 grep -q "^PathExists=/tmp/foo$" "/run/systemd/transient/$UNIT.path"
 grep -q "^PathChanged=/root/bar$" "/run/systemd/transient/$UNIT.path"
-grep -qE "^ExecStart=.*/bin/true.*$" "/run/systemd/transient/$UNIT.service"
+grep -qE "^ExecStart=.*true.*$" "/run/systemd/transient/$UNIT.service"
 systemctl stop "$UNIT.path" "$UNIT.service" || :
+
+UNIT="path-explicit-$RANDOM.path"
+SERVICE="${UNIT%.path}.service"
+systemd-run --remain-after-exit \
+            --unit="$UNIT" \
+            --path-property=PathExists=/tmp \
+            true
+systemctl cat "$UNIT" "$SERVICE"
+grep -q "^PathExists=/tmp$" "/run/systemd/transient/$UNIT"
+grep -qE "^ExecStart=.*true.*$" "/run/systemd/transient/$SERVICE"
+systemctl stop "$UNIT" "$SERVICE" || :
 
 : "Transient socket unit"
 UNIT="socket-0-$RANDOM"
@@ -197,7 +221,25 @@ systemd-analyze verify --recursive-errors=no "/run/systemd/transient/$UNIT.socke
 grep -q "^ListenFIFO=/tmp/socket.fifo$" "/run/systemd/transient/$UNIT.socket"
 grep -q "^SocketMode=0666$" "/run/systemd/transient/$UNIT.socket"
 grep -q "^SocketMode=0644$" "/run/systemd/transient/$UNIT.socket"
-grep -qE "^ExecStart=.*/bin/true.*$" "/run/systemd/transient/$UNIT.service"
+grep -qE "^ExecStart=.*true.*$" "/run/systemd/transient/$UNIT.service"
+systemctl stop "$UNIT.socket" "$UNIT.service" || :
+
+UNIT="socket-explicit-$RANDOM.socket"
+SERVICE="${UNIT%.socket}.service"
+systemd-run --remain-after-exit \
+            --unit="$UNIT" \
+            --socket-property=ListenFIFO=/tmp/socket-explicit.fifo \
+            true
+systemctl cat "$UNIT" "$SERVICE"
+grep -q "^ListenFIFO=/tmp/socket-explicit.fifo$" "/run/systemd/transient/$UNIT"
+grep -qE "^ExecStart=.*true.*$" "/run/systemd/transient/$SERVICE"
+systemctl stop "$UNIT" "$SERVICE" || :
+
+UNIT="socket-no-block-$RANDOM"
+systemd-run --no-block --collect \
+            --unit="$UNIT" \
+            --socket-property=ListenStream=/proc/systemd-run-repro/socket \
+            true
 systemctl stop "$UNIT.socket" "$UNIT.service" || :
 
 : "Job mode"
@@ -214,9 +256,28 @@ systemd-run --scope --property=Conflicts=slowly-activating.service --job-mode=re
 SHELL=/bin/true systemd-run --shell
 SHELL=/bin/true systemd-run --scope --shell
 systemd-run --wait --pty true
+# stdout as a regular file cannot be polled, the forwarder must cope without a stdout event source
+systemd-run --wait --pty echo pty-regular-file >/tmp/pty-regular.out
+grep pty-regular-file /tmp/pty-regular.out >/dev/null
+rm -f /tmp/pty-regular.out
+
+# The shared file offset keeps "trailer" from clobbering our output
+{ echo header; systemd-run --wait --pty --quiet echo hello; echo trailer; } >/tmp/pty-offset.out
+assert_eq "$(tr -d '\r' </tmp/pty-offset.out)" "$(printf 'header\nhello\ntrailer')"
+rm -f /tmp/pty-offset.out
+
+# Reading ahead on stdin must not eat the lines the loop still expects to read
+printf 'one\ntwo\nthree\n' >/tmp/pty-input.list
+n=0
+while read -r _; do systemd-run --wait --pty --quiet true; n=$((n + 1)); done </tmp/pty-input.list
+assert_eq "$n" 3
+rm -f /tmp/pty-input.list
 systemd-run --wait --machine=.host --pty true
-systemd-run --json=short /bin/true | jq . >/dev/null
-systemd-run --json=pretty /bin/true | jq . >/dev/null
+systemd-run --json=short true | jq . >/dev/null
+systemd-run --json=pretty true | jq . >/dev/null
+(! systemd-run --wait --pipe --json=short true)
+(! systemd-run --json=short --on-active=30s true)
+(! systemd-run --wait --verbose --json=short true)
 (! SHELL=/bin/false systemd-run --quiet --shell)
 
 (! systemd-run)
@@ -294,10 +355,54 @@ if [[ -e /usr/lib/pam.d/systemd-run0 ]] || [[ -e /etc/pam.d/systemd-run0 ]]; the
     assert_eq "$(run0 --pipe echo -n foo)" "foo"
     assert_eq "$(run0 --pipe --pty echo -n foo)" "foo"
 
+    # When run0 is used in a pipeline, the caller's TTY is passed through as an fd. Its
+    # ownership/access mode must not be changed to the target user.
+    script -qec 'bash -euxc '"'"'
+        set -o pipefail
+        tty_path="$(tty)"
+        tty_stat="$(stat -Lc "%u:%g:%a" "$tty_path")"
+        run0 --user=testuser echo -n foo | cat >/dev/null
+        [[ "$(stat -Lc "%u:%g:%a" "$tty_path")" == "$tty_stat" ]]
+    '"'" /dev/null
+
+    # --pty also passes a service PTY as an fd. It must still provide a usable TTY to
+    # the target user without changing the caller's TTY ownership/access mode.
+    script -qec 'bash -euxc '"'"'
+        tty_path="$(tty)"
+        tty_stat="$(stat -Lc "%u:%g:%a" "$tty_path")"
+        run0 --pty --user=testuser bash -xec \
+            "test \"\$(id -un)\" = testuser; test -t 0; test -t 1; test -t 2; tty >/dev/null"
+        [[ "$(stat -Lc "%u:%g:%a" "$tty_path")" == "$tty_stat" ]]
+    '"'" /dev/null
+
     # Validate when we invoke run0 without a tty, that depending on --pty it either allocates a tty or not
     assert_neq "$(run0 --pty tty < /dev/null)" "not a tty"
     assert_eq "$(run0 --pipe tty < /dev/null)" "not a tty"
+
+    # Validate that --empower gives all capabilities to a non-root user.
+    caps="$(run0 -u testuser --empower systemd-analyze capability --mask "$(grep CapEff /proc/self/status | cut -d':' -f2)" --json=pretty | jq -r length)"
+    assert_neq "$caps" "0"
+
+    run0 -u testuser --empower touch /run/empower
+    assert_eq "$(stat -c "%U" /run/empower)" testuser
+    rm /run/empower
 fi
 
 # Tests whether intermediate disconnects corrupt us (modified testcase from https://github.com/systemd/systemd/issues/27204)
 assert_rc "37" timeout 300 systemd-run --unit=disconnecttest --wait --pipe --user -M testuser@.host bash -ec 'systemctl --user daemon-reexec; sleep 3; exit 37'
+
+# Trigger on_exit_event(): SIGINT makes systemd-run leave the event loop
+# while PTY forwarding is active. coproc gives us a pollable stdout and exec
+# makes $PTY_FWD_PID point at systemd-run
+coproc PTY_FWD { exec systemd-run --quiet --pty -- bash -c 'echo PTY_FORWARD_READY; exec sleep 60'; }
+PTY_FWD_PID_SAVED="$PTY_FWD_PID"
+read -r -t 30 -u "${PTY_FWD[0]}" PTY_FWD_LINE || true
+[[ "$PTY_FWD_LINE" == *PTY_FORWARD_READY* ]]
+kill -INT "$PTY_FWD_PID_SAVED"
+PTY_FWD_RC=0
+wait "$PTY_FWD_PID_SAVED" || PTY_FWD_RC=$?
+# ASan reports the UAF as systemd-run exiting non-zero.
+if [[ "$PTY_FWD_RC" != 0 ]]; then
+    echo "systemd-run --pty failed"
+    exit 1
+fi

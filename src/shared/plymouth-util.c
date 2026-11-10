@@ -7,6 +7,35 @@
 #include "plymouth-util.h"
 #include "socket-util.h"
 
+int plymouth_build_password_packet(const char *message, char **ret_packet, size_t *ret_size) {
+        size_t l, sz;
+        char *packet;
+
+        assert(message);
+        assert(ret_packet);
+        assert(ret_size);
+
+        l = strlen(message);
+        if (l >= UCHAR_MAX)
+                return -EMSGSIZE;
+
+        /* 3 byte header ('*', command, payload length), followed by the message and its NUL terminator. */
+        sz = 3 + l + 1;
+
+        packet = new(char, sz);
+        if (!packet)
+                return -ENOMEM;
+
+        packet[0] = '*';
+        packet[1] = '\x02';
+        packet[2] = (uint8_t) (l + 1);
+        memcpy(packet + 3, message, l + 1);
+
+        *ret_packet = packet;
+        *ret_size = sz;
+        return 0;
+}
+
 int plymouth_connect(int flags) {
         static const union sockaddr_union sa = {
                 .un.sun_family = AF_UNIX,
@@ -53,6 +82,17 @@ int plymouth_send_msg(const char *text, bool pause_spinner) {
         if (r < 0)
                 return log_full_errno(ERRNO_IS_NO_PLYMOUTH(r) ? LOG_DEBUG : LOG_WARNING, r,
                                       "Failed to communicate with plymouth, ignoring: %m");
+
+        return 0;
+}
+
+int plymouth_hide_splash(void) {
+        int r;
+
+        r = plymouth_send_raw("H\0", 2, SOCK_NONBLOCK);
+        if (r < 0)
+                return log_full_errno(ERRNO_IS_NO_PLYMOUTH(r) ? LOG_DEBUG : LOG_WARNING, r,
+                                      "Failed to communicate with plymouth: %m");
 
         return 0;
 }

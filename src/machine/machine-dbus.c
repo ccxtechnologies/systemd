@@ -20,11 +20,13 @@
 #include "machine-dbus.h"
 #include "machined.h"
 #include "mount-util.h"
+#include "namespace-util.h"
 #include "operation.h"
 #include "path-util.h"
 #include "signal-util.h"
 #include "string-util.h"
 #include "strv.h"
+#include "user-util.h"
 
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_class, machine_class, MachineClass);
 static BUS_DEFINE_PROPERTY_GET2(property_get_state, "s", Machine, machine_get_state, machine_state_to_string);
@@ -54,24 +56,27 @@ int bus_machine_method_unregister(sd_bus_message *message, void *userdata, sd_bu
 
         assert(message);
 
-        const char *details[] = {
-                "machine", m->name,
-                "verb", "unregister",
-                NULL
-        };
+        if (m->manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                const char *details[] = {
+                        "machine", m->name,
+                        "verb", "unregister",
+                        NULL
+                };
 
-        r = bus_verify_polkit_async_full(
-                        message,
-                        "org.freedesktop.machine1.manage-machines",
-                        details,
-                        m->uid,
-                        /* flags= */ 0,
-                        &m->manager->polkit_registry,
-                        error);
-        if (r < 0)
-                return r;
-        if (r == 0)
-                return 1; /* Will call us back */
+                r = bus_verify_polkit_async_full(
+                                message,
+                                "org.freedesktop.machine1.manage-machines",
+                                details,
+                                m->uid,
+                                /* flags= */ 0,
+                                &m->manager->polkit_registry,
+                                /* ret_admin= */ NULL,
+                                error);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 1; /* Will call us back */
+        }
 
         r = machine_finalize(m);
         if (r < 0)
@@ -86,24 +91,27 @@ int bus_machine_method_terminate(sd_bus_message *message, void *userdata, sd_bus
 
         assert(message);
 
-        const char *details[] = {
-                "machine", m->name,
-                "verb", "terminate",
-                NULL
-        };
+        if (m->manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                const char *details[] = {
+                        "machine", m->name,
+                        "verb", "terminate",
+                        NULL
+                };
 
-        r = bus_verify_polkit_async_full(
-                        message,
-                        "org.freedesktop.machine1.manage-machines",
-                        details,
-                        m->uid,
-                        /* flags= */ 0,
-                        &m->manager->polkit_registry,
-                        error);
-        if (r < 0)
-                return r;
-        if (r == 0)
-                return 1; /* Will call us back */
+                r = bus_verify_polkit_async_full(
+                                message,
+                                "org.freedesktop.machine1.manage-machines",
+                                details,
+                                m->uid,
+                                /* flags= */ 0,
+                                &m->manager->polkit_registry,
+                                /* ret_admin= */ NULL,
+                                error);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 1; /* Will call us back */
+        }
 
         r = machine_stop(m);
         if (r < 0)
@@ -136,24 +144,27 @@ int bus_machine_method_kill(sd_bus_message *message, void *userdata, sd_bus_erro
         if (!SIGNAL_VALID(signo))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid signal %i", signo);
 
-        const char *details[] = {
-                "machine", m->name,
-                "verb", "kill",
-                NULL
-        };
+        if (m->manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                const char *details[] = {
+                        "machine", m->name,
+                        "verb", "kill",
+                        NULL
+                };
 
-        r = bus_verify_polkit_async_full(
-                        message,
-                        "org.freedesktop.machine1.manage-machines",
-                        details,
-                        m->uid,
-                        /* flags= */ 0,
-                        &m->manager->polkit_registry,
-                        error);
-        if (r < 0)
-                return r;
-        if (r == 0)
-                return 1; /* Will call us back */
+                r = bus_verify_polkit_async_full(
+                                message,
+                                "org.freedesktop.machine1.manage-machines",
+                                details,
+                                m->uid,
+                                /* flags= */ 0,
+                                &m->manager->polkit_registry,
+                                /* ret_admin= */ NULL,
+                                error);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 1; /* Will call us back */
+        }
 
         r = machine_kill(m, whom, signo);
         if (r < 0)
@@ -239,6 +250,25 @@ int bus_machine_method_get_os_release(sd_bus_message *message, void *userdata, s
 
         assert(message);
 
+        if (m->manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                const char *details[] = {
+                        "machine", m->name,
+                        "verb", "get_os_release",
+                        NULL
+                };
+
+                r = bus_verify_polkit_async(
+                                message,
+                                "org.freedesktop.machine1.inspect-machines",
+                                details,
+                                &m->manager->polkit_registry,
+                                error);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 1; /* Will call us back */
+        }
+
         r = machine_get_os_release(m, &l);
         if (r == -ENONET)
                 return sd_bus_error_set(error, SD_BUS_ERROR_FAILED, "Machine does not contain OS release information.");
@@ -259,23 +289,26 @@ int bus_machine_method_open_pty(sd_bus_message *message, void *userdata, sd_bus_
 
         assert(message);
 
-        const char *details[] = {
-                "machine", m->name,
-                NULL
-        };
+        if (m->manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                const char *details[] = {
+                        "machine", m->name,
+                        NULL
+                };
 
-        r = bus_verify_polkit_async_full(
-                        message,
-                        m->class == MACHINE_HOST ? "org.freedesktop.machine1.host-open-pty" : "org.freedesktop.machine1.open-pty",
-                        details,
-                        m->uid,
-                        /* flags= */ 0,
-                        &m->manager->polkit_registry,
-                        error);
-        if (r < 0)
-                return r;
-        if (r == 0)
-                return 1; /* Will call us back */
+                r = bus_verify_polkit_async_full(
+                                message,
+                                m->class == MACHINE_HOST ? "org.freedesktop.machine1.host-open-pty" : "org.freedesktop.machine1.open-pty",
+                                details,
+                                m->uid,
+                                /* flags= */ 0,
+                                &m->manager->polkit_registry,
+                                /* ret_admin= */ NULL,
+                                error);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 1; /* Will call us back */
+        }
 
         master = machine_openpt(m, O_RDWR|O_NOCTTY|O_CLOEXEC, &pty_name);
         if (master < 0)
@@ -301,24 +334,27 @@ int bus_machine_method_open_login(sd_bus_message *message, void *userdata, sd_bu
 
         assert(message);
 
-        const char *details[] = {
-                "machine", m->name,
-                "verb", "login",
-                NULL
-        };
+        if (m->manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                const char *details[] = {
+                        "machine", m->name,
+                        "verb", "login",
+                        NULL
+                };
 
-        r = bus_verify_polkit_async_full(
-                        message,
-                        m->class == MACHINE_HOST ? "org.freedesktop.machine1.host-login" : "org.freedesktop.machine1.login",
-                        details,
-                        m->uid,
-                        /* flags= */ 0,
-                        &m->manager->polkit_registry,
-                        error);
-        if (r < 0)
-                return r;
-        if (r == 0)
-                return 1; /* Will call us back */
+                r = bus_verify_polkit_async_full(
+                                message,
+                                m->class == MACHINE_HOST ? "org.freedesktop.machine1.host-login" : "org.freedesktop.machine1.login",
+                                details,
+                                m->uid,
+                                /* flags= */ 0,
+                                &m->manager->polkit_registry,
+                                /* ret_admin= */ NULL,
+                                error);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 1; /* Will call us back */
+        }
 
         master = machine_openpt(m, O_RDWR|O_NOCTTY|O_CLOEXEC, &pty_name);
         if (master < 0)
@@ -344,7 +380,6 @@ int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bu
         _cleanup_free_ char *pty_name = NULL;
         _cleanup_close_ int master = -EBADF;
         _cleanup_strv_free_ char **env = NULL, **args_wire = NULL, **args = NULL;
-        _cleanup_free_ char *command_line = NULL;
         Machine *m = ASSERT_PTR(userdata);
         const char *user, *path;
         int r;
@@ -355,6 +390,32 @@ int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bu
         if (r < 0)
                 return r;
         user = isempty(user) ? "root" : user;
+
+        if (!valid_user_group_name(user, VALID_USER_RELAX | VALID_USER_ALLOW_NUMERIC))
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid user name '%s'", user);
+
+        /* Ensure only root can shell into the root namespace. This is to avoid unprivileged users registering
+         * a process they own in the root user namespace, and then shelling in as root or another user. Note that
+         * the shell operation is privileged and requires 'auth_admin', so we do not need to check the caller's uid,
+         * as that will be checked by polkit, and if the machine's and the caller's do not match, authorization
+         * will be required. It's only the case where the caller owns the machine that will be shortcut and needs
+         * to be checked here. */
+        if (m->manager->runtime_scope != RUNTIME_SCOPE_USER && m->uid != 0) {
+                assert(m->class != MACHINE_HOST);
+
+                r = pidref_in_same_namespace(&PIDREF_MAKE_FROM_PID(1), &m->leader, NAMESPACE_USER);
+                if (r < 0)
+                        return log_debug_errno(
+                                        r,
+                                        "Failed to check if machine '%s' is running in the root user namespace: %m",
+                                        m->name);
+                if (r > 0)
+                        return sd_bus_error_set(
+                                        error,
+                                        SD_BUS_ERROR_ACCESS_DENIED,
+                                        "Only root may shell into the root user namespace");
+        }
+
         r = sd_bus_message_read_strv(message, &args_wire);
         if (r < 0)
                 return r;
@@ -379,32 +440,40 @@ int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bu
         r = sd_bus_message_read_strv(message, &env);
         if (r < 0)
                 return r;
+
+        if (strv_length(env) > ENVIRONMENT_ASSIGNMENTS_MAX)
+                return sd_bus_error_set(error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                        "Too many environment assignments in a single query.");
         if (!strv_env_is_valid(env))
                 return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid environment assignments");
 
-        command_line = strv_join(args, " ");
-        if (!command_line)
-                return -ENOMEM;
-        const char *details[] = {
-                "machine", m->name,
-                "user", user,
-                "program", path,
-                "command_line", command_line,
-                NULL
-        };
+        if (m->manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                _cleanup_free_ char *command_line = strv_join(args, " ");
+                if (!command_line)
+                        return -ENOMEM;
 
-        r = bus_verify_polkit_async_full(
-                        message,
-                        m->class == MACHINE_HOST ? "org.freedesktop.machine1.host-shell" : "org.freedesktop.machine1.shell",
-                        details,
-                        m->uid,
-                        /* flags= */ 0,
-                        &m->manager->polkit_registry,
-                        error);
-        if (r < 0)
-                return r;
-        if (r == 0)
-                return 1; /* Will call us back */
+                const char *details[] = {
+                        "machine", m->name,
+                        "user", user,
+                        "program", path,
+                        "command_line", command_line,
+                        NULL
+                };
+
+                r = bus_verify_polkit_async_full(
+                                message,
+                                m->class == MACHINE_HOST ? "org.freedesktop.machine1.host-shell" : "org.freedesktop.machine1.shell",
+                                details,
+                                m->uid,
+                                /* flags= */ 0,
+                                &m->manager->polkit_registry,
+                                /* ret_admin= */ NULL,
+                                error);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 1; /* Will call us back */
+        }
 
         master = machine_openpt(m, O_RDWR|O_NOCTTY|O_CLOEXEC, &pty_name);
         if (master < 0)
@@ -450,25 +519,27 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
         else if (!path_is_absolute(dest) || !path_is_normalized(dest))
                 return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Destination path must be absolute and normalized.");
 
-        const char *details[] = {
-                "machine", m->name,
-                "verb", "bind",
-                "src", src,
-                "dest", dest,
-                NULL
-        };
+        if (m->manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                const char *details[] = {
+                        "machine", m->name,
+                        "verb", "bind",
+                        "src", src,
+                        "dest", dest,
+                        NULL
+                };
 
-        /* NB: For now not opened up to owner of machine without auth */
-        r = bus_verify_polkit_async(
-                        message,
-                        "org.freedesktop.machine1.manage-machines",
-                        details,
-                        &m->manager->polkit_registry,
-                        error);
-        if (r < 0)
-                return r;
-        if (r == 0)
-                return 1; /* Will call us back */
+                /* NB: For now not opened up to owner of machine without auth */
+                r = bus_verify_polkit_async(
+                                message,
+                                "org.freedesktop.machine1.manage-machines",
+                                details,
+                                &m->manager->polkit_registry,
+                                error);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 1; /* Will call us back */
+        }
 
         r = machine_get_uid_shift(m, &uid);
         if (r < 0)
@@ -496,7 +567,7 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
 
 int bus_machine_method_copy(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         const char *src, *dest, *host_path, *container_path;
-        CopyFlags copy_flags = COPY_REFLINK|COPY_MERGE|COPY_HARDLINKS;
+        CopyFlags copy_flags = COPY_MERGE|COPY_HARDLINKS;
         Machine *m = ASSERT_PTR(userdata);
         Manager *manager = m->manager;
         bool copy_from;
@@ -528,33 +599,35 @@ int bus_machine_method_copy(sd_bus_message *message, void *userdata, sd_bus_erro
                         copy_flags |= COPY_REPLACE;
         }
 
-        if (!path_is_absolute(src))
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Source path must be absolute.");
+        if (!path_is_absolute(src) || !path_is_normalized(src))
+                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Source path must be absolute and normalized.");
 
         if (isempty(dest))
                 dest = src;
-        else if (!path_is_absolute(dest))
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Destination path must be absolute.");
+        else if (!path_is_absolute(dest) || !path_is_normalized(dest))
+                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Destination path must be absolute and normalized.");
 
-        const char *details[] = {
-                "machine", m->name,
-                "verb", "copy",
-                "src", src,
-                "dest", dest,
-                NULL
-        };
+        if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                const char *details[] = {
+                        "machine", m->name,
+                        "verb", "copy",
+                        "src", src,
+                        "dest", dest,
+                        NULL
+                };
 
-        /* NB: For now not opened up to owner of machine without auth */
-        r = bus_verify_polkit_async(
-                        message,
-                        "org.freedesktop.machine1.manage-machines",
-                        details,
-                        &manager->polkit_registry,
-                        error);
-        if (r < 0)
-                return r;
-        if (r == 0)
-                return 1; /* Will call us back */
+                /* NB: For now not opened up to owner of machine without auth */
+                r = bus_verify_polkit_async(
+                                message,
+                                "org.freedesktop.machine1.manage-machines",
+                                details,
+                                &manager->polkit_registry,
+                                error);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 1; /* Will call us back */
+        }
 
         copy_from = strstr(sd_bus_message_get_member(message), "CopyFrom");
 
@@ -582,23 +655,25 @@ int bus_machine_method_open_root_directory(sd_bus_message *message, void *userda
 
         assert(message);
 
-        const char *details[] = {
-                "machine", m->name,
-                "verb", "open_root_directory",
-                NULL
-        };
+        if (m->manager->runtime_scope != RUNTIME_SCOPE_USER) {
+                const char *details[] = {
+                        "machine", m->name,
+                        "verb", "open_root_directory",
+                        NULL
+                };
 
-        /* NB: For now not opened up to owner of machine without auth */
-        r = bus_verify_polkit_async(
-                        message,
-                        "org.freedesktop.machine1.manage-machines",
-                        details,
-                        &m->manager->polkit_registry,
-                        error);
-        if (r < 0)
-                return r;
-        if (r == 0)
-                return 1; /* Will call us back */
+                /* NB: For now not opened up to owner of machine without auth */
+                r = bus_verify_polkit_async(
+                                message,
+                                "org.freedesktop.machine1.manage-machines",
+                                details,
+                                &m->manager->polkit_registry,
+                                error);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 1; /* Will call us back */
+        }
 
         fd = machine_open_root_directory(m);
         if (ERRNO_IS_NEG_NOT_SUPPORTED(fd))
@@ -832,20 +907,19 @@ const BusObjectImplementation machine_object = {
         .node_enumerator = machine_node_enumerator,
 };
 
-int machine_send_signal(Machine *m, bool new_machine) {
-        _cleanup_free_ char *p = NULL;
-
+int machine_send_signal(Machine *m, const char *signal_name) {
         assert(m);
+        assert(signal_name);
 
-        p = machine_bus_path(m);
+        _cleanup_free_ char *p = machine_bus_path(m);
         if (!p)
                 return -ENOMEM;
 
         return sd_bus_emit_signal(
-                        m->manager->bus,
+                        m->manager->api_bus,
                         "/org/freedesktop/machine1",
                         "org.freedesktop.machine1.Manager",
-                        new_machine ? "MachineNew" : "MachineRemoved",
+                        signal_name,
                         "so", m->name, p);
 }
 

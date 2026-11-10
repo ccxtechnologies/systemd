@@ -10,6 +10,7 @@
 #include "fileio.h"
 #include "parse-util.h"
 #include "psi-util.h"
+#include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
 
@@ -18,7 +19,7 @@ int read_resource_pressure(const char *path, PressureType type, ResourcePressure
         _cleanup_fclose_ FILE *f = NULL;
         unsigned field_filled = 0;
         ResourcePressure rp = {};
-        const char *t, *cline;
+        const char *cline;
         char *word;
         int r;
 
@@ -26,12 +27,7 @@ int read_resource_pressure(const char *path, PressureType type, ResourcePressure
         assert(IN_SET(type, PRESSURE_TYPE_SOME, PRESSURE_TYPE_FULL));
         assert(ret);
 
-        if (type == PRESSURE_TYPE_SOME)
-                t = "some";
-        else if (type == PRESSURE_TYPE_FULL)
-                t = "full";
-        else
-                return -EINVAL;
+        const char *t = ASSERT_PTR(pressure_type_to_string(type));
 
         r = fopen_unlocked(path, "re", &f);
         if (r < 0)
@@ -103,6 +99,39 @@ int read_resource_pressure(const char *path, PressureType type, ResourcePressure
         *ret = rp;
         return 0;
 }
+
+const PressureResourceInfo pressure_resource_info[_PRESSURE_RESOURCE_MAX] = {
+        [PRESSURE_MEMORY] = {
+                .name      = "memory",
+                .env_watch = "MEMORY_PRESSURE_WATCH",
+                .env_write = "MEMORY_PRESSURE_WRITE",
+        },
+        [PRESSURE_CPU] = {
+                .name      = "cpu",
+                .env_watch = "CPU_PRESSURE_WATCH",
+                .env_write = "CPU_PRESSURE_WRITE",
+        },
+        [PRESSURE_IO] = {
+                .name      = "io",
+                .env_watch = "IO_PRESSURE_WATCH",
+                .env_write = "IO_PRESSURE_WRITE",
+        },
+};
+
+static const char* const pressure_resource_table[_PRESSURE_RESOURCE_MAX] = {
+        [PRESSURE_MEMORY] = "memory",
+        [PRESSURE_CPU]    = "cpu",
+        [PRESSURE_IO]     = "io",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(pressure_resource, PressureResource);
+
+static const char* const pressure_type_table[_PRESSURE_TYPE_MAX] = {
+        [PRESSURE_TYPE_SOME] = "some",
+        [PRESSURE_TYPE_FULL] = "full",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(pressure_type, PressureType);
 
 int is_pressure_supported(void) {
         static thread_local int cached = -1;

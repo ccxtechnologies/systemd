@@ -3,7 +3,11 @@
 #include "qrcode-util.h"
 
 #if HAVE_QRENCODE
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBQRENCODE
+#  error "missing libqrencode_cflags in meson dependency."
+#endif
 #include <qrencode.h>
+#endif
 #include <stdio.h>
 
 #include "ansi-color.h"
@@ -18,22 +22,21 @@
 #define UNICODE_LOWER_HALF_BLOCK UTF8("▄")
 #define UNICODE_UPPER_HALF_BLOCK UTF8("▀")
 
-static void *qrcode_dl = NULL;
-
+#if HAVE_QRENCODE
 static DLSYM_PROTOTYPE(QRcode_encodeString) = NULL;
 static DLSYM_PROTOTYPE(QRcode_free) = NULL;
+#endif
 
-int dlopen_qrencode(void) {
+int dlopen_qrencode(int log_level) {
+#if HAVE_QRENCODE
+        static void *qrcode_dl = NULL;
         int r;
 
-        ELF_NOTE_DLOPEN("qrencode",
-                        "Support for generating QR codes",
-                        ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
-                        "libqrencode.so.4", "libqrencode.so.3");
+        LIBQRENCODE_NOTE(suggested);
 
         FOREACH_STRING(s, "libqrencode.so.4", "libqrencode.so.3") {
                 r = dlopen_many_sym_or_warn(
-                        &qrcode_dl, s, LOG_DEBUG,
+                        &qrcode_dl, s, log_level,
                         DLSYM_ARG(QRcode_encodeString),
                         DLSYM_ARG(QRcode_free));
                 if (r >= 0)
@@ -41,7 +44,13 @@ int dlopen_qrencode(void) {
         }
 
         return r;
+#else
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libqrencode support is not compiled in.");
+#endif
 }
+
+#if HAVE_QRENCODE
 
 static void print_border(FILE *output, unsigned width, unsigned row, unsigned column) {
         assert(output);
@@ -174,7 +183,9 @@ static void write_qrcode(FILE *output, QRcode *qr, unsigned row, unsigned column
         fflush(output);
 }
 
-DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(QRcode*, sym_QRcode_free, NULL);
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(QRcode*, sym_QRcode_free, QRcode_freep, NULL);
+
+#endif
 
 int print_qrcode_full(
                 FILE *out,
@@ -186,6 +197,7 @@ int print_qrcode_full(
                 unsigned tty_height,
                 bool check_tty) {
 
+#if HAVE_QRENCODE
         int r;
 
         /* If this is not a UTF-8 system or ANSI colors aren't supported/disabled don't print any QR
@@ -195,12 +207,11 @@ int print_qrcode_full(
         if (check_tty && !colors_enabled())
                 return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Colors are disabled, cannot print qrcode");
 
-        r = dlopen_qrencode();
+        r = dlopen_qrencode(LOG_DEBUG);
         if (r < 0)
                 return r;
 
-        _cleanup_(sym_QRcode_freep) QRcode *qr =
-                sym_QRcode_encodeString(string, 0, QR_ECLEVEL_L, QR_MODE_8, 1);
+        _cleanup_(QRcode_freep) QRcode *qr = sym_QRcode_encodeString(string, 0, QR_ECLEVEL_L, QR_MODE_8, 1);
         if (!qr)
                 return log_oom_debug();
 
@@ -235,5 +246,7 @@ int print_qrcode_full(
         fputc('\n', out);
 
         return 0;
-}
+#else
+        return -EOPNOTSUPP;
 #endif
+}

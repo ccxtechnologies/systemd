@@ -42,8 +42,8 @@ static int process_deps(Unit *u, UnitDependency dependency, const char *dir_suff
 
                 if (null_or_empty_path(*p) > 0) {
                         /* an error usually means an invalid symlink, which is not a mask */
-                        log_unit_debug(u, "%s dependency on %s is masked by %s, ignoring.",
-                                       unit_dependency_to_string(dependency), entry, *p);
+                        log_unit_debug(u, "%s dependency is masked by %s, ignoring.",
+                                       unit_dependency_to_string(dependency), *p);
                         continue;
                 }
 
@@ -126,11 +126,11 @@ int unit_load_dropin(Unit *u) {
                 return r;
 
         /* Load .conf dropins */
-        r = unit_find_dropin_paths(u, /* use_unit_path_cache = */ true, &l);
+        r = unit_find_dropin_paths(u, /* use_unit_path_cache= */ true, &l);
         if (r <= 0)
                 return 0;
 
-        r = strv_extend_strv_consume(&u->dropin_paths, TAKE_PTR(l), /* filter_duplicates = */ true);
+        r = strv_extend_strv_consume(&u->dropin_paths, TAKE_PTR(l), /* filter_duplicates= */ true);
         if (r < 0)
                 return log_oom();
 

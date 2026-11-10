@@ -3,6 +3,6 @@
 
 #include "systemctl.h"
 
-int daemon_reload(enum action, bool graceful);
+int daemon_reload(enum action action, bool graceful);
 
-int verb_daemon_reload(int argc, char *argv[], void *userdata);
+int verb_daemon_reload(int argc, char *argv[], uintptr_t _data, void *userdata);

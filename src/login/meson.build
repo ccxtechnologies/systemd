@@ -7,7 +7,7 @@ endif
 systemd_logind_sources = files(
         'logind.c',
 )
-systemd_logind_extract_sources = files(
+systemd_logind_export_sources = files(
         'logind-action.c',
         'logind-brightness.c',
         'logind-button.c',
@@ -21,6 +21,7 @@ systemd_logind_extract_sources = files(
         'logind-session-dbus.c',
         'logind-session-device.c',
         'logind-session.c',
+        'logind-shutdown.c',
         'logind-user-dbus.c',
         'logind-user.c',
         'logind-utmp.c',
@@ -34,7 +35,7 @@ logind_gperf_c = custom_target(
         command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
 generated_sources += logind_gperf_c
-systemd_logind_extract_sources += [logind_gperf_c]
+systemd_logind_export_sources += [logind_gperf_c]
 
 loginctl_sources = files(
         'loginctl.c',
@@ -45,11 +46,10 @@ executables += [
         libexec_template + {
                 'name' : 'systemd-logind',
                 'dbus' : true,
-                'sources' : systemd_logind_sources + systemd_logind_extract_sources,
-                'include_directories' : [libexec_template['include_directories'], include_directories('.')],
-                'extract' : systemd_logind_extract_sources,
+                'sources' : systemd_logind_sources,
+                'export' : systemd_logind_export_sources,
                 'dependencies' : [
-                        threads,
+                        libacl_cflags,
                 ],
         },
         executable_template + {
@@ -60,7 +60,6 @@ executables += [
                         liblz4_cflags,
                         libxz_cflags,
                         libzstd_cflags,
-                        threads,
                 ],
         },
         executable_template + {
@@ -78,8 +77,7 @@ executables += [
         },
         test_template + {
                 'sources' : files('test-login-tables.c'),
-                'objects' : ['systemd-logind'],
-                'dependencies' : threads,
+                'import' : ['systemd-logind'],
         },
         test_template + {
                 'sources' : files('test-session-properties.c'),
@@ -110,7 +108,7 @@ custom_target(
         input : 'logind.conf.in',
         output : 'logind.conf',
         command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
-        install : install_sysconfdir_samples and pkgsysconfdir != 'no',
+        install : install_sysconfdir_samples,
         install_dir : pkgconfigfiledir)
 
 custom_target(

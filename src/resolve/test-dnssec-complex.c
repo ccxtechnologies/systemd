@@ -18,6 +18,8 @@ static void prefix_random(const char *name, char **ret) {
         uint64_t i, u;
         char *m = NULL;
 
+        assert(ret);
+
         u = 1 + (random_u64() & 3);
 
         for (i = 0; i < u; i++) {
@@ -195,7 +197,7 @@ int main(int argc, char* argv[]) {
         test_hostname_lookup(bus, "poettering.de", AF_INET, NULL);
         test_hostname_lookup(bus, "poettering.de", AF_INET6, NULL);
 
-#if HAVE_LIBIDN2 || HAVE_LIBIDN
+#if HAVE_LIBIDN2
         /* Unsigned A with IDNA conversion necessary */
         test_hostname_lookup(bus, "pöttering.de", AF_UNSPEC, NULL);
         test_hostname_lookup(bus, "pöttering.de", AF_INET, NULL);

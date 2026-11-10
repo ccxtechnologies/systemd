@@ -5,6 +5,7 @@
 #include "alloc-util.h"
 #include "bootctl.h"
 #include "bootctl-random-seed.h"
+#include "bootctl-util.h"
 #include "efivars.h"
 #include "env-util.h"
 #include "fd-util.h"
@@ -61,7 +62,7 @@ static int set_system_token(void) {
         if (!touch_variables())
                 return 0;
 
-        r = getenv_bool("SYSTEMD_WRITE_SYSTEM_TOKEN");
+        r = secure_getenv_bool("SYSTEMD_WRITE_SYSTEM_TOKEN");
         if (r < 0) {
                 if (r != -ENXIO)
                         log_warning_errno(r, "Failed to parse $SYSTEMD_WRITE_SYSTEM_TOKEN, ignoring.");
@@ -110,8 +111,8 @@ static int set_system_token(void) {
         return 0;
 }
 
-int install_random_seed(const char *esp) {
-        _cleanup_close_ int esp_fd = -EBADF, loader_dir_fd = -EBADF, fd = -EBADF;
+int install_random_seed(const char *esp, int esp_fd) {
+        _cleanup_close_ int loader_dir_fd = -EBADF, fd = -EBADF;
         _cleanup_free_ char *tmp = NULL;
         uint8_t buffer[RANDOM_EFI_SEED_SIZE];
         struct sha256_ctx hash_state;
@@ -119,12 +120,12 @@ int install_random_seed(const char *esp) {
         int r;
 
         assert(esp);
+        assert(esp_fd >= 0);
 
         assert_cc(RANDOM_EFI_SEED_SIZE == SHA256_DIGEST_SIZE);
 
-        esp_fd = open(esp, O_DIRECTORY|O_RDONLY|O_CLOEXEC);
-        if (esp_fd < 0)
-                return log_error_errno(errno, "Failed to open ESP directory '%s': %m", esp);
+        if (!arg_install_random_seed)
+                return 0;
 
         (void) random_seed_verify_permissions(esp_fd, S_IFDIR);
 
@@ -172,26 +173,22 @@ int install_random_seed(const char *esp) {
         if (fd < 0)
                 return log_error_errno(fd, "Failed to open random seed file for writing: %m");
 
+        CLEANUP_TMPFILE_AT(loader_dir_fd, tmp);
+
         if (!warned) /* only warn once per seed file */
                 (void) random_seed_verify_permissions(fd, S_IFREG);
 
         r = loop_write(fd, buffer, sizeof(buffer));
-        if (r < 0) {
-                log_error_errno(r, "Failed to write random seed file: %m");
-                goto fail;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to write random seed file: %m");
 
-        if (fsync(fd) < 0 || fsync(loader_dir_fd) < 0) {
-                r = log_error_errno(errno, "Failed to sync random seed file: %m");
-                goto fail;
-        }
+        if (fsync(fd) < 0 || fsync(loader_dir_fd) < 0)
+                return log_error_errno(errno, "Failed to sync random seed file: %m");
 
-        if (renameat(loader_dir_fd, tmp, loader_dir_fd, "random-seed") < 0) {
-                r = log_error_errno(errno, "Failed to move random seed file into place: %m");
-                goto fail;
-        }
+        if (renameat(loader_dir_fd, tmp, loader_dir_fd, "random-seed") < 0)
+                return log_error_errno(errno, "Failed to move random seed file into place: %m");
 
-        tmp = mfree(tmp);
+        tmp = mfree(tmp); /* disarm CLEANUP_TMPFILE_AT() */
 
         if (syncfs(fd) < 0)
                 return log_error_errno(errno, "Failed to sync ESP file system: %m");
@@ -199,18 +196,13 @@ int install_random_seed(const char *esp) {
         log_info("Random seed file %s/loader/random-seed successfully %s (%zu bytes).", esp, refreshed ? "refreshed" : "written", sizeof(buffer));
 
         return set_system_token();
-
-fail:
-        assert(tmp);
-        (void) unlinkat(loader_dir_fd, tmp, 0);
-
-        return r;
 }
 
-int verb_random_seed(int argc, char *argv[], void *userdata) {
+int verb_random_seed(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
-        r = find_esp_and_warn(arg_root, arg_esp_path, false, &arg_esp_path, NULL, NULL, NULL, NULL, NULL);
+        _cleanup_close_ int esp_fd = -EBADF;
+        r = find_esp_and_warn(arg_root, arg_esp_path, /* unprivileged_mode= */ false, &arg_esp_path, &esp_fd);
         if (r == -ENOKEY) {
                 /* find_esp_and_warn() doesn't warn about ENOKEY, so let's do that on our own */
                 if (arg_graceful() == ARG_GRACEFUL_NO)
@@ -222,7 +214,7 @@ int verb_random_seed(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return r;
 
-        r = install_random_seed(arg_esp_path);
+        r = install_random_seed(arg_esp_path, esp_fd);
         if (r < 0)
                 return r;
 

@@ -2,40 +2,48 @@
 
 #include "alloc-util.h"
 #include "conf-parser.h"
+#include "fd-util.h"
 #include "kernel-config.h"
 #include "path-util.h"
 
-int load_kernel_install_conf(
+int load_kernel_install_conf_at(
                 const char *root,
+                int root_fd,
                 const char *conf_root,
                 char **ret_machine_id,
                 char **ret_boot_root,
                 char **ret_layout,
                 char **ret_initrd_generator,
-                char **ret_uki_generator) {
+                char **ret_uki_generator,
+                char **ret_entry_name_format) {
 
         _cleanup_free_ char *machine_id = NULL, *boot_root = NULL, *layout = NULL,
-                            *initrd_generator = NULL, *uki_generator = NULL;
+                            *initrd_generator = NULL, *uki_generator = NULL,
+                            *entry_name_format = NULL;
         const ConfigTableItem items[] = {
-                { NULL, "MACHINE_ID",       config_parse_string, 0, &machine_id       },
-                { NULL, "BOOT_ROOT",        config_parse_string, 0, &boot_root        },
-                { NULL, "layout",           config_parse_string, 0, &layout           },
-                { NULL, "initrd_generator", config_parse_string, 0, &initrd_generator },
-                { NULL, "uki_generator",    config_parse_string, 0, &uki_generator    },
+                { NULL, "MACHINE_ID",        config_parse_string, 0, &machine_id        },
+                { NULL, "BOOT_ROOT",         config_parse_string, 0, &boot_root         },
+                { NULL, "layout",            config_parse_string, 0, &layout            },
+                { NULL, "initrd_generator",  config_parse_string, 0, &initrd_generator  },
+                { NULL, "uki_generator",     config_parse_string, 0, &uki_generator     },
+                { NULL, "entry_name_format", config_parse_string, 0, &entry_name_format },
                 {}
         };
         int r;
+
+        assert(wildcard_fd_is_valid(root_fd));
 
         if (conf_root) {
                 _cleanup_free_ char *conf = path_join(conf_root, "install.conf");
                 if (!conf)
                         return log_oom();
 
-                r = config_parse_many(
+                r = config_parse_many_full(
                                 STRV_MAKE_CONST(conf),
                                 STRV_MAKE_CONST(conf_root),
                                 "install.conf.d",
-                                /* root= */ NULL, /* $KERNEL_INSTALL_CONF_ROOT and --root are independent */
+                                root,
+                                root_fd,
                                 /* sections= */ NULL,
                                 config_item_table_lookup, items,
                                 CONFIG_PARSE_WARN,
@@ -45,6 +53,7 @@ int load_kernel_install_conf(
         } else
                 r = config_parse_standard_file_with_dropins_full(
                                 root,
+                                root_fd,
                                 "kernel/install.conf",
                                 /* sections= */ NULL,
                                 config_item_table_lookup, items,
@@ -65,5 +74,7 @@ int load_kernel_install_conf(
                 *ret_initrd_generator = TAKE_PTR(initrd_generator);
         if (ret_uki_generator)
                 *ret_uki_generator = TAKE_PTR(uki_generator);
+        if (ret_entry_name_format)
+                *ret_entry_name_format = TAKE_PTR(entry_name_format);
         return r >= 0;  /* Return 0 if we got -ENOENT above, 1 otherwise. */
 }

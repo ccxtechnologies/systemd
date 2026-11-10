@@ -9,12 +9,16 @@
 #include "build-path.h"
 #include "common-signal.h"
 #include "env-util.h"
+#include "errno-util.h"
 #include "event-util.h"
+#include "exit-status.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
 #include "log.h"
 #include "mkdir.h"
+#include "pidfd-util.h"
+#include "pidref.h"
 #include "process-util.h"
 #include "set.h"
 #include "signal-util.h"
@@ -38,6 +42,14 @@ static int on_worker_exit(sd_event_source *s, const siginfo_t *si, void *userdat
         sd_event_source_disable_unref(s);
 
         if (si->si_code == CLD_EXITED) {
+                if (si->si_status == EXIT_EXEC) {
+                        /* The worker binary cannot be executed, respawning it would just fail the same way
+                         * over and over again. Let's give up. */
+                        log_error("Worker " PID_FMT " failed to execute worker binary, exiting.", si->si_pid);
+                        sd_event_exit(m->event, EXIT_FAILURE);
+                        return 0;
+                }
+
                 if (si->si_status == EXIT_SUCCESS)
                         log_debug("Worker " PID_FMT " exited successfully.", si->si_pid);
                 else
@@ -47,7 +59,7 @@ static int on_worker_exit(sd_event_source *s, const siginfo_t *si, void *userdat
         else if (si->si_code == CLD_DUMPED)
                 log_warning("Worker " PID_FMT " dumped core by signal %s, ignoring.", si->si_pid, signal_to_string(si->si_status));
         else
-                log_warning("Can't handle SIGCHLD of this type");
+                log_warning("Can't handle exit code of this type");
 
         (void) start_workers(m, /* explicit_request= */ false); /* Fill up workers again if we fell below the low watermark */
         return 0;
@@ -58,7 +70,7 @@ static int on_sigusr2(sd_event_source *s, const struct signalfd_siginfo *si, voi
 
         assert(s);
 
-        (void) start_workers(m, /* explicit_request=*/ true); /* Workers told us there's more work, let's add one more worker as long as we are below the high watermark */
+        (void) start_workers(m, /* explicit_request= */ true); /* Workers told us there's more work, let's add one more worker as long as we are below the high watermark */
         return 0;
 }
 
@@ -69,13 +81,15 @@ static int on_deferred_start_worker(sd_event_source *s, uint64_t usec, void *use
 
         m->deferred_start_worker_event_source = sd_event_source_unref(m->deferred_start_worker_event_source);
 
-        (void) start_workers(m, /* explicit_request=*/ false);
+        (void) start_workers(m, /* explicit_request= */ false);
         return 0;
 }
 
 int manager_new(Manager **ret) {
         _cleanup_(manager_freep) Manager *m = NULL;
         int r;
+
+        assert(ret);
 
         m = new(Manager, 1);
         if (!m)
@@ -142,19 +156,19 @@ static size_t manager_current_workers(Manager *m) {
 static int start_one_worker(Manager *m) {
         _cleanup_(sd_event_source_disable_unrefp) sd_event_source *source = NULL;
         bool fixed;
-        pid_t pid;
         int r;
 
         assert(m);
 
         fixed = set_size(m->workers_fixed) < USERDB_WORKERS_MIN;
 
-        r = safe_fork_full(
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = pidref_safe_fork_full(
                         "(sd-worker)",
                         /* stdio_fds= */ NULL,
                         &m->listen_fd, 1,
                         FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_REOPEN_LOG|FORK_LOG|FORK_CLOSE_ALL_FDS,
-                        &pid);
+                        &pidref);
         if (r < 0)
                 return log_error_errno(r, "Failed to fork new worker child: %m");
         if (r == 0) {
@@ -175,10 +189,19 @@ static int start_one_worker(Manager *m) {
                         safe_close(m->listen_fd);
                 }
 
-                r = setenvf("LISTEN_PID", /* overwrite= */ true, PID_FMT, pid);
+                r = setenvf("LISTEN_PID", /* overwrite= */ true, PID_FMT, pidref.pid);
                 if (r < 0) {
                         log_error_errno(r, "Failed to set $LISTEN_PID: %m");
                         _exit(EXIT_FAILURE);
+                }
+
+                uint64_t pidfdid;
+                if (pidfd_get_inode_id_self_cached(&pidfdid) >= 0) {
+                        r = setenvf("LISTEN_PIDFDID", true, "%" PRIu64, pidfdid);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to set $LISTEN_PIDFDID: %m");
+                                _exit(EXIT_FAILURE);
+                        }
                 }
 
                 if (setenv("LISTEN_FDS", "1", 1) < 0) {
@@ -199,12 +222,12 @@ static int start_one_worker(Manager *m) {
 
                 r = invoke_callout_binary(SYSTEMD_USERWORK_PATH, STRV_MAKE(SYSTEMD_USERWORK_PATH, "xxxxxxxxxxxxxxxx")); /* With some extra space rename_process() can make use of */
                 log_error_errno(r, "Failed to start worker process: %m");
-                _exit(EXIT_FAILURE);
+                _exit(ERRNO_IS_NEG_RESOURCE(r) ? EXIT_FAILURE : EXIT_EXEC);
         }
 
-        r = sd_event_add_child(m->event, &source, pid, WEXITED, on_worker_exit, m);
+        r = event_add_child_pidref(m->event, &source, &pidref, WEXITED, on_worker_exit, m);
         if (r < 0)
-                return log_error_errno(r, "Failed to watch child " PID_FMT ": %m", pid);
+                return log_error_errno(r, "Failed to watch child " PID_FMT ": %m", pidref.pid);
 
         r = set_ensure_put(
                         fixed ? &m->workers_fixed : &m->workers_dynamic,
@@ -246,7 +269,7 @@ static int start_workers(Manager *m, bool explicit_request) {
                                 r = sd_event_add_time(
                                                 m->event,
                                                 &m->deferred_start_worker_event_source,
-                                                CLOCK_MONOTONIC,
+                                                CLOCK_BOOTTIME,
                                                 ratelimit_end(&m->worker_ratelimit),
                                                 /* accuracy= */ 0,
                                                 on_deferred_start_worker,

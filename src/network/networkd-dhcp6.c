@@ -24,6 +24,7 @@
 #include "networkd-queue.h"
 #include "networkd-route.h"
 #include "networkd-state-file.h"
+#include "networkd-wwan.h"
 #include "set.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -46,7 +47,7 @@ static DHCP6ClientStartMode link_get_dhcp6_client_start_mode(Link *link) {
                 return link->network->dhcp6_client_start_mode;
 
         /* When this interface itself is an uplink interface, then start dhcp6 client in solicit mode. */
-        if (dhcp_pd_is_uplink(link, link, /* accept_auto = */ false))
+        if (dhcp_pd_is_uplink(link, link, /* accept_auto= */ false))
                 return DHCP6_CLIENT_START_MODE_SOLICIT;
 
         /* Otherwise, start dhcp6 client when RA is received. */
@@ -81,6 +82,10 @@ static int dhcp6_remove(Link *link, bool only_marked) {
 
                 RET_GATHER(ret, address_remove_and_cancel(address, link));
         }
+
+        if (!only_marked)
+                /* Also drop pending requests when the lease is lost or the client is stopped. */
+                RET_GATHER(ret, link_drop_requests(link, NETWORK_CONFIG_SOURCE_DHCP6));
 
         return ret;
 }
@@ -125,7 +130,7 @@ int dhcp6_check_ready(Link *link) {
         link->dhcp6_configured = true;
         log_link_debug(link, "DHCPv6 addresses and routes set.");
 
-        r = dhcp6_remove(link, /* only_marked = */ true);
+        r = dhcp6_remove(link, /* only_marked= */ true);
         if (r < 0)
                 return r;
 
@@ -200,6 +205,10 @@ static int dhcp6_request_address(
         _cleanup_(address_unrefp) Address *addr = NULL;
         Address *existing;
         int r;
+
+        assert(link);
+        assert(server_address);
+        assert(ip6_addr);
 
         r = address_new(&addr);
         if (r < 0)
@@ -335,7 +344,7 @@ static int dhcp6_lease_ip_acquired(sd_dhcp6_client *client, Link *link) {
         if (link->dhcp6_messages == 0) {
                 link->dhcp6_configured = true;
 
-                r = dhcp6_remove(link, /* only_marked = */ true);
+                r = dhcp6_remove(link, /* only_marked= */ true);
                 if (r < 0)
                         return r;
         } else
@@ -359,7 +368,7 @@ static int dhcp6_lease_information_acquired(sd_dhcp6_client *client, Link *link)
         if (r < 0)
                 return log_link_error_errno(link, r, "Failed to get DHCPv6 lease: %m");
 
-        unref_and_replace_full(link->dhcp6_lease, lease, sd_dhcp6_lease_ref, sd_dhcp6_lease_unref);
+        unref_and_replace_new_ref(link->dhcp6_lease, lease, sd_dhcp6_lease_ref, sd_dhcp6_lease_unref);
 
         link_dirty(link);
         return 0;
@@ -381,7 +390,7 @@ static int dhcp6_lease_lost(Link *link) {
 
         link->dhcp6_lease = sd_dhcp6_lease_unref(link->dhcp6_lease);
 
-        r = dhcp6_remove(link, /* only_marked = */ false);
+        r = dhcp6_remove(link, /* only_marked= */ false);
         if (r < 0)
                 return r;
 
@@ -492,6 +501,9 @@ int dhcp6_start(Link *link) {
                 return 0;
 
         if (!link_dhcp6_enabled(link))
+                return 0;
+
+        if (link_dhcp_enabled_by_bearer(link, AF_INET6) == 0)
                 return 0;
 
         if (!link_has_carrier(link))
@@ -808,7 +820,7 @@ static int dhcp6_process_request(Request *req, Link *link, void *userdata) {
 
         assert(link);
 
-        if (!link_is_ready_to_configure(link, /* allow_unmanaged = */ false))
+        if (!link_is_ready_to_configure(link, /* allow_unmanaged= */ false))
                 return 0;
 
         r = dhcp_configure_duid(link, link_get_dhcp6_duid(link));
@@ -865,7 +877,7 @@ int link_drop_dhcp6_config(Link *link, Network *network) {
                 ret = sd_dhcp6_client_stop(link->dhcp6_client);
 
                 /* Also explicitly drop DHCPv6 addresses and routes. See also link_drop_dhcp4_config(). */
-                RET_GATHER(ret, dhcp6_remove(link, /* only_marked = */ false));
+                RET_GATHER(ret, dhcp6_remove(link, /* only_marked= */ false));
         }
 
         /* Even if the client is currently enabled and also enabled in the new .network file, detailed

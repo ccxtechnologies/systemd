@@ -7,17 +7,17 @@
 
 #include "alloc-util.h"
 #include "capability-util.h"
+#include "dns-answer.h"
+#include "dns-packet.h"
+#include "dns-question.h"
+#include "dns-rr.h"
 #include "dns-type.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "log.h"
 #include "missing-network.h"
 #include "resolve-util.h"
-#include "resolved-dns-answer.h"
-#include "resolved-dns-packet.h"
 #include "resolved-dns-query.h"
-#include "resolved-dns-question.h"
-#include "resolved-dns-rr.h"
 #include "resolved-dns-stream.h"
 #include "resolved-dns-stub.h"
 #include "resolved-dns-transaction.h"
@@ -81,9 +81,9 @@ int dns_stub_listener_extra_new(
                 Manager *m,
                 DnsStubListenerExtra **ret) {
 
-        DnsStubListenerExtra *l;
+        assert(ret);
 
-        l = new(DnsStubListenerExtra, 1);
+        DnsStubListenerExtra *l = new(DnsStubListenerExtra, 1);
         if (!l)
                 return -ENOMEM;
 
@@ -101,6 +101,19 @@ DnsStubListenerExtra *dns_stub_listener_extra_free(DnsStubListenerExtra *p) {
 
         p->udp_event_source = sd_event_source_disable_unref(p->udp_event_source);
         p->tcp_event_source = sd_event_source_disable_unref(p->tcp_event_source);
+
+        assert(p->manager);
+
+        /* Detach the raw back-pointers that DnsStream and DnsQuery objects keep to this listener before we
+         * free it. Otherwise a later dns_stream_complete()/dns_query_free() during the same reload would
+         * dereference the freed slab: dns_query_free() reads q->stub_listener_extra->queries_by_packet. */
+        LIST_FOREACH(streams, s, p->manager->dns_streams)
+                if (s->stub_listener_extra == p)
+                        s->stub_listener_extra = NULL;
+
+        LIST_FOREACH(queries, q, p->manager->dns_queries)
+                if (q->stub_listener_extra == p)
+                        q->stub_listener_extra = NULL;
 
         hashmap_free(p->queries_by_packet);
 
@@ -146,7 +159,7 @@ static int stub_packet_compare_func(const DnsPacket *x, const DnsPacket *y) {
         return memcmp(DNS_PACKET_HEADER(x), DNS_PACKET_HEADER(y), sizeof(DnsPacketHeader));
 }
 
-DEFINE_HASH_OPS(stub_packet_hash_ops, DnsPacket, stub_packet_hash_func, stub_packet_compare_func);
+DEFINE_PRIVATE_HASH_OPS(stub_packet_hash_ops, DnsPacket, stub_packet_hash_func, stub_packet_compare_func);
 
 static int reply_add_with_rrsig(
                 DnsAnswer **reply,
@@ -464,7 +477,7 @@ static int dns_stub_finish_reply_packet(
         assert(p);
 
         if (add_opt) {
-                r = dns_packet_append_opt(p, max_udp_size, edns0_do, /* include_rfc6975 = */ false, nsid ? nsid_string() : NULL, rcode, NULL);
+                r = dns_packet_append_opt(p, max_udp_size, edns0_do, /* include_rfc6975= */ false, nsid ? nsid_string() : NULL, rcode, NULL);
                 if (r == -EMSGSIZE) /* Hit the size limit? then indicate truncation */
                         tc = true;
                 else if (r < 0)
@@ -694,7 +707,7 @@ static int dns_stub_send_failure(
         return dns_stub_send(m, l, s, p, reply);
 }
 
-static int dns_stub_patch_bypass_reply_packet(
+int dns_stub_patch_bypass_reply_packet(
                 DnsPacket **ret,       /* Where to place the patched packet */
                 DnsPacket *original,   /* The packet to patch */
                 DnsPacket *request,    /* The packet the patched packet shall look like a reply to */
@@ -735,7 +748,10 @@ static int dns_stub_patch_bypass_reply_packet(
          * set the TC bit if our reply is larger than what the client supports, and truncate. */
         if (c->size > dns_packet_payload_size_max(request)) {
                 log_debug("Artificially truncating stub response, as advertised size of client is smaller than upstream one.");
-                dns_packet_truncate(c, dns_packet_payload_size_max(request));
+                r = dns_packet_truncate_rrs(c, dns_packet_payload_size_max(request),
+                                            /* reserve_opt= */ !!request->opt);
+                if (r < 0)
+                        return r;
                 DNS_PACKET_HEADER(c)->flags = htobe16(be16toh(DNS_PACKET_HEADER(c)->flags) | DNS_PACKET_FLAG_TC);
         }
 
@@ -769,7 +785,7 @@ static void dns_stub_query_complete(DnsQuery *query) {
                         _cleanup_(dns_packet_unrefp) DnsPacket *reply = NULL;
 
                         r = dns_stub_patch_bypass_reply_packet(&reply, q->answer_full_packet, q->request_packet,
-                                        /* validated = */ !FLAGS_SET(q->flags, SD_RESOLVED_NO_VALIDATE),
+                                        /* validated= */ !FLAGS_SET(q->flags, SD_RESOLVED_NO_VALIDATE),
                                         FLAGS_SET(q->answer_query_flags, SD_RESOLVED_AUTHENTICATED));
                         if (r < 0)
                                 log_debug_errno(r, "Failed to patch bypass reply packet: %m");

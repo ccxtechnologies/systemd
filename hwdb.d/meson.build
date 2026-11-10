@@ -5,7 +5,6 @@
 # So we don't "test" them.
 hwdb_files_notest = files(
         'README',
-        '20-dmi-id.hwdb',
         '20-pci-vendor-model.hwdb',
         '20-pci-classes.hwdb',
         '20-usb-vendor-model.hwdb',
@@ -15,10 +14,12 @@ hwdb_files_notest = files(
         '20-bluetooth-vendor-product.hwdb',
         '20-acpi-vendor.hwdb',
         '20-OUI.hwdb',
-        '20-net-ifname.hwdb',
         '20-vmbus-class.hwdb')
 
 hwdb_files_test = files(
+        '20-dmi-id.hwdb',
+        '20-net-ifname.hwdb',
+        '40-imds.hwdb',
         '60-autosuspend.hwdb',
         '60-autosuspend-fingerprint-reader.hwdb',
         '60-evdev.hwdb',
@@ -26,11 +27,14 @@ hwdb_files_test = files(
         '60-keyboard.hwdb',
         '60-seat.hwdb',
         '60-sensor.hwdb',
+        '60-tpm2.hwdb',
         '70-analyzers.hwdb',
         '70-av-production.hwdb',
         '70-cameras.hwdb',
+        '70-debug-appliance.hwdb',
         '70-hardware-wallets.hwdb',
         '70-joystick.hwdb',
+        '70-lights.hwdb',
         '70-maker-tools.hwdb',
         '70-mouse.hwdb',
         '70-pda.hwdb',
@@ -38,7 +42,9 @@ hwdb_files_test = files(
         '70-software-radio.hwdb',
         '70-sound-card.hwdb',
         '70-touchpad.hwdb',
-        '80-ieee1394-unit-function.hwdb')
+        '70-vsock.hwdb',
+        '80-ieee1394-unit-function.hwdb',
+        '82-net-auto-link-local.hwdb')
 
 if conf.get('ENABLE_HWDB') == 1
         auto_suspend_rules = custom_target(

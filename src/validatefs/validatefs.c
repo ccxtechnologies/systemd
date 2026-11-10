@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
-
 #include "sd-device.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "blkid-util.h"
@@ -10,6 +9,7 @@
 #include "build.h"
 #include "chase.h"
 #include "device-util.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "gpt.h"
@@ -19,10 +19,10 @@
 #include "mountpoint-util.h"
 #include "parse-argument.h"
 #include "path-util.h"
-#include "pretty-print.h"
 #include "string-util.h"
 #include "strv.h"
 #include "utf8.h"
+#include "verbs.h"
 #include "xattr-util.h"
 
 static char *arg_target = NULL;
@@ -31,94 +31,62 @@ static char *arg_root = NULL;
 STATIC_DESTRUCTOR_REGISTER(arg_target, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
 
-static int help(void) {
-        int r;
-
-        _cleanup_free_ char *link = NULL;
-        r = terminal_urlify_man("systemd-validatefs@.service", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s [OPTIONS...] /path/to/mountpoint\n"
-               "\n%3$sCheck file system validation constraints.%4$s\n\n"
-               "  -h --help            Show this help and exit\n"
-               "     --version         Print version string and exit\n"
-               "     --root=PATH|auto  Operate relative to the specified path\n"
-               "\nSee the %2$s for details.\n",
-               program_invocation_short_name,
-               link,
-               ansi_highlight(),
-               ansi_normal());
-
-        return 0;
-}
+COMMAND(
+        "systemd-validatefs\0",
+        "Check file system validation constraints.",
+        .argspec = "MOUNTPOINT\0",
+        .man_pages = "systemd-validatefs@.service(8)\0",
+);
 
 static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_ROOT,
-        };
-
-        int c, r;
-
-        static const struct option options[] = {
-                { "help",     no_argument,       NULL, 'h'         },
-                { "version" , no_argument,       NULL, ARG_VERSION },
-                { "root",     required_argument, NULL, ARG_ROOT    },
-                {}
-        };
+        int r;
 
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
-                switch (c) {
-                case 'h':
-                        return help();
+        OptionParser opts = { argc, argv };
 
-                case ARG_VERSION:
+        FOREACH_OPTION_OR_RETURN(c, &opts)
+                switch (c) {
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_ROOT:
-                        if (streq(optarg, "auto")) {
-                                arg_root = mfree(arg_root);
+                OPTION_LONG("root", "PATH|auto", "Operate relative to the specified path"):
+                        if (streq(opts.arg, "auto"))
+                                r = free_and_strdup_warn(&arg_root, in_initrd() ? "/sysroot" : NULL);
+                        else {
+                                if (!path_is_absolute(opts.arg))
+                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                               "--root= argument must be 'auto' or absolute path, got: %s", opts.arg);
 
-                                if (in_initrd()) {
-                                        arg_root = strdup("/sysroot");
-                                        if (!arg_root)
-                                                return log_oom();
-                                }
-
-                                break;
+                                r = parse_path_argument(opts.arg, /* suppress_root= */ true, &arg_root);
                         }
-
-                        if (!path_is_absolute(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--root= argument must be 'auto' or absolute path, got: %s", optarg);
-
-                        r = parse_path_argument(optarg, /* suppress_root= */ true, &arg_root);
                         if (r < 0)
                                 return r;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (optind + 1 != argc)
+        char **args = option_parser_get_args(&opts);
+
+        if (strv_length(args) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "%s excepts exactly one argument (the mount point).",
+                                       "%s expects exactly one argument (the mount point).",
                                        program_invocation_short_name);
 
-        arg_target = strdup(argv[optind]);
+        arg_target = strdup(args[0]);
         if (!arg_target)
                 return log_oom();
 
         if (arg_root && !path_startswith(arg_target, arg_root))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Specified path '%s' does not start with specified root '%s', refusing.", arg_target, arg_root);
-
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Specified path '%s' does not start with specified root '%s', refusing.",
+                                       arg_target, arg_root);
         return 1;
 }
 
@@ -257,7 +225,7 @@ static int validate_gpt_label(blkid_probe b, const ValidateFields *f) {
                 return 0;
 
         const char *v = NULL;
-        (void) blkid_probe_lookup_value(b, "PART_ENTRY_NAME", &v, /* len= */ NULL);
+        (void) sym_blkid_probe_lookup_value(b, "PART_ENTRY_NAME", &v, /* len= */ NULL);
 
         if (strv_contains(f->gpt_label, strempty(v)))
                 return 0;
@@ -277,7 +245,7 @@ static int validate_gpt_type(blkid_probe b, const ValidateFields *f) {
                 return 0;
 
         const char *v = NULL;
-        (void) blkid_probe_lookup_value(b, "PART_ENTRY_TYPE", &v, /* len= */ NULL);
+        (void) sym_blkid_probe_lookup_value(b, "PART_ENTRY_TYPE", &v, /* len= */ NULL);
 
         sd_id128_t id;
         if (!v || sd_id128_from_string(v, &id) < 0) {
@@ -305,26 +273,30 @@ static int validate_gpt_metadata_one(sd_device *d, const char *path, const Valid
         assert(d);
         assert(f);
 
+        r = dlopen_libblkid(LOG_ERR);
+        if (r < 0)
+                return r;
+
         _cleanup_close_ int block_fd = sd_device_open(d, O_RDONLY|O_CLOEXEC|O_NONBLOCK);
         if (block_fd < 0)
                 return log_error_errno(block_fd, "Failed to open block device backing '%s': %m", path);
 
-        _cleanup_(blkid_free_probep) blkid_probe b = blkid_new_probe();
+        _cleanup_(blkid_free_probep) blkid_probe b = sym_blkid_new_probe();
         if (!b)
                 return log_oom();
 
         errno = 0;
-        r = blkid_probe_set_device(b, block_fd, 0, 0);
+        r = sym_blkid_probe_set_device(b, block_fd, 0, 0);
         if (r != 0)
                 return log_error_errno(errno_or_else(ENOMEM), "Failed to set up block device prober for '%s': %m", path);
 
-        (void) blkid_probe_enable_superblocks(b, 1);
-        (void) blkid_probe_set_superblocks_flags(b, BLKID_SUBLKS_TYPE|BLKID_SUBLKS_LABEL);
-        (void) blkid_probe_enable_partitions(b, 1);
-        (void) blkid_probe_set_partitions_flags(b, BLKID_PARTS_ENTRY_DETAILS);
+        (void) sym_blkid_probe_enable_superblocks(b, 1);
+        (void) sym_blkid_probe_set_superblocks_flags(b, BLKID_SUBLKS_TYPE|BLKID_SUBLKS_LABEL);
+        (void) sym_blkid_probe_enable_partitions(b, 1);
+        (void) sym_blkid_probe_set_partitions_flags(b, BLKID_PARTS_ENTRY_DETAILS);
 
         errno = 0;
-        r = blkid_do_safeprobe(b);
+        r = sym_blkid_do_safeprobe(b);
         if (r == _BLKID_SAFEPROBE_ERROR)
                 return log_error_errno(errno_or_else(EIO), "Failed to probe block device of '%s': %m", path);
         if (r == _BLKID_SAFEPROBE_AMBIGUOUS)
@@ -335,7 +307,7 @@ static int validate_gpt_metadata_one(sd_device *d, const char *path, const Valid
         assert(r == _BLKID_SAFEPROBE_FOUND);
 
         const char *v = NULL;
-        (void) blkid_probe_lookup_value(b, "PART_ENTRY_SCHEME", &v, /* len= */ NULL);
+        (void) sym_blkid_probe_lookup_value(b, "PART_ENTRY_SCHEME", &v, /* len= */ NULL);
         if (!streq_ptr(v, "gpt"))
                 return log_error_errno(SYNTHETIC_ERRNO(EPERM), "File system is supposed to be on a GPT partition table, but is not, refusing.");
 
@@ -411,6 +383,8 @@ static int validate_fields_check(int fd, const char *path, const ValidateFields 
 static int run(int argc, char *argv[]) {
         int r;
 
+        LIBBLKID_NOTE(required);
+
         log_setup();
 
         r = parse_argv(argc, argv);
@@ -422,7 +396,7 @@ static int run(int argc, char *argv[]) {
         if (target_fd < 0)
                 return log_error_errno(target_fd, "Failed to open directory '%s': %m", arg_target);
 
-        r = is_mount_point_at(target_fd, /* filename= */ NULL, /* flags= */ 0);
+        r = is_mount_point_at(target_fd, /* path= */ NULL, /* flags= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to determine whether '%s' is a mount point: %m", resolved);
         if (!r)

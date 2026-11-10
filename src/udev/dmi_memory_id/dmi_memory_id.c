@@ -42,8 +42,9 @@
  *    https://www.dmtf.org/sites/default/files/DSP0270_1.0.1.pdf
  */
 
-#include <getopt.h>
 #include <stdio.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
@@ -52,6 +53,8 @@
 #include "string-util.h"
 #include "udev-util.h"
 #include "unaligned.h"
+#include "utf8.h"
+#include "verbs.h"
 
 #define SUPPORTED_SMBIOS_VER 0x030300
 
@@ -78,12 +81,46 @@ struct dmi_header {
 
 static const char *arg_source_file = NULL;
 
+COMMAND(
+        "dmi_memory_id\0",
+        "Identify memory devices from DMI/SMBIOS data.",
+);
+
 static bool verify_checksum(const uint8_t *buf, size_t len) {
         uint8_t sum = 0;
+
+        assert(buf);
 
         for (size_t a = 0; a < len; a++)
                 sum += buf[a];
         return sum == 0;
+}
+
+static bool verify_checksum_offset(
+                const uint8_t *buf,
+                size_t size,
+                size_t length_offset,
+                size_t min_length) {
+
+        assert(buf);
+
+        if (length_offset >= size)
+                return false;
+
+        size_t len = buf[length_offset];
+        if (len < min_length || len > size)
+                return false;
+
+        return verify_checksum(buf, len);
+}
+
+static bool verify_checksum_fixed(const uint8_t *buf, size_t size, size_t len) {
+        assert(buf);
+
+        if (len > size)
+                return false;
+
+        return verify_checksum(buf, len);
 }
 
 /*
@@ -186,7 +223,7 @@ static void dmi_memory_device_string(
 
         str = strdupa_safe(dmi_string(h, s));
         str = strstrip(str);
-        if (!isempty(str))
+        if (!isempty(str) && utf8_is_valid(str) && !string_has_cc(str, /* ok= */ NULL))
                 printf("MEMORY_DEVICE_%u_%s=%s\n", slot_num, attr_suffix, str);
 }
 
@@ -595,17 +632,13 @@ static int dmi_table(int64_t base, uint32_t len, uint16_t num, const char *devme
 }
 
 /* Same thing for SMBIOS3 entry points */
-static int smbios3_decode(const uint8_t *buf, const char *devmem, bool no_file_offset) {
+static int smbios3_decode(const uint8_t *buf, size_t size, const char *devmem, bool no_file_offset) {
         uint64_t offset;
 
-        /* Don't let checksum run beyond the buffer */
-        if (buf[0x06] > 0x20)
+        if (!verify_checksum_offset(buf, size, 0x06U, 0x18U))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Entry point length too large (%"PRIu8" bytes, expected %u).",
-                                       buf[0x06], 0x18U);
-
-        if (!verify_checksum(buf, buf[0x06]))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to verify checksum.");
+                                       "Entry point length out of range or checksum is invalid (%"PRIu8" bytes, buffer size is %zu).",
+                                       buf[0x06], size);
 
         offset = QWORD(buf + 0x10);
 
@@ -617,70 +650,57 @@ static int smbios3_decode(const uint8_t *buf, const char *devmem, bool no_file_o
         return dmi_table(offset, DWORD(buf + 0x0C), 0, devmem, no_file_offset);
 }
 
-static int smbios_decode(const uint8_t *buf, const char *devmem, bool no_file_offset) {
-        /* Don't let checksum run beyond the buffer */
-        if (buf[0x05] > 0x20)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Entry point length too large (%"PRIu8" bytes, expected %u).",
-                                       buf[0x05], 0x1FU);
-
-        if (!verify_checksum(buf, buf[0x05])
+static int smbios_decode(const uint8_t *buf, size_t size, const char *devmem, bool no_file_offset) {
+        if (!verify_checksum_offset(buf, size, 0x05U, 0x1FU)
             || memcmp(buf + 0x10, "_DMI_", 5) != 0
-            || !verify_checksum(buf + 0x10, 0x0F))
+            || !verify_checksum_fixed(buf + 0x10, size - 0x10U, 0x0FU))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to verify checksum.");
 
         return dmi_table(DWORD(buf + 0x18), WORD(buf + 0x16), WORD(buf + 0x1C),
                          devmem, no_file_offset);
 }
 
-static int legacy_decode(const uint8_t *buf, const char *devmem, bool no_file_offset) {
-        if (!verify_checksum(buf, 0x0F))
+static int legacy_decode(const uint8_t *buf, size_t size, const char *devmem, bool no_file_offset) {
+        if (!verify_checksum_fixed(buf, size, 0x0FU))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to verify checksum.");
 
         return dmi_table(DWORD(buf + 0x08), WORD(buf + 0x06), WORD(buf + 0x0C),
                          devmem, no_file_offset);
 }
 
-static int help(void) {
-        printf("%s [OPTIONS...]\n\n"
-               "  -F --from-dump FILE  Read DMI information from a binary file\n"
-               "  -h --help            Show this help text\n"
-               "     --version         Show package version\n",
-               program_invocation_short_name);
-        return 0;
-}
+static int parse_argv(int argc, char *argv[]) {
+        assert(argc >= 0);
+        assert(argv);
 
-static int parse_argv(int argc, char * const *argv) {
-        static const struct option options[] = {
-                { "from-dump", required_argument, NULL, 'F' },
-                { "version",   no_argument,       NULL, 'V' },
-                { "help",      no_argument,       NULL, 'h' },
-                { "version",   no_argument,       NULL, 'v' },
-                {}
-        };
-        int c;
+        OptionParser opts = { argc, argv };
 
-        while ((c = getopt_long(argc, argv, "F:hV", options, NULL)) >= 0)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
-                case 'F':
-                        arg_source_file = optarg;
+
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION: {}
+                OPTION_SHORT('V', NULL, /* help= */ NULL): /* -V is accepted but not documented. */
+                        return version();
+
+                OPTION('F', "from-dump", "FILE",
+                       "Read DMI information from a binary file"):
+                        arg_source_file = opts.arg;
                         break;
-                case 'V':
-                        return version();
-                case 'h':
-                        return help();
-                case '?':
-                        return -EINVAL;
-                case 'v':
-                        return version();
-                default:
-                        assert_not_reached();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
+
+        if (option_parser_get_n_args(&opts) > 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "This program takes no arguments.");
 
         return 1;
 }
 
-static int run(int argc, char* const* argv) {
+static int run(int argc, char *argv[]) {
         _cleanup_free_ uint8_t *buf = NULL;
         bool no_file_offset = false;
         size_t size;
@@ -708,11 +728,11 @@ static int run(int argc, char* const* argv) {
         }
 
         if (size >= 24 && memory_startswith(buf, size, "_SM3_"))
-                return smbios3_decode(buf, arg_source_file, no_file_offset);
+                return smbios3_decode(buf, size, arg_source_file, no_file_offset);
         if (size >= 31 && memory_startswith(buf, size, "_SM_"))
-                return smbios_decode(buf, arg_source_file, no_file_offset);
+                return smbios_decode(buf, size, arg_source_file, no_file_offset);
         if (size >= 15 && memory_startswith(buf, size, "_DMI_"))
-                return legacy_decode(buf, arg_source_file, no_file_offset);
+                return legacy_decode(buf, size, arg_source_file, no_file_offset);
 
         return -EINVAL;
 }

@@ -2,23 +2,19 @@
 
 #include <unistd.h>
 
-#include "sd-bus.h"
 #include "sd-daemon.h"
 #include "sd-device.h"
 #include "sd-netlink.h"
 #include "sd-network.h"
 
 #include "alloc-util.h"
-#include "bus-error.h"
-#include "bus-locator.h"
-#include "bus-util.h"
-#include "bus-wait-for-jobs.h"
 #include "conf-files.h"
 #include "edit-util.h"
 #include "errno-util.h"
 #include "extract-word.h"
+#include "fd-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "netlink-util.h"
 #include "network-util.h"
 #include "networkctl.h"
@@ -106,7 +102,13 @@ static int get_config_files_by_name(
                 if (!dropin_dirname)
                         return -ENOMEM;
 
-                r = conf_files_list_dropins(ret_dropins, dropin_dirname, /* root = */ NULL, NETWORK_DIRS);
+                r = conf_files_list_dropins(
+                                ret_dropins,
+                                dropin_dirname,
+                                /* root= */ NULL,
+                                /* root_fd= */ XAT_FDROOT,
+                                CONF_FILES_WARN,
+                                NETWORK_DIRS);
                 if (r < 0)
                         return r;
         }
@@ -381,55 +383,15 @@ static int add_config_to_edit(
         if (!comment_paths)
                 return log_oom();
 
-        r = strv_extend_strv(&comment_paths, dropins, /* filter_duplicates = */ false);
+        r = strv_extend_strv(&comment_paths, dropins, /* filter_duplicates= */ false);
         if (r < 0)
                 return log_oom();
 
         return edit_files_add(context, dropin_path, old_dropin, comment_paths);
 }
 
-static int udevd_reload(sd_bus *bus) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_(bus_wait_for_jobs_freep) BusWaitForJobs *w = NULL;
-        const char *job_path;
-        int r;
-
-        assert(bus);
-
-        r = bus_wait_for_jobs_new(bus, &w);
-        if (r < 0)
-                return log_error_errno(r, "Could not watch jobs: %m");
-
-        r = bus_call_method(bus,
-                            bus_systemd_mgr,
-                            "ReloadUnit",
-                            &error,
-                            &reply,
-                            "ss",
-                            "systemd-udevd.service",
-                            "replace");
-        if (r < 0)
-                return log_error_errno(r, "Failed to reload systemd-udevd: %s", bus_error_message(&error, r));
-
-        r = sd_bus_message_read(reply, "o", &job_path);
-        if (r < 0)
-                return bus_log_parse_error(r);
-
-        r = bus_wait_for_jobs_one(w, job_path, /* flags = */ 0, NULL);
-        if (r == -ENOEXEC) {
-                log_debug("systemd-udevd is not running, skipping reload.");
-                return 0;
-        }
-        if (r < 0)
-                return log_error_errno(r, "Failed to reload systemd-udevd: %m");
-
-        return 1;
-}
-
 static int reload_daemons(ReloadFlags flags) {
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        int r, ret = 1;
+        int ret = 1;
 
         if (arg_no_reload)
                 return 0;
@@ -442,28 +404,20 @@ static int reload_daemons(ReloadFlags flags) {
                 return 0;
         }
 
-        r = sd_bus_open_system(&bus);
-        if (r < 0)
-                return log_error_errno(r, "Failed to connect to system bus: %m");
-
         if (FLAGS_SET(flags, RELOAD_UDEVD))
-                RET_GATHER(ret, udevd_reload(bus));
+                RET_GATHER(ret, reload_udevd());
 
         if (FLAGS_SET(flags, RELOAD_NETWORKD)) {
-                if (networkd_is_running()) {
-                        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-
-                        r = bus_call_method(bus, bus_network_mgr, "Reload", &error, NULL, NULL);
-                        if (r < 0)
-                                RET_GATHER(ret, log_error_errno(r, "Failed to reload systemd-networkd: %s", bus_error_message(&error, r)));
-                } else
+                if (!networkd_is_running())
                         log_debug("systemd-networkd is not running, skipping reload.");
+                else
+                        RET_GATHER(ret, reload_networkd(/* reconfigure_links= */ true));
         }
 
         return ret;
 }
 
-int verb_edit(int argc, char *argv[], void *userdata) {
+int verb_edit(int argc, char *argv[], uintptr_t _data, void *userdata) {
         char **args = ASSERT_PTR(strv_skip(argv, 1));
         _cleanup_(edit_file_context_done) EditFileContext context = {
                 .marker_start = DROPIN_MARKER_START,
@@ -505,7 +459,7 @@ int verb_edit(int argc, char *argv[], void *userdata) {
                                                        "Config type 'all' cannot be used with 'edit'.");
 
                         r = get_config_files_by_link_config(ifname, type,
-                                                            /* ignore_missing = */ false,
+                                                            /* ignore_missing= */ false,
                                                             &rtnl,
                                                             &path, &dropins);
                         if (r < 0)
@@ -530,7 +484,7 @@ int verb_edit(int argc, char *argv[], void *userdata) {
                 else
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Network config of unknown type: %s", *name);
 
-                r = get_config_files_by_name(*name, /* allow_masked = */ false, &path, &dropins);
+                r = get_config_files_by_name(*name, /* allow_masked= */ false, &path, &dropins);
                 if (r == -ERFKILL)
                         return log_error_errno(r, "Network config '%s' is masked.", *name);
                 if (r == -ENOENT) {
@@ -588,7 +542,7 @@ static int cat_files_by_link_one(
         if (!*first)
                 putchar('\n');
 
-        r = cat_files(path, dropins, /* flags = */ CAT_FORMAT_HAS_SECTIONS);
+        r = cat_files(path, dropins, /* flags= */ CAT_FORMAT_HAS_SECTIONS);
         if (r < 0)
                 return r;
 
@@ -612,7 +566,7 @@ static int cat_files_by_link_config(const char *link_config, sd_netlink **rtnl, 
 
         if (type == _CONFIG_MAX) {
                 for (LinkConfigType i = 0; i < _CONFIG_MAX; i++) {
-                        r = cat_files_by_link_one(ifname, i, rtnl, /* ignore_missing = */ true, first);
+                        r = cat_files_by_link_one(ifname, i, rtnl, /* ignore_missing= */ true, first);
                         if (r < 0)
                                 return r;
                 }
@@ -620,10 +574,10 @@ static int cat_files_by_link_config(const char *link_config, sd_netlink **rtnl, 
                 return 0;
         }
 
-        return cat_files_by_link_one(ifname, type, rtnl, /* ignore_missing = */ false, first);
+        return cat_files_by_link_one(ifname, type, rtnl, /* ignore_missing= */ false, first);
 }
 
-int verb_cat(int argc, char *argv[], void *userdata) {
+int verb_cat(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
         char **args = strv_skip(argv, 1);
         int r, ret = 0;
@@ -651,7 +605,7 @@ int verb_cat(int argc, char *argv[], void *userdata) {
                 _cleanup_strv_free_ char **dropins = NULL;
                 _cleanup_free_ char *path = NULL;
 
-                r = get_config_files_by_name(*name, /* allow_masked = */ false, &path, &dropins);
+                r = get_config_files_by_name(*name, /* allow_masked= */ false, &path, &dropins);
                 if (r == -ENOENT) {
                         RET_GATHER(ret, log_error_errno(r, "Cannot find network config file '%s'.", *name));
                         continue;
@@ -666,7 +620,7 @@ int verb_cat(int argc, char *argv[], void *userdata) {
                 if (!first)
                         putchar('\n');
 
-                r = cat_files(path, dropins, /* flags = */ CAT_FORMAT_HAS_SECTIONS);
+                r = cat_files(path, dropins, /* flags= */ CAT_FORMAT_HAS_SECTIONS);
                 if (r < 0)
                         return r;
 
@@ -676,7 +630,7 @@ int verb_cat(int argc, char *argv[], void *userdata) {
         return ret;
 }
 
-int verb_mask(int argc, char *argv[], void *userdata) {
+int verb_mask(int argc, char *argv[], uintptr_t _data, void *userdata) {
         ReloadFlags flags = 0;
         int r;
 
@@ -699,7 +653,7 @@ int verb_mask(int argc, char *argv[], void *userdata) {
                 else
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Network config of unknown type: %s", *name);
 
-                r = get_config_files_by_name(*name, /* allow_masked = */ true, &config_path, /* ret_dropins = */ NULL);
+                r = get_config_files_by_name(*name, /* allow_masked= */ true, &config_path, /* ret_dropins= */ NULL);
                 if (r == -ENOENT)
                         log_warning("No existing network config '%s' found, proceeding anyway.", *name);
                 else if (r < 0)
@@ -740,7 +694,7 @@ int verb_mask(int argc, char *argv[], void *userdata) {
         return reload_daemons(flags);
 }
 
-int verb_unmask(int argc, char *argv[], void *userdata) {
+int verb_unmask(int argc, char *argv[], uintptr_t _data, void *userdata) {
         ReloadFlags flags = 0;
         int r;
 
@@ -758,7 +712,7 @@ int verb_unmask(int argc, char *argv[], void *userdata) {
                 else
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Network config of unknown type: %s", *name);
 
-                r = get_config_files_by_name(*name, /* allow_masked = */ true, &path, /* ret_dropins = */ NULL);
+                r = get_config_files_by_name(*name, /* allow_masked= */ true, &path, /* ret_dropins= */ NULL);
                 if (r == -ENOENT) {
                         log_debug_errno(r, "Network configuration '%s' doesn't exist, skipping.", *name);
                         continue;

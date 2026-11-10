@@ -1,26 +1,28 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "sd-daemon.h"
 #include "sd-event.h"
 
 #include "alloc-util.h"
+#include "compress.h"
 #include "copy.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
 #include "import-common.h"
-#include "import-compress.h"
 #include "import-raw.h"
 #include "import-util.h"
 #include "install-file.h"
 #include "io-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "pretty-print.h"
 #include "qcow2-util.h"
 #include "ratelimit.h"
+#include "stat-util.h"
 #include "string-util.h"
 #include "terminal-util.h"
 #include "time-util.h"
@@ -43,11 +45,11 @@ typedef struct RawImport {
         int input_fd;
         int output_fd;
 
-        ImportCompress compress;
+        Compressor *compress;
 
         sd_event_source *input_event_source;
 
-        uint8_t buffer[16*1024];
+        uint8_t buffer[COMPRESS_PIPE_BUFFER_SIZE];
         size_t buffer_size;
 
         uint64_t written_compressed;
@@ -71,7 +73,7 @@ RawImport* raw_import_unref(RawImport *i) {
 
         unlink_and_free(i->temp_path);
 
-        import_compress_free(&i->compress);
+        i->compress = compressor_free(i->compress);
 
         sd_event_unref(i->event);
 
@@ -215,6 +217,12 @@ static int raw_import_finish(RawImport *i) {
         assert(i);
         assert(i->output_fd >= 0);
 
+        if (FLAGS_SET(i->flags, IMPORT_ZERO_FILL)) {
+                r = import_zero_fill(i->output_fd, i->offset, i->size_max, i->written_uncompressed);
+                if (r < 0)
+                        return r;
+        }
+
         /* Nothing of what is below applies to block devices */
         if (S_ISBLK(i->output_stat.st_mode)) {
 
@@ -308,9 +316,9 @@ static int raw_import_open_disk(RawImport *i) {
         if (fstat(i->output_fd, &i->output_stat) < 0)
                 return log_error_errno(errno, "Failed to stat() output file: %m");
 
-        if (!S_ISREG(i->output_stat.st_mode) && !S_ISBLK(i->output_stat.st_mode))
-                return log_error_errno(SYNTHETIC_ERRNO(EBADFD),
-                                       "Target file is not a regular file or block device");
+        r = stat_verify_regular_or_block(&i->output_stat);
+        if (r < 0)
+                return log_error_errno(r, "Target file is not a regular file or block device.");
 
         if (i->offset != UINT64_MAX) {
                 if (lseek(i->output_fd, i->offset, SEEK_SET) < 0)
@@ -328,7 +336,7 @@ static int raw_import_try_reflink(RawImport *i) {
         assert(i->input_fd >= 0);
         assert(i->output_fd >= 0);
 
-        if (i->compress.type != IMPORT_COMPRESS_UNCOMPRESSED)
+        if (compressor_type(i->compress) != COMPRESSION_NONE)
                 return 0;
 
         if (i->offset != UINT64_MAX || i->size_max != UINT64_MAX)
@@ -425,13 +433,13 @@ static int raw_import_process(RawImport *i) {
 
         i->buffer_size += l;
 
-        if (i->compress.type == IMPORT_COMPRESS_UNKNOWN) {
+        if (!i->compress) {
 
                 if (l == 0) { /* EOF */
                         log_debug("File too short to be compressed, as no compression signature fits in, thus assuming uncompressed.");
-                        import_uncompress_force_off(&i->compress);
+                        decompressor_force_off(&i->compress);
                 } else {
-                        r = import_uncompress_detect(&i->compress, i->buffer, i->buffer_size);
+                        r = decompressor_detect(&i->compress, i->buffer, i->buffer_size);
                         if (r < 0) {
                                 log_error_errno(r, "Failed to detect file compression: %m");
                                 goto finish;
@@ -451,7 +459,7 @@ static int raw_import_process(RawImport *i) {
                         goto complete;
         }
 
-        r = import_uncompress(&i->compress, i->buffer, i->buffer_size, raw_import_write, i);
+        r = decompressor_push(i->compress, i->buffer, i->buffer_size, raw_import_write, i);
         if (r < 0) {
                 log_error_errno(r, "Failed to decode and write: %m");
                 goto finish;
@@ -508,6 +516,7 @@ int raw_import_start(
         assert(local);
         assert(!(flags & ~IMPORT_FLAGS_MASK_RAW));
         assert(offset == UINT64_MAX || FLAGS_SET(flags, IMPORT_DIRECT));
+        assert(!FLAGS_SET(flags, IMPORT_ZERO_FILL) || (offset != UINT64_MAX && size_max != UINT64_MAX));
 
         if (!import_validate_local(local, flags))
                 return -EINVAL;

@@ -17,6 +17,7 @@
 #include "device-util.h"
 #include "devnum-util.h"
 #include "dirent-util.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "escape.h"
 #include "fd-util.h"
@@ -35,15 +36,17 @@
 #include "logind-utmp.h"
 #include "logind-varlink.h"
 #include "main-func.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "parse-util.h"
 #include "process-util.h"
 #include "service-util.h"
 #include "signal-util.h"
+#include "stat-util.h"
 #include "strv.h"
 #include "terminal-util.h"
 #include "udev-util.h"
 #include "user-util.h"
+#include "verbs.h"
 
 static Manager* manager_free(Manager *m);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_free);
@@ -140,7 +143,10 @@ static Manager* manager_free(Manager *m) {
         sd_event_source_unref(m->console_active_event_source);
         sd_event_source_unref(m->lid_switch_ignore_event_source);
 
+        sd_event_source_unref(m->power_key_long_press_event_source);
         sd_event_source_unref(m->reboot_key_long_press_event_source);
+        sd_event_source_unref(m->suspend_key_long_press_event_source);
+        sd_event_source_unref(m->hibernate_key_long_press_event_source);
 
 #if ENABLE_UTMP
         sd_event_source_unref(m->utmp_event_source);
@@ -235,7 +241,7 @@ static int manager_enumerate_buttons(Manager *m) {
         FOREACH_DEVICE(e, d) {
                 if (device_is_processed(d) <= 0)
                         continue;
-                RET_GATHER(r, manager_process_button_device(m, d));
+                RET_GATHER(r, manager_process_button_device(m, d, /* ret_button= */ NULL));
         }
 
         return r;
@@ -440,35 +446,45 @@ static int deliver_session_device_fd(Session *s, const char *fdname, int fd, dev
         return 0;
 }
 
-static int deliver_session_leader_fd_consume(Session *s, const char *fdname, int fd) {
+static int deliver_session_leader_fd_consume(Session *s, const char *fdname, int fd_consume) {
+        _cleanup_close_ int fd = ASSERT_FD(fd_consume);
         _cleanup_(pidref_done) PidRef leader_fdstore = PIDREF_NULL;
         int r;
 
         assert(s);
         assert(fdname);
-        assert(fd >= 0);
 
-        if (!pid_is_valid(s->deserialized_pid)) {
+        /* Already deserialized via pidfd id? */
+        if (pidref_is_set(&s->leader)) {
+                assert(s->leader.pid == s->deserialized_pid);
+                assert(s->leader.fd >= 0);
+
+                r = fd_inode_same(fd, s->leader.fd);
+                if (r < 0)
+                        return log_warning_errno(r, "Failed to compare pidfd with deserialized leader for session '%s': %m",
+                                                 s->id);
+                if (r > 0)
+                        return 0;
+
+                log_warning("Got leader pidfd for session '%s' which mismatches with the deserialized process, resetting with pidfd.",
+                            s->id);
+
+        } else if (!pid_is_valid(s->deserialized_pid)) {
                 r = log_warning_errno(SYNTHETIC_ERRNO(EOWNERDEAD),
                                       "Got leader pidfd for session '%s', but LEADER= is not set, refusing.",
                                       s->id);
                 goto fail_close;
         }
 
-        if (!s->leader_fd_saved)
-                log_warning("Got leader pidfd for session '%s', but not recorded in session state, proceeding anyway.",
-                            s->id);
-        else
-                assert(!pidref_is_set(&s->leader));
-
         r = pidref_set_pidfd_take(&leader_fdstore, fd);
         if (r < 0) {
-                if (r == -ESRCH)
-                        log_debug_errno(r, "Leader of session '%s' is gone while deserializing.", s->id);
-                else
-                        log_warning_errno(r, "Failed to create reference to leader of session '%s': %m", s->id);
+                log_warning_errno(r,
+                                  r == -ESRCH ? "Leader of session '%s' is gone while deserializing."
+                                              : "Failed to create reference to leader of session '%s': %m",
+                                  s->id);
                 goto fail_close;
         }
+        TAKE_FD(fd);
 
         if (leader_fdstore.pid != s->deserialized_pid)
                 log_warning("Leader from pidfd (" PID_FMT ") doesn't match with LEADER=" PID_FMT " for session '%s', proceeding anyway.",
@@ -481,7 +497,7 @@ static int deliver_session_leader_fd_consume(Session *s, const char *fdname, int
         return 0;
 
 fail_close:
-        close_and_notify_warn(fd, fdname);
+        close_and_notify_warn(TAKE_FD(fd), fdname);
         return r;
 }
 
@@ -555,7 +571,7 @@ static int manager_enumerate_sessions(Manager *m) {
                 session_add_to_gc_queue(s);
 
                 k = session_load(s);
-                if (k < 0)
+                if (k < 0 && k != -ESRCH)
                         RET_GATHER(r, log_warning_errno(k, "Failed to deserialize session '%s', ignoring: %m", s->id));
         }
 
@@ -569,7 +585,7 @@ static int manager_enumerate_fds(Manager *m, int *ret_varlink_fd) {
         assert(m);
         assert(ret_varlink_fd);
 
-        n = sd_listen_fds_with_names(/* unset_environment = */ true, &fdnames);
+        n = sd_listen_fds_with_names(/* unset_environment= */ true, &fdnames);
         if (n < 0)
                 return log_error_errno(n, "Failed to acquire passed fd list: %m");
 
@@ -728,10 +744,13 @@ static int manager_dispatch_vcsa_udev(sd_device_monitor *monitor, sd_device *dev
 
 static int manager_dispatch_button_udev(sd_device_monitor *monitor, sd_device *device, void *userdata) {
         Manager *m = ASSERT_PTR(userdata);
+        Button *b;
 
         assert(device);
 
-        manager_process_button_device(m, device);
+        if (manager_process_button_device(m, device, &b) > 0)
+                (void) button_check_switches(b);
+
         return 0;
 }
 
@@ -866,7 +885,7 @@ static int manager_vt_switch(sd_event_source *src, const struct signalfd_siginfo
                         return 0;
                 }
 
-                r = vt_release(fd, /* restore = */ true);
+                r = vt_release(fd, /* restore= */ true);
                 if (r < 0)
                         log_warning_errno(r, "Failed to release current VT, ignoring: %m");
 
@@ -968,7 +987,7 @@ static int manager_connect_udev(Manager *m) {
                 return r;
 
         FOREACH_STRING(s, "input", "graphics", "drm") {
-                r = sd_device_monitor_filter_add_match_subsystem_devtype(m->device_monitor, s, /* devtype = */ NULL);
+                r = sd_device_monitor_filter_add_match_subsystem_devtype(m->device_monitor, s, /* devtype= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -1062,7 +1081,7 @@ static void manager_gc(Manager *m, bool drop_not_started) {
                 seat->in_gc_queue = false;
 
                 if (seat_may_gc(seat, drop_not_started)) {
-                        seat_stop(seat, /* force = */ false);
+                        seat_stop(seat, /* force= */ false);
                         seat_free(seat);
                 }
         }
@@ -1073,7 +1092,7 @@ static void manager_gc(Manager *m, bool drop_not_started) {
                 /* First, if we are not closing yet, initiate stopping. */
                 if (session_may_gc(session, drop_not_started) &&
                     session_get_state(session) != SESSION_CLOSING)
-                        (void) session_stop(session, /* force = */ false);
+                        (void) session_stop(session, /* force= */ false);
 
                 /* Normally, this should make the session referenced again, if it doesn't then let's get rid
                  * of it immediately. */
@@ -1102,6 +1121,7 @@ static int manager_dispatch_idle_action(sd_event_source *s, uint64_t t, void *us
         Manager *m = ASSERT_PTR(userdata);
         struct dual_timestamp since;
         usec_t n, elapse;
+        bool idle;
         int r;
 
         if (m->idle_action == HANDLE_IGNORE ||
@@ -1110,8 +1130,8 @@ static int manager_dispatch_idle_action(sd_event_source *s, uint64_t t, void *us
 
         n = now(CLOCK_MONOTONIC);
 
-        r = manager_get_idle_hint(m, &since);
-        if (r <= 0) {
+        idle = manager_get_idle_hint(m, &since);
+        if (!idle) {
                 /* Not idle. Let's check if after a timeout it might be idle then. */
                 elapse = n + m->idle_action_usec;
                 m->was_idle = false;
@@ -1328,18 +1348,31 @@ static int manager_run(Manager *m) {
         }
 }
 
+COMMAND(
+        "systemd-logind\0",
+        "Manage user logins and devices and privileged operations.",
+        .man_pages = "systemd-logind.service(8)\0",
+        .option_namespace = "service",
+        .option_groups =
+                "Options\0"
+                "Bus introspection\0",
+);
+
 static int run(int argc, char *argv[]) {
         _cleanup_(manager_freep) Manager *m = NULL;
         _unused_ _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         int r;
 
+        LIBACL_NOTE(recommended);
+        LIBBLKID_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+
         log_set_facility(LOG_AUTH);
         log_setup();
 
-        r = service_parse_argv("systemd-logind.service",
-                               "Manager for user logins and devices and privileged operations.",
-                               BUS_IMPLEMENTATIONS(&manager_object,
+        r = service_parse_argv(BUS_IMPLEMENTATIONS(&manager_object,
                                                    &log_control_object),
+                               /* runtime_scope= */ NULL,
                                argc, argv);
         if (r <= 0)
                 return r;
@@ -1356,8 +1389,6 @@ static int run(int argc, char *argv[]) {
         (void) mkdir_label("/run/systemd/seats", 0755);
         (void) mkdir_label("/run/systemd/users", 0755);
         (void) mkdir_label("/run/systemd/sessions", 0755);
-
-        assert_se(sigprocmask_many(SIG_BLOCK, /* ret_old_mask= */ NULL, SIGCHLD) >= 0);
 
         r = manager_new(&m);
         if (r < 0)

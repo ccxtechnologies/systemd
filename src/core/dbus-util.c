@@ -18,7 +18,7 @@ int bus_property_get_triggered_unit(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Unit *u = userdata, *trigger;
 
@@ -48,7 +48,7 @@ int bus_set_transient_string(
                 char **p,
                 sd_bus_message *message,
                 UnitWriteFlags flags,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         const char *v;
         int r;
@@ -77,7 +77,7 @@ int bus_set_transient_bool(
                 bool *p,
                 sd_bus_message *message,
                 UnitWriteFlags flags,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         int v, r;
 
@@ -101,7 +101,7 @@ int bus_set_transient_tristate(
                 int *p,
                 sd_bus_message *message,
                 UnitWriteFlags flags,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         int v, r;
 
@@ -126,7 +126,7 @@ static int bus_set_transient_usec_internal(
                 bool fix_0,
                 sd_bus_message *message,
                 UnitWriteFlags flags,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         uint64_t v;
         int r;
@@ -150,12 +150,12 @@ static int bus_set_transient_usec_internal(
         return 1;
 }
 
-int bus_set_transient_usec(Unit *u, const char *name, usec_t *p, sd_bus_message *message, UnitWriteFlags flags, sd_bus_error *error) {
-        return bus_set_transient_usec_internal(u, name, p, false, message, flags, error);
+int bus_set_transient_usec(Unit *u, const char *name, usec_t *p, sd_bus_message *message, UnitWriteFlags flags, sd_bus_error *reterr_error) {
+        return bus_set_transient_usec_internal(u, name, p, false, message, flags, reterr_error);
 }
 
-int bus_set_transient_usec_fix_0(Unit *u, const char *name, usec_t *p, sd_bus_message *message, UnitWriteFlags flags, sd_bus_error *error) {
-        return bus_set_transient_usec_internal(u, name, p, true, message, flags, error);
+int bus_set_transient_usec_fix_0(Unit *u, const char *name, usec_t *p, sd_bus_message *message, UnitWriteFlags flags, sd_bus_error *reterr_error) {
+        return bus_set_transient_usec_internal(u, name, p, true, message, flags, reterr_error);
 }
 
 int bus_verify_manage_units_async_impl(
@@ -164,7 +164,7 @@ int bus_verify_manage_units_async_impl(
                 const char *verb,
                 const char *polkit_message,
                 sd_bus_message *call,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         const char *details[9];
         size_t n_details = 0;
@@ -197,19 +197,19 @@ int bus_verify_manage_units_async_impl(
                         "org.freedesktop.systemd1.manage-units",
                         n_details > 0 ? details : NULL,
                         &manager->polkit_registry,
-                        error);
+                        reterr_error);
 }
 
-int bus_verify_manage_units_async_full(Unit *u, const char *verb, const char *polkit_message, sd_bus_message *call, sd_bus_error *error) {
+int bus_verify_manage_units_async_full(Unit *u, const char *verb, const char *polkit_message, sd_bus_message *call, sd_bus_error *reterr_error) {
         assert(u);
-        return bus_verify_manage_units_async_impl(u->manager, u->id, verb, polkit_message, call, error);
+        return bus_verify_manage_units_async_impl(u->manager, u->id, verb, polkit_message, call, reterr_error);
 }
 
-int bus_verify_manage_units_async(Manager *manager, sd_bus_message *call, sd_bus_error *error) {
-        return bus_verify_manage_units_async_impl(manager, NULL, NULL, NULL, call, error);
+int bus_verify_manage_units_async(Manager *manager, sd_bus_message *call, sd_bus_error *reterr_error) {
+        return bus_verify_manage_units_async_impl(manager, NULL, NULL, NULL, call, reterr_error);
 }
 
-int bus_verify_manage_unit_files_async(Manager *m, sd_bus_message *call, sd_bus_error *error) {
+int bus_verify_manage_unit_files_async(Manager *m, sd_bus_message *call, sd_bus_error *reterr_error) {
         assert(m);
         assert(call);
 
@@ -218,10 +218,10 @@ int bus_verify_manage_unit_files_async(Manager *m, sd_bus_message *call, sd_bus_
                         "org.freedesktop.systemd1.manage-unit-files",
                         /* details= */ NULL,
                         &m->polkit_registry,
-                        error);
+                        reterr_error);
 }
 
-int bus_verify_reload_daemon_async(Manager *m, sd_bus_message *call, sd_bus_error *error) {
+int bus_verify_reload_daemon_async(Manager *m, sd_bus_message *call, sd_bus_error *reterr_error) {
         assert(m);
         assert(call);
 
@@ -229,10 +229,10 @@ int bus_verify_reload_daemon_async(Manager *m, sd_bus_message *call, sd_bus_erro
                         call,
                         "org.freedesktop.systemd1.reload-daemon",
                         /* details= */ NULL,
-                        &m->polkit_registry, error);
+                        &m->polkit_registry, reterr_error);
 }
 
-int bus_verify_set_environment_async(Manager *m, sd_bus_message *call, sd_bus_error *error) {
+int bus_verify_set_environment_async(Manager *m, sd_bus_message *call, sd_bus_error *reterr_error) {
         assert(m);
         assert(call);
 
@@ -241,10 +241,10 @@ int bus_verify_set_environment_async(Manager *m, sd_bus_message *call, sd_bus_er
                         "org.freedesktop.systemd1.set-environment",
                         /* details= */ NULL,
                         &m->polkit_registry,
-                        error);
+                        reterr_error);
 }
 
-int bus_verify_bypass_dump_ratelimit_async(Manager *m, sd_bus_message *call, sd_bus_error *error) {
+int bus_verify_bypass_dump_ratelimit_async(Manager *m, sd_bus_message *call, sd_bus_error *reterr_error) {
         assert(m);
         assert(call);
 
@@ -253,61 +253,64 @@ int bus_verify_bypass_dump_ratelimit_async(Manager *m, sd_bus_message *call, sd_
                         "org.freedesktop.systemd1.bypass-dump-ratelimit",
                         /* details= */ NULL,
                         &m->polkit_registry,
-                        error);
+                        reterr_error);
 }
 
-/* ret_format_str is an accumulator, so if it has any pre-existing content, new options will be appended to it */
+/* in_out_format_str is an accumulator, so if it has any pre-existing content it will be read, and new
+ * options will be appended to it */
 int bus_read_mount_options(
                 sd_bus_message *message,
-                sd_bus_error *error,
+                sd_bus_error *reterr_error,
                 MountOptions **ret_options,
-                char **ret_format_str,
+                char **in_out_format_str,
                 const char *separator) {
 
         _cleanup_(mount_options_free_allp) MountOptions *options = NULL;
         _cleanup_free_ char *format_str = NULL;
-        const char *mount_options, *partition;
         int r;
 
         assert(message);
         assert(ret_options);
-        assert(separator);
+        assert(!in_out_format_str == !separator);
 
         r = sd_bus_message_enter_container(message, 'a', "(ss)");
         if (r < 0)
                 return r;
 
+        const char *partition, *mount_options;
         while ((r = sd_bus_message_read(message, "(ss)", &partition, &mount_options)) > 0) {
-                _cleanup_free_ char *escaped = NULL;
-                _cleanup_free_ MountOptions *o = NULL;
                 PartitionDesignator partition_designator;
 
                 if (chars_intersect(mount_options, WHITESPACE))
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
-                                                "Invalid mount options string, contains whitespace character(s): %s", mount_options);
+                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                                 "Invalid mount options string, contains whitespace character(s): %s", mount_options);
 
                 partition_designator = partition_designator_from_string(partition);
                 if (partition_designator < 0)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid partition name %s", partition);
+                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Invalid partition name %s", partition);
 
-                /* Need to store the options with the escapes, so that they can be parsed again */
-                escaped = shell_escape(mount_options, ":");
-                if (!escaped)
-                        return -ENOMEM;
+                if (!options) {
+                        options = new0(MountOptions, 1);
+                        if (!options)
+                                return -ENOMEM;
+                }
 
-                if (!strextend_with_separator(&format_str, separator, partition, ":", escaped))
-                        return -ENOMEM;
+                r = free_and_strdup(&options->options[partition_designator], mount_options);
+                if (r < 0)
+                        return r;
 
-                o = new(MountOptions, 1);
-                if (!o)
-                        return -ENOMEM;
-                *o = (MountOptions) {
-                        .partition_designator = partition_designator,
-                        .options = strdup(mount_options),
-                };
-                if (!o->options)
-                        return -ENOMEM;
-                LIST_APPEND(mount_options, options, TAKE_PTR(o));
+                if (in_out_format_str && !isempty(mount_options)) {
+                        /* Need to store the options with the escapes, so that they can be parsed again */
+                        _cleanup_free_ char *escaped = NULL;
+
+                        escaped = shell_escape(mount_options, ":");
+                        if (!escaped)
+                                return -ENOMEM;
+
+                        r = strextendf_with_separator(&format_str, separator, "%s:%s", partition, escaped);
+                        if (r < 0)
+                                return r;
+                }
         }
         if (r < 0)
                 return r;
@@ -316,15 +319,10 @@ int bus_read_mount_options(
         if (r < 0)
                 return r;
 
-        if (options) {
-                if (ret_format_str) {
-                        char *final = strjoin(*ret_format_str, !isempty(*ret_format_str) ? separator : "", format_str);
-                        if (!final)
-                                return -ENOMEM;
-                        free_and_replace(*ret_format_str, final);
-                }
-                LIST_JOIN(mount_options, *ret_options, options);
-        }
+        if (in_out_format_str && !strextend_with_separator(in_out_format_str, separator, format_str))
+                return -ENOMEM;
+
+        *ret_options = TAKE_PTR(options);
 
         return 0;
 }
@@ -336,7 +334,7 @@ int bus_property_get_activation_details(
                 const char *property,
                 sd_bus_message *reply,
                 void *userdata,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         ActivationDetails **details = ASSERT_PTR(userdata);
         _cleanup_strv_free_ char **pairs = NULL;

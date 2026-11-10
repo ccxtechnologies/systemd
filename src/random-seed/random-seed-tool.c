@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
-#include <getopt.h>
 #include <stdlib.h>
 #include <sys/random.h>
 #include <sys/stat.h>
@@ -9,23 +8,24 @@
 #include <unistd.h>
 
 #include "sd-id128.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
+#include "initrd-util.h"
 #include "io-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "mkdir.h"
 #include "parse-util.h"
-#include "pretty-print.h"
 #include "random-util.h"
 #include "sha256.h"
-#include "string-table.h"
 #include "string-util.h"
 #include "sync-util.h"
+#include "verbs.h"
 #include "xattr-util.h"
 
 typedef enum SeedAction {
@@ -42,6 +42,12 @@ typedef enum CreditEntropy {
 } CreditEntropy;
 
 static SeedAction arg_action = _ACTION_INVALID;
+
+COMMAND(
+        "systemd-random-seed\0",
+        "Load and save the system random seed at boot and shutdown.",
+        .man_pages = "systemd-random-seed(8)\0",
+);
 
 static CreditEntropy may_credit(int seed_fd) {
         const char *e;
@@ -87,8 +93,8 @@ static CreditEntropy may_credit(int seed_fd) {
         /* Don't credit the random seed if we are in first-boot mode, because we are supposed to start from
          * scratch. This is a safety precaution for cases where people ship "golden" images with empty
          * /etc but populated /var that contains a random seed. */
-        r = RET_NERRNO(access("/run/systemd/first-boot", F_OK));
-        if (r == -ENOENT)
+        r = in_first_boot();
+        if (r == 0)
                 /* All is good, we are not in first-boot mode. */
                 return CREDIT_ENTROPY_YES_PLEASE;
         if (r < 0) {
@@ -281,7 +287,7 @@ static int save_seed_file(
                 return log_error_errno(r, "Failed to write new random seed file: %m");
 
         if (ftruncate(seed_fd, k) < 0)
-                return log_error_errno(r, "Failed to truncate random seed file: %m");
+                return log_error_errno(errno, "Failed to truncate random seed file: %m");
 
         r = fsync_full(seed_fd);
         if (r < 0)
@@ -296,75 +302,38 @@ static int save_seed_file(
         return 0;
 }
 
-static int help(int argc, char *argv[], void *userdata) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-random-seed", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s [OPTIONS...] COMMAND\n"
-               "\n%5$sLoad and save the system random seed at boot and shutdown.%6$s\n"
-               "\n%3$sCommands:%4$s\n"
-               "  load                Load a random seed saved on disk into the kernel entropy pool\n"
-               "  save                Save a new random seed on disk\n"
-               "\n%3$sOptions:%4$s\n"
-               "  -h --help           Show this help\n"
-               "     --version        Show package version\n"
-               "\nSee the %2$s for details.\n",
-               program_invocation_short_name,
-               link,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal());
-
+VERB_FULL(verb_set_action, "load", NULL, VERB_ANY, 1, 0, ACTION_LOAD,
+          "Load a random seed saved on disk into the kernel entropy pool");
+VERB_FULL(verb_set_action, "save", NULL, VERB_ANY, 1, 0, ACTION_SAVE,
+          "Save a new random seed on disk");
+static int verb_set_action(int argc, char *argv[], uintptr_t data, void *userdata) {
+        arg_action = data;
         return 0;
 }
 
-static const char* const seed_action_table[_ACTION_MAX] = {
-        [ACTION_LOAD] = "load",
-        [ACTION_SAVE] = "save",
-};
-
-DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(seed_action, SeedAction);
-
 static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-        };
-
-        static const struct option options[] = {
-                { "help",    no_argument, NULL, 'h'         },
-                { "version", no_argument, NULL, ARG_VERSION },
-                {}
-        };
-
-        int c;
-
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
-                switch (c) {
-                case 'h':
-                        return help(0, NULL, NULL);
-                case ARG_VERSION:
-                        return version();
-                case '?':
-                        return -EINVAL;
+        OptionParser opts = { argc, argv };
+        int r;
 
-                default:
-                        assert_not_reached();
+        FOREACH_OPTION_OR_RETURN(c, &opts)
+                switch (c) {
+
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
+                        return version();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (optind + 1 != argc)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program requires one argument.");
-
-        arg_action = seed_action_from_string(argv[optind]);
-        if (arg_action < 0)
-                return log_error_errno(arg_action, "Unknown action '%s'", argv[optind]);
+        r = dispatch_verb(option_parser_get_args(&opts), NULL);
+        if (r < 0)
+                return r;
 
         return 1;
 }

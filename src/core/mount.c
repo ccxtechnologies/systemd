@@ -23,7 +23,7 @@
 #include "libmount-util.h"
 #include "log.h"
 #include "manager.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "mount.h"
 #include "mount-setup.h"
@@ -60,7 +60,9 @@ static const UnitActiveState state_translation_table[_MOUNT_STATE_MAX] = {
 };
 
 static int mount_dispatch_timer(sd_event_source *source, usec_t usec, void *userdata);
+#if HAVE_LIBMOUNT
 static int mount_dispatch_io(sd_event_source *source, int fd, uint32_t revents, void *userdata);
+#endif
 static void mount_enter_dead(Mount *m, MountResult f, bool flush_result);
 static void mount_enter_mounted(Mount *m, MountResult f);
 static void mount_cycle_clear(Mount *m);
@@ -236,34 +238,6 @@ static void mount_done(Unit *u) {
         mount_unwatch_control_pid(m);
 
         m->timer_event_source = sd_event_source_disable_unref(m->timer_event_source);
-}
-
-static int update_parameters_proc_self_mountinfo(
-                Mount *m,
-                const char *what,
-                const char *options,
-                const char *fstype) {
-
-        MountParameters *p;
-        int r, q, w;
-
-        assert(m);
-
-        p = &m->parameters_proc_self_mountinfo;
-
-        r = free_and_strdup(&p->what, what);
-        if (r < 0)
-                return r;
-
-        q = free_and_strdup(&p->options, options);
-        if (q < 0)
-                return q;
-
-        w = free_and_strdup(&p->fstype, fstype);
-        if (w < 0)
-                return w;
-
-        return r > 0 || q > 0 || w > 0;
 }
 
 static int mount_add_mount_dependencies(Mount *m) {
@@ -691,7 +665,7 @@ static int mount_load(Unit *u) {
 
         bool from_kernel = m->from_proc_self_mountinfo || u->perpetual;
 
-        r = unit_load_fragment_and_dropin(u, /* fragment_required = */ !from_kernel);
+        r = unit_load_fragment_and_dropin(u, /* fragment_required= */ !from_kernel);
 
         /* Add in some extras. Note we do this in all cases (even if we failed to load the unit) when announced by the
          * kernel, because we need some things to be set up no matter what when the kernel establishes a mount and thus
@@ -790,7 +764,7 @@ static void mount_catchup(Unit *u) {
                         break;
                 case MOUNT_MOUNTED:
                         assert(!pidref_is_set(&m->control_pid));
-                        mount_enter_dead(m, MOUNT_SUCCESS, /* flush_result = */ false);
+                        mount_enter_dead(m, MOUNT_SUCCESS, /* flush_result= */ false);
                         break;
                 default:
                         ;
@@ -919,17 +893,17 @@ static int mount_spawn(Mount *m, ExecCommand *c, ExecFlags flags, PidRef *ret_pi
 static void mount_enter_dead(Mount *m, MountResult f, bool flush_result) {
         assert(m);
 
-        if (m->result == MOUNT_SUCCESS || flush_result)
+        if (m->result == MOUNT_SUCCESS || f == MOUNT_FAILURE_START_LIMIT_HIT || flush_result)
                 m->result = f;
 
         unit_log_result(UNIT(m), m->result == MOUNT_SUCCESS, mount_result_to_string(m->result));
-        unit_warn_leftover_processes(UNIT(m), /* start = */ false);
+        unit_warn_leftover_processes(UNIT(m), /* start= */ false);
 
         mount_set_state(m, m->result != MOUNT_SUCCESS ? MOUNT_FAILED : MOUNT_DEAD);
 
         m->exec_runtime = exec_runtime_destroy(m->exec_runtime);
 
-        unit_destroy_runtime_data(UNIT(m), &m->exec_context, /* destroy_runtime_dir = */ true);
+        unit_destroy_runtime_data(UNIT(m), &m->exec_context, /* destroy_runtime_dir= */ true);
 
         unit_unref_uid_gid(UNIT(m), true);
 
@@ -950,7 +924,7 @@ static void mount_enter_mounted(Mount *m, MountResult f) {
          *
          * Note that this effectively means fresh creds are used during remount, but that's mostly what
          * users would expect anyways. */
-        unit_destroy_runtime_data(UNIT(m), &m->exec_context, /* destroy_runtime_dir = */ false);
+        unit_destroy_runtime_data(UNIT(m), &m->exec_context, /* destroy_runtime_dir= */ false);
 
         mount_set_state(m, MOUNT_MOUNTED);
 }
@@ -1018,12 +992,12 @@ static void mount_enter_signal(Mount *m, MountState state, MountResult f) {
         else if (state == MOUNT_UNMOUNTING_SIGTERM && m->kill_context.send_sigkill)
                 mount_enter_signal(m, MOUNT_UNMOUNTING_SIGKILL, MOUNT_SUCCESS);
         else
-                mount_enter_dead_or_mounted(m, MOUNT_SUCCESS, /* flush_result = */ false);
+                mount_enter_dead_or_mounted(m, MOUNT_SUCCESS, /* flush_result= */ false);
 
         return;
 
 fail:
-        mount_enter_dead_or_mounted(m, MOUNT_FAILURE_RESOURCES, /* flush_result = */ false);
+        mount_enter_dead_or_mounted(m, MOUNT_FAILURE_RESOURCES, /* flush_result= */ false);
 }
 
 static int mount_set_umount_command(Mount *m, ExecCommand *c) {
@@ -1084,7 +1058,7 @@ static void mount_enter_unmounting(Mount *m) {
         return;
 
 fail:
-        mount_enter_dead_or_mounted(m, MOUNT_FAILURE_RESOURCES, /* flush_result = */ false);
+        mount_enter_dead_or_mounted(m, MOUNT_FAILURE_RESOURCES, /* flush_result= */ false);
 }
 
 static int mount_apply_graceful_options(Mount *m, const MountParameters *p, char **opts) {
@@ -1197,7 +1171,7 @@ static void mount_enter_mounting(Mount *m) {
          * couldn't support that reasonably: the mounts in /proc/self/mountinfo would not be recognizable to
          * us anymore. */
         fd = chase_and_open_parent(m->where, /* root= */ NULL, CHASE_PROHIBIT_SYMLINKS|CHASE_MKDIR_0755|CHASE_TRIGGER_AUTOFS, &fn);
-        if (fd == -EREMCHG) {
+        if (fd == -ELOOP) {
                 r = unit_log_noncanonical_mount_path(UNIT(m), m->where);
                 goto fail;
         }
@@ -1214,7 +1188,7 @@ static void mount_enter_mounting(Mount *m) {
 
         bool source_is_dir = true;
         if (mount_is_bind(p)) {
-                r = is_dir(p->what, /* follow = */ true);
+                r = is_dir(p->what, /* follow= */ true);
                 if (r < 0 && r != -ENOENT)
                         log_unit_info_errno(UNIT(m), r, "Failed to determine type of bind mount source '%s', ignoring: %m", p->what);
                 else if (r == 0)
@@ -1274,12 +1248,12 @@ static void mount_enter_mounting(Mount *m) {
         }
 
         mount_unwatch_control_pid(m);
-        unit_warn_leftover_processes(UNIT(m), /* start = */ true);
+        unit_warn_leftover_processes(UNIT(m), /* start= */ true);
 
         m->control_command_id = MOUNT_EXEC_MOUNT;
         m->control_command = m->exec_command + MOUNT_EXEC_MOUNT;
 
-        r = mount_set_mount_command(m, m->control_command, p, /* remount = */ false);
+        r = mount_set_mount_command(m, m->control_command, p, /* remount= */ false);
         if (r < 0) {
                 log_unit_error_errno(UNIT(m), r, "Failed to prepare mount command line: %m");
                 goto fail;
@@ -1295,7 +1269,7 @@ static void mount_enter_mounting(Mount *m) {
         return;
 
 fail:
-        mount_enter_dead_or_mounted(m, MOUNT_FAILURE_RESOURCES, /* flush_result = */ false);
+        mount_enter_dead_or_mounted(m, MOUNT_FAILURE_RESOURCES, /* flush_result= */ false);
 }
 
 static void mount_set_reload_result(Mount *m, MountResult result) {
@@ -1326,7 +1300,7 @@ static void mount_enter_remounting(Mount *m) {
         m->control_command_id = MOUNT_EXEC_REMOUNT;
         m->control_command = m->exec_command + MOUNT_EXEC_REMOUNT;
 
-        r = mount_set_mount_command(m, m->control_command, p, /* remount = */ true);
+        r = mount_set_mount_command(m, m->control_command, p, /* remount= */ true);
         if (r < 0) {
                 log_unit_error_errno(UNIT(m), r, "Failed to prepare remount command line: %m");
                 goto fail;
@@ -1343,7 +1317,7 @@ static void mount_enter_remounting(Mount *m) {
 
 fail:
         mount_set_reload_result(m, MOUNT_FAILURE_RESOURCES);
-        mount_enter_dead_or_mounted(m, MOUNT_SUCCESS, /* flush_result = */ false);
+        mount_enter_dead_or_mounted(m, MOUNT_SUCCESS, /* flush_result= */ false);
 }
 
 static void mount_cycle_clear(Mount *m) {
@@ -1363,19 +1337,6 @@ static int mount_start(Unit *u) {
         Mount *m = ASSERT_PTR(MOUNT(u));
         int r;
 
-        /* We cannot fulfill this request right now, try again later
-         * please! */
-        if (IN_SET(m->state,
-                   MOUNT_UNMOUNTING,
-                   MOUNT_UNMOUNTING_SIGTERM,
-                   MOUNT_UNMOUNTING_SIGKILL,
-                   MOUNT_CLEANING))
-                return -EAGAIN;
-
-        /* Already on it! */
-        if (IN_SET(m->state, MOUNT_MOUNTING, MOUNT_MOUNTING_DONE))
-                return 0;
-
         assert(IN_SET(m->state, MOUNT_DEAD, MOUNT_FAILED));
 
         r = unit_acquire_invocation_id(u);
@@ -1390,6 +1351,7 @@ static int mount_start(Unit *u) {
 
 static int mount_stop(Unit *u) {
         Mount *m = ASSERT_PTR(MOUNT(u));
+        int r;
 
         switch (m->state) {
 
@@ -1401,21 +1363,22 @@ static int mount_stop(Unit *u) {
 
         case MOUNT_MOUNTING:
         case MOUNT_MOUNTING_DONE:
-        case MOUNT_REMOUNTING:
                 /* If we are still waiting for /bin/mount, we go directly into kill mode. */
                 mount_enter_signal(m, MOUNT_UNMOUNTING_SIGTERM, MOUNT_SUCCESS);
                 return 0;
 
+        case MOUNT_REMOUNTING:
         case MOUNT_REMOUNTING_SIGTERM:
-                /* If we are already waiting for a hung remount, convert this to the matching unmounting state */
-                mount_set_state(m, MOUNT_UNMOUNTING_SIGTERM);
-                return 0;
+                assert(pidref_is_set(&m->control_pid));
 
+                r = pidref_kill_and_sigcont(&m->control_pid, SIGKILL);
+                if (r < 0)
+                        log_unit_debug_errno(u, r,
+                                             "Failed to kill remount process " PID_FMT ", ignoring: %m",
+                                             m->control_pid.pid);
+
+                _fallthrough_;
         case MOUNT_REMOUNTING_SIGKILL:
-                /* as above */
-                mount_set_state(m, MOUNT_UNMOUNTING_SIGKILL);
-                return 0;
-
         case MOUNT_MOUNTED:
                 mount_enter_unmounting(m);
                 return 1;
@@ -1591,12 +1554,8 @@ static void mount_sigchld_event(Unit *u, pid_t pid, int code, int status) {
                 /* MOUNT_MOUNTING and MOUNT_UNMOUNTING states need to be patched, see below. */
                 m->result = f;
 
-        if (m->control_command) {
+        if (m->control_command)
                 exec_status_exit(&m->control_command->exec_status, &m->exec_context, pid, code, status);
-
-                m->control_command = NULL;
-                m->control_command_id = _MOUNT_EXEC_COMMAND_INVALID;
-        }
 
         unit_log_process_exit(
                         u,
@@ -1604,6 +1563,9 @@ static void mount_sigchld_event(Unit *u, pid_t pid, int code, int status) {
                         mount_exec_command_to_string(m->control_command_id),
                         f == MOUNT_SUCCESS,
                         code, status);
+
+        m->control_command = NULL;
+        m->control_command_id = _MOUNT_EXEC_COMMAND_INVALID;
 
         /* Note that due to the io event priority logic, we can be sure the new mountinfo is loaded
          * before we process the SIGCHLD for the mount command. */
@@ -1619,7 +1581,7 @@ static void mount_sigchld_event(Unit *u, pid_t pid, int code, int status) {
                         log_unit_warning(UNIT(m), "Mount process finished, but there is no mount.");
                         f = MOUNT_FAILURE_PROTOCOL;
                 }
-                mount_enter_dead(m, f, /* flush_result = */ false);
+                mount_enter_dead(m, f, /* flush_result= */ false);
                 break;
 
         case MOUNT_MOUNTING_DONE:
@@ -1629,7 +1591,7 @@ static void mount_sigchld_event(Unit *u, pid_t pid, int code, int status) {
         case MOUNT_REMOUNTING:
         case MOUNT_REMOUNTING_SIGTERM:
         case MOUNT_REMOUNTING_SIGKILL:
-                mount_enter_dead_or_mounted(m, MOUNT_SUCCESS, /* flush_result = */ false);
+                mount_enter_dead_or_mounted(m, MOUNT_SUCCESS, /* flush_result= */ false);
                 break;
 
         case MOUNT_UNMOUNTING:
@@ -1650,27 +1612,27 @@ static void mount_sigchld_event(Unit *u, pid_t pid, int code, int status) {
                         /* Hmm, umount process spawned by us failed, but the mount disappeared anyway?
                          * Maybe someone else is trying to unmount at the same time. */
                         log_unit_notice(u, "Mount disappeared even though umount process failed, continuing.");
-                        mount_enter_dead(m, MOUNT_SUCCESS, /* flush_result = */ true);
+                        mount_enter_dead(m, MOUNT_SUCCESS, /* flush_result= */ true);
                 } else
                         /* At this point, either the unmount succeeded or unexpected error occurred. We usually
                          * remember the first error in 'result', but here let's update that forcibly, since
                          * there could previous failed attempts yet we only care about the most recent
                          * attempt. IOW, if we eventually managed to unmount the stuff, don't enter failed
                          * end state. */
-                        mount_enter_dead_or_mounted(m, f, /* flush_result = */ true);
+                        mount_enter_dead_or_mounted(m, f, /* flush_result= */ true);
 
                 break;
 
         case MOUNT_UNMOUNTING_SIGTERM:
         case MOUNT_UNMOUNTING_SIGKILL:
-                mount_enter_dead_or_mounted(m, f, /* flush_result = */ false);
+                mount_enter_dead_or_mounted(m, f, /* flush_result= */ false);
                 break;
 
         case MOUNT_CLEANING:
                 if (m->clean_result == MOUNT_SUCCESS)
                         m->clean_result = f;
 
-                mount_enter_dead(m, MOUNT_SUCCESS, /* flush_result = */ false);
+                mount_enter_dead(m, MOUNT_SUCCESS, /* flush_result= */ false);
                 break;
 
         default:
@@ -1708,7 +1670,7 @@ static int mount_dispatch_timer(sd_event_source *source, usec_t usec, void *user
                         mount_enter_signal(m, MOUNT_REMOUNTING_SIGKILL, MOUNT_SUCCESS);
                 } else {
                         log_unit_warning(UNIT(m), "Remounting timed out. Skipping SIGKILL. Ignoring.");
-                        mount_enter_dead_or_mounted(m, MOUNT_SUCCESS, /* flush_result = */ false);
+                        mount_enter_dead_or_mounted(m, MOUNT_SUCCESS, /* flush_result= */ false);
                 }
                 break;
 
@@ -1716,7 +1678,7 @@ static int mount_dispatch_timer(sd_event_source *source, usec_t usec, void *user
                 mount_set_reload_result(m, MOUNT_FAILURE_TIMEOUT);
 
                 log_unit_warning(UNIT(m), "Mount process still around after SIGKILL. Ignoring.");
-                mount_enter_dead_or_mounted(m, MOUNT_SUCCESS, /* flush_result = */ false);
+                mount_enter_dead_or_mounted(m, MOUNT_SUCCESS, /* flush_result= */ false);
                 break;
 
         case MOUNT_UNMOUNTING:
@@ -1730,13 +1692,13 @@ static int mount_dispatch_timer(sd_event_source *source, usec_t usec, void *user
                         mount_enter_signal(m, MOUNT_UNMOUNTING_SIGKILL, MOUNT_FAILURE_TIMEOUT);
                 } else {
                         log_unit_warning(UNIT(m), "Mount process timed out. Skipping SIGKILL. Ignoring.");
-                        mount_enter_dead_or_mounted(m, MOUNT_FAILURE_TIMEOUT, /* flush_result = */ false);
+                        mount_enter_dead_or_mounted(m, MOUNT_FAILURE_TIMEOUT, /* flush_result= */ false);
                 }
                 break;
 
         case MOUNT_UNMOUNTING_SIGKILL:
                 log_unit_warning(UNIT(m), "Mount process still around after SIGKILL. Ignoring.");
-                mount_enter_dead_or_mounted(m, MOUNT_FAILURE_TIMEOUT, /* flush_result = */ false);
+                mount_enter_dead_or_mounted(m, MOUNT_FAILURE_TIMEOUT, /* flush_result= */ false);
                 break;
 
         case MOUNT_CLEANING:
@@ -1753,6 +1715,35 @@ static int mount_dispatch_timer(sd_event_source *source, usec_t usec, void *user
         }
 
         return 0;
+}
+
+#if HAVE_LIBMOUNT
+static int update_parameters_proc_self_mountinfo(
+                Mount *m,
+                const char *what,
+                const char *options,
+                const char *fstype) {
+
+        MountParameters *p;
+        int r, q, w;
+
+        assert(m);
+
+        p = &m->parameters_proc_self_mountinfo;
+
+        r = free_and_strdup(&p->what, what);
+        if (r < 0)
+                return r;
+
+        q = free_and_strdup(&p->options, options);
+        if (q < 0)
+                return q;
+
+        w = free_and_strdup(&p->fstype, fstype);
+        if (w < 0)
+                return w;
+
+        return r > 0 || q > 0 || w > 0;
 }
 
 static int mount_setup_new_unit(
@@ -1952,16 +1943,16 @@ static int mount_load_proc_self_mountinfo(Manager *m, bool set_flags) {
                 struct libmnt_fs *fs;
                 const char *device, *path, *options, *fstype;
 
-                r = mnt_table_next_fs(table, iter, &fs);
+                r = sym_mnt_table_next_fs(table, iter, &fs);
                 if (r == 1)
                         break;
                 if (r < 0)
                         return log_error_errno(r, "Failed to get next entry from /proc/self/mountinfo: %m");
 
-                device = mnt_fs_get_source(fs);
-                path = mnt_fs_get_target(fs);
-                options = mnt_fs_get_options(fs);
-                fstype = mnt_fs_get_fstype(fs);
+                device = sym_mnt_fs_get_source(fs);
+                path = sym_mnt_fs_get_target(fs);
+                options = sym_mnt_fs_get_options(fs);
+                fstype = sym_mnt_fs_get_fstype(fs);
 
                 if (!device || !path)
                         continue;
@@ -1977,14 +1968,17 @@ static int mount_load_proc_self_mountinfo(Manager *m, bool set_flags) {
 
         return 0;
 }
+#endif
 
 static void mount_shutdown(Manager *m) {
         assert(m);
 
         m->mount_event_source = sd_event_source_disable_unref(m->mount_event_source);
 
-        mnt_unref_monitor(m->mount_monitor);
-        m->mount_monitor = NULL;
+        if (m->mount_monitor) {
+                sym_mnt_unref_monitor(m->mount_monitor);
+                m->mount_monitor = NULL;
+        }
 }
 
 static void mount_handoff_timestamp(
@@ -2008,6 +2002,8 @@ static int mount_get_timeout(Unit *u, usec_t *timeout) {
         usec_t t;
         int r;
 
+        assert(timeout);
+
         if (!m->timer_event_source)
                 return 0;
 
@@ -2026,6 +2022,7 @@ static void mount_enumerate_perpetual(Manager *m) {
         int r;
 
         assert(m);
+        assert(unit_type_supported(UNIT_MOUNT));
 
         /* Whatever happens, we know for sure that the root directory is around, and cannot go away. Let's
          * unconditionally synthesize it here and mark it as perpetual. */
@@ -2045,6 +2042,7 @@ static void mount_enumerate_perpetual(Manager *m) {
         unit_add_to_dbus_queue(u);
 }
 
+#if HAVE_LIBMOUNT
 static bool mount_is_mounted(Mount *m) {
         assert(m);
 
@@ -2069,39 +2067,42 @@ static int mount_on_ratelimit_expire(sd_event_source *s, void *userdata) {
 
         return 0;
 }
+#endif
 
 static void mount_enumerate(Manager *m) {
+        assert(m);
+        assert(unit_type_supported(UNIT_MOUNT));
+
+#if HAVE_LIBMOUNT
         int r;
 
-        assert(m);
-
-        mnt_init_debug(0);
+        sym_mnt_init_debug(0);
 
         if (!m->mount_monitor) {
                 usec_t mount_rate_limit_interval = 1 * USEC_PER_SEC;
                 unsigned mount_rate_limit_burst = 5;
                 int fd;
 
-                m->mount_monitor = mnt_new_monitor();
+                m->mount_monitor = sym_mnt_new_monitor();
                 if (!m->mount_monitor) {
                         log_oom();
                         goto fail;
                 }
 
-                r = mnt_monitor_enable_kernel(m->mount_monitor, 1);
+                r = sym_mnt_monitor_enable_kernel(m->mount_monitor, 1);
                 if (r < 0) {
                         log_error_errno(r, "Failed to enable watching of kernel mount events: %m");
                         goto fail;
                 }
 
-                r = mnt_monitor_enable_userspace(m->mount_monitor, 1, NULL);
+                r = sym_mnt_monitor_enable_userspace(m->mount_monitor, 1, NULL);
                 if (r < 0) {
                         log_error_errno(r, "Failed to enable watching of userspace mount events: %m");
                         goto fail;
                 }
 
                 /* mnt_unref_monitor() will close the fd */
-                fd = r = mnt_monitor_get_fd(m->mount_monitor);
+                fd = r = sym_mnt_monitor_get_fd(m->mount_monitor);
                 if (r < 0) {
                         log_error_errno(r, "Failed to acquire watch file descriptor: %m");
                         goto fail;
@@ -2156,14 +2157,19 @@ static void mount_enumerate(Manager *m) {
         return;
 
 fail:
+#endif
         mount_shutdown(m);
 }
 
 static int drain_libmount(Manager *m) {
+        assert(m);
+
+        if (!m->mount_monitor)
+                return false;
+
+#if HAVE_LIBMOUNT
         bool rescan = false;
         int r;
-
-        assert(m);
 
         /* Drain all events and verify that the event is valid.
          *
@@ -2172,7 +2178,7 @@ static int drain_libmount(Manager *m) {
          *
          * error: r < 0; valid: r == 0, false positive: r == 1 */
         do {
-                r = mnt_monitor_next_change(m->mount_monitor, NULL, NULL);
+                r = sym_mnt_monitor_next_change(m->mount_monitor, NULL, NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to drain libmount events: %m");
                 if (r == 0)
@@ -2180,11 +2186,13 @@ static int drain_libmount(Manager *m) {
         } while (r == 0);
 
         return rescan;
+
+#else
+        assert_not_reached();
+#endif
 }
 
 static int mount_process_proc_self_mountinfo(Manager *m) {
-        _cleanup_set_free_ Set *around = NULL, *gone = NULL;
-        const char *what;
         int r;
 
         assert(m);
@@ -2193,6 +2201,7 @@ static int mount_process_proc_self_mountinfo(Manager *m) {
         if (r <= 0)
                 return r;
 
+#if HAVE_LIBMOUNT
         r = mount_load_proc_self_mountinfo(m, true);
         if (r < 0) {
                 /* Reset flags, just in case, for later calls */
@@ -2203,6 +2212,8 @@ static int mount_process_proc_self_mountinfo(Manager *m) {
         }
 
         manager_dispatch_load_queue(m);
+
+        _cleanup_set_free_ Set *around = NULL, *gone = NULL;
 
         LIST_FOREACH(units_by_type, u, m->units_by_type[UNIT_MOUNT]) {
                 Mount *mount = MOUNT(u);
@@ -2228,7 +2239,7 @@ static int mount_process_proc_self_mountinfo(Manager *m) {
                                  * Also explicitly override the result (see the comment in mount_sigchld_event()),
                                  * but more aggressively here since the state change is extrinsic. */
                                 mount_cycle_clear(mount);
-                                mount_enter_dead(mount, MOUNT_SUCCESS, /* flush_result = */ true);
+                                mount_enter_dead(mount, MOUNT_SUCCESS, /* flush_result= */ true);
                                 break;
 
                         case MOUNT_MOUNTING_DONE:
@@ -2283,6 +2294,7 @@ static int mount_process_proc_self_mountinfo(Manager *m) {
                 mount->proc_flags = 0;
         }
 
+        const char *what;
         SET_FOREACH(what, gone) {
                 if (set_contains(around, what))
                         continue;
@@ -2292,8 +2304,12 @@ static int mount_process_proc_self_mountinfo(Manager *m) {
         }
 
         return 0;
+#else
+        assert_not_reached();
+#endif
 }
 
+#if HAVE_LIBMOUNT
 static int mount_dispatch_io(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
         Manager *m = ASSERT_PTR(userdata);
 
@@ -2301,6 +2317,7 @@ static int mount_dispatch_io(sd_event_source *source, int fd, uint32_t revents, 
 
         return mount_process_proc_self_mountinfo(m);
 }
+#endif
 
 static void mount_reset_failed(Unit *u) {
         Mount *m = MOUNT(u);
@@ -2369,20 +2386,28 @@ static int mount_can_clean(Unit *u, ExecCleanMask *ret) {
         return exec_context_get_clean_mask(&m->exec_context, ret);
 }
 
-static int mount_can_start(Unit *u) {
+static int mount_test_startable(Unit *u) {
         Mount *m = ASSERT_PTR(MOUNT(u));
         int r;
 
+        /* It is already being started. */
+        if (IN_SET(m->state, MOUNT_MOUNTING, MOUNT_MOUNTING_DONE))
+                return false;
+
         r = unit_test_start_limit(u);
         if (r < 0) {
-                mount_enter_dead(m, MOUNT_FAILURE_START_LIMIT_HIT, /* flush_result = */ false);
+                mount_enter_dead(m, MOUNT_FAILURE_START_LIMIT_HIT, /* flush_result= */ false);
                 return r;
         }
 
         if (!get_mount_parameters_fragment(m))
                 return -ENOENT;
 
-        return 1;
+        return true;
+}
+
+static bool mount_supported(void) {
+        return dlopen_libmount(LOG_DEBUG) >= 0;
 }
 
 static int mount_subsystem_ratelimited(Manager *m) {
@@ -2404,7 +2429,6 @@ char* mount_get_where_escaped(const Mount *m) {
 }
 
 char* mount_get_what_escaped(const Mount *m) {
-        _cleanup_free_ char *escaped = NULL;
         const char *s = NULL;
 
         assert(m);
@@ -2413,14 +2437,10 @@ char* mount_get_what_escaped(const Mount *m) {
                 s = m->parameters_proc_self_mountinfo.what;
         else if (m->from_fragment && m->parameters_fragment.what)
                 s = m->parameters_fragment.what;
+        if (!s)
+                return strdup("");
 
-        if (s) {
-                escaped = utf8_escape_invalid(s);
-                if (!escaped)
-                        return NULL;
-        }
-
-        return escaped ? TAKE_PTR(escaped) : strdup("");
+        return utf8_escape_invalid(s);
 }
 
 char* mount_get_options_escaped(const Mount *m) {
@@ -2488,6 +2508,8 @@ const UnitVTable mount_vtable = {
         .can_transient = true,
         .can_fail = true,
         .exclude_from_switch_root_serialization = true,
+        .notify_plymouth = true,
+        .track_orphaned = true,
 
         .init = mount_init,
         .load = mount_load,
@@ -2534,6 +2556,7 @@ const UnitVTable mount_vtable = {
         .enumerate_perpetual = mount_enumerate_perpetual,
         .enumerate = mount_enumerate,
         .shutdown = mount_shutdown,
+        .supported = mount_supported,
         .subsystem_ratelimited = mount_subsystem_ratelimited,
 
         .status_message_formats = {
@@ -2553,7 +2576,5 @@ const UnitVTable mount_vtable = {
                 },
         },
 
-        .can_start = mount_can_start,
-
-        .notify_plymouth = true,
+        .test_startable = mount_test_startable,
 };

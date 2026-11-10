@@ -22,9 +22,8 @@ test -d /run/initrd-mount-target
 mountpoint /run/initrd-mount-target
 [[ -e /run/initrd-mount-target/hello-world ]]
 
-# Copy the prepared exitrd to its intended location. Check the respective
-# test.sh file for details
-mkdir -p /run/initramfs
-cp -r /exitrd/* /run/initramfs/
+# The initrd-run-initramfs.service in the initrd should have populated /run/initramfs
+# from the initrd's own contents before switch-root.
+test -x /run/initramfs/shutdown
 
 touch /testok

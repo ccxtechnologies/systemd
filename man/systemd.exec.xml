@@ -63,15 +63,26 @@
 
       <listitem><para>Units with <varname>PrivateTmp=yes</varname> automatically gain dependencies of type
       <varname>Wants=</varname> and <varname>After=</varname> on all mounts required to access
-      <filename>/tmp/</filename> and <filename>/var/tmp/</filename>. They will also gain an automatic
+      <filename>/tmp/</filename> and <filename>/var/tmp/</filename> and an automatic
       <varname>After=</varname> dependency on
-      <citerefentry><refentrytitle>systemd-tmpfiles-setup.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
-      </para></listitem>
+      <citerefentry><refentrytitle>systemd-tmpfiles-setup.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
+      unless <varname>DefaultDependencies=no</varname> is specified. If
+      <varname>DefaultDependencies=no</varname> is specified, and a
+      <varname>RequiresMountsFor=/tmp/</varname>, <varname>WantsMountsFor=/tmp/</varname>,
+      <varname>After=tmp.mount</varname>, or <varname>RootDirectory=</varname>/<varname>RootImage=</varname>
+      are not specified, <varname>PrivateTmp=yes</varname> is converted to
+      <varname>PrivateTmp=disconnected</varname>.</para></listitem>
 
       <listitem><para>Units with <varname>PrivateTmp=disconnected</varname> automatically gain dependencies
       of type <varname>Wants=</varname> and <varname>After=</varname> on the mount required to access
       <filename>/var/</filename>, unless <varname>DefaultDependencies=no</varname> and/or
-      <varname>RootDirectory=/RootImage=</varname> are specified.</para></listitem>
+      <varname>RootDirectory=</varname>/<varname>RootImage=</varname> are specified. If
+      <varname>DefaultDependencies=no</varname> is specified, and a
+      <varname>RequiresMountsFor=/var/</varname>, <varname>WantsMountsFor=/var/</varname>,
+      <varname>After=var.mount</varname>, <varname>RootDirectory=</varname>/<varname>RootImage=</varname> are
+      not specified, the private mount on <filename>/tmp/</filename> is reused for
+      <filename>/var/tmp/</filename> by setting <varname>$TMPDIR</varname> appropriately.</para>
+      </listitem>
 
       <listitem><para>Units whose standard output or error output is connected to <option>journal</option> or
       <option>kmsg</option> (or their combinations with console output, see below) automatically acquire
@@ -174,9 +185,9 @@
         or loopback file instead of a directory. The device node or file system image file needs to contain a
         file system without a partition table, or a file system within an MBR/MS-DOS or GPT partition table
         with only a single Linux-compatible partition, or a set of file systems within a GPT partition table
-        that follows the
-        <ulink url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">
-          Discoverable Partitions Specification</ulink>.</para>
+        that follows the <ulink
+        url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">UAPI.2
+        Discoverable Partitions Specification</ulink>.</para>
 
         <para>When <varname>DevicePolicy=</varname> is set to <literal>closed</literal> or
         <literal>strict</literal>, or set to <literal>auto</literal> and <varname>DeviceAllow=</varname> is
@@ -201,7 +212,7 @@
 
         <xi:include href="vpick.xml" xpointer="image"/>
 
-        <xi:include href="system-only.xml" xpointer="singular"/>
+        <xi:include href="system-or-user-ns-mountfsd.xml" xpointer="singular"/>
 
         <xi:include href="version-info.xml" xpointer="v233"/></listitem>
       </varlistentry>
@@ -213,8 +224,7 @@
         <varname>RootImage=</varname>. Optionally a partition name can be prefixed, followed by colon, in
         case the image has multiple partitions, otherwise partition name <literal>root</literal> is implied.
         Options for multiple partitions can be specified in a single line with space separators. Assigning an empty
-        string removes previous assignments. Duplicated options are ignored. For a list of valid mount options, please
-        refer to
+        string removes previous assignments. For a list of valid mount options, please refer to
         <citerefentry project='man-pages'><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
         </para>
 
@@ -226,6 +236,9 @@
         <constant>var</constant>.</para>
 
         <xi:include href="system-only.xml" xpointer="singular"/>
+
+        <xi:include href="system-or-user-ns-mountfsd-mount-options.xml" xpointer="plural"/>
+        <xi:include href="system-or-user-ns-mountfsd-mount-options.xml" xpointer="example"/>
 
         <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
@@ -275,7 +288,7 @@
         image. There's currently no option to configure the root hash for the <filename>/usr/</filename> file
         system via the unit file directly.</para>
 
-        <xi:include href="system-only.xml" xpointer="singular"/>
+        <xi:include href="system-or-user-ns-mountfsd.xml" xpointer="singular"/>
 
         <xi:include href="version-info.xml" xpointer="v246"/></listitem>
       </varlistentry>
@@ -298,7 +311,7 @@
         configure the root hash signature for the <filename>/usr/</filename> via the unit file
         directly.</para>
 
-        <xi:include href="system-only.xml" xpointer="singular"/>
+        <xi:include href="system-or-user-ns-mountfsd.xml" xpointer="singular"/>
 
         <xi:include href="version-info.xml" xpointer="v246"/></listitem>
       </varlistentry>
@@ -319,7 +332,7 @@
         <ulink url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">
           Discoverable Partitions Specification</ulink>.</para>
 
-        <xi:include href="system-only.xml" xpointer="singular"/>
+        <xi:include href="system-or-user-ns-mountfsd.xml" xpointer="singular"/>
 
         <xi:include href="version-info.xml" xpointer="v246"/></listitem>
       </varlistentry>
@@ -348,6 +361,26 @@
         usr=verity+signed+encrypted+unprotected+absent</programlisting>
 
         <xi:include href="version-info.xml" xpointer="v254"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>RootMStack=</varname></term>
+
+        <listitem><para>Takes a path to a
+        <citerefentry><refentrytitle>systemd.mstack</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+        directory encapsulating a mount stack consisting of layers and bind mounts. Similar to
+        <varname>RootDirectory=</varname> and <varname>RootImage=</varname> this runs the service off a
+        distinct root file system, in this case set up via <literal>overlayfs</literal>.</para>
+
+        <para>Since <filename>.mstack/</filename> directories may reference disk images (DDIs) similar device
+        policy extensions and dependencies are in effect when <varname>RootMStack=</varname> is used as are
+        if <varname>RootImage=</varname> is used.</para>
+
+        <xi:include href="vpick.xml" xpointer="image"/>
+
+        <xi:include href="system-or-user-ns-mountfsd.xml" xpointer="singular"/>
+
+        <xi:include href="version-info.xml" xpointer="v260"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -448,16 +481,16 @@
         <term><varname>BindPaths=</varname></term>
         <term><varname>BindReadOnlyPaths=</varname></term>
 
-        <listitem><para>Configures unit-specific bind mounts. A bind mount makes a particular file or directory
-        available at an additional place in the unit's view of the file system. Any bind mounts created with this
-        option are specific to the unit, and are not visible in the host's mount table. This option expects a
-        whitespace separated list of bind mount definitions. Each definition consists of a colon-separated triple of
-        source path, destination path and option string, where the latter two are optional. If only a source path is
-        specified the source and destination is taken to be the same. The option string may be either
-        <literal>rbind</literal> or <literal>norbind</literal> for configuring a recursive or non-recursive bind
-        mount. If the destination path is omitted, the option string must be omitted too.
-        Each bind mount definition may be prefixed with <literal>-</literal>, in which case it will be ignored
-        when its source path does not exist.</para>
+        <listitem><para>Configures unit-specific bind mounts. A bind mount makes a particular file or
+        directory available at an additional place in the unit's view of the file system. Any bind mounts
+        created with this option are specific to the unit, and are not visible in the host's mount
+        table. This option expects a whitespace separated list of bind mount definitions. Each definition
+        consists of a colon-separated triple of source path, destination path and option string, where the
+        latter two are optional. If only a source path is specified the source and destination is taken to be
+        the same. The option string may be either <literal>rbind</literal> or <literal>norbind</literal> for
+        configuring a recursive or non-recursive bind mount. If the destination path is omitted, the option
+        string must be omitted too.  Each bind mount definition may be prefixed with <literal>-</literal>, in
+        which case it will be ignored when its source path does not exist or is not accessible.</para>
 
         <para><varname>BindPaths=</varname> creates regular writable bind mounts (unless the source file system mount
         is already marked read-only), while <varname>BindReadOnlyPaths=</varname> creates read-only bind mounts. These
@@ -523,7 +556,10 @@
         <varname>PrivateDevices=</varname> below, as it may change the setting of
         <varname>DevicePolicy=</varname>.</para>
 
-        <xi:include href="system-only.xml" xpointer="singular"/>
+        <xi:include href="system-or-user-ns-mountfsd.xml" xpointer="singular"/>
+
+        <xi:include href="system-or-user-ns-mountfsd-mount-options.xml" xpointer="plural"/>
+        <xi:include href="system-or-user-ns-mountfsd-mount-options.xml" xpointer="example"/>
 
         <xi:include href="version-info.xml" xpointer="v247"/></listitem>
       </varlistentry>
@@ -567,14 +603,13 @@
         To disable the safety check that the extension-release file name matches the image file name, the
         <varname>x-systemd.relax-extension-release-check</varname> mount option may be appended.</para>
 
-        <para>This option can be used together with a <option>notify-reload</option> service type and
-        <citerefentry><refentrytitle>systemd.v</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-        to manage configuration updates. When such a service carrying confext images is reloaded via
-        <command>systemctl reload foo.service</command> or equivalent D-Bus method, the confext itself will
-        be reloaded to pick up any changes. This only applies to confext extensions. Note that in case a
-        service has this configuration enabled at first, and then it is subsequently removed in an update
-        followed by a daemon-reload operation, reloading the confexts will be a no-op, and a full service
-        restart is required instead. See
+        <para>If a service employs this option with
+        <citerefentry><refentrytitle>systemd.v</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
+        and has <option>RefreshOnReload=extensions</option> enabled (the default), the confexts will
+        be refreshed to pick up any changes on service reload. This only applies to confext extensions.
+        Note that in case a service has this configuration enabled at first, and then it is subsequently
+        removed in an update followed by a daemon-reload operation, reloading the confexts will be a no-op,
+        and a full service restart is required instead. See
         <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
         also for details.</para>
 
@@ -590,7 +625,10 @@
 
         <xi:include href="vpick.xml" xpointer="image"/>
 
-        <xi:include href="system-only.xml" xpointer="singular"/>
+        <xi:include href="system-or-user-ns-mountfsd.xml" xpointer="singular"/>
+
+        <xi:include href="system-or-user-ns-mountfsd-mount-options.xml" xpointer="plural"/>
+        <xi:include href="system-or-user-ns-mountfsd-mount-options.xml" xpointer="example"/>
 
         <xi:include href="version-info.xml" xpointer="v248"/></listitem>
       </varlistentry>
@@ -622,14 +660,13 @@
         or the host. See:
         <citerefentry><refentrytitle>os-release</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para>
 
-        <para>This option can be used together with a <option>notify-reload</option> service type and
-        <citerefentry><refentrytitle>systemd.v</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-        to manage configuration updates. When such a service carrying confext directories is reloaded via
-        <command>systemctl reload foo.service</command> or equivalent D-Bus method, the confext itself will
-        be reloaded to pick up any changes. This only applies to confext extensions. Note that in case a
-        service has this configuration enabled at first, and then it is subsequently removed in an update
-        followed by a daemon-reload operation, reloading the confexts will be a no-op, and a full service
-        restart is required instead. See
+        <para>If a service employs this option with
+        <citerefentry><refentrytitle>systemd.v</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
+        and has <option>RefreshOnReload=extensions</option> enabled (the default), the confexts will
+        be refreshed to pick up any changes on service reload. This only applies to confext extensions.
+        Note that in case a service has this configuration enabled at first, and then it is subsequently
+        removed in an update followed by a daemon-reload operation, reloading the confexts will be a no-op,
+        and a full service restart is required instead. See
         <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
         also for details.</para>
 
@@ -916,11 +953,15 @@ CapabilityBoundingSet=~CAP_B CAP_C</programlisting>
 
         <listitem><para>Controls the secure bits set for the executed process. Takes a space-separated combination of
         options from the following list: <option>keep-caps</option>, <option>keep-caps-locked</option>,
-        <option>no-setuid-fixup</option>, <option>no-setuid-fixup-locked</option>, <option>noroot</option>, and
-        <option>noroot-locked</option>. This option may appear more than once, in which case the secure bits are
+        <option>no-setuid-fixup</option>, <option>no-setuid-fixup-locked</option>, <option>noroot</option>,
+        <option>noroot-locked</option>, <option>no-cap-ambient-raise</option>, <option>no-cap-ambient-raise-locked</option>,
+        <option>exec-restrict-file</option>, <option>exec-restrict-file-locked</option>,
+        <option>exec-deny-interactive</option>, and <option>exec-deny-interactive-locked</option>.
+        This option may appear more than once, in which case the secure bits are
         ORed. If the empty string is assigned to this option, the bits are reset to 0. This does not affect commands
         prefixed with <literal>+</literal>. See <citerefentry
-        project='man-pages'><refentrytitle>capabilities</refentrytitle><manvolnum>7</manvolnum></citerefentry> for
+        project='man-pages'><refentrytitle>capabilities</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+        and <ulink url="https://docs.kernel.org/userspace-api/check_exec.html">Executability check</ulink> for
         details.</para></listitem>
       </varlistentry>
 
@@ -1043,6 +1084,10 @@ CapabilityBoundingSet=~CAP_B CAP_C</programlisting>
         <varname>TasksMax=</varname> (see <citerefentry><refentrytitle>systemd.resource-control</refentrytitle>
         <manvolnum>5</manvolnum></citerefentry>) is typically a better choice than <varname>LimitNPROC=</varname>.
         </para>
+
+        <para>These settings, including the defaults described below, do not affect commands prefixed with
+        <literal>+</literal>. Such commands inherit the resource limits of the service manager itself, which may be
+        different.</para>
 
         <para>Resource limits not configured explicitly for a unit default to the value configured in the various
         <varname>DefaultLimitCPU=</varname>, <varname>DefaultLimitFSIZE=</varname>, … options available in
@@ -1326,7 +1371,7 @@ CapabilityBoundingSet=~CAP_B CAP_C</programlisting>
         <term><varname>CPUSchedulingPolicy=</varname></term>
 
         <listitem><para>Sets the CPU scheduling policy for executed processes. Takes one of <option>other</option>,
-        <option>batch</option>, <option>idle</option>, <option>fifo</option> or <option>rr</option>. See
+        <option>batch</option>, <option>idle</option>, <option>fifo</option>, <option>rr</option> or <option>ext</option>. See
         <citerefentry project='man-pages'><refentrytitle>sched_setscheduler</refentrytitle><manvolnum>2</manvolnum></citerefentry> for
         details.</para></listitem>
       </varlistentry>
@@ -1371,12 +1416,16 @@ CapabilityBoundingSet=~CAP_B CAP_C</programlisting>
         <term><varname>NUMAPolicy=</varname></term>
 
         <listitem><para>Controls the NUMA memory policy of the executed processes. Takes a policy type, one of:
-        <option>default</option>, <option>preferred</option>, <option>bind</option>, <option>interleave</option> and
-        <option>local</option>. A list of NUMA nodes that should be associated with the policy must be specified
-        in <varname>NUMAMask=</varname>. For more details on each policy please see,
+        <option>default</option>, <option>preferred</option>, <option>bind</option>, <option>interleave</option>,
+        <option>local</option>, <option>preferred-many</option> (requires Linux 5.15 or newer) and
+        <option>weighted-interleave</option> (requires Linux 6.9 or newer, weights are configured via
+        <filename>/sys/kernel/mm/mempolicy/weighted_interleave/</filename>). A list of NUMA nodes that should be
+        associated with the policy must be specified in <varname>NUMAMask=</varname>. For more details on each
+        policy please see,
         <citerefentry><refentrytitle>set_mempolicy</refentrytitle><manvolnum>2</manvolnum></citerefentry>. For overall
         overview of NUMA support in Linux see,
         <citerefentry project='man-pages'><refentrytitle>numa</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
+        If the kernel does not support the requested policy, a warning is logged and the setting is ignored.
         </para>
 
         <xi:include href="version-info.xml" xpointer="v243"/></listitem>
@@ -1500,6 +1549,9 @@ CapabilityBoundingSet=~CAP_B CAP_C</programlisting>
         actually require access to the user's private data. This setting is implied if
         <varname>DynamicUser=</varname> is set. This setting cannot ensure protection in all cases. In
         general it has the same limitations as <varname>ReadOnlyPaths=</varname>, see below.</para>
+
+        <para>Note that this setting provides no protection if home directories are placed at a non-standard
+        location, i.e. outside of the hierarchies listed above.</para>
 
         <xi:include href="system-or-user-ns.xml" xpointer="singular"/>
 
@@ -1732,6 +1784,15 @@ StateDirectory=aaa/bbb ccc</programlisting>
         stopped. Note that since the runtime directory <filename>/run/</filename> is a mount point of
         <literal>tmpfs</literal>, then for system services the directories specified in
         <varname>RuntimeDirectory=</varname> are removed when the system is rebooted.</para>
+
+        <para>If <varname>DynamicUser=</varname> is used together with
+        <varname>RuntimeDirectoryPreserve=</varname> set to values other than <option>no</option>, the logic
+        is slightly altered: the <varname>RuntimeDirectory=</varname> directories are created below
+        <filename>/run/private/</filename>, which is a host directory made inaccessible to unprivileged
+        users, which ensures that access to these directories cannot be gained through dynamic user ID
+        recycling. Symbolic links are created to hide this difference in behaviour. Both from the
+        perspective of the host and from inside the unit, the relevant directories hence always appear
+        directly below <filename>/run/</filename>.</para>
 
         <xi:include href="version-info.xml" xpointer="v235"/></listitem>
       </varlistentry>
@@ -2027,6 +2088,20 @@ BindReadOnlyPaths=/var/lib/systemd</programlisting>
       </varlistentry>
 
       <varlistentry>
+        <term><varname>UserNamespacePath=</varname></term>
+
+        <listitem><para>Takes an absolute file system path referring to a Linux user namespace
+        pseudo-file (i.e. a file like <filename>/proc/$PID/ns/user</filename> or a bind mount or symlink to
+        one). When set the invoked processes are added to the user namespace referenced by that path. The
+        path has to point to a valid namespace file at the moment the processes are forked off. If this
+        option is used <varname>PrivateUsers=</varname> has no effect.</para>
+
+        <para>This option is only available for system services.</para>
+
+        <xi:include href="version-info.xml" xpointer="v259"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>NetworkNamespacePath=</varname></term>
 
         <listitem><para>Takes an absolute file system path referring to a Linux network namespace
@@ -2121,6 +2196,41 @@ BindReadOnlyPaths=/var/lib/systemd</programlisting>
       </varlistentry>
 
       <varlistentry>
+        <term><varname>MemoryTHP=</varname></term>
+
+        <listitem><para>Transparent Hugepages (THPs) is a Linux kernel feature that manages memory
+        using larger pages (2MB on x86, compared to the default 4KB). The main goal is to improve memory management
+        efficiency and system performance, especially for memory-intensive applications.
+        However, it can cause drawbacks in some scenarios, such as memory regression and latency spikes.
+        THP policy is governed for the entire system via <filename>/sys/kernel/mm/transparent_hugepage/enabled</filename>.
+        However, it can be overridden for individual workloads via
+        <citerefentry><refentrytitle>prctl</refentrytitle><manvolnum>2</manvolnum></citerefentry>.
+        <varname>MemoryTHP=</varname> may be used to disable THPs at process invocation time to stop providing
+        THPs for workloads where the drawbacks outweigh the advantages.
+        When <varname>MemoryTHP=</varname> is set to <literal>inherit</literal> or not set at all, systemd
+        inherits THP settings from the process that starts it and no
+        <citerefentry><refentrytitle>prctl</refentrytitle><manvolnum>2</manvolnum></citerefentry>
+        <constant>PR_SET_THP_DISABLE</constant> call is made.
+        When set to <literal>disable</literal>, <varname>MemoryTHP=</varname> disables THPs completely for the process,
+        irrespecitive of global THP controls.
+        When set to <literal>madvise</literal>, <varname>MemoryTHP=</varname> disables THPs for the process except when
+        specifically requested via <citerefentry><refentrytitle>madvise</refentrytitle><manvolnum>2</manvolnum></citerefentry>
+        by the process with <constant>MADV_HUGEPAGE</constant> or <constant>MADV_COLLAPSE</constant>.
+        When set to <literal>system</literal>, <varname>MemoryTHP=</varname> resets the THP policy to system wide policy.
+        This can be used when the process that starts systemd has already disabled THPs via
+        <constant>PR_SET_THP_DISABLE</constant>, and we want to restore the system default THP setting at
+        process invocation time. For details, see
+        <ulink url="https://docs.kernel.org/admin-guide/mm/transhuge.html">Transparent Hugepage Support</ulink>
+        in the kernel documentation.</para>
+        <para>Note that this functionality might not be available, for example if THP is disabled in the
+        kernel, or the kernel does not support controlling THP at the process level through
+        <citerefentry><refentrytitle>prctl</refentrytitle><manvolnum>2</manvolnum></citerefentry>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v260"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>PrivatePIDs=</varname></term>
 
         <listitem><para>Takes a boolean argument. Defaults to false. If enabled, sets up a new PID namespace
@@ -2147,16 +2257,17 @@ BindReadOnlyPaths=/var/lib/systemd</programlisting>
       <varlistentry>
         <term><varname>PrivateUsers=</varname></term>
 
-        <listitem><para>Takes a boolean argument or one of <literal>self</literal>, <literal>identity</literal>,
-        or <literal>full</literal>. Defaults to false. If enabled, sets up a new user namespace for the
-        executed processes and configures a user and group mapping. If set to a true value or
-        <literal>self</literal>, a minimal user and group mapping is configured that maps the
-        <literal>root</literal> user and group as well as the unit's own user and group to themselves and
-        everything else to the <literal>nobody</literal> user and group. This is useful to securely detach
-        the user and group databases used by the unit from the rest of the system, and thus to create an
-        effective sandbox environment. All files, directories, processes, IPC objects and other resources
-        owned by users/groups not equaling <literal>root</literal> or the unit's own will stay visible from
-        within the unit but appear owned by the <literal>nobody</literal> user and group. </para>
+        <listitem><para>Takes a boolean argument or one of <literal>self</literal>,
+        <literal>identity</literal>, <literal>full</literal> or <literal>managed</literal>. Defaults to
+        false. If enabled, sets up a new user namespace for the executed processes and configures a user and
+        group mapping. If set to a true value or <literal>self</literal>, a minimal user and group mapping is
+        configured that maps the <literal>root</literal> user and group as well as the unit's own user and
+        group to themselves and everything else to the <literal>nobody</literal> user and group. This is
+        useful to securely detach the user and group databases used by the unit from the rest of the system,
+        and thus to create an effective sandbox environment. All files, directories, processes, IPC objects
+        and other resources owned by users/groups not equaling <literal>root</literal> or the unit's own will
+        stay visible from within the unit but appear owned by the <literal>nobody</literal> user and
+        group. </para>
 
         <para>If the parameter is <literal>identity</literal>, user namespacing is set up with an identity
         mapping for the first 65536 UIDs/GIDs. Any UIDs/GIDs above 65536 will be mapped to the
@@ -2169,14 +2280,21 @@ BindReadOnlyPaths=/var/lib/systemd</programlisting>
         to call <function>setgroups()</function> system calls (by setting
         <filename>/proc/<replaceable>pid</replaceable>/setgroups</filename> to <literal>allow</literal>).
         Similar to <literal>identity</literal>, this does not provide UID/GID isolation, but it does provide
-        process capability isolation.</para>
+        process capability isolation. If this mode is enabled, all unit processes are run without privileges
+        in the host user namespace (regardless of whether the unit's own user/group is
+        <literal>root</literal> or not). Specifically this means that the process will have zero process
+        capabilities on the host's user namespace, but full capabilities within the service's user
+        namespace. Settings such as <varname>CapabilityBoundingSet=</varname> will affect only the latter,
+        and there's no way to acquire additional capabilities in the host's user namespace.</para>
 
-        <para>If this mode is enabled, all unit processes are run without privileges in the host user
-        namespace (regardless of whether the unit's own user/group is <literal>root</literal> or not). Specifically
-        this means that the process will have zero process capabilities on the host's user namespace, but
-        full capabilities within the service's user namespace. Settings such as
-        <varname>CapabilityBoundingSet=</varname> will affect only the latter, and there's no way to acquire
-        additional capabilities in the host's user namespace.</para>
+        <para>If the parameter is <literal>managed</literal> a transient, dynamically allocated range of
+        65536 UIDs/GIDs is allocated for the unit, and a UID/GID mapping is assigned to the unit's process
+        so the UID/GID 0 from inside the unit maps to the first UID/GID of the allocated mapping. Note that
+        in this mode the UID/GID the service process will run as is different depending if looking from the
+        host side (where it will be a high, dynamically assigned UID) or from inside the unit (where it will
+        be 0). Also note that this mode will enable file system UID mapping for the file systems this service
+        accesses, mapping the "foreign" UID range on disk to the selected dynamic UID range at
+        runtime.</para>
 
         <para>When this setting is set up by a per-user instance of the service manager, the mapping of the
         <literal>root</literal> user and group to itself is omitted (unless the user manager is root).
@@ -2685,7 +2803,10 @@ RestrictNamespaces=~cgroup net</programlisting>
         for details about these scheduling policies. Realtime scheduling policies may be used to monopolize CPU
         time for longer periods of time, and may hence be used to lock up or otherwise trigger Denial-of-Service
         situations on the system. It is hence recommended to restrict access to realtime scheduling to the few programs
-        that actually require them. Defaults to off.</para>
+        that actually require them. Note that the scheduling policy passed to
+        <citerefentry project='man-pages'><refentrytitle>sched_setattr</refentrytitle><manvolnum>2</manvolnum></citerefentry>
+        cannot be inspected by the system call filter, hence that system call is refused altogether, including
+        for non-realtime uses. Defaults to off.</para>
 
         <xi:include href="version-info.xml" xpointer="v231"/></listitem>
       </varlistentry>
@@ -2707,6 +2828,11 @@ RestrictNamespaces=~cgroup net</programlisting>
         <para>In other cases, this setting defaults to the value set with <varname>DefaultRestrictSUIDSGID=</varname> in
         <citerefentry><refentrytitle>systemd-system.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>, which
         defaults to off.</para>
+
+        <para>This setting is implemented using seccomp filtering. For system calls where the mode bits are
+        passed directly as arguments, the call is denied only when the SUID or SGID bits are set. For system
+        calls where those bits are passed indirectly and cannot be inspected by the filter, such as
+        <function>openat2()</function>, the call is blocked entirely, regardless of the requested mode.</para>
 
         <xi:include href="version-info.xml" xpointer="v242"/></listitem>
       </varlistentry>
@@ -3181,11 +3307,16 @@ SystemCallErrorNumber=EPERM</programlisting>
         ignored; both the backslash and the following character are preserved verbatim. Leading and trailing
         whitespace outside of the double quotes is discarded.</para>
 
-        <para>The argument passed should be an absolute filename or wildcard expression, optionally prefixed with
-        <literal>-</literal>, which indicates that if the file does not exist, it will not be read and no error or
-        warning message is logged. This option may be specified more than once in which case all specified files are
-        read. If the empty string is assigned to this option, the list of file to read is reset, all prior assignments
+        <para>The argument passed should be an absolute filename or wildcard expression. If the file does not
+        exist, cannot be read, or contains invalid content, the service will fail to start. To make the file
+        optional, prefix the path with <literal>-</literal>, which causes all errors related to the file to be
+        silently ignored. This option may be specified more than once in which case all specified files are read.
+        If the empty string is assigned to this option, the list of files to read is reset, all prior assignments
         have no effect.</para>
+
+        <para>Note that shell variables such as <literal>$HOME</literal> are not expanded in this path.
+        Use <literal>%</literal>-specifiers instead; for example, <literal>%h</literal> expands to the
+        user's home directory.</para>
 
         <para>The files listed with this directive will be read shortly before the process is executed (more
         specifically, after all processes from a previous unit state terminated. This means you can generate these
@@ -3242,7 +3373,9 @@ SystemCallErrorNumber=EPERM</programlisting>
         assignments made through <varname>Environment=</varname> or <varname>EnvironmentFile=</varname>, inherited from
         the system manager's global set of environment variables, inherited via <varname>PassEnvironment=</varname>,
         set by the service manager itself (such as <varname>$NOTIFY_SOCKET</varname> and such), or set by a PAM module
-        (in case <varname>PAMName=</varname> is used).</para>
+        (in case <varname>PAMName=</varname> is used). Note that variable expansion in the command lines of
+        <varname>ExecStart=</varname> and friends is not affected by this option, as it happens before the
+        unsetting is applied.</para>
 
         <para>See "Environment Variables in Spawned Processes" below for a description of how those
         settings combine to form the inherited environment. See <citerefentry
@@ -3294,7 +3427,9 @@ SystemCallErrorNumber=EPERM</programlisting>
         system object to standard input. An absolute path following the <literal>:</literal> character is expected,
         which may refer to a regular file, a FIFO or special file. If an <constant>AF_UNIX</constant> socket in the
         file system is specified, a stream socket is connected to it. The latter is useful for connecting standard
-        input of processes to arbitrary system services.</para>
+        input of processes to arbitrary system services. Note that the file system object is opened by the
+        service manager before the executable is invoked; see the note on the security context this
+        happens in for <varname>StandardOutput=</varname> below.</para>
 
         <para>The <option>socket</option> option is valid in socket-activated services only, and requires the relevant
         socket unit file (see
@@ -3388,6 +3523,14 @@ SystemCallErrorNumber=EPERM</programlisting>
         only one process runs at a time, such as services with a single <varname>ExecStart=</varname> and no
         <varname>ExecStartPost=</varname>, <varname>ExecReload=</varname>, <varname>ExecStop=</varname> or
         similar.</para>
+
+        <para>Note that for <option>file:<replaceable>path</replaceable></option>,
+        <option>append:<replaceable>path</replaceable></option> and
+        <option>truncate:<replaceable>path</replaceable></option> of <varname>StandardOutput=</varname>,
+        <varname>StandardError=</varname> or <varname>StandardInput=</varname>, the target path is opened
+        by the service manager before the executable is invoked — and hence before
+        <varname>SELinuxContext=</varname> or any policy-defined transition takes effect. The resulting
+        descriptor is then inherited across that transition into the unit's own domain.</para>
 
         <para><option>socket</option> connects standard output to a socket acquired via socket activation. The
         semantics are similar to the same option of <varname>StandardInput=</varname>, see above.</para>
@@ -3915,6 +4058,13 @@ StandardInputData=V2XigLJyZSBubyBzdHJhbmdlcnMgdG8gbG92ZQpZb3Uga25vdyB0aGUgcnVsZX
         <varname>LoadCredential=</varname> and <varname>LoadCredentialEncrypted=</varname> take priority over
         credentials found by <varname>ImportCredential=</varname>.</para>
 
+        <para>Note that if decryption or authentication of a credential picked up as result of
+        <varname>ImportCredential=</varname> fails it will be skipped gracefully (a warning is generated, but
+        the credential will not be made available to the invoked service). This is different for those
+        configured via
+        <varname>SetCredentialEncrypted=</varname>/<varname>LoadCredentialEncrypted=</varname>, where failed
+        decryption/authentication will result in service failure.</para>
+
         <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
 
@@ -4034,7 +4184,9 @@ StandardInputData=V2XigLJyZSBubyBzdHJhbmdlcnMgdG8gbG92ZQpZb3Uga25vdyB0aGUgcnVsZX
     <para>If the same environment variable is set by multiple of these sources, the later source — according
     to the order of the list above — wins. Note that as the final step all variables listed in
     <varname>UnsetEnvironment=</varname> are removed from the compiled environment variable list, immediately
-    before it is passed to the executed process.</para>
+    before it is passed to the executed process. This unsetting happens after variable expansion in
+    the command lines of <varname>ExecStart=</varname> and friends is performed, hence command line
+    expansion is not affected by <varname>UnsetEnvironment=</varname>.</para>
 
     <para>The general philosophy is to expose a small curated list of environment variables to processes.
     Services started by the system manager (PID 1) will be started, without additional service-specific
@@ -4200,6 +4352,7 @@ StandardInputData=V2XigLJyZSBubyBzdHJhbmdlcnMgdG8gbG92ZQpZb3Uga25vdyB0aGUgcnVsZX
         <varlistentry>
           <term><varname>$LISTEN_FDS</varname></term>
           <term><varname>$LISTEN_PID</varname></term>
+          <term><varname>$LISTEN_PIDFDID</varname></term>
           <term><varname>$LISTEN_FDNAMES</varname></term>
 
           <listitem><para>Information about file descriptors passed to a
@@ -4344,7 +4497,7 @@ StandardInputData=V2XigLJyZSBubyBzdHJhbmdlcnMgdG8gbG92ZQpZb3Uga25vdyB0aGUgcnVsZX
                 </row>
                 <row>
                   <entry><literal>exec-condition</literal></entry>
-                  <entry>Service did not run because <varname>ExecCondition=</varname> failed.</entry>
+                  <entry>Service did not run because <varname>ExecCondition=</varname> failed (that is its command exited with an exit status of 1 through 254 (inclusive)).</entry>
                 </row>
                 <row>
                   <entry><literal>oom-kill</literal></entry>
@@ -4583,11 +4736,35 @@ StandardInputData=V2XigLJyZSBubyBzdHJhbmdlcnMgdG8gbG92ZQpZb3Uga25vdyB0aGUgcnVsZX
           <term><varname>$MEMORY_PRESSURE_WRITE</varname></term>
 
           <listitem><para>If memory pressure monitoring is enabled for this service unit, the path to watch
-          and the data to write into it. See <ulink url="https://systemd.io/MEMORY_PRESSURE">Memory Pressure
+          and the data to write into it. See <ulink url="https://systemd.io/PRESSURE">Resource Pressure
           Handling</ulink> for details about these variables and the service protocol data they
           convey.</para>
 
           <xi:include href="version-info.xml" xpointer="v254"/></listitem>
+        </varlistentry>
+
+        <varlistentry>
+          <term><varname>$CPU_PRESSURE_WATCH</varname></term>
+          <term><varname>$CPU_PRESSURE_WRITE</varname></term>
+
+          <listitem><para>If CPU pressure monitoring is enabled for this service unit, the path to watch
+          and the data to write into it. See <ulink url="https://systemd.io/PRESSURE">Resource Pressure
+          Handling</ulink> for details about these variables and the service protocol data they
+          convey.</para>
+
+          <xi:include href="version-info.xml" xpointer="v261"/></listitem>
+        </varlistentry>
+
+        <varlistentry>
+          <term><varname>$IO_PRESSURE_WATCH</varname></term>
+          <term><varname>$IO_PRESSURE_WRITE</varname></term>
+
+          <listitem><para>If IO pressure monitoring is enabled for this service unit, the path to watch
+          and the data to write into it. See <ulink url="https://systemd.io/PRESSURE">Resource Pressure
+          Handling</ulink> for details about these variables and the service protocol data they
+          convey.</para>
+
+          <xi:include href="version-info.xml" xpointer="v261"/></listitem>
         </varlistentry>
 
         <varlistentry>

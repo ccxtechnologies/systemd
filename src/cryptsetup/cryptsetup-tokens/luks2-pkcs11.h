@@ -3,6 +3,7 @@
 #pragma once
 
 #include "forward.h"
+#include "pkcs11-util.h"
 
 int acquire_luks2_key(
                 struct crypt_device *cd,
@@ -18,4 +19,5 @@ int parse_luks2_pkcs11_data(
                 const char *json,
                 char **ret_uri,
                 void **ret_encrypted_key,
-                size_t *ret_encrypted_key_size);
+                size_t *ret_encrypted_key_size,
+                Pkcs11RsaPadding *ret_rsa_padding);

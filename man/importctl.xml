@@ -39,9 +39,9 @@
     <para><command>importctl</command> may be used to download, import, and export disk images via
     <citerefentry><refentrytitle>systemd-importd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
 
-    <para><command>importctl</command> operates both on block-level disk images (such as DDIs) as well as
-    file-system-level images (tarballs). It supports disk images in one of the four following
-    classes:</para>
+    <para><command>importctl</command> operates both on block-level disk images (such as DDIs),
+    file-system-level images (tarballs), as well as OCI images. It supports disk images in one of the four
+    following classes:</para>
 
     <itemizedlist>
       <listitem><para>VM images or full OS container images, that may be run via
@@ -124,9 +124,10 @@
         <filename>.sha256</filename> suffixed file or the <filename>SHA256SUMS</filename> file.  With
         <option>--verify=signature</option>, the sha checksum file is first verified with the detached GPG
         signature of <filename>.sha256</filename> or <filename>SHA256SUMS</filename>.  The public key for
-        this verification step needs to be available in
-        <filename>/usr/lib/systemd/import-pubring.pgp</filename> or
-        <filename>/etc/systemd/import-pubring.pgp</filename>.</para>
+        this verification step needs to be available in the system keyring consisting of
+        <filename>/usr/lib/systemd/import-pubring.pgp</filename> and the local keyring in
+        <filename>/etc/systemd/import-pubring.pgp</filename> (or, if that does not exist,
+        <filename>/etc/systemd/import-pubring.gpg</filename>).</para>
 
         <para>If <option>-keep-download=yes</option> is specified the image will be downloaded and stored in
         a read-only subvolume/directory in the image directory that is named after the specified URL and its
@@ -169,6 +170,24 @@
         <command>cancel-transfer</command>, described below.</para>
 
         <xi:include href="version-info.xml" xpointer="v256"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>pull-oci</command> <replaceable>REF</replaceable> [<replaceable>NAME</replaceable>]</term>
+
+        <listitem><para>Downloads the specified OCI container image, and makes it available under the
+        specified local name in the image directory for the selected <option>--class=</option>. The first
+        argument must be an OCI container reference, such as <literal>library/nginx</literal> If the local
+        name is omitted, it is automatically derived from the last component of the URL, with its suffix
+        removed.</para>
+
+        <para>When downloading images of this type no image verification is done beyond the usual
+        authentication of the HTTPS certificates.</para>
+
+        <para>Note that pressing Control-c during execution of this command will not abort the download. Use
+        <command>cancel-transfer</command>, described below.</para>
+
+        <xi:include href="version-info.xml" xpointer="v260"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -296,9 +315,10 @@
         <literal>signature</literal>.  If <literal>no</literal>, no verification is done. If
         <literal>checksum</literal> is specified, the download is checked for integrity after the transfer is
         complete, but no signatures are verified. If <literal>signature</literal> is specified, the checksum
-        is verified and the image's signature is checked against a local keyring of trustable vendors. It is
-        strongly recommended to set this option to <literal>signature</literal> if the server and protocol
-        support this. Defaults to <literal>signature</literal>.</para>
+        is verified and the image's signature is checked against a local keyring of trustable vendors, in
+        combination with the vendor keyring in <filename>/usr/lib/systemd/import-pubring.pgp</filename>.
+        It is strongly recommended to set this option to <literal>signature</literal> if the server and
+        protocol support this. Defaults to <literal>signature</literal>.</para>
 
         <xi:include href="version-info.xml" xpointer="v256"/></listitem>
       </varlistentry>

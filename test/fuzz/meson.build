@@ -23,7 +23,7 @@ unit_directives = []
 foreach section : ['Automount', 'Mount', 'Path', 'Scope', 'Service', 'Slice', 'Socket', 'Swap', 'Timer']
         unit_type = section.to_lower()
         sec_rx = section == 'Service' ? '(Service|Unit|Install)' : section
-        name = 'directives.@0@'.format(unit_type)
+        name = f'directives.@unit_type@'
         unit_directives += custom_target(
                 output: name,
                 command: [generate_directives_py, load_fragment_gperf_gperf, sec_rx, unit_type],
@@ -36,13 +36,18 @@ fuzz_regression_tests += { 'fuzz-unit-file' : dict }
 
 fuzz_testsdir = 'test/fuzz'
 
-if git.found() and fs.is_dir(meson.project_source_root() / '.git')
+# In a git worktree, .git is a file that contains the path of the repository. git fails when the
+# repository isn't at the path in .git, for example in a container that only mounts the worktree.
+use_git = git.found() and fs.exists(meson.project_source_root() / '.git')
+if use_git
         out = run_command(env, '-u', 'GIT_WORK_TREE',
                           git, '--git-dir=@0@/.git'.format(meson.project_source_root()),
                           'ls-files', ':/@0@/*/*'.format(fuzz_testsdir),
-                          check: true)
-else
-        out = run_command(sh, '-c', 'cd "@0@"; echo @1@/*/*'.format(meson.project_source_root(), fuzz_testsdir), check: true)
+                          check: false)
+        use_git = out.returncode() == 0
+endif
+if not use_git
+        out = run_command(sh, '-c', 'cd "@0@"; printf "%s " @1@/*/*'.format(meson.project_source_root(), fuzz_testsdir), check: true)
 endif
 
 # Add crafted fuzz inputs we have in the repo
@@ -51,7 +56,7 @@ foreach p : out.stdout().split()
         #
         # Also, backslashes get mangled, so skip test. See
         # https://github.com/mesonbuild/meson/issues/1564.
-        if p.contains('\\')
+        if p.contains('\\') or not fs.exists(meson.project_source_root() / p)
                 continue
         endif
         fuzzer = fs.name(fs.parent(p))

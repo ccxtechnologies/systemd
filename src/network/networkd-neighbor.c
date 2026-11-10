@@ -268,7 +268,7 @@ static void neighbor_forget(Link *link, Neighbor *neighbor, const char *msg) {
                 return;
 
         neighbor_enter_removed(neighbor);
-        log_neighbor_debug(neighbor, "Forgetting", link);
+        log_neighbor_debug(neighbor, msg, link);
         neighbor_detach(neighbor);
 }
 
@@ -497,7 +497,7 @@ int link_drop_unmanaged_neighbors(Link *link) {
                 if (!neighbor_exists(neighbor))
                         continue;
 
-                if (!link_should_mark_config(link, /* only_static = */ false, neighbor->source, RTPROT_STATIC))
+                if (!link_should_mark_config(link, /* only_static= */ false, neighbor->source, RTPROT_STATIC))
                         continue;
 
                 neighbor_mark(neighbor);

@@ -11,8 +11,8 @@
 #include "strv.h"
 
 static int saved_log_context_enabled = -1;
-thread_local LIST_HEAD(LogContext, _log_context) = NULL;
-thread_local size_t _log_context_num_fields = 0;
+static thread_local LIST_HEAD(LogContext, _log_context) = NULL;
+static thread_local size_t _log_context_num_fields = 0;
 
 bool log_context_enabled(void) {
         int r;
@@ -58,7 +58,9 @@ static LogContext* log_context_detach(LogContext *c) {
 LogContext* log_context_new(const char *key, const char *value) {
         assert(key);
         assert(endswith(key, "="));
-        assert(value);
+
+        if (!value)
+                return NULL;
 
         LIST_FOREACH(ll, i, _log_context)
                 if (i->key == key && i->value == value)
@@ -143,7 +145,7 @@ static LogContext* log_context_free(LogContext *c) {
 DEFINE_TRIVIAL_REF_UNREF_FUNC(LogContext, log_context, log_context_free);
 
 LogContext* log_context_new_strv_consume(char **fields) {
-        LogContext *c = log_context_new_strv(fields, /*owned=*/ true);
+        LogContext *c = log_context_new_strv(fields, /* owned= */ true);
         if (!c)
                 strv_free(fields);
 
@@ -151,7 +153,7 @@ LogContext* log_context_new_strv_consume(char **fields) {
 }
 
 LogContext* log_context_new_iov_consume(struct iovec *input_iovec, size_t n_input_iovec) {
-        LogContext *c = log_context_new_iov(input_iovec, n_input_iovec, /*owned=*/ true);
+        LogContext *c = log_context_new_iov(input_iovec, n_input_iovec, /* owned= */ true);
         if (!c)
                 iovec_array_free(input_iovec, n_input_iovec);
 
@@ -173,6 +175,14 @@ size_t log_context_num_contexts(void) {
 
 size_t log_context_num_fields(void) {
         return _log_context_num_fields;
+}
+
+void log_context_swap(LogContext **log_context, size_t *num_fields) {
+        assert(log_context);
+        assert(num_fields);
+
+        SWAP_TWO(_log_context, *log_context);
+        SWAP_TWO(_log_context_num_fields, *num_fields);
 }
 
 void _reset_log_level(int *saved_log_level) {

@@ -8,8 +8,16 @@ set -o pipefail
 
 if ! command -v systemd-firstboot >/dev/null; then
     echo "systemd-firstboot not found, skipping the test"
-    exit 0
+    exit 77
 fi
+
+restore_etc_hostname() {
+    if [[ -e /tmp/etc-hostname.bak ]]; then
+        mv /tmp/etc-hostname.bak /etc/hostname
+    elif [[ -e /tmp/etc-hostname.absent ]]; then
+        rm -f /etc/hostname /tmp/etc-hostname.absent
+    fi
+}
 
 at_exit() {
     if [[ -n "${ROOT:-}" ]]; then
@@ -21,6 +29,11 @@ at_exit() {
     if [[ -d /etc/otherpath ]]; then
         rm -rf /etc/otherpath
     fi
+
+    [[ -n "${WROOT:-}" ]] && rm -rf "$WROOT"
+    [[ -n "${WCREDS:-}" ]] && rm -rf "$WCREDS"
+    [[ -n "${WWORDS:-}" ]] && rm -rf "$WWORDS"
+    restore_etc_hostname
 
     restore_locale
 }
@@ -77,10 +90,61 @@ systemd-firstboot --root="$ROOT" --keymap=foo
 grep -q "KEYMAP=foo" "$ROOT/etc/vconsole.conf"
 
 systemd-firstboot --root="$ROOT" --timezone=Europe/Berlin
-readlink "$ROOT/etc/localtime" | grep -q "Europe/Berlin"
+readlink "$ROOT/etc/localtime" | grep "Europe/Berlin" >/dev/null
 
 systemd-firstboot --root="$ROOT" --hostname "foobar"
 grep -q "foobar" "$ROOT/etc/hostname"
+
+# Hostname wildcard templates (see hostname(5)) must be accepted by both the --hostname option and the
+# firstboot.hostname credential (both go through hostname_is_valid() with the wildcard flags). Since these
+# invocations operate on an offline image (--root=), the template is written verbatim and only resolved
+# later, on the target's first boot (the resolve-and-freeze path is taken only when running on the live
+# system, where the machine ID is final).
+WROOT=test-root-hostname-wildcard
+
+# '$' word token via --hostname, stored as-is
+rm -rf "$WROOT"; mkdir -p "$WROOT"
+systemd-firstboot --root="$WROOT" --hostname='$-$'
+assert_eq "$(cat "$WROOT/etc/hostname")" '$-$'
+
+# '?' hex token via --hostname, stored as-is
+rm -rf "$WROOT"; mkdir -p "$WROOT"
+systemd-firstboot --root="$WROOT" --hostname='foo-????'
+assert_eq "$(cat "$WROOT/etc/hostname")" 'foo-????'
+
+# the firstboot.hostname credential is accepted and written verbatim too
+rm -rf "$WROOT"; mkdir -p "$WROOT"
+WCREDS="$(mktemp -d)"
+echo -n '$-$-????' >"$WCREDS/firstboot.hostname"
+CREDENTIALS_DIRECTORY="$WCREDS" systemd-firstboot --root="$WROOT"
+assert_eq "$(cat "$WROOT/etc/hostname")" '$-$-????'
+rm -rf "$WCREDS"
+
+# an invalid hostname (disallowed character) is refused and nothing is written
+rm -rf "$WROOT"; mkdir -p "$WROOT"
+(! systemd-firstboot --root="$WROOT" --hostname='foo_bar')
+[[ ! -e "$WROOT/etc/hostname" ]]
+
+rm -rf "$WROOT"
+
+# When run on the live system (no --root=) the machine ID is final, so the wildcards are resolved
+# immediately and the concrete result is persisted, "freezing" the generated name (see hostname(5)).
+if [[ -f /etc/hostname ]]; then
+    cp /etc/hostname /tmp/etc-hostname.bak
+else
+    touch /tmp/etc-hostname.absent
+fi
+WWORDS="$(mktemp -d)"
+printf 'wildly\nquietly\n' >"$WWORDS/1"
+printf 'happy\nsad\n'      >"$WWORDS/2"
+SYSTEMD_HOSTNAME_WORDLIST_PATH="$WWORDS" systemd-firstboot --force --hostname='$-$-????'
+H="$(cat /etc/hostname)"
+IFS='-' read -r w1 w2 suffix <<<"$H"
+grep -Fx -- "$w1" "$WWORDS/1" >/dev/null
+grep -Fx -- "$w2" "$WWORDS/2" >/dev/null
+[[ "$suffix" =~ ^[0-9a-f]{4}$ ]]
+rm -rf "$WWORDS"
+restore_etc_hostname
 
 systemd-firstboot --root="$ROOT" --machine-id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 grep -q "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$ROOT/etc/machine-id"
@@ -145,7 +209,7 @@ systemd-firstboot --root="$ROOT" \
 grep -q "LANG=foo" "$ROOT$LOCALE_PATH"
 grep -q "LC_MESSAGES=bar" "$ROOT$LOCALE_PATH"
 grep -q "KEYMAP=foo" "$ROOT/etc/vconsole.conf"
-readlink "$ROOT/etc/localtime" | grep -q "Europe/Berlin$"
+readlink "$ROOT/etc/localtime" | grep "Europe/Berlin$" >/dev/null
 grep -q "foobar" "$ROOT/etc/hostname"
 grep -q "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$ROOT/etc/machine-id"
 grep -q "^root:x:0:0:.*:/bin/fooshell$" "$ROOT/etc/passwd"
@@ -166,7 +230,7 @@ systemd-firstboot --root="$ROOT" --force \
 grep -q "LANG=locale-overwrite" "$ROOT$LOCALE_PATH"
 grep -q "LC_MESSAGES=messages-overwrite" "$ROOT$LOCALE_PATH"
 grep -q "KEYMAP=keymap-overwrite" "$ROOT/etc/vconsole.conf"
-readlink "$ROOT/etc/localtime" | grep -q "/Europe/Berlin$"
+readlink "$ROOT/etc/localtime" | grep "/Europe/Berlin$" >/dev/null
 grep -q "hostname-overwrite" "$ROOT/etc/hostname"
 grep -q "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$ROOT/etc/machine-id"
 grep -q "^root:x:0:0:.*:/bin/barshell$" "$ROOT/etc/passwd"
@@ -211,7 +275,7 @@ set +o pipefail
 # We can do only limited testing here, since it's all an interactive stuff, so
 # --prompt is skipped on purpose and only limited --prompt-root-password
 # testing can be done.
-echo -ne "\nfoo\nbar\n" | systemd-firstboot --root="$ROOT" --prompt-locale
+echo -ne "foo\nbar\n" | systemd-firstboot --root="$ROOT" --prompt-locale
 grep -q "LANG=foo" "$ROOT$LOCALE_PATH"
 grep -q "LC_MESSAGES=bar" "$ROOT$LOCALE_PATH"
 # systemd-firstboot in prompt-keymap mode requires keymaps to be installed so
@@ -219,22 +283,26 @@ grep -q "LC_MESSAGES=bar" "$ROOT$LOCALE_PATH"
 # compatible keymaps (from the kbd package), skip this test if the keymaps are
 # missing.
 if [ -d "/usr/share/keymaps/" ] || [ -d "/usr/share/kbd/keymaps/" ] || [ -d "/usr/lib/kbd/keymaps/" ] ; then
-   echo -ne "\nfoo\n" | systemd-firstboot --root="$ROOT" --prompt-keymap
+   echo -ne "foo\n" | systemd-firstboot --root="$ROOT" --prompt-keymap
    grep -q "KEYMAP=foo" "$ROOT/etc/vconsole.conf"
+
+   rm "$ROOT/etc/vconsole.conf"
+   # this should be a NOP, given that stdout is connected to /dev/null, and hence not a VT
+   systemd-firstboot --root="$ROOT" --prompt-keymap-auto >/dev/null
 fi
-echo -ne "\nEurope/Berlin\n" | systemd-firstboot --root="$ROOT" --prompt-timezone
-readlink "$ROOT/etc/localtime" | grep -q "Europe/Berlin$"
-echo -ne "\nfoobar\n" | systemd-firstboot --root="$ROOT" --prompt-hostname
+echo -ne "Europe/Berlin\n" | systemd-firstboot --root="$ROOT" --prompt-timezone
+readlink "$ROOT/etc/localtime" | grep "Europe/Berlin$" >/dev/null
+echo -ne "foobar\n" | systemd-firstboot --root="$ROOT" --prompt-hostname
 grep -q "foobar" "$ROOT/etc/hostname"
 # With no root password provided, a locked account should be created.
 systemd-firstboot --root="$ROOT" --prompt-root-password </dev/null
 grep -q "^root:x:0:0:" "$ROOT/etc/passwd"
 grep -q "^root:!\*:" "$ROOT/etc/shadow"
 rm -fv "$ROOT/etc/passwd" "$ROOT/etc/shadow"
-echo -ne "\n/bin/fooshell\n" | systemd-firstboot --root="$ROOT" --prompt-root-shell
+echo -ne "/bin/fooshell\n" | systemd-firstboot --root="$ROOT" --prompt-root-shell
 grep -q "^root:.*:0:0:.*:/bin/fooshell$" "$ROOT/etc/passwd"
 # Existing files should not get overwritten
-echo -ne "\n/bin/barshell\n" | systemd-firstboot --root="$ROOT" --prompt-root-shell
+echo -ne "/bin/barshell\n" | systemd-firstboot --root="$ROOT" --prompt-root-shell
 grep -q "^root:.*:0:0:.*:/bin/fooshell$" "$ROOT/etc/passwd"
 # Now without the welcome screen but with force
 echo -ne "/bin/barshell\n" | systemd-firstboot --root="$ROOT" --force --prompt-root-shell --welcome=no
@@ -266,7 +334,7 @@ systemd-run --wait --pipe --service-type=exec \
 grep -q "LANG=foo" "$ROOT$LOCALE_PATH"
 grep -q "LC_MESSAGES=bar" "$ROOT$LOCALE_PATH"
 grep -q "KEYMAP=foo" "$ROOT/etc/vconsole.conf"
-readlink "$ROOT/etc/localtime" | grep -q "Europe/Berlin$"
+readlink "$ROOT/etc/localtime" | grep "Europe/Berlin$" >/dev/null
 grep -q "^root:x:0:0:.*:/bin/fooshell$" "$ROOT/etc/passwd"
 grep -q "^root:$ROOT_HASHED_PASSWORD1:" "$ROOT/etc/shadow"
 
@@ -284,6 +352,11 @@ grep -q "^root::" "$ROOT/etc/shadow"
 rm -fv "$ROOT/etc/passwd" "$ROOT/etc/shadow"
 
 (! systemd-firstboot --root="$ROOT" --root-shell=/bin/nonexistentshell)
+WCREDS="$(mktemp -d)"
+printf '/bin/nonexistentshell' >"$WCREDS/passwd.shell.root"
+(! CREDENTIALS_DIRECTORY="$WCREDS" systemd-firstboot --root="$ROOT")
+[[ ! -e "$ROOT/etc/passwd" ]]
+rm -rf "$WCREDS"
 (! systemd-firstboot --root="$ROOT" --machine-id=invalidmachineid)
 (! systemd-firstboot --root="$ROOT" --timezone=Foo/Bar)
 

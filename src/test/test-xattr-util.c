@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
 #include "nulstr-util.h"
@@ -43,6 +44,16 @@ TEST(getxattr_at_malloc) {
         safe_close(fd);
         ASSERT_OK_ERRNO(fd = open("/", O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOCTTY));
         r = getxattr_at_malloc(fd, "usr", "user.idontexist", 0, &value, /* ret_size= */ NULL);
+        ASSERT_TRUE(ERRNO_IS_NEG_XATTR_ABSENT(r));
+
+        /* A non-existent path component must also be treated as xattr-absent. The kernel
+         * returns -ENOENT in this case, which is inherited from stat(2)'s error list
+         * (see ERRORS in getxattr(2)). Without this, callers that semantically just want
+         * to know "is the xattr there?" end up logging spurious errors for paths that
+         * are simply gone — e.g. journald reading a unit's cgroup xattr after the
+         * cgroup directory has been torn down. */
+        r = getxattr_at_malloc(fd, "this-path-does-not-exist-XXXXXX", "user.idontexist",
+                               0, &value, /* ret_size= */ NULL);
         ASSERT_TRUE(ERRNO_IS_NEG_XATTR_ABSENT(r));
 
         safe_close(fd);
@@ -147,6 +158,10 @@ TEST(xsetxattr) {
 
         ASSERT_OK(xsetxattr_full(dfd, "test", 0, "user.foo", "dirfd", SIZE_MAX, XATTR_REPLACE));
         verify_xattr(dfd, "dirfd");
+
+        /* Empty xattr values are allowed */
+        ASSERT_OK(xsetxattr_full(dfd, "test", 0, "user.foo", NULL, 0, 0));
+        verify_xattr(dfd, "");
 
         /* by fd (O_PATH) */
         ASSERT_OK_ERRNO(fd = openat(dfd, "test", O_PATH|O_CLOEXEC));

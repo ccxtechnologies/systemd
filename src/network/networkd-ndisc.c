@@ -17,6 +17,7 @@
 #include "networkd-address.h"
 #include "networkd-address-generation.h"
 #include "networkd-dhcp6.h"
+#include "networkd-ipv6ll.h"
 #include "networkd-link.h"
 #include "networkd-manager.h"
 #include "networkd-ndisc.h"
@@ -43,6 +44,12 @@
 /* Neither defined in the RFC. Just for safety. Otherwise, malformed messages can make clients trigger OOM.
  * Not sure if the threshold is high enough. Let's adjust later if not. */
 #define NDISC_PREF64_MAX 64U
+/* Not defined in the RFC either, but let's cap the number of routers, routes, addresses, and redirects we
+ * accept per link, for safety. */
+#define NDISC_ROUTER_MAX 64U
+#define NDISC_ROUTE_MAX 512U
+#define NDISC_ADDRESS_MAX 64U
+#define NDISC_REDIRECT_MAX 64U
 
 static int ndisc_drop_outdated(Link *link, const struct in6_addr *router, usec_t timestamp_usec);
 
@@ -91,7 +98,8 @@ bool link_ndisc_enabled(Link *link) {
 void network_adjust_ndisc(Network *network) {
         assert(network);
 
-        if (!FLAGS_SET(network->link_local, ADDRESS_FAMILY_IPV6)) {
+        if (!FLAGS_SET(network->link_local, ADDRESS_FAMILY_IPV6) &&
+            !network_has_static_ipv6ll_address(network)) {
                 if (network->ndisc > 0)
                         log_warning("%s: IPv6AcceptRA= is enabled but IPv6 link-local addressing is disabled or not supported. "
                                     "Disabling IPv6AcceptRA=.", network->filename);
@@ -205,11 +213,18 @@ static int ndisc_remove_unused_nexthop_by_id(Link *link, uint32_t id) {
         if (id == 0)
                 return 0;
 
+        /* The nexthop is only added to manager->nexthops_by_id once the kernel acknowledges it.
+         * A just-requested nexthop (e.g. via ndisc_set_route_nexthop(request=true), right before abandoning
+         * its route) exists only in the request queue, so handle that case too. */
         NextHop *nexthop;
-        if (nexthop_get_by_id(link->manager, id, &nexthop) < 0)
-                return 0;
+        if (nexthop_get_by_id(link->manager, id, &nexthop) >= 0)
+                return ndisc_remove_unused_nexthop(link, nexthop);
 
-        return ndisc_remove_unused_nexthop(link, nexthop);
+        Request *req;
+        if (nexthop_get_request_by_id(link->manager, id, &req) >= 0)
+                return ndisc_remove_unused_nexthop(link, ASSERT_PTR(req->userdata));
+
+        return 0;
 }
 
 static int ndisc_remove_unused_nexthops(Link *link) {
@@ -489,7 +504,94 @@ static void ndisc_set_route_priority(Link *link, Route *route) {
         }
 }
 
+static size_t ndisc_route_count(Link *link) {
+        Route *route;
+        Request *req;
+        size_t n = 0;
+
+        assert(link);
+        assert(link->manager);
+
+        SET_FOREACH(route, link->manager->routes) {
+                if (route->source != NETWORK_CONFIG_SOURCE_NDISC)
+                        continue;
+
+                if (!route_is_bound_to_link(route, link))
+                        continue;
+
+                /* Skip routes pending removal (e.g. just expired by ndisc_drop_outdated() in this same RA):
+                 * they linger in manager->routes until the kernel acknowledges the removal. */
+                if (!route_exists(route))
+                        continue;
+                n++;
+        }
+
+        /* Also count already-requested but not-yet-installed routes, otherwise all RIOs of a single RA (and
+         * RAs arriving before the kernel acknowledges earlier requests) would be admitted past the limit. */
+        ORDERED_SET_FOREACH(req, link->manager->request_queue) {
+                Route *existing;
+
+                if (req->type != REQUEST_TYPE_ROUTE || req->link != link)
+                        continue;
+
+                route = ASSERT_PTR(req->userdata);
+                if (route->source != NETWORK_CONFIG_SOURCE_NDISC)
+                        continue;
+
+                /* Skip the route if it's already installed and live, so it's counted above, but it's also
+                 * being requested again (e.g. on RA refresh). */
+                if (route_get(link->manager, route, &existing) >= 0 && route_exists(existing))
+                        continue;
+                n++;
+        }
+
+        return n;
+}
+
+static size_t ndisc_address_count(Link *link) {
+        Address *address;
+        Request *req;
+        size_t n = 0;
+
+        assert(link);
+        assert(link->manager);
+
+        SET_FOREACH(address, link->addresses) {
+                if (address->source != NETWORK_CONFIG_SOURCE_NDISC)
+                        continue;
+
+                /* Skip addresses pending removal. */
+                if (!address_exists(address))
+                        continue;
+                n++;
+        }
+
+        /* Also count already-requested but not-yet-installed addresses. */
+        ORDERED_SET_FOREACH(req, link->manager->request_queue) {
+                Address *existing;
+
+                if (req->type != REQUEST_TYPE_ADDRESS || req->link != link)
+                        continue;
+
+                address = ASSERT_PTR(req->userdata);
+                if (address->source != NETWORK_CONFIG_SOURCE_NDISC)
+                        continue;
+
+                /* Skip the address if it's already installed and live, so it's counted above, but it's also
+                 * being requested again (e.g. on RA refresh). */
+                if (address_get(link, address, &existing) >= 0 && address_exists(existing))
+                        continue;
+                n++;
+        }
+
+        return n;
+}
+
+/* Returns 1 if the route was requested (or already present), 0 if it was refused (e.g. NDISC_ROUTE_MAX
+ * reached or a conflicting static route exists), and a negative errno on failure. */
 static int ndisc_request_route(Route *route, Link *link) {
+        uint8_t pref, pref_original;
+        bool is_new;
         int r;
 
         assert(route);
@@ -501,11 +603,24 @@ static int ndisc_request_route(Route *route, Link *link) {
         if (r < 0)
                 return r;
 
-        r = ndisc_set_route_nexthop(route, link, /* request = */ true);
+        r = ndisc_set_route_nexthop(route, link, /* request= */ true);
         if (r < 0)
                 return r;
 
-        uint8_t pref, pref_original = route->pref;
+        /* Reject new routes once the per-link limit is reached, *before* the conflict-resolution loop below
+         * calls route_remove_and_cancel() - otherwise a refused route would still tear down an existing one.
+         * Refreshes (the route is already installed or requested) are always allowed. The priority is set
+         * first so that the existence checks use the route's final identity. */
+        ndisc_set_route_priority(link, route);
+        if (route_get(link->manager, route, NULL) < 0 &&
+            route_get_request(link->manager, route, NULL) < 0 &&
+            ndisc_route_count(link) >= NDISC_ROUTE_MAX) {
+                log_link_debug(link, "Too many NDisc routes per link (%u), ignoring route %s.",
+                               NDISC_ROUTE_MAX, IN6_ADDR_PREFIX_TO_STRING(&route->dst.in6, route->dst_prefixlen));
+                goto refuse;
+        }
+
+        pref_original = route->pref;
         FOREACH_ARGUMENT(pref, SD_NDISC_PREFERENCE_LOW, SD_NDISC_PREFERENCE_MEDIUM, SD_NDISC_PREFERENCE_HIGH) {
                 Route *existing;
                 Request *req;
@@ -532,7 +647,7 @@ static int ndisc_request_route(Route *route, Link *link) {
                         if (!route_can_update(link->manager, existing, route)) {
                                 if (existing->source == NETWORK_CONFIG_SOURCE_STATIC) {
                                         log_link_debug(link, "Found a pending route request that conflicts with new request based on a received RA, ignoring request.");
-                                        return 0;
+                                        goto refuse;
                                 }
 
                                 log_link_debug(link, "Found a pending route request that conflicts with new request based on a received RA, cancelling.");
@@ -553,7 +668,7 @@ static int ndisc_request_route(Route *route, Link *link) {
                         if (!route_can_update(link->manager, existing, route)) {
                                 if (existing->source == NETWORK_CONFIG_SOURCE_STATIC) {
                                         log_link_debug(link, "Found an existing route that conflicts with new route based on a received RA, ignoring request.");
-                                        return 0;
+                                        goto refuse;
                                 }
 
                                 log_link_debug(link, "Found an existing route that conflicts with new route based on a received RA, removing.");
@@ -568,7 +683,7 @@ static int ndisc_request_route(Route *route, Link *link) {
         route->pref = pref_original;
         ndisc_set_route_priority(link, route);
 
-        bool is_new = route_get(link->manager, route, NULL) < 0;
+        is_new = route_get(link->manager, route, NULL) < 0;
 
         r = link_request_route(link, route, &link->ndisc_messages, ndisc_route_handler);
         if (r < 0)
@@ -576,6 +691,15 @@ static int ndisc_request_route(Route *route, Link *link) {
         if (r > 0 && is_new)
                 link->ndisc_configured = false;
 
+        return 1;
+
+refuse:
+        /* We may have requested a nexthop for this route above via ndisc_set_route_nexthop(request=true). As we
+         * are not going to install the route, drop that nexthop again if it ended up unreferenced, so that a
+         * refused route does not leave an orphaned nexthop in the FIB until the next periodic cleanup. This is
+         * a no-op if no nexthop was requested (e.g. ManageForeignNextHops=no, or an on-link route), or if the
+         * nexthop is still shared with another route. */
+        (void) ndisc_remove_unused_nexthop_by_id(link, route->nexthop_id);
         return 0;
 }
 
@@ -623,7 +747,7 @@ static int ndisc_remove_route(Route *route, Link *link) {
         assert(link);
         assert(link->manager);
 
-        r = ndisc_set_route_nexthop(route, link, /* request = */ false);
+        r = ndisc_set_route_nexthop(route, link, /* request= */ false);
         if (r < 0)
                 return r;
 
@@ -698,7 +822,8 @@ static int ndisc_address_handler(sd_netlink *rtnl, sd_netlink_message *m, Reques
 }
 
 static int ndisc_request_address(Address *address, Link *link) {
-        bool is_new;
+        Address *existing;
+        bool is_new, remove_dhcp6 = false;
         int r;
 
         assert(address);
@@ -710,25 +835,35 @@ static int ndisc_request_address(Address *address, Link *link) {
         if (r < 0)
                 return r;
 
-        Address *existing;
         if (address_get_harder(link, address, &existing) < 0)
                 is_new = true;
         else if (address_can_update(existing, address))
                 is_new = false;
         else if (existing->source == NETWORK_CONFIG_SOURCE_DHCP6) {
-                /* SLAAC address is preferred over DHCPv6 address. */
-                log_link_debug(link, "Conflicting DHCPv6 address %s exists, removing.",
-                               IN_ADDR_PREFIX_TO_STRING(existing->family, &existing->in_addr, existing->prefixlen));
-                r = address_remove(existing, link);
-                if (r < 0)
-                        return r;
-
+                /* SLAAC address is preferred over DHCPv6 address; the latter is removed below. */
                 is_new = true;
+                remove_dhcp6 = true;
         } else {
                 /* Conflicting static address is configured?? */
                 log_link_debug(link, "Conflicting address %s exists, ignoring request.",
                                IN_ADDR_PREFIX_TO_STRING(existing->family, &existing->in_addr, existing->prefixlen));
                 return 0;
+        }
+
+        /* Check the limit before removing any conflicting DHCPv6 address, so that hitting the cap does not
+         * leave the link with neither the DHCPv6 nor the SLAAC address. */
+        if (is_new && ndisc_address_count(link) >= NDISC_ADDRESS_MAX) {
+                log_link_debug(link, "Too many NDisc addresses per link (%u), ignoring address %s.",
+                               NDISC_ADDRESS_MAX, IN6_ADDR_TO_STRING(&address->in_addr.in6));
+                return 0;
+        }
+
+        if (remove_dhcp6) {
+                log_link_debug(link, "Conflicting DHCPv6 address %s exists, removing.",
+                               IN_ADDR_PREFIX_TO_STRING(existing->family, &existing->in_addr, existing->prefixlen));
+                r = address_remove(existing, link);
+                if (r < 0)
+                        return r;
         }
 
         r = link_request_address(link, address, &link->ndisc_messages,
@@ -979,7 +1114,7 @@ static int ndisc_redirect_handler(Link *link, sd_ndisc_redirect *rd) {
         if (r < 0)
                 return r;
 
-        r = ndisc_drop_outdated(link, /* router = */ NULL, now_usec);
+        r = ndisc_drop_outdated(link, /* router= */ NULL, now_usec);
         if (r < 0)
                 return r;
 
@@ -991,6 +1126,15 @@ static int ndisc_redirect_handler(Link *link, sd_ndisc_redirect *rd) {
         r = ndisc_redirect_drop_conflict(link, rd);
         if (r < 0)
                 return r;
+
+        if (set_size(link->ndisc_redirects) >= NDISC_REDIRECT_MAX) {
+                struct in6_addr dest;
+
+                if (sd_ndisc_redirect_get_destination_address(rd, &dest) >= 0)
+                        log_link_debug(link, "Too many NDisc redirects per link (%u), ignoring redirect for %s.",
+                                       NDISC_REDIRECT_MAX, IN6_ADDR_TO_STRING(&dest));
+                return 0;
+        }
 
         /* Then, remember the received message. */
         r = set_ensure_put(&link->ndisc_redirects, &ndisc_redirect_hash_ops, rd);
@@ -1015,7 +1159,17 @@ static int ndisc_redirect_handler(Link *link, sd_ndisc_redirect *rd) {
 
         ndisc_route_prepare(route, link);
 
-        return ndisc_request_route(route, link);
+        r = ndisc_request_route(route, link);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                sd_ndisc_redirect_unref(set_remove(link->ndisc_redirects, rd));
+
+        /* Unlike ndisc_router_handler(), the redirect path has no readiness re-check of its own. If the route
+         * above was refused, ndisc_set_route_nexthop() may have already cleared link->ndisc_configured while
+         * requesting a nexthop that we then cancelled - with no netlink handler left to run ndisc_check_ready().
+         * Re-check here so the link does not stay unconfigured. */
+        return ndisc_check_ready(link);
 }
 
 static int ndisc_drop_redirect(Link *link, const struct in6_addr *router) {
@@ -1145,6 +1299,12 @@ static int ndisc_router_process_default(Link *link, sd_ndisc_router *rt) {
         r = sd_ndisc_router_get_sender_address(rt, &gateway);
         if (r < 0)
                 return log_link_warning_errno(link, r, "Failed to get gateway address from RA: %m");
+
+        /* Only remembered routers may be used as a default gateway. If this sender was refused above because
+         * the per-link router limit was reached (see ndisc_remember_router()), don't install a default route
+         * or gateway routes for it. */
+        if (!hashmap_contains(link->ndisc_routers_by_sender, &gateway))
+                return 0;
 
         r = sd_ndisc_router_get_preference(rt, &preference);
         if (r < 0)
@@ -1286,6 +1446,12 @@ static int ndisc_remember_router(Link *link, sd_ndisc_router *rt) {
         r = sd_ndisc_router_get_lifetime(rt, NULL);
         if (r <= 0)
                 return r;
+
+        if (hashmap_size(link->ndisc_routers_by_sender) >= NDISC_ROUTER_MAX) {
+                log_link_debug(link, "Too many routers remembered per link (%u), ignoring RA from %s.",
+                               NDISC_ROUTER_MAX, IN6_ADDR_TO_STRING(&rt->packet->sender_address));
+                return 0;
+        }
 
         r = hashmap_ensure_put(&link->ndisc_routers_by_sender, &ndisc_router_hash_ops, &rt->packet->sender_address, rt);
         if (r < 0)
@@ -1909,6 +2075,8 @@ static int ndisc_router_process_dnssl(Link *link, sd_ndisc_router *rt, bool zero
                 _cleanup_free_ NDiscDNSSL *s = NULL;
                 NDiscDNSSL *dnssl;
 
+                /* Silence static analyzers */
+                assert(strlen(*j) <= SIZE_MAX - ALIGN(sizeof(NDiscDNSSL)) - 1);
                 s = malloc0(ALIGN(sizeof(NDiscDNSSL)) + strlen(*j) + 1);
                 if (!s)
                         return log_oom();
@@ -2048,7 +2216,7 @@ static int ndisc_router_process_captive_portal(Link *link, sd_ndisc_router *rt, 
                                 target = c;
 
                 assert(target);
-                assert(set_remove(link->ndisc_captive_portals, target) == target);
+                assert_se(set_remove(link->ndisc_captive_portals, target) == target);
                 ndisc_captive_portal_free(target);
         }
 
@@ -2198,7 +2366,7 @@ static int ndisc_dnr_compare_func(const NDiscDNR *a, const NDiscDNR *b) {
                 strcmp_ptr(a->resolver.dohpath, b->resolver.dohpath) ||
                 CMP(a->resolver.family, b->resolver.family) ||
                 CMP(a->resolver.n_addrs, b->resolver.n_addrs) ||
-                memcmp(a->resolver.addrs, b->resolver.addrs, sizeof(a->resolver.addrs[0]) * a->resolver.n_addrs);
+                memcmp(a->resolver.addrs, b->resolver.addrs, sizeof(a->resolver.addrs[0]) * a->resolver.n_addrs) != 0;
 }
 
 static void ndisc_dnr_hash_func(const NDiscDNR *x, struct siphash *state) {
@@ -2239,7 +2407,7 @@ static int sd_dns_resolver_copy(const sd_dns_resolver *a, sd_dns_resolver *b) {
         /* addrs, n_addrs */
         c.addrs = newdup(union in_addr_union, a->addrs, a->n_addrs);
         if (!c.addrs)
-                return r;
+                return -ENOMEM;
         c.n_addrs = a->n_addrs;
 
         /* dohpath */
@@ -2522,7 +2690,7 @@ static int ndisc_expire_handler(sd_event_source *s, uint64_t usec, void *userdat
 
         assert_se(sd_event_now(link->manager->event, CLOCK_BOOTTIME, &now_usec) >= 0);
 
-        (void) ndisc_drop_outdated(link, /* router = */ NULL, now_usec);
+        (void) ndisc_drop_outdated(link, /* router= */ NULL, now_usec);
         (void) ndisc_setup_expire(link);
         return 0;
 }
@@ -2629,7 +2797,7 @@ static int ndisc_start_dhcp6_client(Link *link, sd_ndisc_router *rt) {
         case IPV6_ACCEPT_RA_START_DHCP6_CLIENT_ALWAYS:
                 /* When IPv6AcceptRA.DHCPv6Client=always, start dhcp6 client in solicit mode
                  * even if the router flags have neither M nor O flags. */
-                r = dhcp6_start_on_ra(link, /* information_request = */ false);
+                r = dhcp6_start_on_ra(link, /* information_request= */ false);
                 break;
 
         default:
@@ -2677,7 +2845,7 @@ static int ndisc_router_handler(Link *link, sd_ndisc_router *rt) {
         if (r < 0)
                 return r;
 
-        r = ndisc_drop_outdated(link, /* router = */ NULL, timestamp_usec);
+        r = ndisc_drop_outdated(link, /* router= */ NULL, timestamp_usec);
         if (r < 0)
                 return r;
 
@@ -2705,7 +2873,7 @@ static int ndisc_router_handler(Link *link, sd_ndisc_router *rt) {
         if (r < 0)
                 return r;
 
-        r = ndisc_router_process_options(link, rt, /* zero_lifetime = */ true);
+        r = ndisc_router_process_options(link, rt, /* zero_lifetime= */ true);
         if (r < 0)
                 return r;
 
@@ -2713,7 +2881,7 @@ static int ndisc_router_handler(Link *link, sd_ndisc_router *rt) {
         if (r < 0)
                 return r;
 
-        r = ndisc_router_process_options(link, rt, /* zero_lifetime = */ false);
+        r = ndisc_router_process_options(link, rt, /* zero_lifetime= */ false);
         if (r < 0)
                 return r;
 
@@ -2967,18 +3135,27 @@ static int ndisc_configure(Link *link) {
         return 0;
 }
 
+static bool ndisc_can_start(Link *link) {
+        assert(link);
+
+        if (!link->ndisc || !link->dhcp6_client)
+                return false;
+
+        if (!link_has_carrier(link))
+                return false;
+
+        if (in6_addr_is_null(&link->ipv6ll_address))
+                return false;
+
+        return true;
+}
+
 int ndisc_start(Link *link) {
         int r;
 
         assert(link);
 
-        if (!link->ndisc || !link->dhcp6_client)
-                return 0;
-
-        if (!link_has_carrier(link))
-                return 0;
-
-        if (in6_addr_is_null(&link->ipv6ll_address))
+        if (!ndisc_can_start(link))
                 return 0;
 
         r = sd_ndisc_set_link_local_address(link->ndisc, &link->ipv6ll_address);
@@ -2994,12 +3171,51 @@ int ndisc_start(Link *link) {
         return 1;
 }
 
+int ndisc_update_mac(Link *link) {
+        int r;
+
+        assert(link);
+
+        if (!link->ndisc || link->hw_addr.length != ETH_ALEN)
+                return 0;
+
+        r = sd_ndisc_set_mac(link->ndisc, &link->hw_addr.ether);
+        if (r < 0)
+                return r;
+
+        if (sd_ndisc_is_running(link->ndisc) <= 0)
+                return 0;
+
+        /* Only restart if a start is possible right now. Otherwise keep the running client,
+         * whatever makes the conditions true again should also restart discovery. */
+        if (!ndisc_can_start(link)) {
+                log_link_debug(link, "MAC address changed, but not restarting IPv6 Router Discovery now.");
+                return 0;
+        }
+
+        /* A changed MAC can mean a changed network, e.g. on a bond failover. Restart discovery to
+         * solicit RAs instead of waiting for the next unsolicited one. Keep learned state, so use
+         * sd_ndisc_stop() rather than ndisc_stop(). */
+        r = sd_ndisc_stop(link->ndisc);
+        if (r < 0)
+                return r;
+
+        r = ndisc_start(link);
+        if (r < 0)
+                return r;
+        /* Should be unreachable, otherwise check ndisc_can_start(). */
+        if (r == 0)
+                log_link_debug(link, "MAC address changed, but IPv6 Router Discovery was not restarted.");
+
+        return 0;
+}
+
 static int ndisc_process_request(Request *req, Link *link, void *userdata) {
         int r;
 
         assert(link);
 
-        if (!link_is_ready_to_configure(link, /* allow_unmanaged = */ false))
+        if (!link_is_ready_to_configure(link, /* allow_unmanaged= */ false))
                 return 0;
 
         r = ndisc_configure(link);
@@ -3074,7 +3290,7 @@ int link_drop_ndisc_config(Link *link, Network *network) {
         /* Redirect messages will be ignored. Drop configurations based on the previously received redirect
          * messages. */
         if (!network->ndisc_use_redirect)
-                (void) ndisc_drop_redirect(link, /* router = */ NULL);
+                (void) ndisc_drop_redirect(link, /* router= */ NULL);
 
         /* If one of the route setting is changed, drop all routes. */
         if (link->network->ndisc_use_gateway != network->ndisc_use_gateway ||
@@ -3142,9 +3358,12 @@ int ndisc_stop(Link *link) {
 void ndisc_flush(Link *link) {
         assert(link);
 
+        /* First, drop pending requests. */
+        (void) link_drop_requests(link, NETWORK_CONFIG_SOURCE_NDISC);
+
         /* Remove all addresses, routes, RDNSS, DNSSL, DNR, and Captive Portal entries, without exception. */
-        (void) ndisc_drop_outdated(link, /* router = */ NULL, /* timestamp_usec = */ USEC_INFINITY);
-        (void) ndisc_drop_redirect(link, /* router = */ NULL);
+        (void) ndisc_drop_outdated(link, /* router= */ NULL, /* timestamp_usec= */ USEC_INFINITY);
+        (void) ndisc_drop_redirect(link, /* router= */ NULL);
 
         link->ndisc_routers_by_sender = hashmap_free(link->ndisc_routers_by_sender);
         link->ndisc_rdnss = set_free(link->ndisc_rdnss);

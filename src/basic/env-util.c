@@ -19,7 +19,7 @@
 
 /* We follow bash for the character set. Different shells have different rules. */
 #define VALID_BASH_ENV_NAME_CHARS               \
-        DIGITS LETTERS                          \
+        ALPHANUMERICAL                          \
         "_"
 
 size_t sc_arg_max(void) {
@@ -555,7 +555,7 @@ char* strv_env_get_n(char * const *l, const char *name, size_t k, ReplaceEnvFlag
                 const char *t;
 
                 /* Safety check that the name is not overly long, before we do a stack allocation */
-                if (k > (size_t) sysconf(_SC_ARG_MAX) - 2)
+                if (k > sc_arg_max() - 2)
                         return NULL;
 
                 t = strndupa_safe(name, k);
@@ -605,10 +605,10 @@ int strv_env_get_merged(char **l, char ***ret) {
         return 0;
 }
 
-char** strv_env_clean_with_callback(char **e, void (*invalid_callback)(const char *p, void *userdata), void *userdata) {
+char** strv_env_clean_with_callback(char **l, void (*invalid_callback)(const char *p, void *userdata), void *userdata) {
         int k = 0;
 
-        STRV_FOREACH(p, e) {
+        STRV_FOREACH(p, l) {
                 size_t n;
                 bool duplicate = false;
 
@@ -631,13 +631,13 @@ char** strv_env_clean_with_callback(char **e, void (*invalid_callback)(const cha
                         continue;
                 }
 
-                e[k++] = *p;
+                l[k++] = *p;
         }
 
-        if (e)
-                e[k] = NULL;
+        if (l)
+                l[k] = NULL;
 
-        return e;
+        return l;
 }
 
 static int strv_extend_with_length(char ***l, const char *s, size_t n) {
@@ -948,6 +948,8 @@ int replace_env_argv(
                         }
 
                         k += q;
+                        /* reallocarray() does not zero-initialize the grown tail, add NUL termination */
+                        n[k] = NULL;
                         continue;
                 }
 

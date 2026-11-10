@@ -41,7 +41,7 @@ size_t strnpcpy_full(char **dest, size_t size, const char *src, size_t len, bool
         if (ret_truncated)
                 *ret_truncated = truncated;
 
-        *dest[0] = '\0';
+        (*dest)[0] = '\0';
         return size;
 }
 
@@ -63,6 +63,8 @@ size_t strpcpyf_full(char **dest, size_t size, bool *ret_truncated, const char *
         va_start(va, src);
         i = vsnprintf(*dest, size, src, va);
         va_end(va);
+
+        assert(i >= 0);
 
         if (i < (int) size) {
                 *dest += i;

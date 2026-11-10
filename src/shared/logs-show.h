@@ -57,9 +57,9 @@ int add_matches_for_unit_full(sd_journal *j, MatchUnitFlag flags, const char *un
 static inline int add_matches_for_unit(sd_journal *j, const char *unit) {
         return add_matches_for_unit_full(j, MATCH_UNIT_ALL, unit);
 }
-int add_matches_for_user_unit_full(sd_journal *j, MatchUnitFlag flags, const char *unit);
+int add_matches_for_user_unit_full(sd_journal *j, MatchUnitFlag flags, uid_t uid, const char *unit);
 static inline int add_matches_for_user_unit(sd_journal *j, const char *unit) {
-        return add_matches_for_user_unit_full(j, MATCH_UNIT_ALL, unit);
+        return add_matches_for_user_unit_full(j, MATCH_UNIT_ALL, UID_INVALID, unit);
 }
 
 int show_journal_by_unit(
@@ -80,6 +80,8 @@ void json_escape(
                 const char* p,
                 size_t l,
                 OutputFlags flags);
+
+int journal_entry_to_json(sd_journal *j, OutputFlags flags, const Set *output_fields, sd_json_variant **ret);
 
 int discover_next_id(
                 sd_journal *j,
@@ -106,7 +108,7 @@ static inline int journal_find_boot(
                 sd_id128_t *ret) {
 
         return journal_find_log_id(j, LOG_BOOT_ID,
-                                   /* boot_id = */ SD_ID128_NULL, /* unit = */ NULL,
+                                   /* boot_id= */ SD_ID128_NULL, /* unit= */ NULL,
                                    id, offset, ret);
 }
 
@@ -128,7 +130,7 @@ static inline int journal_get_boots(
                 size_t *ret_n_ids) {
 
         return journal_get_log_ids(j, LOG_BOOT_ID,
-                                   /* boot_id = */ SD_ID128_NULL, /* unit = */ NULL,
+                                   /* boot_id= */ SD_ID128_NULL, /* unit= */ NULL,
                                    advance_older, max_ids,
                                    ret_ids, ret_n_ids);
 }

@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "openssl-util.h"
 #include "sparse-endian.h"
 #include "uki.h"
 
@@ -142,6 +141,7 @@ const IMAGE_SECTION_HEADER* pe_section_table_find(const IMAGE_SECTION_HEADER *se
 int pe_load_headers(int fd, IMAGE_DOS_HEADER **ret_dos_header, PeHeader **ret_pe_header);
 
 int pe_load_sections(int fd, const IMAGE_DOS_HEADER *dos_header, const PeHeader *pe_header, IMAGE_SECTION_HEADER **ret_sections);
+int pe_load_headers_and_sections(int fd, PeHeader **ret_pe_header, IMAGE_SECTION_HEADER **ret_sections);
 int pe_read_section_data(int fd, const IMAGE_SECTION_HEADER *section, size_t max_size, void **ret, size_t *ret_size);
 int pe_read_section_data_by_name(int fd, const PeHeader *pe_header, const IMAGE_SECTION_HEADER *sections, const char *name, size_t max_size, void **ret, size_t *ret_size);
 
@@ -151,8 +151,11 @@ bool pe_is_addon(const PeHeader *pe_header, const IMAGE_SECTION_HEADER *sections
 bool pe_is_native(const PeHeader *pe_header);
 int pe_is_native_fd(int fd);
 
+#if HAVE_OPENSSL
 int pe_hash(int fd, const EVP_MD *md, void **ret_hash, size_t *ret_hash_size);
 
+/* This does not depend on OpenSSL, but is currently only used by sbsign which requires OpenSSL. */
 int pe_checksum(int fd, uint32_t *ret);
 
 int uki_hash(int fd, const EVP_MD *md, void *ret_hashes[static _UNIFIED_SECTION_MAX], size_t *ret_hash_size);
+#endif

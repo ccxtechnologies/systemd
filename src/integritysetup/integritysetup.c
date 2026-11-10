@@ -1,17 +1,19 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <stdio.h>
 #include <sys/stat.h>
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
-#include "argv-util.h"
+#include "build.h"
 #include "cryptsetup-util.h"
+#include "dlopen-note.h"
 #include "fileio.h"
 #include "integrity-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "path-util.h"
-#include "pretty-print.h"
+#include "string-table.h"
 #include "string-util.h"
 #include "time-util.h"
 #include "verbs.h"
@@ -20,29 +22,30 @@ static uint32_t arg_activate_flags;
 static int arg_percent;
 static usec_t arg_commit_time;
 static char *arg_existing_data_device;
-static char *arg_integrity_algorithm;
+static IntegrityAlgorithm arg_integrity_algorithm = _INTEGRITY_ALGORITHM_INVALID;
 
 STATIC_DESTRUCTOR_REGISTER(arg_existing_data_device, freep);
-STATIC_DESTRUCTOR_REGISTER(arg_integrity_algorithm, freep);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
+/* Integrity algorithm names used by dm-integrity */
+static const char* const dm_integrity_algorithm_table[_INTEGRITY_ALGORITHM_MAX] = {
+        [INTEGRITY_ALGORITHM_CRC32]        = "crc32",
+        [INTEGRITY_ALGORITHM_CRC32C]       = "crc32c",
+        [INTEGRITY_ALGORITHM_XXHASH64]     = "xxhash64",
+        [INTEGRITY_ALGORITHM_SHA1]         = "sha1",
+        [INTEGRITY_ALGORITHM_SHA256]       = "sha256",
+        [INTEGRITY_ALGORITHM_HMAC_SHA256]  = "hmac(sha256)",
+        [INTEGRITY_ALGORITHM_HMAC_SHA512]  = "hmac(sha512)",
+        [INTEGRITY_ALGORITHM_PHMAC_SHA256] = "phmac(sha256)",
+        [INTEGRITY_ALGORITHM_PHMAC_SHA512] = "phmac(sha512)",
+};
 
-        r = terminal_urlify_man("systemd-integritysetup@.service", "8", &link);
-        if (r < 0)
-                return log_oom();
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(dm_integrity_algorithm, IntegrityAlgorithm);
 
-        printf("%s attach VOLUME DEVICE [HMAC_KEY_FILE|-] [OPTIONS]\n"
-               "%s detach VOLUME\n\n"
-               "Attach or detach an integrity protected block device.\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               program_invocation_short_name,
-               link);
-
-        return 0;
-}
+COMMAND(
+        "systemd-integritysetup\0",
+        "Attach or detach an integrity protected block device.",
+        .man_pages = "systemd-integritysetup@.service(8)\0",
+);
 
 static int load_key_file(
                 const char *key_file,
@@ -72,18 +75,16 @@ static int load_key_file(
 }
 
 static const char *integrity_algorithm_select(const void *key_file_buf) {
-        /*  To keep a bit of sanity for end users, the subset of integrity
-            algorithms we support will match what is used in integritysetup */
-        if (arg_integrity_algorithm) {
-                if (streq("hmac-sha256", arg_integrity_algorithm))
-                        return DM_HMAC_256;
-                return arg_integrity_algorithm;
-        } else if (key_file_buf)
-                return DM_HMAC_256;
-        return "crc32c";
+        IntegrityAlgorithm a = arg_integrity_algorithm >= 0
+                ? arg_integrity_algorithm
+                : (key_file_buf ? INTEGRITY_ALGORITHM_HMAC_SHA256 : INTEGRITY_ALGORITHM_CRC32C);
+
+        return dm_integrity_algorithm_to_string(a);
 }
 
-static int verb_attach(int argc, char *argv[], void *userdata) {
+VERB(verb_attach, "attach", "VOLUME DEVICE [HMAC_KEY_FILE|-] [OPTIONS]\0", 3, 5, 0,
+     "Attach an integrity protected block device");
+static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
         crypt_status_info status;
         _cleanup_(erase_and_freep) void *key_buf = NULL;
@@ -115,19 +116,19 @@ static int verb_attach(int argc, char *argv[], void *userdata) {
                         return r;
         }
 
-        r = crypt_init(&cd, device);
+        r = sym_crypt_init(&cd, device);
         if (r < 0)
                 return log_error_errno(r, "Failed to open integrity device %s: %m", device);
 
         cryptsetup_enable_logging(cd);
 
-        status = crypt_status(cd, volume);
+        status = sym_crypt_status(cd, volume);
         if (IN_SET(status, CRYPT_ACTIVE, CRYPT_BUSY)) {
                 log_info("Volume %s already active.", volume);
                 return 0;
         }
 
-        r = crypt_load(cd,
+        r = sym_crypt_load(cd,
                        CRYPT_INTEGRITY,
                        &(struct crypt_params_integrity) {
                                .journal_watermark = arg_percent,
@@ -138,19 +139,21 @@ static int verb_attach(int argc, char *argv[], void *userdata) {
                 return log_error_errno(r, "Failed to load integrity superblock: %m");
 
         if (!isempty(arg_existing_data_device)) {
-                r = crypt_set_data_device(cd, arg_existing_data_device);
+                r = sym_crypt_set_data_device(cd, arg_existing_data_device);
                 if (r < 0)
                         return log_error_errno(r, "Failed to add separate data device: %m");
         }
 
-        r = crypt_activate_by_volume_key(cd, volume, key_buf, key_buf_size, arg_activate_flags);
+        r = sym_crypt_activate_by_volume_key(cd, volume, key_buf, key_buf_size, arg_activate_flags);
         if (r < 0)
                 return log_error_errno(r, "Failed to set up integrity device: %m");
 
         return 0;
 }
 
-static int verb_detach(int argc, char *argv[], void *userdata) {
+VERB(verb_detach, "detach", "VOLUME\0", 2, 2, 0,
+     "Detach an integrity protected block device");
+static int verb_detach(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
         int r;
 
@@ -161,7 +164,7 @@ static int verb_detach(int argc, char *argv[], void *userdata) {
         if (!filename_is_valid(volume))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Volume name '%s' is not valid.", volume);
 
-        r = crypt_init_by_name(&cd, volume);
+        r = sym_crypt_init_by_name(&cd, volume);
         if (r == -ENODEV) {
                 log_info("Volume %s already inactive.", volume);
                 return 0;
@@ -171,30 +174,58 @@ static int verb_detach(int argc, char *argv[], void *userdata) {
 
         cryptsetup_enable_logging(cd);
 
-        r = crypt_deactivate(cd, volume);
+        r = sym_crypt_deactivate(cd, volume);
         if (r < 0)
                 return log_error_errno(r, "Failed to deactivate: %m");
 
         return 0;
 }
 
+VERB_COMMON_HELP_AUTO_HIDDEN();
+
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
+        assert(argc >= 0);
+        assert(argv);
+        assert(ret_args);
+
+        OptionParser opts = { argc, argv };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
+                switch (c) {
+
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
+                        return version();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
+                }
+
+        *ret_args = option_parser_get_args(&opts);
+        return 1;
+}
+
 static int run(int argc, char *argv[]) {
-        if (argv_looks_like_help(argc, argv))
-                return help();
+        int r;
+
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
+        if (r <= 0)
+                return r;
 
         log_setup();
 
-        cryptsetup_enable_logging(NULL);
+        LIBCRYPTSETUP_NOTE(required);
+
+        r = dlopen_cryptsetup(LOG_ERR);
+        if (r < 0)
+                return r;
 
         umask(0022);
 
-        static const Verb verbs[] = {
-                { "attach", 3, 5, 0, verb_attach },
-                { "detach", 2, 2, 0, verb_detach },
-                {}
-        };
-
-        return dispatch_verb(argc, argv, verbs, NULL);
+        return dispatch_verb(args, /* userdata= */ NULL);
 }
 
 DEFINE_MAIN_FUNCTION(run);

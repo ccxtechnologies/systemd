@@ -5,6 +5,7 @@
 #include <netinet/ip6.h>
 
 #include "sd-dns-resolver.h"
+#include "forward.h"
 
 #include "time-util.h"
 
@@ -332,7 +333,6 @@ static inline int ndisc_option_add_encrypted_dns(
 }
 static inline int ndisc_option_set_encrypted_dns(
                 Set **options,
-                size_t offset,
                 sd_dns_resolver *res,
                 usec_t lifetime,
                 usec_t valid_until) {

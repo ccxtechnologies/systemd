@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
@@ -18,6 +19,7 @@
 #include "string-util.h"
 #include "tests.h"
 #include "tmpfile-util.h"
+#include "virt.h"
 
 static void test_mount_propagation_flag_one(const char *name, int ret, unsigned long expected) {
         unsigned long flags;
@@ -281,18 +283,16 @@ TEST(is_mount_point_at) {
         fd = open("/", O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOCTTY);
         assert_se(fd >= 0);
 
-        /* Not allowed, since "/" is a path, not a plain filename */
-        assert_se(is_mount_point_at(fd, "/", 0) == -EINVAL);
-        assert_se(is_mount_point_at(fd, "..", 0) == -EINVAL);
-        assert_se(is_mount_point_at(fd, "../", 0) == -EINVAL);
-        assert_se(is_mount_point_at(fd, "/proc", 0) == -EINVAL);
-        assert_se(is_mount_point_at(fd, "/proc/", 0) == -EINVAL);
-        assert_se(is_mount_point_at(fd, "proc/sys", 0) == -EINVAL);
-        assert_se(is_mount_point_at(fd, "proc/sys/", 0) == -EINVAL);
-
-        /* This one definitely is a mount point */
-        assert_se(is_mount_point_at(fd, "proc", 0) > 0);
-        assert_se(is_mount_point_at(fd, "proc/", 0) > 0);
+        ASSERT_OK_POSITIVE(is_mount_point_at(fd, "/", /* flags= */ 0));
+        ASSERT_OK_POSITIVE(is_mount_point_at(fd, "..", /* flags= */ 0));
+        ASSERT_OK_POSITIVE(is_mount_point_at(fd, "../", /* flags= */ 0));
+        r = ASSERT_OK(proc_mounted());
+        ASSERT_OK_EQ(is_mount_point_at(fd, "/proc", /* flags= */ 0), r);
+        ASSERT_OK_EQ(is_mount_point_at(fd, "/proc/", /* flags= */ 0), r);
+        ASSERT_OK_EQ(is_mount_point_at(fd, "proc", /* flags= */ 0), r);
+        ASSERT_OK_EQ(is_mount_point_at(fd, "proc/", /* flags= */ 0), r);
+        ASSERT_OK_ZERO(is_mount_point_at(fd, "usr/lib", /* flags= */ 0));
+        ASSERT_OK_ZERO(is_mount_point_at(fd, "usr/lib", /* flags= */ 0));
 
         safe_close(fd);
         fd = open("/tmp", O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOCTTY);
@@ -357,10 +357,6 @@ TEST(is_mount_point_at) {
         ASSERT_STREQ(t, "/usr");
 
         ASSERT_OK(is_mount_point_at(fd, "regular", 0));
-}
-
-TEST(ms_nosymfollow_supported) {
-        log_info("MS_NOSYMFOLLOW supported: %s", yes_no(ms_nosymfollow_supported()));
 }
 
 TEST(mount_option_supported) {
@@ -454,6 +450,12 @@ TEST(path_get_mnt_id_at_null) {
 static int intro(void) {
         /* let's move into our own mount namespace with all propagation from the host turned off, so
          * that /proc/self/mountinfo is static and constant for the whole time our test runs. */
+
+        if (running_in_chroot() != 0) {
+                /* We cannot remount file system with MS_PRIVATE when running in chroot. */
+                log_notice("Running in chroot, proceeding in originating mount namespace.");
+                return EXIT_SUCCESS;
+        }
 
         if (unshare(CLONE_NEWNS) < 0) {
                 if (!ERRNO_IS_PRIVILEGE(errno))

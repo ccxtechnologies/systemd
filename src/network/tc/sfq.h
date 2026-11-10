@@ -2,7 +2,6 @@
  * Copyright © 2019 VMware, Inc. */
 #pragma once
 
-#include "forward.h"
 #include "qdisc.h"
 
 typedef struct StochasticFairnessQueueing {
@@ -14,4 +13,4 @@ typedef struct StochasticFairnessQueueing {
 DEFINE_QDISC_CAST(SFQ, StochasticFairnessQueueing);
 extern const QDiscVTable sfq_vtable;
 
-CONFIG_PARSER_PROTOTYPE(config_parse_stochastic_fairness_queueing_perturb_period);
+CONFIG_PARSER_PROTOTYPE(config_parse_sfq_perturb_period);

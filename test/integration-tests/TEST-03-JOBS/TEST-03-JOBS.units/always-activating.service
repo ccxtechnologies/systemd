@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
 [Unit]
 Description=Service that never leaves state ACTIVATING
 Requires=always-activating.socket
@@ -5,4 +7,4 @@ After=always-activating.socket
 
 [Service]
 Type=notify
-ExecStart=bash -c 'sleep infinity'
+ExecStart=sleep infinity

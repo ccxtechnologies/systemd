@@ -18,6 +18,31 @@ units = [
           'file' : 'machines.target',
           'conditions' : ['ENABLE_MACHINED'],
         },
+        {
+          'file' : 'systemd-machined.service.in',
+          'conditions' : ['ENABLE_MACHINED'],
+          'symlinks' : ['dbus-org.freedesktop.machine1.service'],
+        },
+        {
+          'file' : 'systemd-machined.socket',
+          'conditions' : ['ENABLE_MACHINED'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-importd.service.in',
+          'conditions' : ['ENABLE_IMPORTD'],
+          'symlinks' : ['dbus-org.freedesktop.import1.service'],
+        },
+        {
+          'file' : 'systemd-importd.socket',
+          'conditions' : ['ENABLE_IMPORTD'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-portabled.service.in',
+          'conditions' : ['ENABLE_PORTABLED'],
+          'symlinks' : ['dbus-org.freedesktop.portable1.service'],
+        },
         { 'file' : 'paths.target' },
         { 'file' : 'printer.target' },
         { 'file' : 'session.slice' },
@@ -31,6 +56,18 @@ units = [
         },
         { 'file' : 'systemd-ask-password@.service' },
         { 'file' : 'systemd-exit.service' },
+        { 'file' : 'systemd-journalctl@.service' },
+        {
+          'file' : 'systemd-journalctl.socket',
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-storage-fs.socket',
+          'symlinks' : ['sockets.target.wants/']
+        },
+        {
+          'file' : 'systemd-storage-fs@.service.in',
+        },
         { 'file' : 'systemd-tmpfiles-clean.service' },
         { 'file' : 'systemd-tmpfiles-clean.timer' },
         { 'file' : 'systemd-tmpfiles-setup.service' },
@@ -72,7 +109,6 @@ foreach unit : units
 
         if needs_jinja
                 t = custom_target(
-                        name,
                         input : source,
                         output : name,
                         command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],

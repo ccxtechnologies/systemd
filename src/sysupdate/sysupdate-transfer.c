@@ -25,6 +25,7 @@
 #include "notify-recv.h"
 #include "parse-helpers.h"
 #include "parse-util.h"
+#include "path-util.h"
 #include "percent-util.h"
 #include "pidref.h"
 #include "process-util.h"
@@ -35,23 +36,30 @@
 #include "strv.h"
 #include "sync-util.h"
 #include "sysupdate.h"
+#include "sysupdate-cleanup.h"
+#include "sysupdate-config.h"
 #include "sysupdate-feature.h"
 #include "sysupdate-instance.h"
 #include "sysupdate-pattern.h"
 #include "sysupdate-resource.h"
 #include "sysupdate-transfer.h"
 #include "time-util.h"
-#include "tmpfile-util.h"
 #include "web-util.h"
 
 /* Default value for InstancesMax= for fs object targets */
 #define DEFAULT_FILE_INSTANCES_MAX 3
 
+enum {
+        MATCH_PATTERN_SOURCE,
+        MATCH_PATTERN_TARGET,
+};
+
 Transfer* transfer_free(Transfer *t) {
         if (!t)
                 return NULL;
 
-        t->temporary_path = rm_rf_subvolume_and_free(t->temporary_path);
+        free(t->temporary_partial_path);
+        free(t->temporary_pending_path);
 
         free(t->id);
 
@@ -67,6 +75,7 @@ Transfer* transfer_free(Transfer *t) {
         strv_free(t->appstream);
 
         partition_info_destroy(&t->partition_info);
+        free(t->final_partition_label);
 
         resource_destroy(&t->source);
         resource_destroy(&t->target);
@@ -95,6 +104,9 @@ Transfer* transfer_new(Context *ctx) {
                 .read_only = -1,
                 .growfs = -1,
 
+                /* whether to fill up the rest of the partition with zeroes, as configured by the user */
+                .zero_fill = -1,
+
                 /* the read only flag, as ultimately determined */
                 .install_read_only = -1,
 
@@ -120,18 +132,24 @@ static int config_parse_protect_version(
 
         _cleanup_free_ char *resolved = NULL;
         char ***protected_versions = ASSERT_PTR(data);
+        Transfer *t = ASSERT_PTR(userdata);
         int r;
 
         assert(rvalue);
 
-        r = specifier_printf(rvalue, NAME_MAX, specifier_table, arg_root, NULL, &resolved);
+        if (isempty(rvalue)) {
+                *protected_versions = strv_free(*protected_versions);
+                return 0;
+        }
+
+        r = specifier_printf(rvalue, NAME_MAX, system_and_tmp_specifier_table, t->context->root, NULL, &resolved);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to expand specifiers in ProtectVersion=, ignoring: %s", rvalue);
                 return 0;
         }
 
-        if (!version_is_valid(resolved))  {
+        if (!version_is_valid(resolved, VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS))  {
                 log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "ProtectVersion= string is not valid, ignoring: %s", resolved);
                 return 0;
@@ -158,18 +176,24 @@ static int config_parse_min_version(
 
         _cleanup_free_ char *resolved = NULL;
         char **version = ASSERT_PTR(data);
+        Transfer *t = ASSERT_PTR(userdata);
         int r;
 
         assert(rvalue);
 
-        r = specifier_printf(rvalue, NAME_MAX, specifier_table, arg_root, NULL, &resolved);
+        if (isempty(rvalue)) {
+                *version = mfree(*version);
+                return 0;
+        }
+
+        r = specifier_printf(rvalue, NAME_MAX, system_and_tmp_specifier_table, t->context->root, NULL, &resolved);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to expand specifiers in MinVersion=, ignoring: %s", rvalue);
                 return 0;
         }
 
-        if (!version_is_valid(rvalue)) {
+        if (!version_is_valid(resolved, VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS)) {
                 log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "MinVersion= string is not valid, ignoring: %s", resolved);
                 return 0;
@@ -178,7 +202,7 @@ static int config_parse_min_version(
         return free_and_replace(*version, resolved);
 }
 
-static int config_parse_url_specifiers(
+static int config_parse_transfer_url_specifiers_many(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -189,35 +213,13 @@ static int config_parse_url_specifiers(
                 const char *rvalue,
                 void *data,
                 void *userdata) {
-        char ***s = ASSERT_PTR(data);
-        _cleanup_free_ char *resolved = NULL;
-        int r;
 
-        assert(rvalue);
+        Transfer *t = ASSERT_PTR(userdata);
 
-        if (isempty(rvalue)) {
-                *s = strv_free(*s);
-                return 0;
-        }
+        /* Here we expect userdata to point to our Transfer object, but config_parse_url_specifiers() wants
+         * the root dir there, hence fix this up */
 
-        r = specifier_printf(rvalue, NAME_MAX, specifier_table, arg_root, NULL, &resolved);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to expand specifiers in %s=, ignoring: %s", lvalue, rvalue);
-                return 0;
-        }
-
-        if (!http_url_is_valid(resolved)) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "%s= URL is not valid, ignoring: %s", lvalue, rvalue);
-                return 0;
-        }
-
-        r = strv_push(s, TAKE_PTR(resolved));
-        if (r < 0)
-                return log_oom();
-
-        return 0;
+        return config_parse_url_specifiers_many(unit, filename, line, section, section_line, lvalue, ltype, rvalue, data, t->context->root);
 }
 
 static int config_parse_current_symlink(
@@ -234,11 +236,17 @@ static int config_parse_current_symlink(
 
         _cleanup_free_ char *resolved = NULL;
         char **current_symlink = ASSERT_PTR(data);
+        Transfer *t = ASSERT_PTR(userdata);
         int r;
 
         assert(rvalue);
 
-        r = specifier_printf(rvalue, NAME_MAX, specifier_table, arg_root, NULL, &resolved);
+        if (isempty(rvalue)) {
+                *current_symlink = mfree(*current_symlink);
+                return 0;
+        }
+
+        r = specifier_printf(rvalue, PATH_MAX-1, system_and_tmp_specifier_table, t->context->root, NULL, &resolved);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to expand specifiers in CurrentSymlink=, ignoring: %s", rvalue);
@@ -305,6 +313,8 @@ static int config_parse_resource_pattern(
                 void *userdata) {
 
         char ***patterns = ASSERT_PTR(data);
+        Transfer *t = ASSERT_PTR(userdata);
+        bool is_source = ltype == MATCH_PATTERN_SOURCE;
         int r;
 
         assert(rvalue);
@@ -316,6 +326,7 @@ static int config_parse_resource_pattern(
 
         for (;;) {
                 _cleanup_free_ char *word = NULL, *resolved = NULL;
+                const char *body;
 
                 r = extract_first_word(&rvalue, &word, NULL, EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_RELAX);
                 if (r < 0) {
@@ -326,15 +337,30 @@ static int config_parse_resource_pattern(
                 if (r == 0)
                         break;
 
-                r = specifier_printf(word, NAME_MAX, specifier_table, arg_root, NULL, &resolved);
+                r = specifier_printf(word, NAME_MAX, system_and_tmp_specifier_table, t->context->root, NULL, &resolved);
                 if (r < 0) {
                         log_syntax(unit, LOG_WARNING, filename, line, r,
                                    "Failed to expand specifiers in MatchPattern=, ignoring: %s", rvalue);
                         return 0;
                 }
 
-                if (!pattern_valid(resolved))
-                        return log_syntax(unit, LOG_ERR, filename, line, SYNTHETIC_ERRNO(EINVAL),
+                /* The glob directory prefix on a source MatchPattern= means "match the rest against the
+                 * basename" thus the remainder must be a valid filename (no slashes).
+                 * Target patterns can not use it. */
+                body = resolved;
+                if (pattern_skip_glob_directory_prefix(&body)) {
+                        if (!is_source)
+                                return log_syntax(unit, LOG_ERR, filename, line, SYNTHETIC_ERRNO(EINVAL),
+                                                  "'**/' prefix is only supported in a source MatchPattern=, refusing: %s", resolved);
+                        if (!filename_is_valid(body))
+                                return log_syntax(unit, LOG_ERR, filename, line, SYNTHETIC_ERRNO(EINVAL),
+                                                  "The pattern after a '**/' prefix must be a valid filename, refusing: %s", resolved);
+                }
+
+                /* The glob directory prefix is not allowed in the remainder and pattern_valid will catch this. */
+                r = pattern_valid(body);
+                if (r <= 0)
+                        return log_syntax(unit, LOG_ERR, filename, line, r < 0 ? r : SYNTHETIC_ERRNO(EINVAL),
                                           "MatchPattern= string is not valid, refusing: %s", resolved);
 
                 r = strv_consume(patterns, TAKE_PTR(resolved));
@@ -359,6 +385,7 @@ static int config_parse_resource_path(
                 void *userdata) {
         _cleanup_free_ char *resolved = NULL;
         Resource *rr = ASSERT_PTR(data);
+        Transfer *t = ASSERT_PTR(userdata);
         int r;
 
         assert(rvalue);
@@ -369,7 +396,7 @@ static int config_parse_resource_path(
                 return 0;
         }
 
-        r = specifier_printf(rvalue, PATH_MAX-1, specifier_table, arg_root, NULL, &resolved);
+        r = specifier_printf(rvalue, PATH_MAX-1, system_and_tmp_specifier_table, t->context->root, NULL, &resolved);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to expand specifiers in Path=, ignoring: %s", rvalue);
@@ -406,6 +433,12 @@ static int config_parse_resource_ptype(
 
         assert(rvalue);
 
+        if (isempty(rvalue)) {
+                rr->partition_type = (GptPartitionType) {};
+                rr->partition_type_set = false;
+                return 0;
+        }
+
         r = gpt_partition_type_from_string(rvalue, &rr->partition_type);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r,
@@ -433,6 +466,12 @@ static int config_parse_partition_uuid(
         int r;
 
         assert(rvalue);
+
+        if (isempty(rvalue)) {
+                t->partition_uuid = SD_ID128_NULL;
+                t->partition_uuid_set = false;
+                return 0;
+        }
 
         r = sd_id128_from_string(rvalue, &t->partition_uuid);
         if (r < 0) {
@@ -462,7 +501,13 @@ static int config_parse_partition_flags(
 
         assert(rvalue);
 
-        r = safe_atou64(rvalue, &t->partition_flags);
+        if (isempty(rvalue)) {
+                t->partition_flags = 0;
+                t->partition_flags_set = false;
+                return 0;
+        }
+
+        r = safe_atoux64(rvalue, &t->partition_flags);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse partition flags, ignoring: %s", rvalue);
@@ -502,33 +547,34 @@ int transfer_read_definition(Transfer *t, const char *path, const char **dirs, H
         assert(t);
 
         ConfigTableItem table[] = {
-                { "Transfer",    "MinVersion",              config_parse_min_version,          0, &t->min_version             },
-                { "Transfer",    "ProtectVersion",          config_parse_protect_version,      0, &t->protected_versions      },
-                { "Transfer",    "Verify",                  config_parse_bool,                 0, &t->verify                  },
-                { "Transfer",    "ChangeLog",               config_parse_url_specifiers,       0, &t->changelog               },
-                { "Transfer",    "AppStream",               config_parse_url_specifiers,       0, &t->appstream               },
-                { "Transfer",    "Features",                config_parse_strv,                 0, &t->features                },
-                { "Transfer",    "RequisiteFeatures",       config_parse_strv,                 0, &t->requisite_features      },
-                { "Source",      "Type",                    config_parse_resource_type,        0, &t->source.type             },
-                { "Source",      "Path",                    config_parse_resource_path,        0, &t->source                  },
-                { "Source",      "PathRelativeTo",          config_parse_resource_path_relto,  0, &t->source.path_relative_to },
-                { "Source",      "MatchPattern",            config_parse_resource_pattern,     0, &t->source.patterns         },
-                { "Target",      "Type",                    config_parse_resource_type,        0, &t->target.type             },
-                { "Target",      "Path",                    config_parse_resource_path,        0, &t->target                  },
-                { "Target",      "PathRelativeTo",          config_parse_resource_path_relto,  0, &t->target.path_relative_to },
-                { "Target",      "MatchPattern",            config_parse_resource_pattern,     0, &t->target.patterns         },
-                { "Target",      "MatchPartitionType",      config_parse_resource_ptype,       0, &t->target                  },
-                { "Target",      "PartitionUUID",           config_parse_partition_uuid,       0, t                           },
-                { "Target",      "PartitionFlags",          config_parse_partition_flags,      0, t                           },
-                { "Target",      "PartitionNoAuto",         config_parse_tristate,             0, &t->no_auto                 },
-                { "Target",      "PartitionGrowFileSystem", config_parse_tristate,             0, &t->growfs                  },
-                { "Target",      "ReadOnly",                config_parse_tristate,             0, &t->read_only               },
-                { "Target",      "Mode",                    config_parse_mode,                 0, &t->mode                    },
-                { "Target",      "TriesLeft",               config_parse_uint64,               0, &t->tries_left              },
-                { "Target",      "TriesDone",               config_parse_uint64,               0, &t->tries_done              },
-                { "Target",      "InstancesMax",            config_parse_instances_max,        0, &t->instances_max           },
-                { "Target",      "RemoveTemporary",         config_parse_bool,                 0, &t->remove_temporary        },
-                { "Target",      "CurrentSymlink",          config_parse_current_symlink,      0, &t->current_symlink         },
+                { "Transfer",    "MinVersion",              config_parse_min_version,                  0,                    &t->min_version             },
+                { "Transfer",    "ProtectVersion",          config_parse_protect_version,              0,                    &t->protected_versions      },
+                { "Transfer",    "Verify",                  config_parse_bool,                         0,                    &t->verify                  },
+                { "Transfer",    "ChangeLog",               config_parse_transfer_url_specifiers_many, 0,                    &t->changelog               },
+                { "Transfer",    "AppStream",               config_parse_transfer_url_specifiers_many, 0,                    &t->appstream               },
+                { "Transfer",    "Features",                config_parse_strv,                         0,                    &t->features                },
+                { "Transfer",    "RequisiteFeatures",       config_parse_strv,                         0,                    &t->requisite_features      },
+                { "Source",      "Type",                    config_parse_resource_type,                0,                    &t->source.type             },
+                { "Source",      "Path",                    config_parse_resource_path,                0,                    &t->source                  },
+                { "Source",      "PathRelativeTo",          config_parse_resource_path_relto,          0,                    &t->source.path_relative_to },
+                { "Source",      "MatchPattern",            config_parse_resource_pattern,             MATCH_PATTERN_SOURCE, &t->source.patterns         },
+                { "Target",      "Type",                    config_parse_resource_type,                0,                    &t->target.type             },
+                { "Target",      "Path",                    config_parse_resource_path,                0,                    &t->target                  },
+                { "Target",      "PathRelativeTo",          config_parse_resource_path_relto,          0,                    &t->target.path_relative_to },
+                { "Target",      "MatchPattern",            config_parse_resource_pattern,             MATCH_PATTERN_TARGET, &t->target.patterns         },
+                { "Target",      "MatchPartitionType",      config_parse_resource_ptype,               0,                    &t->target                  },
+                { "Target",      "PartitionUUID",           config_parse_partition_uuid,               0,                    t                           },
+                { "Target",      "PartitionFlags",          config_parse_partition_flags,              0,                    t                           },
+                { "Target",      "PartitionNoAuto",         config_parse_tristate,                     0,                    &t->no_auto                 },
+                { "Target",      "PartitionGrowFileSystem", config_parse_tristate,                     0,                    &t->growfs                  },
+                { "Target",      "PartitionZeroFill",       config_parse_tristate,                     0,                    &t->zero_fill               },
+                { "Target",      "ReadOnly",                config_parse_tristate,                     0,                    &t->read_only               },
+                { "Target",      "Mode",                    config_parse_mode,                         0,                    &t->mode                    },
+                { "Target",      "TriesLeft",               config_parse_uint64,                       0,                    &t->tries_left              },
+                { "Target",      "TriesDone",               config_parse_uint64,                       0,                    &t->tries_done              },
+                { "Target",      "InstancesMax",            config_parse_instances_max,                0,                    &t->instances_max           },
+                { "Target",      "RemoveTemporary",         config_parse_bool,                         0,                    &t->remove_temporary        },
+                { "Target",      "CurrentSymlink",          config_parse_current_symlink,              0,                    &t->current_symlink         },
                 {}
         };
 
@@ -543,19 +589,20 @@ int transfer_read_definition(Transfer *t, const char *path, const char **dirs, H
         if (r < 0)
                 return log_error_errno(r, "Failed to extract filename from path '%s': %m", path);
 
-        r = config_parse_many(
+        r = config_parse_many_full(
                         STRV_MAKE_CONST(path),
                         dirs,
                         strjoina(filename, ".d"),
-                        arg_root,
+                        t->context->root,
+                        /* root_fd= */ -EBADF,
                         "Transfer\0"
                         "Source\0"
                         "Target\0",
                         config_item_table_lookup, table,
                         CONFIG_PARSE_WARN,
-                        /* userdata= */ NULL,
-                        /* stats_by_path= */ NULL,
-                        /* drop_in_files= */ NULL);
+                        t,
+                        /* ret_stats_by_path= */ NULL,
+                        /* ret_drop_in_files= */ NULL);
         if (r < 0)
                 return r;
 
@@ -598,6 +645,11 @@ int transfer_read_definition(Transfer *t, const char *path, const char **dirs, H
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
                                   "Target Type= must be one of partition, regular-file, directory, subvolume.");
 
+        if (t->target.type == RESOURCE_PARTITION && !t->target.partition_type_set) {
+                t->target.partition_type = gpt_partition_type_from_uuid(SD_GPT_LINUX_GENERIC);
+                t->target.partition_type_set = true;
+        }
+
         if ((IN_SET(t->source.type, RESOURCE_URL_FILE, RESOURCE_PARTITION, RESOURCE_REGULAR_FILE) &&
              !IN_SET(t->target.type, RESOURCE_PARTITION, RESOURCE_REGULAR_FILE)) ||
             (IN_SET(t->source.type, RESOURCE_URL_TAR, RESOURCE_TAR, RESOURCE_DIRECTORY, RESOURCE_SUBVOLUME) &&
@@ -610,7 +662,7 @@ int transfer_read_definition(Transfer *t, const char *path, const char **dirs, H
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
                                   "Source specification lacks Path=.");
 
-        if (t->source.path_relative_to == PATH_RELATIVE_TO_EXPLICIT && !arg_transfer_source)
+        if (t->source.path_relative_to == PATH_RELATIVE_TO_EXPLICIT && !t->context->transfer_source)
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
                                   "PathRelativeTo=explicit requires --transfer-source= to be specified.");
 
@@ -637,6 +689,11 @@ int transfer_read_definition(Transfer *t, const char *path, const char **dirs, H
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
                                   "Source specification lacks MatchPattern=.");
 
+        if (IN_SET(t->source.type, RESOURCE_DIRECTORY, RESOURCE_SUBVOLUME) &&
+            resource_has_glob_directory_pattern(&t->source))
+                return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                  "MatchPattern= with '**/' prefix is not supported for source Type=directory and Type=subvolume, refusing.");
+
         if (!t->target.path && !t->target.path_auto)
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
                                   "Target specification lacks Path= field.");
@@ -652,6 +709,19 @@ int transfer_read_definition(Transfer *t, const char *path, const char **dirs, H
                 t->target.patterns = strv_copy(t->source.patterns);
                 if (!t->target.patterns)
                         return log_oom();
+
+                /* Strip any glob directory prefix when inheriting from source because it's only used for finding and
+                 * not to replicate the same directory layout at the target, so we don't support it there. */
+                STRV_FOREACH(p, t->target.patterns) {
+                        const char *body = *p;
+
+                        if (pattern_skip_glob_directory_prefix(&body))
+                                memmove(*p, body, strlen(body) + 1);
+                }
+
+                /* Stripping the glob directory prefix can turn distinct source patterns into duplicates,
+                 * so re-uniq for parity with the source side. */
+                strv_uniq(t->target.patterns);
         }
 
         if (t->current_symlink && !RESOURCE_IS_FILESYSTEM(t->target.type) && !path_is_absolute(t->current_symlink))
@@ -679,11 +749,11 @@ int transfer_resolve_paths(
 
         assert(t);
 
-        r = resource_resolve_path(&t->source, root, arg_transfer_source, node);
+        r = resource_resolve_path(&t->source, root, t->context->transfer_source, node);
         if (r < 0)
                 return r;
 
-        r = resource_resolve_path(&t->target, root, /*relative_to_directory=*/ NULL, node);
+        r = resource_resolve_path(&t->target, root, /* relative_to_directory= */ NULL, node);
         if (r < 0)
                 return r;
 
@@ -702,7 +772,8 @@ static void transfer_remove_temporary(Transfer *t) {
         if (!IN_SET(t->target.type, RESOURCE_REGULAR_FILE, RESOURCE_DIRECTORY, RESOURCE_SUBVOLUME))
                 return;
 
-        /* Removes all temporary files/dirs from previous runs in the target directory, i.e. all those starting with '.#' */
+        /* Removes all incomplete files/dirs from previous runs in the target directory. Clean both the
+         * current partial sysupdate prefix and the legacy '.#' prefix. */
 
         d = opendir(t->target.path);
         if (!d) {
@@ -724,7 +795,7 @@ static void transfer_remove_temporary(Transfer *t) {
                         break;
                 }
 
-                if (!startswith(de->d_name, ".#"))
+                if (!STARTSWITH_SET(de->d_name, ".#", ".sysupdate.partial."))
                         continue;
 
                 r = rm_rf_child(dirfd(d), de->d_name, REMOVE_PHYSICAL|REMOVE_SUBVOLUME|REMOVE_CHMOD);
@@ -739,6 +810,58 @@ static void transfer_remove_temporary(Transfer *t) {
         }
 }
 
+static int transfer_instance_vacuum(
+                Transfer *t,
+                Instance *instance) {
+        int r;
+
+        assert(t);
+        assert(instance);
+
+        switch (t->target.type) {
+
+        case RESOURCE_REGULAR_FILE:
+        case RESOURCE_DIRECTORY:
+        case RESOURCE_SUBVOLUME:
+                r = rm_rf(instance->path, REMOVE_ROOT|REMOVE_PHYSICAL|REMOVE_SUBVOLUME|REMOVE_MISSING_OK|REMOVE_CHMOD);
+                if (r < 0 && r != -ENOENT)
+                        return log_error_errno(r, "Failed to make room, deleting '%s' failed: %m", instance->path);
+
+                (void) rmdir_parents(instance->path, t->target.path);
+
+                break;
+
+        case RESOURCE_PARTITION: {
+                PartitionInfo pinfo = instance->partition_info;
+                PartitionChange change = PARTITION_LABEL;
+
+                /* label "_empty" means "no contents" for our purposes */
+                pinfo.label = (char*) "_empty";
+
+                /* If the partition had a derived partial/pending type UUID, restore the original
+                 * partition type so that the slot is properly recognized as empty in subsequent
+                 * scans. */
+                if ((instance->is_partial || instance->is_pending) && t->target.partition_type_set) {
+                        pinfo.type = t->target.partition_type.uuid;
+                        change |= PARTITION_TYPE;
+                }
+
+                log_debug("Resetting partition '%s' to empty.", pinfo.device);
+                r = patch_partition(t->target.path, &pinfo, change);
+                if (r < 0)
+                        return r;
+
+                t->target.n_empty++;
+                break;
+        }
+
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
 int transfer_vacuum(
                 Transfer *t,
                 uint64_t space,
@@ -751,9 +874,50 @@ int transfer_vacuum(
 
         transfer_remove_temporary(t);
 
-        /* First, calculate how many instances to keep, based on the instance limit — but keep at least one */
+        /* First, remove any partial or pending instances (unless protected) */
+        for (size_t i = 0; i < t->target.n_instances;) {
+                Instance *instance = t->target.instances[i];
 
-        instances_max = arg_instances_max != UINT64_MAX ? arg_instances_max : t->instances_max;
+                assert(instance);
+
+                if (!instance->is_pending && !instance->is_partial) {
+                        i++;
+                        continue;
+                }
+
+                /* If this is pending and listed among the protected versions, then let's not remove it.
+                 * In future, we will also want to keep partial protected versions, but that’s only useful
+                 * once we support resuming downloads. */
+                if (instance->is_pending &&
+                    (strv_contains(t->protected_versions, instance->metadata.version) ||
+                     (extra_protected_version && streq(extra_protected_version, instance->metadata.version)))) {
+                        log_debug("Version '%s' is pending but protected, not removing.", instance->metadata.version);
+                        i++;
+                        continue;
+                }
+
+                assert(instance->resource);
+
+                log_info("%s Removing old %s '%s' (%s).",
+                         glyph(GLYPH_RECYCLING),
+                         instance->is_partial ? "partial" : "pending",
+                         instance->path,
+                         resource_type_to_string(instance->resource->type));
+
+                r = transfer_instance_vacuum(t, instance);
+                if (r < 0)
+                        return r;
+
+                instance_free(instance);
+                memmove(t->target.instances + i, t->target.instances + i + 1, (t->target.n_instances - i - 1) * sizeof(Instance*));
+                t->target.n_instances--;
+
+                count++;
+        }
+
+        /* Second, calculate how many instances to keep, based on the instance limit — but keep at least one */
+
+        instances_max = t->context->instances_max != UINT64_MAX ? t->context->instances_max : t->instances_max;
         assert(instances_max >= 1);
         if (instances_max == UINT64_MAX) /* Keep infinite instances? */
                 limit = UINT64_MAX;
@@ -769,21 +933,32 @@ int transfer_vacuum(
                 limit = instances_max - space;
 
         if (t->target.type == RESOURCE_PARTITION && space != UINT64_MAX) {
+                _cleanup_free_ char *patterns = NULL;
                 uint64_t rm, remain;
+
+                patterns = strv_join(t->target.patterns, "|");
+                if (!patterns)
+                        (void) log_oom_debug();
 
                 /* If we are looking at a partition table, we also have to take into account how many
                  * partition slots of the right type are available */
 
                 if (t->target.n_empty + t->target.n_instances < 2)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOSPC),
-                                               "Partition table has less than two partition slots of the right type " SD_ID128_UUID_FORMAT_STR " (%s), refusing.",
+                                               "Partition table has less than two partition slots of the right type " SD_ID128_UUID_FORMAT_STR " (%s)%s%s%s, refusing.",
                                                SD_ID128_FORMAT_VAL(t->target.partition_type.uuid),
-                                               gpt_partition_type_uuid_to_string(t->target.partition_type.uuid));
+                                               gpt_partition_type_uuid_to_string(t->target.partition_type.uuid),
+                                               !isempty(patterns) ? " and matching the expected pattern '" : "",
+                                               strempty(patterns),
+                                               !isempty(patterns) ? "'" : "");
                 if (space > t->target.n_empty + t->target.n_instances)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOSPC),
-                                               "Partition table does not have enough partition slots of right type " SD_ID128_UUID_FORMAT_STR " (%s) for operation.",
+                                               "Partition table does not have enough partition slots of right type " SD_ID128_UUID_FORMAT_STR " (%s)%s%s%s for operation.",
                                                SD_ID128_FORMAT_VAL(t->target.partition_type.uuid),
-                                               gpt_partition_type_uuid_to_string(t->target.partition_type.uuid));
+                                               gpt_partition_type_uuid_to_string(t->target.partition_type.uuid),
+                                               !isempty(patterns) ? " and matching the expected pattern '" : "",
+                                               strempty(patterns),
+                                               !isempty(patterns) ? "'" : "");
                 if (space == t->target.n_empty + t->target.n_instances)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOSPC),
                                                "Asked to empty all partition table slots of the right type " SD_ID128_UUID_FORMAT_STR " (%s), can't allow that. One instance must always remain.",
@@ -828,36 +1003,9 @@ int transfer_vacuum(
                          oldest->path,
                          resource_type_to_string(oldest->resource->type));
 
-                switch (t->target.type) {
-
-                case RESOURCE_REGULAR_FILE:
-                case RESOURCE_DIRECTORY:
-                case RESOURCE_SUBVOLUME:
-                        r = rm_rf(oldest->path, REMOVE_ROOT|REMOVE_PHYSICAL|REMOVE_SUBVOLUME|REMOVE_MISSING_OK|REMOVE_CHMOD);
-                        if (r < 0 && r != -ENOENT)
-                                return log_error_errno(r, "Failed to make room, deleting '%s' failed: %m", oldest->path);
-
-                        (void) rmdir_parents(oldest->path, t->target.path);
-
-                        break;
-
-                case RESOURCE_PARTITION: {
-                        PartitionInfo pinfo = oldest->partition_info;
-
-                        /* label "_empty" means "no contents" for our purposes */
-                        pinfo.label = (char*) "_empty";
-
-                        r = patch_partition(t->target.path, &pinfo, PARTITION_LABEL);
-                        if (r < 0)
-                                return r;
-
-                        t->target.n_empty++;
-                        break;
-                }
-
-                default:
-                        assert_not_reached();
-                }
+                r = transfer_instance_vacuum(t, oldest);
+                if (r < 0)
+                        return r;
 
                 instance_free(oldest);
                 memmove(t->target.instances + p, t->target.instances + p + 1, (t->target.n_instances - p - 1) * sizeof(Instance*));
@@ -933,6 +1081,7 @@ static int callout_context_new(const Transfer *t, const Instance *i, TransferPro
         assert(t);
         assert(i);
         assert(cb);
+        assert(ret);
 
         ctx = new(CalloutContext, 1);
         if (!ctx)
@@ -1099,37 +1248,30 @@ static int run_callout(
         return sd_event_loop(event);
 }
 
-int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, void *userdata) {
-        _cleanup_free_ char *formatted_pattern = NULL, *digest = NULL;
-        char offset[DECIMAL_STR_MAX(uint64_t)+1], max_size[DECIMAL_STR_MAX(uint64_t)+1];
-        const char *where = NULL;
-        InstanceMetadata f;
-        Instance *existing;
+/* Build the filenames and paths which is normally done by transfer_acquire_instance(), but for partial
+ * and pending instances which are about to be installed (in which case, transfer_acquire_instance() is
+ * skipped). */
+int transfer_compute_temporary_paths(Transfer *t, Instance *i, InstanceMetadata *f) {
+        _cleanup_free_ char *formatted_pattern = NULL;
         int r;
 
         assert(t);
         assert(i);
-        assert(i->resource == &t->source);
-        assert(cb);
-
-        /* Does this instance already exist in the target? Then we don't need to acquire anything */
-        existing = resource_find_instance(&t->target, i->metadata.version);
-        if (existing) {
-                log_info("No need to acquire '%s', already installed.", i->path);
-                return 0;
-        }
 
         assert(!t->final_path);
-        assert(!t->temporary_path);
+        assert(!t->temporary_partial_path);
+        assert(!t->temporary_pending_path);
+        assert(!t->final_partition_label);
         assert(!strv_isempty(t->target.patterns));
 
         /* Format the target name using the first pattern specified */
-        compile_pattern_fields(t, i, &f);
-        r = pattern_format(t->target.patterns[0], &f, &formatted_pattern);
+        compile_pattern_fields(t, i, f);
+        r = pattern_format(t->target.patterns[0], f, &formatted_pattern);
         if (r < 0)
                 return log_error_errno(r, "Failed to format target pattern: %m");
 
         if (RESOURCE_IS_FILESYSTEM(t->target.type)) {
+                _cleanup_free_ char *final_dir = NULL, *final_filename = NULL, *partial_filename = NULL, *pending_filename = NULL;
 
                 if (!path_is_safe(formatted_pattern))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Formatted pattern is not suitable as file name, refusing: %s", formatted_pattern);
@@ -1138,15 +1280,29 @@ int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, voi
                 if (!t->final_path)
                         return log_oom();
 
-                r = mkdir_parents(t->final_path, 0755);
+                /* Build the paths for the partial and pending files, which hold the resource while it’s
+                 * being acquired and after it’s been acquired (but before it’s moved to the final_path
+                 * when it’s installed).
+                 *
+                 * Split the filename off the `final_path`, then add a prefix to it for each of partial and
+                 * pending, then join them back on to the same directory. */
+                r = path_split_prefix_filename(t->final_path, &final_dir, &final_filename);
                 if (r < 0)
-                        return log_error_errno(r, "Cannot create target directory: %m");
+                        return log_error_errno(r, "Failed to parse path: %m");
 
-                r = tempfn_random(t->final_path, "sysupdate", &t->temporary_path);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to generate temporary target path: %m");
+                if (!strprepend(&partial_filename, ".sysupdate.partial.", final_filename))
+                        return log_oom();
 
-                where = t->final_path;
+                if (!strprepend(&pending_filename, ".sysupdate.pending.", final_filename))
+                        return log_oom();
+
+                t->temporary_partial_path = path_join(final_dir, partial_filename);
+                if (!t->temporary_partial_path)
+                        return log_oom();
+
+                t->temporary_pending_path = path_join(final_dir, pending_filename);
+                if (!t->temporary_pending_path)
+                        return log_oom();
         }
 
         if (t->target.type == RESOURCE_PARTITION) {
@@ -1156,6 +1312,82 @@ int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, voi
                 if (!r)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Formatted pattern is not suitable as GPT partition label, refusing: %s", formatted_pattern);
 
+                assert(t->target.partition_type_set);
+
+                /* Derive temporary partition type UUIDs for partial/pending states from the configured
+                 * partition type. This avoids the need for label prefixes. */
+                r = gpt_partition_type_uuid_for_sysupdate_partial(t->target.partition_type.uuid, &t->partition_type_partial);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to derive partial partition type UUID: %m");
+
+                r = gpt_partition_type_uuid_for_sysupdate_pending(t->target.partition_type.uuid, &t->partition_type_pending);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to derive pending partition type UUID: %m");
+
+                t->final_partition_label = TAKE_PTR(formatted_pattern);
+        }
+
+        return 0;
+}
+
+static bool transfer_zero_fill(const Transfer *t) {
+        assert(t);
+        assert(t->target.type == RESOURCE_PARTITION);
+        assert(t->target.partition_type_set);
+
+        /* Returns whether to fill up the rest of the partition with zeroes after writing the payload. If
+         * configured explicitly, use that. Otherwise, do so for verity signature partitions only: they carry
+         * a JSON object that must be followed by NUL bytes only, up to the end of the partition. The
+         * artifacts we install there generally come without that padding though (repart's --split= mode
+         * trims it, so that the file is a plain JSON text file), hence without zero filling the tail of a
+         * previous, longer signature would survive right after the new one. These partitions are tiny, hence
+         * this is cheap. */
+
+        if (t->zero_fill >= 0)
+                return t->zero_fill;
+
+        return partition_designator_is_verity_sig(t->target.partition_type.designator);
+}
+
+int transfer_acquire_instance(Transfer *t, Instance *i, InstanceMetadata *f, TransferProgress cb, void *userdata) {
+        _cleanup_free_ char *digest = NULL;
+        char offset[DECIMAL_STR_MAX(uint64_t)+1], max_size[DECIMAL_STR_MAX(uint64_t)+1];
+        const char *where = NULL;
+        Instance *existing;
+        int r;
+
+        assert(t);
+        assert(i);
+        assert(f);
+        assert(i->resource == &t->source);
+        assert(cb);
+
+        /* Does this instance already exist in the target? Then we don't need to acquire anything */
+        existing = resource_find_instance(&t->target, i->metadata.version);
+        if (existing && (existing->is_partial || existing->is_pending))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to acquire '%s', instance is already partial or pending in the target.", i->path);
+        if (existing) {
+                log_info("No need to acquire '%s', already installed.", i->path);
+                return 0;
+        }
+
+        if (RESOURCE_IS_FILESYSTEM(t->target.type)) {
+                r = mkdir_parents(t->temporary_partial_path, 0755);
+                if (r < 0)
+                        return log_error_errno(r, "Cannot create target directory: %m");
+
+                r = mkdir_parents(t->temporary_pending_path, 0755);
+                if (r < 0)
+                        return log_error_errno(r, "Cannot create target directory: %m");
+
+                r = mkdir_parents(t->final_path, 0755);
+                if (r < 0)
+                        return log_error_errno(r, "Cannot create target directory: %m");
+
+                where = t->final_path;
+        }
+
+        if (t->target.type == RESOURCE_PARTITION) {
                 r = find_suitable_partition(
                                 t->target.path,
                                 i->metadata.size,
@@ -1168,6 +1400,25 @@ int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, voi
                 xsprintf(max_size, "%" PRIu64, t->partition_info.size);
 
                 where = t->partition_info.device;
+
+                /* Set the partition label and change the partition type to the derived "partial" type UUID
+                 * to indicate that a transfer to it is in progress. */
+                r = free_and_strdup_warn(&t->partition_info.label, t->final_partition_label);
+                if (r < 0)
+                        return r;
+                t->partition_info.type = t->partition_type_partial;
+                t->partition_change = PARTITION_LABEL | PARTITION_TYPE;
+
+                log_debug("Marking partition '%s' as partial (label='%s', type=%s).",
+                          t->partition_info.device,
+                          t->partition_info.label,
+                          SD_ID128_TO_UUID_STRING(t->partition_info.type));
+                r = patch_partition(
+                                t->target.path,
+                                &t->partition_info,
+                                t->partition_change);
+                if (r < 0)
+                        return r;
         }
 
         assert(where);
@@ -1179,7 +1430,7 @@ int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, voi
                  * download. */
 
                 if (!i->metadata.sha256sum_set)
-                        return log_error_errno(r, "SHA256 checksum not known for download '%s', refusing.", i->path);
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "SHA256 checksum not known for download '%s', refusing.", i->path);
 
                 digest = hexmem(i->metadata.sha256sum, sizeof(i->metadata.sha256sum));
                 if (!digest)
@@ -1204,9 +1455,9 @@ int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, voi
                                                SYSTEMD_IMPORT_PATH,
                                                "raw",
                                                "--direct",          /* just copy/unpack the specified file, don't do anything else */
-                                               arg_sync ? "--sync=yes" : "--sync=no",
+                                               t->context->sync ? "--sync=yes" : "--sync=no",
                                                i->path,
-                                               t->temporary_path),
+                                               t->temporary_partial_path),
                                         t, i, cb, userdata);
                         break;
 
@@ -1221,7 +1472,8 @@ int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, voi
                                                "--direct",          /* just copy/unpack the specified file, don't do anything else */
                                                "--offset", offset,
                                                "--size-max", max_size,
-                                               arg_sync ? "--sync=yes" : "--sync=no",
+                                               transfer_zero_fill(t) ? "--zero-fill=yes" : "--zero-fill=no",
+                                               t->context->sync ? "--sync=yes" : "--sync=no",
                                                i->path,
                                                t->target.path),
                                         t, i, cb, userdata);
@@ -1244,10 +1496,10 @@ int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, voi
                                        SYSTEMD_IMPORT_FS_PATH,
                                        "run",
                                        "--direct",          /* just untar the specified file, don't do anything else */
-                                       arg_sync ? "--sync=yes" : "--sync=no",
+                                       t->context->sync ? "--sync=yes" : "--sync=no",
                                        t->target.type == RESOURCE_SUBVOLUME ? "--btrfs-subvol=yes" : "--btrfs-subvol=no",
                                        i->path,
-                                       t->temporary_path),
+                                       t->temporary_partial_path),
                                 t, i, cb, userdata);
                 break;
 
@@ -1261,10 +1513,10 @@ int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, voi
                                        SYSTEMD_IMPORT_PATH,
                                        "tar",
                                        "--direct",          /* just untar the specified file, don't do anything else */
-                                       arg_sync ? "--sync=yes" : "--sync=no",
+                                       t->context->sync ? "--sync=yes" : "--sync=no",
                                        t->target.type == RESOURCE_SUBVOLUME ? "--btrfs-subvol=yes" : "--btrfs-subvol=no",
                                        i->path,
-                                       t->temporary_path),
+                                       t->temporary_partial_path),
                                 t, i, cb, userdata);
                 break;
 
@@ -1282,9 +1534,9 @@ int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, voi
                                                "raw",
                                                "--direct",          /* just download the specified URL, don't download anything else */
                                                "--verify", digest,  /* validate by explicit SHA256 sum */
-                                               arg_sync ? "--sync=yes" : "--sync=no",
+                                               t->context->sync ? "--sync=yes" : "--sync=no",
                                                i->path,
-                                               t->temporary_path),
+                                               t->temporary_partial_path),
                                         t, i, cb, userdata);
                         break;
 
@@ -1300,7 +1552,8 @@ int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, voi
                                                "--verify", digest,      /* validate by explicit SHA256 sum */
                                                "--offset", offset,
                                                "--size-max", max_size,
-                                               arg_sync ? "--sync=yes" : "--sync=no",
+                                               transfer_zero_fill(t) ? "--zero-fill=yes" : "--zero-fill=no",
+                                               t->context->sync ? "--sync=yes" : "--sync=no",
                                                i->path,
                                                t->target.path),
                                         t, i, cb, userdata);
@@ -1322,9 +1575,9 @@ int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, voi
                                        "--direct",          /* just download the specified URL, don't download anything else */
                                        "--verify", digest,  /* validate by explicit SHA256 sum */
                                        t->target.type == RESOURCE_SUBVOLUME ? "--btrfs-subvol=yes" : "--btrfs-subvol=no",
-                                       arg_sync ? "--sync=yes" : "--sync=no",
+                                       t->context->sync ? "--sync=yes" : "--sync=no",
                                        i->path,
-                                       t->temporary_path),
+                                       t->temporary_partial_path),
                                 t, i, cb, userdata);
                 break;
 
@@ -1336,74 +1589,97 @@ int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, voi
 
         if (RESOURCE_IS_FILESYSTEM(t->target.type)) {
                 bool need_sync = false;
-                assert(t->temporary_path);
+                assert(t->temporary_partial_path);
+                assert(t->temporary_pending_path);
 
                 /* Apply file attributes if set */
-                if (f.mtime != USEC_INFINITY) {
+                if (f->mtime != USEC_INFINITY) {
                         struct timespec ts;
 
-                        timespec_store(&ts, f.mtime);
+                        timespec_store(&ts, f->mtime);
 
-                        if (utimensat(AT_FDCWD, t->temporary_path, (struct timespec[2]) { ts, ts }, AT_SYMLINK_NOFOLLOW) < 0)
-                                return log_error_errno(errno, "Failed to adjust mtime of '%s': %m", t->temporary_path);
+                        if (utimensat(AT_FDCWD, t->temporary_partial_path, (struct timespec[2]) { ts, ts }, AT_SYMLINK_NOFOLLOW) < 0)
+                                return log_error_errno(errno, "Failed to adjust mtime of '%s': %m", t->temporary_partial_path);
 
                         need_sync = true;
                 }
 
-                if (f.mode != MODE_INVALID) {
+                if (f->mode != MODE_INVALID) {
                         /* Try with AT_SYMLINK_NOFOLLOW first, because it's the safe thing to do. Older
                          * kernels don't support that however, in that case we fall back to chmod(). Not as
                          * safe, but shouldn't be a problem, given that we don't create symlinks here. */
-                        if (fchmodat(AT_FDCWD, t->temporary_path, f.mode, AT_SYMLINK_NOFOLLOW) < 0 &&
-                            (!ERRNO_IS_NOT_SUPPORTED(errno) || chmod(t->temporary_path, f.mode) < 0))
-                                return log_error_errno(errno, "Failed to adjust mode of '%s': %m", t->temporary_path);
+                        if (fchmodat(AT_FDCWD, t->temporary_partial_path, f->mode, AT_SYMLINK_NOFOLLOW) < 0 &&
+                            (!ERRNO_IS_NOT_SUPPORTED(errno) || chmod(t->temporary_partial_path, f->mode) < 0))
+                                return log_error_errno(errno, "Failed to adjust mode of '%s': %m", t->temporary_partial_path);
 
                         need_sync = true;
                 }
 
                 /* Synchronize */
-                if (arg_sync && need_sync) {
+                if (t->context->sync && need_sync) {
                         if (t->target.type == RESOURCE_REGULAR_FILE)
-                                r = fsync_path_and_parent_at(AT_FDCWD, t->temporary_path);
+                                r = fsync_path_and_parent_at(AT_FDCWD, t->temporary_partial_path);
                         else {
                                 assert(IN_SET(t->target.type, RESOURCE_DIRECTORY, RESOURCE_SUBVOLUME));
-                                r = syncfs_path(AT_FDCWD, t->temporary_path);
+                                r = syncfs_path(AT_FDCWD, t->temporary_partial_path);
                         }
                         if (r < 0)
-                                return log_error_errno(r, "Failed to synchronize file system backing '%s': %m", t->temporary_path);
+                                return log_error_errno(r, "Failed to synchronize file system backing '%s': %m", t->temporary_partial_path);
                 }
 
-                t->install_read_only = f.read_only;
+                t->install_read_only = f->read_only;
+
+                /* Rename the file from `.sysupdate.partial.<VERSION>` to `.sysupdate.pending.<VERSION>` to indicate it’s ready to install. */
+                log_debug("Renaming resource instance '%s' to '%s'.", t->temporary_partial_path, t->temporary_pending_path);
+                r = install_file(AT_FDCWD, t->temporary_partial_path,
+                                 AT_FDCWD, t->temporary_pending_path,
+                                 INSTALL_REPLACE|
+                                 (t->install_read_only > 0 ? INSTALL_READ_ONLY : 0)|
+                                 (t->target.type == RESOURCE_REGULAR_FILE ? INSTALL_FSYNC_FULL : INSTALL_SYNCFS));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to move '%s' into pending place: %m", t->temporary_pending_path);
         }
 
         if (t->target.type == RESOURCE_PARTITION) {
-                free_and_replace(t->partition_info.label, formatted_pattern);
-                t->partition_change = PARTITION_LABEL;
+                /* Now change the partition type to the derived "pending" type UUID to indicate that the
+                 * acquire is complete and the partition is ready for install. */
+                t->partition_info.type = t->partition_type_pending;
+                t->partition_change = PARTITION_TYPE;
 
-                if (f.partition_uuid_set) {
-                        t->partition_info.uuid = f.partition_uuid;
+                if (f->partition_uuid_set) {
+                        t->partition_info.uuid = f->partition_uuid;
                         t->partition_change |= PARTITION_UUID;
                 }
 
-                if (f.partition_flags_set) {
-                        t->partition_info.flags = f.partition_flags;
+                if (f->partition_flags_set) {
+                        t->partition_info.flags = f->partition_flags;
                         t->partition_change |= PARTITION_FLAGS;
                 }
 
-                if (f.no_auto >= 0) {
-                        t->partition_info.no_auto = f.no_auto;
+                if (f->no_auto >= 0) {
+                        t->partition_info.no_auto = f->no_auto;
                         t->partition_change |= PARTITION_NO_AUTO;
                 }
 
-                if (f.read_only >= 0) {
-                        t->partition_info.read_only = f.read_only;
+                if (f->read_only >= 0) {
+                        t->partition_info.read_only = f->read_only;
                         t->partition_change |= PARTITION_READ_ONLY;
                 }
 
-                if (f.growfs >= 0) {
-                        t->partition_info.growfs = f.growfs;
+                if (f->growfs >= 0) {
+                        t->partition_info.growfs = f->growfs;
                         t->partition_change |= PARTITION_GROWFS;
                 }
+
+                log_debug("Marking partition '%s' as pending (type=%s).",
+                          t->partition_info.device,
+                          SD_ID128_TO_UUID_STRING(t->partition_info.type));
+                r = patch_partition(
+                                t->target.path,
+                                &t->partition_info,
+                                t->partition_change);
+                if (r < 0)
+                        return r;
         }
 
         /* For regular file cases the only step left is to install the file in place, which install_file()
@@ -1411,6 +1687,44 @@ int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, voi
          * which is done at the same place. */
 
         log_info("Successfully acquired '%s'.", i->path);
+        return 0;
+}
+
+int transfer_process_partial_and_pending_instance(Transfer *t, Instance *i) {
+        InstanceMetadata f;
+        Instance *existing;
+        int r;
+
+        assert(t);
+        assert(i);
+
+        log_debug("transfer_process_partial_and_pending_instance %s", i->path);
+
+        /* Does this instance already exist in the target but isn’t pending? */
+        existing = resource_find_instance(&t->target, i->metadata.version);
+        if (existing && !existing->is_pending) {
+                log_info("Resource '%s' instance is already in the target but is not pending.", i->path);
+                return 0;
+        }
+
+        /* All we need to do is compute the temporary paths. We don’t need to do any of the other work in
+         * transfer_acquire_instance(). */
+        r = transfer_compute_temporary_paths(t, i, &f);
+        if (r < 0)
+                return r;
+
+        /* This is the analogue of find_suitable_partition(), but since finding the suitable partition has
+         * already happened in the acquire phase, the target should already have that information and it
+         * should already have been claimed with the pending partition type UUID. */
+        if (t->target.type == RESOURCE_PARTITION) {
+                assert(i->resource == &t->target);
+                assert(i->is_pending);
+
+                r = partition_info_copy(&t->partition_info, &i->partition_info);
+                if (r < 0)
+                        return r;
+        }
+
         return 0;
 }
 
@@ -1424,13 +1738,15 @@ int transfer_install_instance(
         assert(t);
         assert(i);
         assert(i->resource);
-        assert(t == container_of(i->resource, Transfer, source));
+        assert(i->is_pending || t == container_of(i->resource, Transfer, source));
 
-        if (t->temporary_path) {
+        log_debug("transfer_install_instance %s %s %s %d", i->path, t->temporary_pending_path, t->final_partition_label, t->partition_change);
+
+        if (t->temporary_pending_path) {
                 assert(RESOURCE_IS_FILESYSTEM(t->target.type));
                 assert(t->final_path);
 
-                r = install_file(AT_FDCWD, t->temporary_path,
+                r = install_file(AT_FDCWD, t->temporary_pending_path,
                                  AT_FDCWD, t->final_path,
                                  INSTALL_REPLACE|
                                  (t->install_read_only > 0 ? INSTALL_READ_ONLY : 0)|
@@ -1444,11 +1760,22 @@ int transfer_install_instance(
                          t->final_path,
                          resource_type_to_string(t->target.type));
 
-                t->temporary_path = mfree(t->temporary_path);
+                t->temporary_pending_path = mfree(t->temporary_pending_path);
+
+                (void) context_installdb_record(t->context, t->target.path, t->target.patterns);
         }
 
-        if (t->partition_change != 0) {
+        if (t->final_partition_label) {
                 assert(t->target.type == RESOURCE_PARTITION);
+                assert(t->target.partition_type_set);
+
+                r = free_and_strdup_warn(&t->partition_info.label, t->final_partition_label);
+                if (r < 0)
+                        return r;
+
+                /* Restore the original partition type UUID now that the partition is fully installed. */
+                t->partition_info.type = t->target.partition_type.uuid;
+                t->partition_change = PARTITION_LABEL | PARTITION_TYPE;
 
                 r = patch_partition(
                                 t->target.path,
@@ -1513,6 +1840,10 @@ int transfer_install_instance(
                         r = path_make_relative(parent, link_target, &relative);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to make symlink path '%s' relative to '%s': %m", link_target, parent);
+
+                        r = mkdir_parents(link_path, 0755);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to create directory for current symlink '%s': %m", link_path);
 
                         r = symlink_atomic(relative, link_path);
                         if (r < 0)

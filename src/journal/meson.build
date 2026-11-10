@@ -3,7 +3,8 @@
 systemd_journald_sources = files(
         'journald.c',
 )
-systemd_journald_extract_sources = files(
+systemd_journald_export_sources = files(
+        'audit-type.c',
         'journald-audit.c',
         'journald-client.c',
         'journald-config.c',
@@ -19,9 +20,6 @@ systemd_journald_extract_sources = files(
         'journald-syslog.c',
         'journald-varlink.c',
         'journald-wall.c',
-        # Build fuzz-journald.c as part of systemd-journald so we only compile it once instead of once per
-        # fuzz test.
-        'fuzz-journald-util.c',
 )
 
 journald_gperf_c = custom_target(
@@ -30,49 +28,79 @@ journald_gperf_c = custom_target(
         command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
 generated_sources += journald_gperf_c
-systemd_journald_extract_sources += journald_gperf_c
+systemd_journald_export_sources += journald_gperf_c
+
+generate_audit_type_list = files('generate-audit_type-list.sh')
+generate_audit_type_command = [env, 'bash', generate_audit_type_list, cpp]
+if libaudit.found()
+        # With the freedesktop.org sysroot rules (e.g. PKG_CONFIG_FDO_SYSROOT_RULES=1, as set by
+        # OpenEmbedded), pkg-config does not prepend the sysroot to variables. Do it ourselves.
+        libaudit_includedir = libaudit.get_variable('includedir')
+        libaudit_sysroot = libaudit.get_variable(pkgconfig : 'pc_sysrootdir', default_value : '')
+        if libaudit_sysroot not in ['', '/'] and not libaudit_includedir.startswith(libaudit_sysroot + '/')
+                libaudit_includedir = libaudit_sysroot + libaudit_includedir
+        endif
+
+        generate_audit_type_command += [
+                '-include', 'libaudit.h',
+                '-I' + libaudit_includedir,
+        ]
+endif
+generate_audit_type_command += system_include_args
+
+audit_type_list_txt = custom_target(
+        input : [generate_audit_type_list],
+        output : 'audit_type-list.txt',
+        command : generate_audit_type_command,
+        capture : true)
+
+audit_type_to_name = custom_target(
+        input : ['audit_type-to-name.awk', audit_type_list_txt],
+        output : 'audit_type-to-name.inc',
+        command : [awk, '-f', '@INPUT0@', '@INPUT1@'],
+        capture : true)
+
+generated_sources += audit_type_to_name
+systemd_journald_export_sources += audit_type_to_name
 
 journalctl_sources = files(
         'journalctl.c',
         'journalctl-authenticate.c',
         'journalctl-catalog.c',
         'journalctl-filter.c',
+        'journalctl-metrics.c',
         'journalctl-misc.c',
         'journalctl-show.c',
         'journalctl-util.c',
         'journalctl-varlink.c',
+        'journalctl-varlink-server.c',
 )
 
-if get_option('link-journalctl-shared')
-        journalctl_link_with = [libshared]
-else
-        journalctl_link_with = [
-                libshared_static,
-                libsystemd_static,
-        ]
-endif
-
 journal_test_template = test_template + {
-        'objects' : ['systemd-journald'],
+        'import' : ['systemd-journald'],
 }
 
 journal_fuzz_template = fuzz_template + {
-        'objects' : ['systemd-journald'],
-        'dependencies' : libselinux,
+        'import' : [
+                'fuzz-journald-audit',
+                'systemd-journald',
+        ],
+        'dependencies' : libselinux_cflags,
 }
 
 executables += [
         libexec_template + {
                 'name' : 'systemd-journald',
-                'sources' : systemd_journald_sources + systemd_journald_extract_sources,
-                'include_directories' : [libexec_template['include_directories'], include_directories('.')],
-                'extract' : systemd_journald_extract_sources,
+                'sources' : systemd_journald_sources,
+                'export' : systemd_journald_export_sources,
                 'dependencies' : [
+                        libacl_cflags,
+                        libaudit_cflags,
                         liblz4_cflags,
-                        libselinux,
+                        libpcre2_cflags,
+                        libselinux_cflags,
                         libxz_cflags,
                         libzstd_cflags,
-                        threads,
                 ],
         },
         libexec_template + {
@@ -80,33 +108,37 @@ executables += [
                 'public' : true,
                 'conditions' : ['HAVE_QRENCODE'],
                 'sources' : files('bsod.c'),
-                'dependencies' : libqrencode,
+                'dependencies' : [
+                        libqrencode_cflags,
+                ],
         },
         executable_template + {
                 'name' : 'systemd-cat',
                 'public' : true,
                 'sources' : files('cat.c'),
-                'objects' : ['systemd-journald'],
-                'dependencies' : [libselinux, threads],
+                'import' : ['systemd-journald'],
         },
         executable_template + {
                 'name' : 'journalctl',
                 'public' : true,
                 'sources' : journalctl_sources,
-                'link_with' : journalctl_link_with,
                 'dependencies' : [
-                        libdl,
                         liblz4_cflags,
+                        libopenssl_cflags,
+                        libpcre2_cflags,
                         libxz_cflags,
                         libzstd_cflags,
-                        threads,
                 ],
+                'install' : get_option('link-journalctl-shared') ? 'yes' : 'static',
+        },
+        journal_test_template + {
+                'sources' : files('test-audit-type.c'),
         },
         journal_test_template + {
                 'sources' : files('test-journald-config.c'),
                 'dependencies' : [
                         liblz4_cflags,
-                        libselinux,
+                        libselinux_cflags,
                         libxz_cflags,
                 ],
         },
@@ -114,7 +146,7 @@ executables += [
                 'sources' : files('test-journald-rate-limit.c'),
                 'dependencies' : [
                         liblz4_cflags,
-                        libselinux,
+                        libselinux_cflags,
                         libxz_cflags,
                 ],
         },
@@ -122,19 +154,21 @@ executables += [
                 'sources' : files('test-journald-syslog.c'),
                 'dependencies' : [
                         liblz4_cflags,
-                        libselinux,
+                        libselinux_cflags,
                         libxz_cflags,
-                        threads,
                 ],
         },
         journal_test_template + {
                 'sources' : files('test-journald-tables.c'),
                 'dependencies' : [
-                        libselinux,
+                        libselinux_cflags,
                 ],
         },
-        journal_fuzz_template + {
+        fuzz_template + {
                 'sources' : files('fuzz-journald-audit.c'),
+                # fuzz-journald-util.c is shared with the other fuzzers below.
+                'export' : files('fuzz-journald-util.c'),
+                'import' : ['systemd-journald'],
         },
         journal_fuzz_template + {
                 'sources' : files('fuzz-journald-kmsg.c'),
@@ -153,10 +187,12 @@ executables += [
         },
 ]
 
-if install_sysconfdir_samples
-        install_data('journald.conf',
-                     install_dir : pkgconfigfiledir)
-endif
+custom_target(
+        input : 'journald.conf.in',
+        output: 'journald.conf',
+        command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
+        install : install_sysconfdir_samples,
+        install_dir : pkgconfigfiledir)
 
 if get_option('create-log-dirs')
         install_emptydir('/var/log/journal',

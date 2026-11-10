@@ -13,9 +13,6 @@ You need to make the follow changes to adapt systemd to your distribution:
 
 1. Find the right configure parameters for:
 
-   * `-Dsysvinit-path=`
-   * `-Dsysvrcnd-path=`
-   * `-Drc-local=`
    * `-Dloadkeys-path=`
    * `-Dsetfont-path=`
    * `-Dtty-gid=`
@@ -56,15 +53,18 @@ If you prefer to use leap second steps, please register your own
 vendor pool at ntp.org and make it the built-in default by
 passing `-Dntp-servers=` to meson.
 Registering vendor pools is
-[free](http://www.pool.ntp.org/en/vendors.html).
+[free](https://www.pool.ntp.org/en/vendors.html).
 
 Use `-Dntp-servers=` to direct systemd-timesyncd to different fallback
 NTP servers.
 
 ## DNS Servers
 
-By default, systemd-resolved uses Cloudflare, Google, Quad9 and DNS0 Public DNS servers
-`1.1.1.1`, `8.8.8.8`, `9.9.9.9`, `193.110.81.0`, `1.0.0.1`, `8.8.4.4`, `149.112.112.112`, `185.253.5.0`, `2606:4700:4700::1111`, `2001:4860:4860::8888`, `2620:fe::fe`, `2a0f:fc80::`, `2606:4700:4700::1001`, `2001:4860:4860::8844`, `2620:fe::9`, `2a0f:fc81::`
+By default, systemd-resolved uses Cloudflare, Google and Quad9 Public DNS servers
+`1.1.1.1`, `8.8.8.8`, `9.9.9.9`,
+`1.0.0.1`, `8.8.4.4`, `149.112.112.112`,
+`2606:4700:4700::1111`, `2001:4860:4860::8888`, `2620:fe::fe`,
+`2606:4700:4700::1001`, `2001:4860:4860::8844`, `2620:fe::9`
 as fallback, if no other DNS configuration is available.
 
 Use `-Ddns-servers=` to direct systemd-resolved to different fallback

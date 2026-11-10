@@ -45,11 +45,19 @@
     <title>Description</title>
 
     <para><command>ukify</command> is a tool whose primary purpose is to combine components (usually a
-    kernel, an initrd, and a UEFI boot stub) to create a
-    <ulink url="https://uapi-group.org/specifications/specs/unified_kernel_image/">Unified Kernel Image (UKI)</ulink>
-    — a PE binary that can be executed by the firmware to start the embedded linux kernel.
-    See <citerefentry><refentrytitle>systemd-stub</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-    for details about the stub.</para>
+    kernel, an initrd, and the
+    <citerefentry><refentrytitle>systemd-stub</refentrytitle><manvolnum>7</manvolnum></citerefentry> UEFI
+    stub) to create a <ulink url="https://uapi-group.org/specifications/specs/unified_kernel_image/">UAPI.5 Unified
+    Kernel Image (UKI)</ulink> — a single PE binary that boots the system. When the UKI is executed, the stub
+    extracts and boots the embedded linux kernel. The UKI can be started directly by the firmware or through
+    a boot loader. When used with <ulink url="https://www.qemu.org/docs/master/">qemu</ulink>, a UKI can also
+    be executed through "direct kernel boot", see example below.</para>
+
+    <para><command>ukify</command> can also be used to generate other types of UKI-like images, in particular
+    extensions. See the description of the <command>build</command> verb below. <command>ukify</command> can
+    also generate certificates and keys for SecureBoot and PCR signing, see the description of the
+    <command>genkey</command> verb below. <command>ukify</command> can also print detailed information about
+    unified kernel images, see the description of <command>inspect</command> verb below.</para>
   </refsect1>
 
   <refsect1>
@@ -135,6 +143,10 @@
       discussion of <varname>PCRPrivateKey=</varname>/<option>--pcr-private-key=</option>,
       <varname>PCRPublicKey=</varname>/<option>--pcr-public-key=</option>, and
       <varname>SecureBootPrivateKey=</varname>/<option>--secureboot-private-key=</option> below.</para>
+
+      <para>The generated certificate's name and lifetime are set with
+      <varname>SecureBootCertificateCommonName=</varname>/<option>--secureboot-certificate-common-name=</option> and
+      <varname>SecureBootCertificateValidity=</varname>/<option>--secureboot-certificate-validity=</option>.</para>
 
       <para>The output files must not exist.</para>
     </refsect2>
@@ -327,7 +339,14 @@
         <varlistentry>
           <term><option>--json</option></term>
 
-          <listitem><para>Generate JSON output (with <command>inspect</command> verb).</para>
+          <listitem><para>Generate JSON output (with <command>inspect</command> verb). The output is an
+          object whose keys are the names of the sections shared between all profiles (i.e. those
+          preceding the first <literal>.profile</literal> section), each mapping to an object describing
+          the section by its <literal>size</literal> and <literal>sha256</literal>, plus a
+          <literal>text</literal> field for textual sections. UKI sections that can occur multiple times
+          (in the same profile) are represented as array. If the image contains profiles, an additional
+          <literal>_profiles</literal> key holds an array with one object per profile, each keyed by
+          section name in the same way (starting with its <literal>.profile</literal> section).</para>
 
           <xi:include href="version-info.xml" xpointer="v255"/></listitem>
         </varlistentry>
@@ -357,7 +376,10 @@
           <listitem><para>The os-release description (the <literal>.osrel</literal> section). The argument
           may be a literal string, or <literal>@</literal> followed by a path name. If not specified, the
           <citerefentry><refentrytitle>os-release</refentrytitle><manvolnum>5</manvolnum></citerefentry> file
-          will be picked up from the host system.</para>
+          will be picked up from the host system. If explicitly set to an empty string, the ".osrel" section
+          is omitted from the UKI (this is not recommended in most cases, and causes the resulting artifact
+          to not be recognized as a UKI by other tools like <command>kernel-install</command>
+          and <command>bootctl</command>).</para>
 
           <xi:include href="version-info.xml" xpointer="v253"/></listitem>
         </varlistentry>
@@ -430,17 +452,22 @@
           <term><varname>HWIDs=<replaceable>PATH</replaceable></varname></term>
           <term><option>--hwids=<replaceable>PATH</replaceable></option></term>
 
-          <listitem><para>The hardware ID device table (the <literal>.hwids</literal> section). The argument is a
-          path to a directory with JSON HWID device description files. Each file needs to contain a single JSON object with a <literal>name</literal>, <literal>compatible</literal> and <literal>hwids</literal> keys. The <literal>name</literal> and <literal>compatible</literal> keys must have string values and the <literal>hwids</literal> key must have a list of strings as value, where the strings must be valid UUIDs that represent CHIDs/HWIDs.
+          <listitem><para>The hardware ID device table (the <literal>.hwids</literal> section). The argument
+          is a path to a directory with JSON HWID device description files. Each file needs to contain a
+          single JSON object with a <literal>name</literal>, <literal>compatible</literal> and
+          <literal>hwids</literal> keys. The <literal>name</literal> and <literal>compatible</literal> keys
+          must have string values and the <literal>hwids</literal> key must have a list of strings as value,
+          where the strings must be valid UUIDs that represent CHIDs/HWIDs.
           Example:
           <programlisting><xi:include href="ukify_hwid.json.example" parse="text" /></programlisting>
-          Here <literal>Example Laptop 16 Gen 7</literal> is the device <literal>name</literal> (as defined by the manufacturer),
-          <literal>example,laptop-16-g7</literal> is the <literal>compatible</literal> (as defined by the kernel) and <literal>hwids</literal>
-          is an array of CHIDs/HWIDs (extracted i.e. from <command>fwupdtool hwids</command> output).
-          If not specified, the section will not be present. It is recommended to specify this parameter if automatically
-          selectable DeviceTrees are to be used.
-
-          </para>
+          Here <literal>Example Laptop 16 Gen 7</literal> is the device <literal>name</literal> (as defined
+          by the manufacturer), <literal>example,laptop-16-g7</literal> is the <literal>compatible</literal>
+          (as defined by the kernel) and <literal>hwids</literal> is an array of CHIDs/HWIDs (extracted i.e.
+          from <command>fwupdtool hwids</command> output). If not specified, and the
+          <literal>/usr/lib/systemd/boot/hwids/[EFI_ARCH]/</literal> directory exists, then the section will
+          be automatically populated from that directory (specify an empty string as the parameter for this
+          option to disable this behavior), otherwise it will not be present. It is recommended to specify
+          this parameter if automatically selectable DeviceTrees are to be used.</para>
 
           <xi:include href="version-info.xml" xpointer="v257"/></listitem>
         </varlistentry>
@@ -512,6 +539,26 @@
         </varlistentry>
 
         <varlistentry>
+          <term><varname>SignInitrdPCRs=<replaceable>BOOL</replaceable></varname></term>
+          <term><option>--sign-initrd-pcrs</option></term>
+          <term><option>--no-sign-initrd-pcrs</option></term>
+
+          <listitem><para>Enable or disable signing of additional PCR policies that are bound to the initrd
+          phase (after <literal>enter-initrd</literal> and before <literal>leave-initrd</literal>) and the
+          <literal>initrd</literal> policy reference. These additional signed policies are consumed by
+          <citerefentry><refentrytitle>systemd-tpm2-setup-early.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+          to authorize the initialization of NvPCRs. They are also useful for enrolling TPM keyslots to encrypted
+          volumes that can only be unlocked from the initrd with
+          <citerefentry><refentrytitle>systemd-cryptenroll</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
+          by using the <option>--tpm2-public-key-policyref=initrd</option> option. The extra signatures reuse
+          the first <varname>PCRPrivateKey=</varname>/<option>--pcr-private-key=</option>, hence one must be
+          specified, unless <option>--policy-digest</option> is used to generate the policies for offline
+          signing. Defaults to false.</para>
+
+          <xi:include href="version-info.xml" xpointer="v262"/></listitem>
+        </varlistentry>
+
+        <varlistentry>
           <term><varname>SecureBootSigningTool=<replaceable>SIGNER</replaceable></varname></term>
           <term><option>--signtool=<replaceable>SIGNER</replaceable></option></term>
 
@@ -548,6 +595,18 @@
           <varname>SecureBootSigningTool=systemd-sbsign</varname>/<option>--signtool=systemd-sbsign</option>. </para>
 
           <xi:include href="version-info.xml" xpointer="v253"/></listitem>
+        </varlistentry>
+
+        <varlistentry>
+          <term><varname>SecureBootCertificateCommonName=<replaceable>CN</replaceable></varname></term>
+          <term><option>--secureboot-certificate-common-name=<replaceable>CN</replaceable></option></term>
+
+          <listitem><para>The common name and issuer name (certificate is self-signed) of a
+          certificate created by <command>genkey</command>. Defaults to <literal>SecureBoot signing key on host
+          <replaceable>HOST</replaceable></literal> with the fully qualified domain name of the machine it runs on.
+          Must not be empty or longer than 64 bytes (X.509 CN limit).</para>
+
+          <xi:include href="version-info.xml" xpointer="v262"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -700,6 +759,25 @@
 
           <xi:include href="version-info.xml" xpointer="v253"/></listitem>
         </varlistentry>
+
+        <varlistentry>
+          <term><varname>PolicyRef=<replaceable>STRING</replaceable></varname></term>
+          <term><varname>--policyref=<replaceable>STRING</replaceable></varname></term>
+
+          <listitem><para>A policy reference to bind the generated signature to.</para>
+
+          <para>The policy reference is an opaque string that is included in the data that is signed, and is
+          also incorporated into the authorization policy of any TPM2 resource that is locked against these
+          signatures (via the <constant>TPM2_PolicyAuthorize</constant> assertion). As a result, a signed
+          policy is only accepted for a resource whose authorization policy was created with the same
+          policy reference. Signed policies created with a different policy reference are rejected, even if
+          they are produced with the same signing key.</para>
+
+          <para>On the command line, when this argument is present, it must appear the same number of times as
+          the <option>--pcr-private-key=</option> option. </para>
+
+          <xi:include href="version-info.xml" xpointer="v262"/></listitem>
+        </varlistentry>
       </variablelist>
     </refsect2>
   </refsect1>
@@ -717,6 +795,27 @@
 </programlisting>
 
       <para>This creates an unsigned UKI <filename>./vmlinuz.unsigned.efi</filename>.</para>
+    </example>
+
+    <example>
+      <title>Direct kernel boot in a virtual machine</title>
+
+      <para>When using <ulink url="https://www.qemu.org/docs/master/">qemu</ulink> with
+      <ulink url="https://www.linux-kvm.org/downloads/lersek/ovmf-whitepaper-c770f8c.txt">OVMF</ulink>
+      (UEFI Firmware for virtual machines) the <option>-kernel</option> switch can be used directly with a
+      UKI. Example:</para>
+
+      <para>
+        <command>qemu-kvm
+        -drive if=pflash,format=qcow2,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2
+        -kernel <filename index='false'>./vmlinuz.unsigned.efi</filename>
+        <replaceable>[ ... ]</replaceable>
+        </command>
+      </para>
+
+      <para>(The path to the firmware file might need to be adjusted depending on the distribution.) Usually,
+      another <option>-drive</option> argument would to be used to attach an actual disk image, but this
+      is not required.</para>
     </example>
 
     <example>
@@ -892,6 +991,7 @@ ID=factory-reset' \
       --cmdline='quiet rw' \
       --pcr-public-key=tpm2-pcr-initrd-public-key.pem \
       --policy-digest \
+      --sign-initrd-pcrs \
       --json=short \
       --output=base.efi >base.pcrs
 </programlisting>
@@ -908,9 +1008,9 @@ base = json.load(open(base_file))
 
 for bank,policies in base.items():
     for policy in policies:
-        pol = base64.b16decode(policy['pol'].upper())
-        call = subprocess.run(['openssl', 'dgst', f'-{bank}', '-sign', priv_key],
-                              input=pol,
+        tbs = base64.b16decode(policy['tbs'].upper())
+        call = subprocess.run(['openssl', 'dgst', '-sha256', '-sign', priv_key],
+                input=tbs,
                               check=True,
                               capture_output=True)
         sig = base64.b64encode(call.stdout).decode()

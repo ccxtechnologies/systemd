@@ -15,10 +15,9 @@
  * Note that we use the GNU variant of strerror_r() here. */
 #define STRERROR(errnum) strerror_r(ABS(errnum), (char[ERRNO_BUF_LEN]){}, ERRNO_BUF_LEN)
 
-/* A helper to print an error message or message for functions that return 0 on EOF.
- * Note that we can't use ({ … }) to define a temporary variable, so errnum is
- * evaluated twice. */
-#define STRERROR_OR_EOF(errnum) ((errnum) != 0 ? STRERROR(errnum) : "Unexpected EOF")
+/* A helper to print an error message or message for functions that return 0 on EOF. */
+const char* strerror_or_eof(int errnum, char *buf, size_t buflen);
+#define STRERROR_OR_EOF(errnum) strerror_or_eof(errnum, (char[ERRNO_BUF_LEN]){}, ERRNO_BUF_LEN)
 
 static inline void _reset_errno_(int *saved_errno) {
         if (*saved_errno < 0) /* Invalidated by UNPROTECT_ERRNO? */
@@ -219,10 +218,13 @@ static inline bool ERRNO_IS_NEG_DEVICE_ABSENT_OR_EMPTY(intmax_t r) {
 }
 _DEFINE_ABS_WRAPPER(DEVICE_ABSENT_OR_EMPTY);
 
-/* Quite often we want to handle cases where the backing FS doesn't support extended attributes at all and
- * where it simply doesn't have the requested xattr the same way */
+/* Quite often we want to handle cases where the backing FS doesn't support extended attributes at all,
+ * where the path component carrying the xattr is missing, and where it simply doesn't have the requested
+ * xattr the same way. Note that getxattr(2) does not enumerate -ENOENT in its own error list, but inherits
+ * it via stat(2) (see ERRORS in getxattr(2)) for the path-component-missing case. */
 static inline bool ERRNO_IS_NEG_XATTR_ABSENT(intmax_t r) {
         return r == -ENODATA ||
+                r == -ENOENT ||
                 ERRNO_IS_NEG_NOT_SUPPORTED(r);
 }
 _DEFINE_ABS_WRAPPER(XATTR_ABSENT);

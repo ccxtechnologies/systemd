@@ -40,7 +40,7 @@ int bus_map_job_id(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_er
 
         assert(m);
 
-        return sd_bus_message_read(m, "(uo)", p, /* path = */ NULL);
+        return sd_bus_message_read(m, "(uo)", p, /* path= */ NULL);
 }
 
 static int map_basic(sd_bus_message *m, unsigned flags, void *userdata) {
@@ -173,21 +173,29 @@ int bus_message_map_all_properties(
                         if (r < 0)
                                 return bus_log_parse_error_debug(r);
 
-                        r = sd_bus_message_enter_container(m, SD_BUS_TYPE_VARIANT, contents);
-                        if (r < 0)
-                                return bus_log_parse_error_debug(r);
+                        if (prop->signature && !streq(contents, prop->signature)) {
+                                log_debug("Unexpected type for property '%s': expected '%s', got '%s', ignoring.",
+                                          member, prop->signature, contents);
+                                r = sd_bus_message_skip(m, "v");
+                                if (r < 0)
+                                        return bus_log_parse_error_debug(r);
+                        } else {
+                                r = sd_bus_message_enter_container(m, SD_BUS_TYPE_VARIANT, contents);
+                                if (r < 0)
+                                        return bus_log_parse_error_debug(r);
 
-                        v = (uint8_t *)userdata + prop->offset;
-                        if (map[i].set)
-                                r = prop->set(sd_bus_message_get_bus(m), member, m, reterr_error, v);
-                        else
-                                r = map_basic(m, flags, v);
-                        if (r < 0)
-                                return bus_log_parse_error_debug(r);
+                                v = (uint8_t*) userdata + prop->offset;
+                                if (prop->set)
+                                        r = prop->set(sd_bus_message_get_bus(m), member, m, reterr_error, v);
+                                else
+                                        r = map_basic(m, flags, v);
+                                if (r < 0)
+                                        return bus_log_parse_error_debug(r);
 
-                        r = sd_bus_message_exit_container(m);
-                        if (r < 0)
-                                return bus_log_parse_error_debug(r);
+                                r = sd_bus_message_exit_container(m);
+                                if (r < 0)
+                                        return bus_log_parse_error_debug(r);
+                        }
                 } else {
                         r = sd_bus_message_skip(m, "v");
                         if (r < 0)

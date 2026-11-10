@@ -1,85 +1,50 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
-
+#include "sd-json.h"
 #include "sd-messages.h"
 
-#include "alloc-util.h"
 #include "build.h"
+#include "dlopen-note.h"
 #include "env-util.h"
 #include "fileio.h"
 #include "log.h"
 #include "main-func.h"
-#include "pretty-print.h"
 #include "proc-cmdline.h"
 #include "tpm2-util.h"
+#include "verbs.h"
 
 static bool arg_graceful = false;
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-tpm2-clear", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s [OPTIONS...]\n"
-               "\n%5$sRequest clearing of the TPM2 from PC firmware.%6$s\n"
-               "\n%3$sOptions:%4$s\n"
-               "  -h --help               Show this help\n"
-               "     --version            Show package version\n"
-               "     --graceful           Exit gracefully if no TPM2 device is found\n"
-               "\nSee the %2$s for details.\n",
-               program_invocation_short_name,
-               link,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal());
-
-        return 0;
-}
+COMMAND(
+        "systemd-tpm2-clear\0",
+        "Request clearing of the TPM2 from PC firmware.",
+        .man_pages = "systemd-tpm2-clear.service(8)\0",
+);
 
 static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_GRACEFUL,
-        };
-
-        static const struct option options[] = {
-                { "help",     no_argument, NULL, 'h'          },
-                { "version",  no_argument, NULL, ARG_VERSION  },
-                { "graceful", no_argument, NULL, ARG_GRACEFUL },
-                {}
-        };
-
-        int c;
-
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_GRACEFUL:
+                OPTION_LONG("graceful", NULL, "Exit gracefully if no TPM2 device is found"):
                         arg_graceful = true;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (optind != argc)
+        if (option_parser_get_n_args(&opts) != 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program expects no arguments.");
 
         return 1;
@@ -122,6 +87,10 @@ static int request_tpm2_clear(void) {
 
 static int run(int argc, char *argv[]) {
         int r;
+
+        LIBTSS2_ESYS_NOTE(suggested);
+        LIBTSS2_MU_NOTE(suggested);
+        LIBTSS2_RC_NOTE(suggested);
 
         log_setup();
 

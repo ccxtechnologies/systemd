@@ -6,14 +6,17 @@
 
 #include "sd-messages.h"
 
+#include "acl-util.h"
 #include "alloc-util.h"
 #include "device-util.h"
+#include "dirent-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
 #include "hashmap.h"
 #include "id128-util.h"
+#include "json-util.h"
 #include "log.h"
 #include "logind.h"
 #include "logind-device.h"
@@ -23,15 +26,17 @@
 #include "logind-session-dbus.h"
 #include "logind-session-device.h"
 #include "logind-user.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "path-util.h"
 #include "set.h"
+#include "stat-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
 #include "terminal-util.h"
 #include "tmpfile-util.h"
 #include "udev-util.h"
 #include "user-record.h"
+#include "user-util.h"
 
 int seat_new(Manager *m, const char *id, Seat **ret) {
         _cleanup_(seat_freep) Seat *s = NULL;
@@ -68,9 +73,6 @@ Seat* seat_free(Seat *s) {
         if (!s)
                 return NULL;
 
-        if (s->in_gc_queue)
-                LIST_REMOVE(gc_queue, s->manager->seat_gc_queue, s);
-
         while (s->sessions)
                 session_free(s->sessions);
 
@@ -78,6 +80,13 @@ Seat* seat_free(Seat *s) {
 
         while (s->devices)
                 device_free(s->devices);
+
+        /* Draining sessions and devices above can put us back onto the GC queue: device_detach()
+         * re-queues the seat once it loses its last master device. Remove ourselves from the queue
+         * only here, after everything that could re-add us has run, otherwise we leave a dangling
+         * pointer behind for the next manager_gc() pass. */
+        if (s->in_gc_queue)
+                LIST_REMOVE(gc_queue, s->manager->seat_gc_queue, s);
 
         hashmap_remove(s->manager->seats, s->id);
 
@@ -321,12 +330,89 @@ static int seat_trigger_devices(Seat *s) {
                         return r;
         }
 
-        seat_triggered_uevents_done(s);
         return 0;
+}
+
+static int static_node_acl(Seat *s) {
+#if HAVE_ACL
+        int r, ret = 0;
+        _cleanup_set_free_ Set *uids = NULL;
+
+        assert(s);
+
+        if (s->active) {
+                r = set_ensure_put(&uids, NULL, UID_TO_PTR(s->active->user->user_record->uid));
+                if (r < 0)
+                        return log_oom();
+        }
+
+        _cleanup_closedir_ DIR *dir = opendir("/run/udev/static_node-tags/uaccess/");
+        if (!dir) {
+                if (errno == ENOENT)
+                        return 0;
+
+                return log_debug_errno(errno, "Failed to open /run/udev/static_node-tags/uaccess/: %m");
+        }
+
+        FOREACH_DIRENT(de, dir, return -errno) {
+                _cleanup_close_ int fd = RET_NERRNO(openat(dirfd(dir), de->d_name, O_CLOEXEC|O_PATH));
+                if (ERRNO_IS_NEG_DEVICE_ABSENT_OR_EMPTY(fd))
+                        continue;
+                if (fd < 0) {
+                        RET_GATHER(ret, log_debug_errno(fd, "Failed to open '/run/udev/static_node-tags/uaccess/%s': %m", de->d_name));
+                        continue;
+                }
+
+                struct stat st;
+                if (fstat(fd, &st) < 0) {
+                        RET_GATHER(ret, log_debug_errno(errno, "Failed to stat '/run/udev/static_node-tags/uaccess/%s': %m", de->d_name));
+                        continue;
+                }
+
+                r = stat_verify_device_node(&st);
+                if (r < 0) {
+                        RET_GATHER(ret, log_debug_errno(r, "'/run/udev/static_node-tags/uaccess/%s' points to a non-device node: %m", de->d_name));
+                        continue;
+                }
+
+                _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
+                r = sd_device_new_from_stat_rdev(&dev, &st);
+                if (r >= 0) {
+                        log_device_debug(dev, "'/run/udev/static_node-tags/uaccess/%s' points to a non-static device node, ignoring.", de->d_name);
+                        continue;
+                }
+                if (!ERRNO_IS_NEG_DEVICE_ABSENT_OR_EMPTY(r))
+                        log_debug_errno(r, "Failed to check if '/run/udev/static_node-tags/uaccess/%s' points to a static device node, ignoring: %m", de->d_name);
+
+                r = devnode_acl(fd, uids);
+                if (r >= 0 || r == -ENOENT)
+                        continue;
+
+                /* de->d_name is escaped, like "snd\x2ftimer", hence let's use the path to node, if possible. */
+                _cleanup_free_ char *node = NULL;
+                (void) fd_get_path(fd, &node);
+
+                if (!set_isempty(uids)) {
+                        RET_GATHER(ret, log_debug_errno(r, "Failed to apply ACL on '%s': %m", node ?: de->d_name));
+
+                        /* Better be safe than sorry and reset ACL */
+                        r = devnode_acl(fd, /* uids= */ NULL);
+                        if (r >= 0 || r == -ENOENT)
+                                continue;
+                }
+                if (r < 0)
+                        RET_GATHER(ret, log_debug_errno(r, "Failed to flush ACL on '%s': %m", node ?: de->d_name));
+        }
+
+        return ret;
+#else
+        return 0;
+#endif
 }
 
 int seat_set_active(Seat *s, Session *session) {
         Session *old_active;
+        int r;
 
         assert(s);
         assert(!session || session->seat == s);
@@ -358,7 +444,16 @@ int seat_set_active(Seat *s, Session *session) {
                 session_send_changed(old_active, "Active");
         }
 
-        return seat_trigger_devices(s);
+        r = seat_trigger_devices(s);
+        if (r < 0)
+                return r;
+
+        r = static_node_acl(s);
+        if (r < 0)
+                return r;
+
+        seat_triggered_uevents_done(s);
+        return 0;
 }
 
 static Session* seat_get_position(Seat *s, unsigned pos) {
@@ -482,8 +577,8 @@ int seat_read_active_vt(Seat *s) {
         if (!seat_has_vts(s))
                 return 0;
 
-        if (lseek(s->manager->console_active_fd, SEEK_SET, 0) < 0)
-                return log_error_errno(errno, "lseek on console_active_fd failed: %m");
+        if (lseek(s->manager->console_active_fd, 0, SEEK_SET) < 0)
+                return log_error_errno(errno, "lseek() on console_active_fd failed: %m");
 
         errno = 0;
         k = read(s->manager->console_active_fd, t, sizeof(t)-1);
@@ -683,7 +778,7 @@ bool seat_can_graphical(Seat *s) {
         return seat_has_master_device(s);
 }
 
-int seat_get_idle_hint(Seat *s, dual_timestamp *t) {
+bool seat_get_idle_hint(Seat *s, dual_timestamp *ret_timestamp) {
         bool idle_hint = true;
         dual_timestamp ts = DUAL_TIMESTAMP_NULL;
 
@@ -691,12 +786,9 @@ int seat_get_idle_hint(Seat *s, dual_timestamp *t) {
 
         LIST_FOREACH(sessions_by_seat, session, s->sessions) {
                 dual_timestamp k;
-                int ih;
+                bool ih;
 
                 ih = session_get_idle_hint(session, &k);
-                if (ih < 0)
-                        return ih;
-
                 if (!ih) {
                         if (!idle_hint) {
                                 if (k.monotonic > ts.monotonic)
@@ -706,14 +798,13 @@ int seat_get_idle_hint(Seat *s, dual_timestamp *t) {
                                 ts = k;
                         }
                 } else if (idle_hint) {
-
                         if (k.monotonic > ts.monotonic)
                                 ts = k;
                 }
         }
 
-        if (t)
-                *t = ts;
+        if (ret_timestamp)
+                *ret_timestamp = ts;
 
         return idle_hint;
 }
@@ -738,6 +829,61 @@ void seat_add_to_gc_queue(Seat *s) {
 
         LIST_PREPEND(gc_queue, s->manager->seat_gc_queue, s);
         s->in_gc_queue = true;
+}
+
+static int seat_sessions_build_json(sd_json_variant **ret, const char *name, void *userdata) {
+        Seat *s = ASSERT_PTR(userdata);
+        int r;
+
+        assert(ret);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        LIST_FOREACH(sessions_by_seat, session, s->sessions) {
+                r = sd_json_variant_append_arrayb(&v, SD_JSON_BUILD_STRING(session->id));
+                if (r < 0)
+                        return r;
+        }
+
+        *ret = TAKE_PTR(v);
+        return 0;
+}
+
+static int seat_context_build_json(sd_json_variant **ret, const char *name, void *userdata) {
+        Seat *s = ASSERT_PTR(userdata);
+
+        assert(ret);
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_STRING("Id", s->id));
+}
+
+static int seat_runtime_build_json(sd_json_variant **ret, const char *name, void *userdata) {
+        Seat *s = ASSERT_PTR(userdata);
+
+        assert(ret);
+
+        dual_timestamp idle_ts;
+        bool idle = seat_get_idle_hint(s, &idle_ts);
+
+        return sd_json_buildo(
+                        ret,
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("ActiveSession", s->active ? s->active->id : NULL),
+                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("Sessions", seat_sessions_build_json, s),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("CanTTY", seat_can_tty(s)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("CanGraphical", seat_can_graphical(s)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("IdleHint", idle),
+                        SD_JSON_BUILD_PAIR_CONDITION(idle, "IdleSinceHint", JSON_BUILD_DUAL_TIMESTAMP(&idle_ts)));
+}
+
+int seat_build_json(Seat *s, sd_json_variant **ret) {
+        assert(s);
+        assert(ret);
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_CALLBACK("context", seat_context_build_json, s),
+                        SD_JSON_BUILD_PAIR_CALLBACK("runtime", seat_runtime_build_json, s));
 }
 
 static bool seat_name_valid_char(char c) {

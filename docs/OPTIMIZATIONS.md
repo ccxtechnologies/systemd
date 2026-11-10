@@ -9,7 +9,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 _So you are working on a Linux distribution or appliance and need very fast boot-ups?_
 
-systemd can already offer boot times of < 1s for the Core OS (userspace only, i.e. only the bits controlled by systemd) and < 2s for a complete up-to-date desktop environments on simpler (but modern, i.e. SSDs) laptops if configured properly (examples: [http://git.fenrus.org/tmp/bootchart-20120512-1036.svg](http://git.fenrus.org/tmp/bootchart-20120512-1036.svg)).
+systemd can already offer boot times of < 1s for the Core OS (userspace only, i.e. only the bits controlled by systemd) and < 2s for a complete up-to-date desktop environments on simpler (but modern, i.e. SSDs) laptops if configured properly.
 
 In this page we want to suggest a couple of ideas how to achieve that, and if the resulting boot times do not suffice where we believe room for improvements are that we'd like to see implemented sooner or later.
 
@@ -96,7 +96,7 @@ This requires introduction of a new kernel interface to get notifications for cg
 
 19. Make use of EXT4_IOC_MOVE_EXT in systemd's readahead implementation.
 This allows reordering/defragmentation of the files needed for boot.
-According to the data from [http://e4rat.sourceforge.net/](http://e4rat.sourceforge.net/) this might shorten the boot time to 40%.
+According to the data from [https://e4rat.sourceforge.net/](https://e4rat.sourceforge.net/) this might shorten the boot time to 40%.
 Implementation is not trivial, but given that we already support btrfs defragmentation and example code for this exists (e4rat as linked) should be fairly straightforward.
 
 20. Compress readahead pack files with XZ or so.Since boot these days tends to be clearly IO bound (and not CPU bound) it might make sense to reduce the IO load for the pack file by compressing it. Since we already have a dependency on XZ we'd recommend using XZ for this.

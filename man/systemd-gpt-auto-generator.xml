@@ -36,7 +36,7 @@
     (XBOOTLDR), and swap partitions and creates mount and swap units for them, based on the partition type
     GUIDs of GUID partition tables (GPT). See <ulink url="https://uefi.org/specifications">UEFI
     Specification</ulink>, chapter 5 for more details. It implements the <ulink
-    url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable
+    url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">UAPI.2 Discoverable
     Partitions Specification</ulink>.</para>
 
     <para>Note that this generator has no effect on non-GPT systems. It will also not create mount point
@@ -75,6 +75,13 @@
       discovery based on the boot loader reported ESP which is also enabled if no <literal>root=</literal>
       parameter is specified at all. (The latter relies on <command>systemd-udevd.service</command>'s
       <filename>/dev/gpt-auto-root</filename> block device symlink generation).</para></listitem>
+
+      <listitem><para>It will also generate a unit file mounting the EFI System Partition (ESP) to
+      <filename>/sysefi/</filename>, if applicable. Unlike the file systems mentioned above this mount is not
+      activated by default however, but can be pulled in by services requiring ESP access from within the
+      initrd. Note that this mount point is initrd-specific and does not make use of autofs. The ESP is
+      typically mounted at a different place and via autofs once the system transitions out of the
+      initrd.</para></listitem>
     </itemizedlist>
     </para>
 
@@ -138,7 +145,7 @@
             <entry>…</entry>
             <entry>Root partitions for other architectures</entry>
             <entry><filename>/</filename></entry>
-            <entry>The first partition with the type UUID matching the architecture, located on the same disk as the ESP used for booting, is used as the root file system <filename>/</filename>. For the full list and constant values, see <ulink url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">Discoverable Partitions Specification</ulink>.</entry>
+            <entry>The first partition with the type UUID matching the architecture, located on the same disk as the ESP used for booting, is used as the root file system <filename>/</filename>. For the full list and constant values, see <ulink url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification">UAPI.2 Discoverable Partitions Specification</ulink>.</entry>
           </row>
           <row>
             <entry><constant>SD_GPT_HOME</constant></entry>
@@ -179,7 +186,7 @@
             <entry><constant>SD_GPT_ESP</constant></entry>
             <entry><constant>c12a7328-f81f-11d2-ba4b-00a0c93ec93b</constant></entry>
             <entry>EFI System Partition (ESP)</entry>
-            <entry><filename>/efi/</filename> or <filename>/boot/</filename></entry>
+            <entry><filename>/efi/</filename> or <filename>/boot/</filename> once the system transitioned out of the initrd, <filename>/sysefi/</filename> before</entry>
             <entry>The first partition with this type UUID located on the same disk as the root partition is mounted to <filename>/boot/</filename> or <filename>/efi/</filename>, see below.</entry>
           </row>
           <row>
@@ -252,14 +259,16 @@
 
     <para>Mount and automount units for the EFI System Partition (ESP) and Extended Boot Loader Partition
     (XBOOTLDR) are generated on EFI systems. If the disk contains an XBOOTLDR partition, as defined in the
-    <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader
+    <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">UAPI.1 Boot Loader
     Specification</ulink>, it is made available at <filename>/boot/</filename>. This generator creates an
     automount unit; the mount will only be activated on-demand when accessed. The mount point will be created
     if necessary.</para>
 
-    <para>The ESP is mounted to <filename>/boot/</filename> if that directory exists and is not used for
+    <para>The ESP is mounted to <filename>/boot/</filename> if that directory is not used for
     XBOOTLDR, and otherwise to <filename>/efi/</filename>. Same as for <filename>/boot/</filename>, an
-    automount unit is used. The mount point will be created if necessary.</para>
+    automount unit is used. The mount point will be created if necessary. These apply once the system
+    transitioned out of the initrd phase. Before that, if components in the initrd require ESP access, it
+    will be mounted to <filename>/sysefi/</filename>.</para>
 
     <para>No configuration is created for mount points that are configured in <citerefentry
     project='man-pages'><refentrytitle>fstab</refentrytitle><manvolnum>5</manvolnum></citerefentry> or when
@@ -272,9 +281,13 @@
     <para>If the system was booted via
     <citerefentry><refentrytitle>systemd-stub</refentrytitle><manvolnum>7</manvolnum></citerefentry> and the
     stub reported to userspace that the kernel image was measured to a TPM2 PCR, then any discovered root and
-    <filename>/var/</filename> volume identifiers (and volume encryption key in case it is encrypted) will be
-    automatically measured into PCR 15 on activation, via
-    <citerefentry><refentrytitle>systemd-pcrfs@.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
+    <filename>/var/</filename> volume identifiers (and volume encryption keys, in case they are encrypted)
+    will be automatically measured into PCR 15 on activation, via
+    <citerefentry><refentrytitle>systemd-pcrfs@.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>. Moreover,
+    information about the LUKS key slot used to unlock the volume is measured into NvPCR
+    <literal>cryptsetup</literal>. Finally, if the root or <filename>/usr/</filename> partition is protected
+    via Verity its root hash and the serial/issuer of the key used for the provided root hash signature (if
+    any) are measured into the NvPCR <literal>verity</literal>.</para>
 
     <para>Mount constraint metadata contained in the file systems is validated by pulling in
     <citerefentry><refentrytitle>systemd-validatefs@.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
@@ -354,7 +367,7 @@
         automatic discovery of the root partition based on GPT partition information is enabled. This is a
         superset of <varname>root=gpt-auto</varname>, as it automatically configures Verity partitions
         (including signature-based setup) following the logic defined for that in the <ulink
-        url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification/">Discoverable
+        url="https://uapi-group.org/specifications/specs/discoverable_partitions_specification/">UAPI.2 Discoverable
         Partitions Specification</ulink>. Moreover it takes the configured image policy and image filter into
         account for all partition types, including the root file system. <literal>root=dissect</literal> will
         wait for the factory reset phase to be completed if it is in effect before activating the root file

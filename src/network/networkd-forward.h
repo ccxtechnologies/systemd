@@ -1,8 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+/* IWYU pragma: always_keep */
+
 #include "conf-parser-forward.h"    /* IWYU pragma: export */
-#include "forward.h"                /* IWYU pragma: export */
+#include "dhcp-forward.h"           /* IWYU pragma: export */
+#include "forward.h"         /* IWYU pragma: export */
 
 typedef enum NetDevLocalAddressType NetDevLocalAddressType;
 typedef enum NetworkConfigSource NetworkConfigSource;

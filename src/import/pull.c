@@ -1,25 +1,27 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <locale.h>
-#include <stdio.h>
 
 #include "sd-event.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
-#include "ansi-color.h"
 #include "build.h"
 #include "discover-image.h"
+#include "dlopen-note.h"
 #include "env-util.h"
 #include "hexdecoct.h"
 #include "import-common.h"
 #include "import-util.h"
 #include "io-util.h"
+#include "iovec-util.h"
 #include "log.h"
 #include "main-func.h"
+#include "oci-util.h"
 #include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "pull-oci.h"
 #include "pull-raw.h"
 #include "pull-tar.h"
 #include "runtime-scope.h"
@@ -28,19 +30,27 @@
 #include "verbs.h"
 #include "web-util.h"
 
-static const char *arg_image_root = NULL;
+static char *arg_image_root = NULL;
 static ImportVerify arg_verify = IMPORT_VERIFY_SIGNATURE;
 static ImportFlags arg_import_flags = IMPORT_PULL_SETTINGS | IMPORT_PULL_ROOTHASH | IMPORT_PULL_ROOTHASH_SIGNATURE | IMPORT_PULL_VERITY | IMPORT_BTRFS_SUBVOL | IMPORT_BTRFS_QUOTA | IMPORT_CONVERT_QCOW2 | IMPORT_SYNC;
 static uint64_t arg_offset = UINT64_MAX, arg_size_max = UINT64_MAX;
-static char *arg_checksum = NULL;
+static struct iovec arg_checksum = {};
 static ImageClass arg_class = IMAGE_MACHINE;
 static RuntimeScope arg_runtime_scope = _RUNTIME_SCOPE_INVALID;
 
-STATIC_DESTRUCTOR_REGISTER(arg_checksum, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_checksum, iovec_done);
+STATIC_DESTRUCTOR_REGISTER(arg_image_root, freep);
+
+COMMAND(
+        "systemd-pull\0",
+        "Download disk images.",
+);
 
 static int normalize_local(const char *local, const char *url, char **ret) {
         _cleanup_free_ char *ll = NULL;
         int r;
+
+        assert(ret);
 
         if (arg_import_flags & IMPORT_DIRECT) {
 
@@ -113,7 +123,8 @@ static void on_tar_finished(TarPull *pull, int error, void *userdata) {
         sd_event_exit(event, ABS(error));
 }
 
-static int pull_tar(int argc, char *argv[], void *userdata) {
+VERB(verb_tar, "tar", "URL [NAME]\0", 2, 3, 0, "Download a TAR image");
+static int verb_tar(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_free_ char *ll = NULL, *normalized = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_(tar_pull_unrefp) TarPull *pull = NULL;
@@ -161,7 +172,7 @@ static int pull_tar(int argc, char *argv[], void *userdata) {
                         normalized,
                         arg_import_flags & IMPORT_PULL_FLAGS_MASK_TAR,
                         arg_verify,
-                        arg_checksum);
+                        &arg_checksum);
         if (r < 0)
                 return log_error_errno(r, "Failed to pull image: %m");
 
@@ -183,7 +194,8 @@ static void on_raw_finished(RawPull *pull, int error, void *userdata) {
         sd_event_exit(event, ABS(error));
 }
 
-static int pull_raw(int argc, char *argv[], void *userdata) {
+VERB(verb_raw, "raw", "URL [NAME]\0", 2, 3, 0, "Download a RAW image");
+static int verb_raw(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_free_ char *ll = NULL, *normalized = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_(raw_pull_unrefp) RawPull *pull = NULL;
@@ -230,7 +242,7 @@ static int pull_raw(int argc, char *argv[], void *userdata) {
                         arg_size_max,
                         arg_import_flags & IMPORT_PULL_FLAGS_MASK_RAW,
                         arg_verify,
-                        arg_checksum);
+                        &arg_checksum);
         if (r < 0)
                 return log_error_errno(r, "Failed to pull image: %m");
 
@@ -242,144 +254,125 @@ static int pull_raw(int argc, char *argv[], void *userdata) {
         return -r;
 }
 
-static int help(int argc, char *argv[], void *userdata) {
+static void on_oci_finished(OciPull *pull, int error, void *userdata) {
+        sd_event *event = userdata;
+        assert(pull);
 
-        printf("%1$s [OPTIONS...] {COMMAND} ...\n"
-               "\n%4$sDownload disk images.%5$s\n"
-               "\n%2$sCommands:%3$s\n"
-               "  tar URL [NAME]              Download a TAR image\n"
-               "  raw URL [NAME]              Download a RAW image\n"
-               "\n%2$sOptions:%3$s\n"
-               "  -h --help                   Show this help\n"
-               "     --version                Show package version\n"
-               "     --force                  Force creation of image\n"
-               "     --verify=MODE            Verify downloaded image, one of: 'no',\n"
-               "                              'checksum', 'signature' or literal SHA256 hash\n"
-               "     --settings=BOOL          Download settings file with image\n"
-               "     --roothash=BOOL          Download root hash file with image\n"
-               "     --roothash-signature=BOOL\n"
-               "                              Download root hash signature file with image\n"
-               "     --verity=BOOL            Download verity file with image\n"
-               "     --image-root=PATH        Image root directory\n"
-               "     --read-only              Create a read-only image\n"
-               "     --direct                 Download directly to specified file\n"
-               "     --btrfs-subvol=BOOL      Controls whether to create a btrfs subvolume\n"
-               "                              instead of a directory\n"
-               "     --btrfs-quota=BOOL       Controls whether to set up quota for btrfs\n"
-               "                              subvolume\n"
-               "     --convert-qcow2=BOOL     Controls whether to convert QCOW2 images to\n"
-               "                              regular disk images\n"
-               "     --sync=BOOL              Controls whether to sync() before completing\n"
-               "     --offset=BYTES           Offset to seek to in destination\n"
-               "     --size-max=BYTES         Maximum number of bytes to write to destination\n"
-               "     --class=CLASS            Select image class (machine, sysext, confext,\n"
-               "                              portable)\n"
-               "     --keep-download=BOOL     Keep a copy pristine copy of the downloaded file\n"
-               "                              around\n",
-               program_invocation_short_name,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal());
+        if (error == 0)
+                log_info("Operation completed successfully.");
 
-        return 0;
+        sd_event_exit(event, ABS(error));
 }
 
-static int parse_argv(int argc, char *argv[]) {
+VERB(verb_oci, "oci", "REF [NAME]\0", 2, 3, 0, "Download an OCI image");
+static int verb_oci(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        int r;
 
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_FORCE,
-                ARG_IMAGE_ROOT,
-                ARG_VERIFY,
-                ARG_SETTINGS,
-                ARG_ROOTHASH,
-                ARG_ROOTHASH_SIGNATURE,
-                ARG_VERITY,
-                ARG_READ_ONLY,
-                ARG_DIRECT,
-                ARG_BTRFS_SUBVOL,
-                ARG_BTRFS_QUOTA,
-                ARG_CONVERT_QCOW2,
-                ARG_SYNC,
-                ARG_OFFSET,
-                ARG_SIZE_MAX,
-                ARG_CLASS,
-                ARG_KEEP_DOWNLOAD,
-        };
+        const char *ref = argv[1];
 
-        static const struct option options[] = {
-                { "help",               no_argument,       NULL, 'h'                    },
-                { "version",            no_argument,       NULL, ARG_VERSION            },
-                { "force",              no_argument,       NULL, ARG_FORCE              },
-                { "image-root",         required_argument, NULL, ARG_IMAGE_ROOT         },
-                { "verify",             required_argument, NULL, ARG_VERIFY             },
-                { "settings",           required_argument, NULL, ARG_SETTINGS           },
-                { "roothash",           required_argument, NULL, ARG_ROOTHASH           },
-                { "roothash-signature", required_argument, NULL, ARG_ROOTHASH_SIGNATURE },
-                { "verity",             required_argument, NULL, ARG_VERITY             },
-                { "read-only",          no_argument,       NULL, ARG_READ_ONLY          },
-                { "direct",             no_argument,       NULL, ARG_DIRECT             },
-                { "btrfs-subvol",       required_argument, NULL, ARG_BTRFS_SUBVOL       },
-                { "btrfs-quota",        required_argument, NULL, ARG_BTRFS_QUOTA        },
-                { "convert-qcow2",      required_argument, NULL, ARG_CONVERT_QCOW2      },
-                { "sync",               required_argument, NULL, ARG_SYNC               },
-                { "offset",             required_argument, NULL, ARG_OFFSET             },
-                { "size-max",           required_argument, NULL, ARG_SIZE_MAX           },
-                { "class",              required_argument, NULL, ARG_CLASS              },
-                { "keep-download",      required_argument, NULL, ARG_KEEP_DOWNLOAD      },
-                {}
-        };
+        _cleanup_free_ char *image = NULL;
+        r = oci_ref_parse(ref, /* ret_registry= */ NULL, &image, /* ret_tag= */ NULL);
+        if (r == -EINVAL)
+                return log_error_errno(r, "OCI ref '%s' is invalid.", ref);
+        if (r < 0)
+                return log_error_errno(r, "Failed to check of OCI ref '%s' is valid: %m", ref);
 
-        int c, r;
+        _cleanup_free_ char *l = NULL;
+        const char *local;
+        if (argc >= 3)
+                local = empty_or_dash_to_null(argv[2]);
+        else {
+                r = path_extract_filename(image, &l);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get extract final component of '%s': %m", image);
+
+                local = l;
+        }
+
+        _cleanup_free_ char *normalized = NULL;
+        r = normalize_local(local, ref, &normalized);
+        if (r < 0)
+                return r;
+
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        r = import_allocate_event_with_signals(&event);
+        if (r < 0)
+                return r;
+
+        _cleanup_(oci_pull_unrefp) OciPull *pull = NULL;
+        r = oci_pull_new(&pull, event, arg_image_root, on_oci_finished, event);
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate puller: %m");
+
+        r = oci_pull_start(
+                        pull,
+                        ref,
+                        normalized,
+                        arg_import_flags & IMPORT_PULL_FLAGS_MASK_OCI);
+        if (r < 0)
+                return log_error_errno(r, "Failed to pull image: %m");
+
+        r = sd_event_loop(event);
+        if (r < 0)
+                return log_error_errno(r, "Failed to run event loop: %m");
+
+        log_info("Exiting.");
+        return -r;
+}
+
+VERB_COMMON_HELP_AUTO_HIDDEN();
+
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
+        int r;
         bool auto_settings = true, auto_keep_download = true;
 
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help(0, NULL, NULL);
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_FORCE:
+                OPTION_LONG("force", NULL, "Force creation of image"):
                         arg_import_flags |= IMPORT_FORCE;
                         break;
 
-                case ARG_IMAGE_ROOT:
-                        arg_image_root = optarg;
+                OPTION_LONG("image-root", "PATH", "Image root directory"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_image_root);
+                        if (r < 0)
+                                return r;
                         break;
 
-                case ARG_VERIFY: {
+                OPTION_LONG("verify", "MODE",
+                            "Verify downloaded image, one of: 'no', 'checksum', 'signature' or literal SHA256 hash"): {
                         ImportVerify v;
 
-                        v = import_verify_from_string(optarg);
+                        v = import_verify_from_string(opts.arg);
                         if (v < 0) {
                                 _cleanup_free_ void *h = NULL;
-                                char *hh;
                                 size_t n;
 
                                 /* If this is not a valid verification mode, maybe it's a literally specified
                                  * SHA256 hash? We can handle that too... */
 
-                                r = unhexmem(optarg, &h, &n);
+                                r = unhexmem(opts.arg, &h, &n);
                                 if (r < 0 || n == 0)
                                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                               "Invalid verification setting: %s", optarg);
+                                                               "Invalid verification setting: %s", opts.arg);
                                 if (n != 32)
                                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                                "64 hex character SHA256 hash required when specifying explicit checksum, %zu specified", n * 2);
 
-                                hh = hexmem(h, n); /* bring into canonical (lowercase) form */
-                                if (!hh)
-                                        return log_oom();
+                                iovec_done(&arg_checksum);
+                                arg_checksum = IOVEC_MAKE(TAKE_PTR(h), n);
 
-                                free_and_replace(arg_checksum, hh);
                                 arg_import_flags &= ~(IMPORT_PULL_SETTINGS|IMPORT_PULL_ROOTHASH|IMPORT_PULL_ROOTHASH_SIGNATURE|IMPORT_PULL_VERITY);
                                 arg_verify = _IMPORT_VERIFY_INVALID;
                         } else
@@ -388,8 +381,8 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                case ARG_SETTINGS:
-                        r = parse_boolean_argument("--settings=", optarg, NULL);
+                OPTION_LONG("settings", "BOOL", "Download settings file with image"):
+                        r = parse_boolean_argument("--settings=", opts.arg, NULL);
                         if (r < 0)
                                 return r;
 
@@ -397,8 +390,8 @@ static int parse_argv(int argc, char *argv[]) {
                         auto_settings = false;
                         break;
 
-                case ARG_ROOTHASH:
-                        r = parse_boolean_argument("--roothash=", optarg, NULL);
+                OPTION_LONG("roothash", "BOOL", "Download root hash file with image"):
+                        r = parse_boolean_argument("--roothash=", opts.arg, NULL);
                         if (r < 0)
                                 return r;
 
@@ -409,110 +402,123 @@ static int parse_argv(int argc, char *argv[]) {
                                 SET_FLAG(arg_import_flags, IMPORT_PULL_ROOTHASH_SIGNATURE, false);
                         break;
 
-                case ARG_ROOTHASH_SIGNATURE:
-                        r = parse_boolean_argument("--roothash-signature=", optarg, NULL);
+                OPTION_LONG("roothash-signature", "BOOL",
+                            "Download root hash signature file with image"):
+                        r = parse_boolean_argument("--roothash-signature=", opts.arg, NULL);
                         if (r < 0)
                                 return r;
 
                         SET_FLAG(arg_import_flags, IMPORT_PULL_ROOTHASH_SIGNATURE, r);
                         break;
 
-                case ARG_VERITY:
-                        r = parse_boolean_argument("--verity=", optarg, NULL);
+                OPTION_LONG("verity", "BOOL", "Download verity file with image"):
+                        r = parse_boolean_argument("--verity=", opts.arg, NULL);
                         if (r < 0)
                                 return r;
 
                         SET_FLAG(arg_import_flags, IMPORT_PULL_VERITY, r);
                         break;
 
-                case ARG_READ_ONLY:
+                OPTION_LONG("read-only", NULL, "Create a read-only image"):
                         arg_import_flags |= IMPORT_READ_ONLY;
                         break;
 
-                case ARG_DIRECT:
+                OPTION_LONG("direct", NULL, "Download directly to specified file"):
                         arg_import_flags |= IMPORT_DIRECT;
                         arg_import_flags &= ~(IMPORT_PULL_SETTINGS|IMPORT_PULL_ROOTHASH|IMPORT_PULL_ROOTHASH_SIGNATURE|IMPORT_PULL_VERITY);
                         break;
 
-                case ARG_BTRFS_SUBVOL:
-                        r = parse_boolean_argument("--btrfs-subvol=", optarg, NULL);
+                OPTION_LONG("btrfs-subvol", "BOOL",
+                            "Controls whether to create a btrfs subvolume instead of a directory"):
+                        r = parse_boolean_argument("--btrfs-subvol=", opts.arg, NULL);
                         if (r < 0)
                                 return r;
-
                         SET_FLAG(arg_import_flags, IMPORT_BTRFS_SUBVOL, r);
                         break;
 
-                case ARG_BTRFS_QUOTA:
-                        r = parse_boolean_argument("--btrfs-quota=", optarg, NULL);
+                OPTION_LONG("btrfs-quota", "BOOL",
+                            "Controls whether to set up quota for btrfs subvolume"):
+                        r = parse_boolean_argument("--btrfs-quota=", opts.arg, NULL);
                         if (r < 0)
                                 return r;
-
                         SET_FLAG(arg_import_flags, IMPORT_BTRFS_QUOTA, r);
                         break;
 
-                case ARG_CONVERT_QCOW2:
-                        r = parse_boolean_argument("--convert-qcow2=", optarg, NULL);
+                OPTION_LONG("convert-qcow2", "BOOL",
+                            "Controls whether to convert QCOW2 images to regular disk images"):
+                        r = parse_boolean_argument("--convert-qcow2=", opts.arg, NULL);
                         if (r < 0)
                                 return r;
-
                         SET_FLAG(arg_import_flags, IMPORT_CONVERT_QCOW2, r);
                         break;
 
-                case ARG_SYNC:
-                        r = parse_boolean_argument("--sync=", optarg, NULL);
+                OPTION_LONG("sync", "BOOL", "Controls whether to sync() before completing"):
+                        r = parse_boolean_argument("--sync=", opts.arg, NULL);
                         if (r < 0)
                                 return r;
-
                         SET_FLAG(arg_import_flags, IMPORT_SYNC, r);
                         break;
 
-                case ARG_OFFSET: {
+                OPTION_LONG("zero-fill", "BOOL", "Controls whether to fill up the destination range with zeroes"):
+                        r = parse_boolean_argument("--zero-fill=", opts.arg, NULL);
+                        if (r < 0)
+                                return r;
+                        SET_FLAG(arg_import_flags, IMPORT_ZERO_FILL, r);
+                        break;
+
+                OPTION_LONG("offset", "BYTES", "Offset to seek to in destination"): {
                         uint64_t u;
 
-                        r = safe_atou64(optarg, &u);
+                        r = safe_atou64(opts.arg, &u);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse --offset= argument: %s", optarg);
+                                return log_error_errno(r, "Failed to parse --offset= argument: %s", opts.arg);
                         if (!FILE_SIZE_VALID(u))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Argument to --offset= switch too large: %s", optarg);
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Argument to --offset= switch too large: %s", opts.arg);
 
                         arg_offset = u;
                         break;
                 }
 
-                case ARG_SIZE_MAX: {
+                OPTION_LONG("size-max", "BYTES", "Maximum number of bytes to write to destination"): {
                         uint64_t u;
 
-                        r = parse_size(optarg, 1024, &u);
+                        r = parse_size(opts.arg, 1024, &u);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse --size-max= argument: %s", optarg);
+                                return log_error_errno(r, "Failed to parse --size-max= argument: %s", opts.arg);
                         if (!FILE_SIZE_VALID(u))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Argument to --size-max= switch too large: %s", optarg);
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Argument to --size-max= switch too large: %s", opts.arg);
 
                         arg_size_max = u;
                         break;
                 }
 
-                case ARG_CLASS:
-                        arg_class = image_class_from_string(optarg);
+                OPTION_LONG("class", "CLASS",
+                            "Select image class (machine, sysext, confext, portable)"):
+                        arg_class = image_class_from_string(opts.arg);
                         if (arg_class < 0)
-                                return log_error_errno(arg_class, "Failed to parse --class= argument: %s", optarg);
-
+                                return log_error_errno(arg_class, "Failed to parse --class= argument: %s", opts.arg);
                         break;
 
-                case ARG_KEEP_DOWNLOAD:
-                        r = parse_boolean(optarg);
+                OPTION_LONG("keep-download", "BOOL",
+                            "Keep a pristine copy of the downloaded file around"):
+                        r = parse_boolean(opts.arg);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse --keep-download= argument: %s", optarg);
+                                return log_error_errno(r, "Failed to parse --keep-download= argument: %s", opts.arg);
 
                         SET_FLAG(arg_import_flags, IMPORT_PULL_KEEP_DOWNLOAD, r);
                         auto_keep_download = false;
                         break;
 
-                case '?':
-                        return -EINVAL;
+                OPTION_COMMON_SYSTEM:
+                        arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
+                        break;
 
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_USER:
+                        arg_runtime_scope = RUNTIME_SCOPE_USER;
+                        break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         /* Make sure offset+size is still in the valid range if both set */
@@ -524,11 +530,17 @@ static int parse_argv(int argc, char *argv[]) {
         if (arg_offset != UINT64_MAX && !FLAGS_SET(arg_import_flags, IMPORT_DIRECT))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "File offset only supported in --direct mode.");
 
-        if (arg_checksum && (arg_import_flags & (IMPORT_PULL_SETTINGS|IMPORT_PULL_ROOTHASH|IMPORT_PULL_ROOTHASH_SIGNATURE|IMPORT_PULL_VERITY)) != 0)
+        if (FLAGS_SET(arg_import_flags, IMPORT_ZERO_FILL) && (arg_offset == UINT64_MAX || arg_size_max == UINT64_MAX))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Zero filling only supported if both --offset= and --size-max= are specified.");
+
+        if (iovec_is_set(&arg_checksum) && (arg_import_flags & (IMPORT_PULL_SETTINGS|IMPORT_PULL_ROOTHASH|IMPORT_PULL_ROOTHASH_SIGNATURE|IMPORT_PULL_VERITY)) != 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Literal checksum verification only supported if no associated files are downloaded.");
 
-        if (!arg_image_root)
-                arg_image_root = image_root_to_string(arg_class);
+        if (!arg_image_root) {
+                r = image_root_pick(arg_runtime_scope < 0 ? RUNTIME_SCOPE_SYSTEM : arg_runtime_scope, arg_class, /* runtime= */ false, &arg_image_root);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to pick image root: %m");
+        }
 
         /* .nspawn settings files only really make sense for machine images, not for sysext/confext/portable */
         if (auto_settings && arg_class != IMAGE_MACHINE)
@@ -539,6 +551,10 @@ static int parse_argv(int argc, char *argv[]) {
         if (auto_keep_download)
                 SET_FLAG(arg_import_flags, IMPORT_PULL_KEEP_DOWNLOAD, arg_class == IMAGE_MACHINE);
 
+        if (arg_runtime_scope == RUNTIME_SCOPE_USER)
+                arg_import_flags |= IMPORT_FOREIGN_UID;
+
+        *ret_args = option_parser_get_args(&opts);
         return 1;
 }
 
@@ -567,32 +583,27 @@ static void parse_env(void) {
                 log_warning_errno(r, "Failed to parse $SYSTEMD_IMPORT_SYNC: %m");
 }
 
-static int pull_main(int argc, char *argv[]) {
-        static const Verb verbs[] = {
-                { "help", VERB_ANY, VERB_ANY, 0, help     },
-                { "tar",  2,        3,        0, pull_tar },
-                { "raw",  2,        3,        0, pull_raw },
-                {}
-        };
-
-        return dispatch_verb(argc, argv, verbs, NULL);
-}
-
 static int run(int argc, char *argv[]) {
         int r;
+
+        ARCHIVE_NOTE(recommended);
+        LIBCRYPTO_NOTE(recommended);
+        LIBCURL_NOTE(suggested);
+        LIBSELINUX_NOTE(recommended);
 
         setlocale(LC_ALL, "");
         log_setup();
 
         parse_env();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
         (void) ignore_signals(SIGPIPE);
 
-        return pull_main(argc, argv);
+        return dispatch_verb(args, NULL);
 }
 
 DEFINE_MAIN_FUNCTION(run);

@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "sd-bus.h"
+#include "sd-device.h"
 #include "sd-event.h"
 #include "sd-messages.h"
 #include "sd-varlink.h"
@@ -18,6 +19,7 @@
 #include "bus-error.h"
 #include "bus-util.h"
 #include "daemon-util.h"
+#include "device-util.h"
 #include "devnum-util.h"
 #include "env-file.h"
 #include "errno-util.h"
@@ -26,6 +28,7 @@
 #include "format-util.h"
 #include "fs-util.h"
 #include "hashmap.h"
+#include "json-util.h"
 #include "login-util.h"
 #include "logind.h"
 #include "logind-dbus.h"
@@ -37,12 +40,13 @@
 #include "logind-user.h"
 #include "logind-user-dbus.h"
 #include "logind-varlink.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "serialize.h"
 #include "string-table.h"
+#include "strv.h"
 #include "terminal-util.h"
 #include "tmpfile-util.h"
 #include "user-record.h"
@@ -195,7 +199,7 @@ Session* session_free(Session *s) {
 
         free(s->scope_job);
 
-        session_reset_leader(s, /* keep_fdstore = */ true);
+        session_reset_leader(s, /* keep_fdstore= */ true);
 
         sd_bus_message_unref(s->create_message);
         sd_bus_message_unref(s->upgrade_message);
@@ -208,6 +212,7 @@ Session* session_free(Session *s) {
         free(s->remote_user);
         free(s->service);
         free(s->desktop);
+        strv_free(s->extra_device_access);
 
         hashmap_remove(s->manager->sessions, s->id);
 
@@ -239,7 +244,7 @@ int session_set_leader_consume(Session *s, PidRef _leader) {
         if (pidref_equal(&s->leader, &pidref))
                 return 0;
 
-        session_reset_leader(s, /* keep_fdstore = */ false);
+        session_reset_leader(s, /* keep_fdstore= */ false);
 
         s->leader = TAKE_PIDREF(pidref);
 
@@ -274,6 +279,59 @@ static void session_save_devices(Session *s, FILE *f) {
                         fprintf(f, DEVNUM_FORMAT_STR " ", DEVNUM_FORMAT_VAL(sd->dev));
                 fprintf(f, "\n");
         }
+}
+
+static int trigger_xaccess(char * const *extra_devices) {
+        int r;
+
+        if (strv_isempty(extra_devices))
+                return 0;
+
+        _cleanup_strv_free_ char **tags = NULL;
+        r = strv_extend_strv_biconcat(&tags, "xaccess-", (const char * const *)extra_devices, /* suffix= */ NULL);
+        if (r < 0)
+                return r;
+
+        _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
+        r = sd_device_enumerator_new(&e);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(tag, tags) {
+                r = sd_device_enumerator_add_match_tag(e, *tag);
+                if (r < 0)
+                        return r;
+        }
+
+        FOREACH_DEVICE(e, d) {
+                /* Verify that the tag is still in place. */
+                bool has_xaccess = false;
+                STRV_FOREACH(tag, tags)
+                        if (sd_device_has_current_tag(d, *tag)) {
+                                has_xaccess = true;
+                                break;
+                        }
+                if (!has_xaccess)
+                        continue;
+
+                /* In case people mistag devices without nodes, we need to ignore this. */
+                r = sd_device_get_devname(d, NULL);
+                if (r == -ENOENT)
+                        continue;
+                if (r < 0)
+                        return r;
+
+                sd_id128_t uuid;
+                r = sd_device_trigger_with_uuid(d, SD_DEVICE_CHANGE, &uuid);
+                if (r < 0) {
+                        log_device_debug_errno(d, r, "Failed to trigger 'change' event, ignoring: %m");
+                        continue;
+                }
+
+                log_device_debug(d, "Triggered synthetic event (ACTION=change, UUID=%s).", SD_ID128_TO_UUID_STRING(uuid));
+        }
+
+        return 0;
 }
 
 int session_save(Session *s) {
@@ -370,6 +428,13 @@ int session_save(Session *s) {
                 session_save_devices(s, f);
         }
 
+        if (s->extra_device_access) {
+                _cleanup_free_ char *extra_devices = strv_join(s->extra_device_access, " ");
+                if (!extra_devices)
+                        return log_oom();
+                fprintf(f, "EXTRA_DEVICE_ACCESS=%s\n", extra_devices);
+        }
+
         r = flink_tmpfile(f, temp_path, s->state_file, LINK_TMPFILE_REPLACE);
         if (r < 0)
                 return log_error_errno(r, "Failed to move '%s' into place: %m", s->state_file);
@@ -401,7 +466,7 @@ static int session_load_devices(Session *s, const char *devices) {
                 }
 
                 /* The file descriptors for loaded devices will be reattached later. */
-                RET_GATHER(r, session_device_new(s, dev, /* open_device = */ false, /* ret = */ NULL));
+                RET_GATHER(r, session_device_new(s, dev, /* open_device= */ false, /* ret= */ NULL));
         }
 
         if (r < 0)
@@ -409,8 +474,51 @@ static int session_load_devices(Session *s, const char *devices) {
         return r;
 }
 
+static int session_load_leader(Session *s, uint64_t pidfdid) {
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        int r;
+
+        assert(s);
+        assert(pid_is_valid(s->deserialized_pid));
+        assert(!pidref_is_set(&s->leader));
+
+        if (pidfdid == 0 && s->leader_fd_saved)
+                /* We have no pidfd id for stable reference, but the pidfd has been submitted to fdstore.
+                 * manager_enumerate_fds() will dispatch the leader fd for us later. */
+                return 0;
+
+        r = pidref_set_pid(&pidref, s->deserialized_pid);
+        if (r == -ESRCH)
+                return log_warning_errno(r, "Leader of session '%s' is gone while deserializing.", s->id);
+        if (r < 0)
+                return log_error_errno(r, "Failed to deserialize leader PID for session '%s': %m", s->id);
+        if (pidref.fd < 0)
+                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
+                                       "Failed to acquire pidfd for session leader '" PID_FMT "', refusing.",
+                                       pidref.pid);
+
+        if (pidfdid > 0) {
+                r = pidref_acquire_pidfd_id(&pidref);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to acquire pidfd id of deserialized leader '" PID_FMT "': %m",
+                                               pidref.pid);
+
+                if (pidref.fd_id != pidfdid)
+                        return log_warning_errno(SYNTHETIC_ERRNO(ESRCH),
+                                                 "Deserialized pidfd id for process " PID_FMT " (%" PRIu64 ") doesn't match the current one (%" PRIu64 "). PID recycled while deserializing?",
+                                                 pidref.pid, pidfdid, pidref.fd_id);
+        }
+
+        r = session_set_leader_consume(s, TAKE_PIDREF(pidref));
+        if (r < 0)
+                return log_error_errno(r, "Failed to set leader PID for session '%s': %m", s->id);
+
+        return 1;
+}
+
 int session_load(Session *s) {
         _cleanup_free_ char *remote = NULL,
+                *extra_device_access = NULL,
                 *seat = NULL,
                 *tty_validity = NULL,
                 *vtnr = NULL,
@@ -418,6 +526,7 @@ int session_load(Session *s) {
                 *position = NULL,
                 *leader_pid = NULL,
                 *leader_fd_saved = NULL,
+                *leader_pidfdid = NULL,
                 *type = NULL,
                 *original_type = NULL,
                 *class = NULL,
@@ -435,33 +544,35 @@ int session_load(Session *s) {
         assert(s);
 
         r = parse_env_file(NULL, s->state_file,
-                           "REMOTE",          &remote,
-                           "SCOPE",           &s->scope,
-                           "SCOPE_JOB",       &s->scope_job,
-                           "FIFO",            &fifo_path,
-                           "SEAT",            &seat,
-                           "TTY",             &s->tty,
-                           "TTY_VALIDITY",    &tty_validity,
-                           "DISPLAY",         &s->display,
-                           "REMOTE_HOST",     &s->remote_host,
-                           "REMOTE_USER",     &s->remote_user,
-                           "SERVICE",         &s->service,
-                           "DESKTOP",         &s->desktop,
-                           "VTNR",            &vtnr,
-                           "STATE",           &state,
-                           "POSITION",        &position,
-                           "LEADER",          &leader_pid,
-                           "LEADER_FD_SAVED", &leader_fd_saved,
-                           "TYPE",            &type,
-                           "ORIGINAL_TYPE",   &original_type,
-                           "CLASS",           &class,
-                           "UID",             &uid,
-                           "REALTIME",        &realtime,
-                           "MONOTONIC",       &monotonic,
-                           "CONTROLLER",      &controller,
-                           "ACTIVE",          &active,
-                           "DEVICES",         &devices,
-                           "IS_DISPLAY",      &is_display);
+                           "REMOTE",              &remote,
+                           "EXTRA_DEVICE_ACCESS", &extra_device_access,
+                           "SCOPE",               &s->scope,
+                           "SCOPE_JOB",           &s->scope_job,
+                           "FIFO",                &fifo_path,
+                           "SEAT",                &seat,
+                           "TTY",                 &s->tty,
+                           "TTY_VALIDITY",        &tty_validity,
+                           "DISPLAY",             &s->display,
+                           "REMOTE_HOST",         &s->remote_host,
+                           "REMOTE_USER",         &s->remote_user,
+                           "SERVICE",             &s->service,
+                           "DESKTOP",             &s->desktop,
+                           "VTNR",                &vtnr,
+                           "STATE",               &state,
+                           "POSITION",            &position,
+                           "LEADER",              &leader_pid,
+                           "LEADER_FD_SAVED",     &leader_fd_saved,
+                           "LEADER_PIDFDID",      &leader_pidfdid,
+                           "TYPE",                &type,
+                           "ORIGINAL_TYPE",       &original_type,
+                           "CLASS",               &class,
+                           "UID",                 &uid,
+                           "REALTIME",            &realtime,
+                           "MONOTONIC",           &monotonic,
+                           "CONTROLLER",          &controller,
+                           "ACTIVE",              &active,
+                           "DEVICES",             &devices,
+                           "IS_DISPLAY",          &is_display);
         if (r < 0)
                 return log_error_errno(r, "Failed to read %s: %m", s->state_file);
 
@@ -493,6 +604,12 @@ int session_load(Session *s) {
                 k = parse_boolean(remote);
                 if (k >= 0)
                         s->remote = k;
+        }
+
+        if (extra_device_access) {
+                s->extra_device_access = strv_split(extra_device_access, /* separators= */ NULL);
+                if (!s->extra_device_access)
+                        return log_oom();
         }
 
         if (vtnr)
@@ -594,8 +711,6 @@ int session_load(Session *s) {
         }
 
         if (leader_pid) {
-                assert(!pidref_is_set(&s->leader));
-
                 r = parse_pid(leader_pid, &s->deserialized_pid);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse LEADER=%s: %m", leader_pid);
@@ -605,25 +720,19 @@ int session_load(Session *s) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse LEADER_FD_SAVED=%s: %m", leader_fd_saved);
                         s->leader_fd_saved = r > 0;
-
-                        if (s->leader_fd_saved)
-                                /* The leader fd will be acquired from fdstore later */
-                                return 0;
                 }
 
-                _cleanup_(pidref_done) PidRef p = PIDREF_NULL;
+                uint64_t pidfdid;
+                if (leader_pidfdid) {
+                        r = safe_atou64(leader_pidfdid, &pidfdid);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse LEADER_PIDFDID=%s: %m", leader_pidfdid);
+                } else
+                        pidfdid = 0;
 
-                r = pidref_set_pid(&p, s->deserialized_pid);
+                r = session_load_leader(s, pidfdid);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to deserialize leader PID for session '%s': %m", s->id);
-                if (p.fd < 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
-                                               "Failed to acquire pidfd for session leader '" PID_FMT "', refusing.",
-                                               p.pid);
-
-                r = session_set_leader_consume(s, TAKE_PIDREF(p));
-                if (r < 0)
-                        return log_error_errno(r, "Failed to set leader PID for session '%s': %m", s->id);
+                        return r;
         }
 
         return 0;
@@ -692,18 +801,18 @@ static int session_start_scope(Session *s, sd_bus_message *properties, sd_bus_er
                         s->manager,
                         scope,
                         &s->leader,
-                        /* allow_pidfd = */ true,
+                        /* allow_pidfd= */ true,
                         s->user->slice,
                         description,
                         /* These should have been pulled in explicitly in user_start(). Just to be sure. */
-                        /* requires = */ STRV_MAKE_CONST(s->user->runtime_dir_unit),
-                        /* wants = */ STRV_MAKE_CONST(SESSION_CLASS_WANTS_SERVICE_MANAGER(s->class) ? s->user->service_manager_unit : NULL),
+                        /* requires= */ STRV_MAKE_CONST(s->user->runtime_dir_unit),
+                        /* wants= */ STRV_MAKE_CONST(SESSION_CLASS_WANTS_SERVICE_MANAGER(s->class) ? s->user->service_manager_unit : NULL),
                         /* We usually want to order session scopes after systemd-user-sessions.service
                          * since the unit is used as login session barrier for unprivileged users. However
                          * the barrier doesn't apply for root as sysadmin should always be able to log in
                          * (and without waiting for any timeout to expire) in case something goes wrong
                          * during the boot process. */
-                        /* extra_after = */ STRV_MAKE_CONST("systemd-logind.service",
+                        /* extra_after= */ STRV_MAKE_CONST("systemd-logind.service",
                                                             SESSION_CLASS_IS_EARLY(s->class) ? NULL : "systemd-user-sessions.service"),
                         user_record_home_directory(s->user->user_record),
                         properties,
@@ -734,7 +843,7 @@ static int session_dispatch_stop_on_idle(sd_event_source *source, uint64_t t, vo
         if (idle) {
                 log_info("Session \"%s\" of user \"%s\" is idle, stopping.", s->id, s->user->user_record->user_name);
 
-                return session_stop(s, /* force = */ true);
+                return session_stop(s, /* force= */ true);
         }
 
         r = sd_event_source_set_time(
@@ -814,10 +923,13 @@ int session_start(Session *s, sd_bus_message *properties, sd_bus_error *error) {
         if (!dual_timestamp_is_set(&s->timestamp))
                 dual_timestamp_now(&s->timestamp);
 
+        /* Must be set before seat_read_active_vt(); the activation it
+         * triggers reaches seat_triggered_uevents_done() synchronously
+         * and gates session_device_resume_all() on s->started. */
+        s->started = true;
+
         if (s->seat)
                 seat_read_active_vt(s->seat);
-
-        s->started = true;
 
         user_elect_display(s->user);
 
@@ -827,9 +939,11 @@ int session_start(Session *s, sd_bus_message *properties, sd_bus_error *error) {
         if (s->seat)
                 (void) seat_save(s->seat);
 
+        (void) trigger_xaccess(s->extra_device_access);
+
         /* Send signals */
-        session_send_signal(s, true);
-        user_send_changed(s->user, "Display");
+        (void) session_send_signal(s, true);
+        (void) user_send_changed(s->user, "Display");
 
         if (s->seat && s->seat->active == s)
                 (void) seat_send_changed(s->seat, "ActiveSession");
@@ -917,6 +1031,8 @@ int session_stop(Session *s, bool force) {
         (void) session_save(s);
         (void) user_save(s->user);
 
+        (void) trigger_xaccess(s->extra_device_access);
+
         return r;
 }
 
@@ -961,7 +1077,7 @@ int session_finalize(Session *s) {
                 seat_save(s->seat);
         }
 
-        session_reset_leader(s, /* keep_fdstore = */ false);
+        session_reset_leader(s, /* keep_fdstore= */ false);
 
         (void) user_save(s->user);
         (void) user_send_changed(s->user, "Display");
@@ -974,7 +1090,7 @@ static int release_timeout_callback(sd_event_source *es, uint64_t usec, void *us
 
         assert(es);
 
-        session_stop(s, /* force = */ false);
+        session_stop(s, /* force= */ false);
         return 0;
 }
 
@@ -1041,19 +1157,23 @@ static int get_process_ctty_atime(pid_t pid, usec_t *atime) {
         return get_tty_atime(p, atime);
 }
 
-int session_get_idle_hint(Session *s, dual_timestamp *t) {
+bool session_get_idle_hint(Session *s, dual_timestamp *ret_timestamp) {
         usec_t atime = 0, dtime = 0;
         int r;
 
         assert(s);
 
-        if (!SESSION_CLASS_CAN_IDLE(s->class))
+        if (!SESSION_CLASS_CAN_IDLE(s->class)) {
+                if (ret_timestamp)
+                        *ret_timestamp = DUAL_TIMESTAMP_NULL;
+
                 return false;
+        }
 
         /* Graphical sessions have an explicit idle hint */
         if (SESSION_TYPE_IS_GRAPHICAL(s->type)) {
-                if (t)
-                        *t = s->idle_hint_timestamp;
+                if (ret_timestamp)
+                        *ret_timestamp = s->idle_hint_timestamp;
 
                 return s->idle_hint;
         }
@@ -1075,14 +1195,14 @@ int session_get_idle_hint(Session *s, dual_timestamp *t) {
                 }
         }
 
-        if (t)
-                *t = DUAL_TIMESTAMP_NULL;
+        if (ret_timestamp)
+                *ret_timestamp = DUAL_TIMESTAMP_NULL;
 
         return false;
 
 found_atime:
-        if (t)
-                dual_timestamp_from_realtime(t, atime);
+        if (ret_timestamp)
+                dual_timestamp_from_realtime(ret_timestamp, atime);
 
         if (s->manager->idle_action_usec > 0 && s->manager->stop_idle_session_usec != USEC_INFINITY)
                 dtime = MIN(s->manager->idle_action_usec, s->manager->stop_idle_session_usec);
@@ -1110,13 +1230,13 @@ int session_set_idle_hint(Session *s, bool b) {
         s->idle_hint = b;
         dual_timestamp_now(&s->idle_hint_timestamp);
 
-        session_send_changed(s, "IdleHint", "IdleSinceHint", "IdleSinceHintMonotonic");
+        (void) session_send_changed(s, "IdleHint", "IdleSinceHint", "IdleSinceHintMonotonic");
 
         if (s->seat)
-                seat_send_changed(s->seat, "IdleHint", "IdleSinceHint", "IdleSinceHintMonotonic");
+                (void) seat_send_changed(s->seat, "IdleHint", "IdleSinceHint", "IdleSinceHintMonotonic");
 
-        user_send_changed(s->user, "IdleHint", "IdleSinceHint", "IdleSinceHintMonotonic");
-        manager_send_changed(s->manager, "IdleHint", "IdleSinceHint", "IdleSinceHintMonotonic");
+        (void) user_send_changed(s->user, "IdleHint", "IdleSinceHint", "IdleSinceHintMonotonic");
+        (void) manager_send_changed(s->manager, "IdleHint", "IdleSinceHint", "IdleSinceHintMonotonic");
 
         return 1;
 }
@@ -1324,7 +1444,7 @@ static int session_prepare_vt(Session *s) {
         if (s->vtnr < 1)
                 return 0;
 
-        vt = session_open_vt(s, /* reopen = */ false);
+        vt = session_open_vt(s, /* reopen= */ false);
         if (vt < 0)
                 return vt;
 
@@ -1390,7 +1510,7 @@ static void session_restore_vt(Session *s) {
                 /* We do a little dance to avoid having the terminal be available
                  * for reuse before we've cleaned it up. */
 
-                int fd = session_open_vt(s, /* reopen = */ true);
+                int fd = session_open_vt(s, /* reopen= */ true);
                 if (fd >= 0)
                         r = vt_restore(fd);
         }
@@ -1420,13 +1540,13 @@ void session_leave_vt(Session *s) {
                 return;
 
         session_device_pause_all(s);
-        r = vt_release(s->vtfd, /* restore = */ false);
+        r = vt_release(s->vtfd, /* restore= */ false);
         if (r == -EIO) {
                 /* Handle the same VT hung-up case as in session_restore_vt */
 
-                int fd = session_open_vt(s, /* reopen = */ true);
+                int fd = session_open_vt(s, /* reopen= */ true);
                 if (fd >= 0)
-                        r = vt_release(fd, /* restore = */ false);
+                        r = vt_release(fd, /* restore= */ false);
         }
         if (r < 0)
                 log_debug_errno(r, "Cannot release VT of session %s: %m", s->id);
@@ -1566,6 +1686,65 @@ bool session_is_self(const char *name) {
 
 bool session_is_auto(const char *name) {
         return streq_ptr(name, "auto");
+}
+
+static int session_context_build_json(sd_json_variant **ret, const char *name, void *userdata) {
+        Session *s = ASSERT_PTR(userdata);
+
+        assert(ret);
+        assert(s->user);
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_UNSIGNED("UID", s->user->user_record->uid),
+                        JSON_BUILD_PAIR_PIDREF_NON_NULL("PID", &s->leader),
+                        JSON_BUILD_PAIR_ENUM("Type", session_type_to_string(s->type)),
+                        JSON_BUILD_PAIR_ENUM("Class", session_class_to_string(s->class)),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Service", s->service),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Desktop", s->desktop),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Seat", s->seat ? s->seat->id : NULL),
+                        JSON_BUILD_PAIR_UNSIGNED_NON_ZERO("VTNr", s->vtnr),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("TTY", s->tty),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Display", s->display),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("Remote", s->remote),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("RemoteHost", s->remote_host),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("RemoteUser", s->remote_user),
+                        JSON_BUILD_PAIR_STRV_NON_EMPTY("ExtraDeviceAccess", s->extra_device_access));
+}
+
+static int session_runtime_build_json(sd_json_variant **ret, const char *name, void *userdata) {
+        Session *s = ASSERT_PTR(userdata);
+
+        assert(ret);
+
+        dual_timestamp idle_ts;
+        bool idle = session_get_idle_hint(s, &idle_ts);
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_STRING("Id", s->id),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Scope", s->scope),
+                        SD_JSON_BUILD_PAIR_CONDITION(audit_session_is_valid(s->audit_id),
+                                                     "Audit", SD_JSON_BUILD_UNSIGNED(s->audit_id)),
+                        JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("Timestamp", &s->timestamp),
+                        JSON_BUILD_PAIR_ENUM("State", session_state_to_string(session_get_state(s))),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("Active", session_is_active(s)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("IdleHint", idle),
+                        SD_JSON_BUILD_PAIR_CONDITION(idle, "IdleSinceHint", JSON_BUILD_DUAL_TIMESTAMP(&idle_ts)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("LockedHint", s->locked_hint),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("CanIdle", SESSION_CLASS_CAN_IDLE(s->class)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("CanLock", SESSION_CLASS_CAN_LOCK(s->class)));
+}
+
+int session_build_json(Session *s, sd_json_variant **ret) {
+        assert(s);
+        assert(s->user);
+        assert(ret);
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_CALLBACK("context", session_context_build_json, s),
+                        SD_JSON_BUILD_PAIR_CALLBACK("runtime", session_runtime_build_json, s));
 }
 
 static const char* const session_state_table[_SESSION_STATE_MAX] = {

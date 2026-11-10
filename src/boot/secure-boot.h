@@ -2,7 +2,7 @@
 #pragma once
 
 #include "efi.h"
-#include "efivars-fundamental.h"
+#include "efivars.h"
 
 typedef enum {
         ENROLL_OFF,         /* no Secure Boot key enrollment whatsoever, even manual entries are not generated */
@@ -18,10 +18,18 @@ typedef enum {
         _SECURE_BOOT_ENROLL_ACTION_MAX,
 } secure_boot_enroll_action;
 
+enum {
+        ENROLL_TIMEOUT_HIDDEN  = 0,
+        ENROLL_TIMEOUT_MIN     = 1,
+        ENROLL_TIMEOUT_DEFAULT = 15,
+        ENROLL_TIMEOUT_MAX     = UINT32_MAX,
+};
+
 bool secure_boot_enabled(void);
 SecureBootMode secure_boot_mode(void);
 
-EFI_STATUS secure_boot_enroll_at(EFI_FILE *root_dir, const char16_t *path, bool force, secure_boot_enroll_action action);
+EFI_STATUS secure_boot_enroll_at(EFI_FILE *root_dir, const char16_t *path, bool force,
+                                 secure_boot_enroll_action action, uint64_t timeout_sec);
 
 typedef bool (*security_validator_t)(
                 const void *ctx,
@@ -33,5 +41,5 @@ void install_security_override(security_validator_t validator, const void *valid
 void uninstall_security_override(void);
 bool security_override_available(void);
 
-const char* secure_boot_enroll_to_string(secure_boot_enroll e) _const_;
-const char* secure_boot_enroll_action_to_string(secure_boot_enroll_action e) _const_;
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(secure_boot_enroll, secure_boot_enroll);
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(secure_boot_enroll_action, secure_boot_enroll_action);

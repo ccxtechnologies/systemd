@@ -53,6 +53,9 @@ bool has_local_address(const struct local_address *addresses, size_t n_addresses
 static void suppress_duplicates(struct local_address *list, size_t *n_list) {
         size_t old_size, new_size;
 
+        POINTER_MAY_BE_NULL(list);
+        assert(n_list);
+
         /* Removes duplicate entries, assumes the list of addresses is already sorted. Updates in-place. */
 
         if (*n_list < 2) /* list with less than two entries can't have duplicates */
@@ -88,6 +91,7 @@ static int add_local_address_full(
         assert(ifindex > 0);
         assert(IN_SET(family, AF_INET, AF_INET6));
         assert(address);
+        POINTER_MAY_BE_NULL(prefsrc);
 
         if (!GREEDY_REALLOC(*list, *n_list + 1))
                 return -ENOMEM;
@@ -115,8 +119,8 @@ int add_local_address(
 
         return add_local_address_full(
                         list, n_list, ifindex,
-                        scope, /* priority = */ 0, /* weight = */ 0,
-                        family, address, /* prefsrc = */ NULL);
+                        scope, /* priority= */ 0, /* weight= */ 0,
+                        family, address, /* prefsrc= */ NULL);
 }
 
 int local_addresses(
@@ -246,7 +250,7 @@ static int add_local_gateway(
         return add_local_address_full(
                         list, n_list,
                         ifindex,
-                        /* scope = */ 0, priority, weight,
+                        /* scope= */ 0, priority, weight,
                         family, address, prefsrc);
 }
 
@@ -306,7 +310,7 @@ static int parse_nexthop_one(
 
                         r = add_local_gateway(list, n_list, rtnh->rtnh_ifindex, priority, rtnh->rtnh_hops, via->family,
                                               &(union in_addr_union) { .in6 = via->address.in6 },
-                                              /* prefsrc = */ NULL);
+                                              /* prefsrc= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -495,7 +499,7 @@ int local_gateways(
                                 /* Ignore prefsrc, and let's take the source address by socket command, if necessary. */
                                 r = add_local_gateway(&list, &n_list, ifi, priority, 0, via.family,
                                                       &(union in_addr_union) { .in6 = via.address.in6 },
-                                                      /* prefsrc = */ NULL);
+                                                      /* prefsrc= */ NULL);
                                 if (r < 0)
                                         return r;
                         }
@@ -534,8 +538,8 @@ static int add_local_outbound(
 
         return add_local_address_full(
                         list, n_list, ifindex,
-                        /* scope = */ 0, /* priority = */ 0, /* weight = */ 0,
-                        family, address, /* prefsrc = */ NULL);
+                        /* scope= */ 0, /* priority= */ 0, /* weight= */ 0,
+                        family, address, /* prefsrc= */ NULL);
 }
 
 static int add_local_outbound_by_prefsrc(

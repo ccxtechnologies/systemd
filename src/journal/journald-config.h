@@ -27,6 +27,14 @@ typedef struct JournalCompressOptions {
         uint64_t threshold_bytes;
 } JournalCompressOptions;
 
+typedef enum AuditSetMode {
+        AUDIT_NO = 0, /* Disables the kernel audit subsystem on start. */
+        AUDIT_YES,    /* Enables the kernel audit subsystem on start. */
+        AUDIT_KEEP,   /* Keep the current kernel audit subsystem state. */
+        _AUDIT_SET_MODE_MAX,
+        _AUDIT_SET_MODE_INVALID = -EINVAL,
+} AuditSetMode;
+
 typedef struct JournalConfig {
         /* Storage=, cred: journal.storage */
         Storage storage;
@@ -37,7 +45,7 @@ typedef struct JournalConfig {
         /* ReadKMsg= */
         int read_kmsg;
         /* Audit= */
-        int set_audit;
+        AuditSetMode set_audit;
         /* SyncIntervalSec= */
         usec_t sync_interval_usec;
         /* RateLimitIntervalSec= */
@@ -89,16 +97,15 @@ void manager_load_config(Manager *m);
 int manager_dispatch_reload_signal(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata);
 
 /* Defined in generated journald-gperf.c */
-const struct ConfigPerfItem* journald_gperf_lookup(const char *key, GPERF_LEN_TYPE length);
+const struct ConfigPerfItem* journald_gperf_lookup(const char *str, GPERF_LEN_TYPE length);
 
-const char* storage_to_string(Storage s) _const_;
-Storage storage_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(storage, Storage);
 
-const char* split_mode_to_string(SplitMode s) _const_;
-SplitMode split_mode_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(split_mode, SplitMode);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_storage);
 CONFIG_PARSER_PROTOTYPE(config_parse_line_max);
 CONFIG_PARSER_PROTOTYPE(config_parse_compress);
 CONFIG_PARSER_PROTOTYPE(config_parse_forward_to_socket);
 CONFIG_PARSER_PROTOTYPE(config_parse_split_mode);
+CONFIG_PARSER_PROTOTYPE(config_parse_audit_set_mode);

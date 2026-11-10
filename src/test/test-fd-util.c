@@ -17,7 +17,6 @@
 #include "random-util.h"
 #include "rlimit-util.h"
 #include "rm-rf.h"
-#include "seccomp-util.h"
 #include "serialize.h"
 #include "stat-util.h"
 #include "tests.h"
@@ -152,16 +151,15 @@ TEST(fd_move_above_stdio) {
         new_fd = fd_move_above_stdio(new_fd);
         assert_se(new_fd >= 3);
 
-        assert_se(dup(original_stdin) == 0);
+        assert_se(fcntl(original_stdin, F_DUPFD, 0) == 0);
         assert_se(close_nointr(original_stdin) != EBADF);
         assert_se(close_nointr(new_fd) != EBADF);
 }
 
 TEST(rearrange_stdio) {
-        pid_t pid;
         int r;
 
-        r = safe_fork("rearrange", FORK_WAIT|FORK_LOG, &pid);
+        r = pidref_safe_fork("rearrange", FORK_WAIT|FORK_LOG, NULL);
         assert_se(r >= 0);
 
         if (r == 0) {
@@ -260,7 +258,7 @@ static size_t validate_fds(
         return c; /* Return number of fds >= 0 in the array */
 }
 
-static void test_close_all_fds_inner(void) {
+static void test_close_all_fds_inner(int (*func)(const int except[], size_t n_except)) {
         _cleanup_free_ int *fds = NULL, *keep = NULL;
         size_t n_fds, n_keep;
         int max_fd;
@@ -320,13 +318,13 @@ static void test_close_all_fds_inner(void) {
         log_settle_target();
 
         /* Close all but the ones to keep */
-        assert_se(close_all_fds(keep, n_keep) >= 0);
+        ASSERT_OK(func(keep, n_keep));
 
         assert_se(validate_fds(false, fds, n_fds) == n_fds - n_keep);
         assert_se(validate_fds(true, keep, n_keep) == n_keep);
 
         /* Close everything else too! */
-        assert_se(close_all_fds(NULL, 0) >= 0);
+        ASSERT_OK(func(NULL, 0));
 
         assert_se(validate_fds(false, fds, n_fds) == n_fds - n_keep);
         assert_se(validate_fds(false, keep, n_keep) == n_keep);
@@ -335,95 +333,27 @@ static void test_close_all_fds_inner(void) {
         log_open();
 }
 
-static int seccomp_prohibit_close_range(void) {
-#if HAVE_SECCOMP && defined(__SNR_close_range)
-        _cleanup_(seccomp_releasep) scmp_filter_ctx seccomp = NULL;
-        int r;
-
-        r = seccomp_init_for_arch(&seccomp, SCMP_ARCH_NATIVE, SCMP_ACT_ALLOW);
-        if (r < 0)
-                return log_warning_errno(r, "Failed to acquire seccomp context, ignoring: %m");
-
-        r = seccomp_rule_add_exact(
-                        seccomp,
-                        SCMP_ACT_ERRNO(EPERM),
-                        SCMP_SYS(close_range),
-                        0);
-        if (r < 0)
-                return log_warning_errno(r, "Failed to add close_range() rule, ignoring: %m");
-
-        r = seccomp_load(seccomp);
-        if (r < 0)
-                return log_warning_errno(r, "Failed to apply close_range() restrictions, ignoring: %m");
-
-        return 0;
-#else
-        return log_warning_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Seccomp support or close_range() syscall definition not available.");
-#endif
-}
-
 TEST(close_all_fds) {
+        ForkFlags flags = FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT;
         int r;
 
-        /* Runs the test four times. Once as is. Once with close_range() syscall blocked via seccomp, once
-         * with /proc/ overmounted, and once with the combination of both. This should trigger all fallbacks
-         * in the close_range_all() function. */
-
-        r = safe_fork("(caf-plain)", FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL);
+        r = ASSERT_OK(pidref_safe_fork("(caf-plain)", flags, NULL));
         if (r == 0) {
-                test_close_all_fds_inner();
+                test_close_all_fds_inner(close_all_fds);
                 _exit(EXIT_SUCCESS);
         }
-        assert_se(r >= 0);
 
-        if (geteuid() != 0)
-                return (void) log_tests_skipped("Lacking privileges for test with close_range() blocked and /proc/ overmounted");
-
-        r = safe_fork("(caf-noproc)", FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT|FORK_NEW_MOUNTNS|FORK_MOUNTNS_SLAVE, NULL);
+        r = ASSERT_OK(pidref_safe_fork("(caf-nomalloc)", flags, NULL));
         if (r == 0) {
-                r = mount_nofollow_verbose(LOG_WARNING, "tmpfs", "/proc", "tmpfs", 0, NULL);
-                if (r < 0)
-                        log_notice("Overmounting /proc/ didn't work, skipping close_all_fds() with masked /proc/.");
-                else
-                        test_close_all_fds_inner();
+                test_close_all_fds_inner(close_all_fds_without_malloc);
                 _exit(EXIT_SUCCESS);
         }
-        if (ERRNO_IS_NEG_PRIVILEGE(r))
-                return (void) log_tests_skipped("Lacking privileges for test in namespace with /proc/ overmounted");
-        assert_se(r >= 0);
 
-        if (!is_seccomp_available())
-                return (void) log_tests_skipped("Seccomp not available");
-
-        r = safe_fork("(caf-seccomp)", FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL);
+        r = ASSERT_OK(pidref_safe_fork("(caf-frugal)", flags, NULL));
         if (r == 0) {
-                r = seccomp_prohibit_close_range();
-                if (r < 0)
-                        log_notice("Applying seccomp filter didn't work, skipping close_all_fds() test with masked close_range().");
-                else
-                        test_close_all_fds_inner();
-
+                test_close_all_fds_inner(close_all_fds_frugal);
                 _exit(EXIT_SUCCESS);
         }
-        assert_se(r >= 0);
-
-        r = safe_fork("(caf-scnp)", FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT|FORK_NEW_MOUNTNS|FORK_MOUNTNS_SLAVE, NULL);
-        if (r == 0) {
-                r = seccomp_prohibit_close_range();
-                if (r < 0)
-                        log_notice("Applying seccomp filter didn't work, skipping close_all_fds() test with masked close_range().");
-                else {
-                        r = mount_nofollow_verbose(LOG_WARNING, "tmpfs", "/proc", "tmpfs", 0, NULL);
-                        if (r < 0)
-                                log_notice("Overmounting /proc/ didn't work, skipping close_all_fds() with masked /proc/.");
-                        else
-                                test_close_all_fds_inner();
-                }
-
-                test_close_all_fds_inner();
-                _exit(EXIT_SUCCESS);
-        }
-        assert_se(r >= 0);
 }
 
 TEST(format_proc_fd_path) {
@@ -544,6 +474,60 @@ TEST(fd_reopen) {
         /* So here's the thing: if we have an O_PATH fd to a symlink, we *cannot* convert it to a regular fd
          * with that. i.e. you cannot have the VFS follow a symlink pinned via an O_PATH fd. */
         assert_se(fd_reopen(fd1, O_RDONLY|O_CLOEXEC) == -ELOOP);
+}
+
+TEST(fd_dup_or_reopen_stdio_nonblock) {
+        _cleanup_(unlink_tempfilep) char path[] = "/tmp/test-fd-dup-or-reopen-stdio-nonblock.XXXXXX";
+        _cleanup_close_ int fd = -EBADF, nfd = -EBADF;
+        _cleanup_close_pair_ int p[2] = EBADF_PAIR;
+        char buf[4] = {};
+        int fl;
+
+        ASSERT_OK(fd = mkostemp_safe(path));
+        ASSERT_OK(nfd = fd_dup_or_reopen_stdio_nonblock(fd, O_WRONLY));
+        ASSERT_OK_EQ_ERRNO(write(nfd, "hello", 5), (ssize_t) 5);
+        ASSERT_OK_EQ_ERRNO(lseek(fd, 0, SEEK_CUR), (off_t) 5);
+        ASSERT_OK_ERRNO(fl = fcntl(fd, F_GETFL));
+        ASSERT_FALSE(FLAGS_SET(fl, O_NONBLOCK));
+        ASSERT_OK_ERRNO(fl = fcntl(nfd, F_GETFL));
+        ASSERT_FALSE(FLAGS_SET(fl, O_NONBLOCK));
+        nfd = safe_close(nfd);
+        fd = safe_close(fd);
+
+        ASSERT_OK_ERRNO(fd = open(path, O_WRONLY|O_APPEND|O_CLOEXEC));
+        ASSERT_OK(nfd = fd_dup_or_reopen_stdio_nonblock(fd, O_WRONLY));
+        ASSERT_OK_ERRNO(fl = fcntl(nfd, F_GETFL));
+        ASSERT_TRUE(FLAGS_SET(fl, O_APPEND));
+        nfd = safe_close(nfd);
+        fd = safe_close(fd);
+
+        /* Reading ahead must not move the offset of the original fd */
+        ASSERT_OK_ERRNO(fd = open(path, O_RDONLY|O_CLOEXEC));
+        ASSERT_OK_EQ_ERRNO(lseek(fd, 2, SEEK_SET), (off_t) 2);
+        ASSERT_OK(nfd = fd_dup_or_reopen_stdio_nonblock(fd, O_RDONLY));
+        ASSERT_OK_EQ_ERRNO(read(nfd, buf, sizeof(buf) - 1), (ssize_t) 3);
+        ASSERT_STREQ(buf, "llo");
+        ASSERT_OK_EQ_ERRNO(lseek(fd, 0, SEEK_CUR), (off_t) 2);
+        ASSERT_OK_ERRNO(fl = fcntl(nfd, F_GETFL));
+        ASSERT_TRUE(FLAGS_SET(fl, O_NONBLOCK));
+        ASSERT_OK_ERRNO(fl = fcntl(fd, F_GETFL));
+        ASSERT_FALSE(FLAGS_SET(fl, O_NONBLOCK));
+        nfd = safe_close(nfd);
+        fd = safe_close(fd);
+
+        ASSERT_OK_ERRNO(pipe2(p, O_CLOEXEC));
+        ASSERT_OK(nfd = fd_dup_or_reopen_stdio_nonblock(p[0], O_RDONLY));
+        ASSERT_OK_ERRNO(fl = fcntl(nfd, F_GETFL));
+        ASSERT_TRUE(FLAGS_SET(fl, O_NONBLOCK));
+        ASSERT_OK_ERRNO(fl = fcntl(p[0], F_GETFL));
+        ASSERT_FALSE(FLAGS_SET(fl, O_NONBLOCK));
+        nfd = safe_close(nfd);
+
+        ASSERT_OK(nfd = fd_dup_or_reopen_stdio_nonblock(p[1], O_WRONLY));
+        ASSERT_OK_ERRNO(fl = fcntl(nfd, F_GETFL));
+        ASSERT_TRUE(FLAGS_SET(fl, O_NONBLOCK));
+        ASSERT_OK_ERRNO(fl = fcntl(p[1], F_GETFL));
+        ASSERT_FALSE(FLAGS_SET(fl, O_NONBLOCK));
 }
 
 TEST(fd_reopen_condition) {
@@ -680,7 +664,135 @@ TEST(dir_fd_is_root) {
         assert_se(dir_fd_is_root_or_cwd(fd) == 0);
 }
 
-TEST(fds_are_same_mount) {
+static void test_path_is_root_at_one(bool expected) {
+        ASSERT_OK_POSITIVE(path_is_root("/"));
+        ASSERT_OK_POSITIVE(path_is_root("/."));
+        ASSERT_OK_EQ(path_is_root("/./.."), expected);
+        ASSERT_OK_EQ(path_is_root("/.."), expected);
+        ASSERT_OK_EQ(path_is_root("/../"), expected);
+        ASSERT_OK_EQ(path_is_root("/../."), expected);
+        ASSERT_OK_EQ(path_is_root("/../.."), expected);
+
+        ASSERT_OK_ZERO(path_is_root("/usr"));
+        ASSERT_OK_ZERO(path_is_root("/./usr"));
+        ASSERT_OK_ZERO(path_is_root("/../usr"));
+        ASSERT_OK_ZERO(path_is_root("/.././usr"));
+        ASSERT_OK_ZERO(path_is_root("/../../usr"));
+
+        _cleanup_close_ int fd = -EBADF;
+        ASSERT_OK_ERRNO(fd = open("/", O_CLOEXEC|O_PATH|O_DIRECTORY|O_NOFOLLOW));
+
+        ASSERT_OK_POSITIVE(path_is_root_at(fd, NULL));
+        ASSERT_OK_POSITIVE(path_is_root_at(fd, ""));
+        ASSERT_OK_POSITIVE(path_is_root_at(fd, "."));
+        ASSERT_OK_EQ(path_is_root_at(fd, "./../"), expected);
+        ASSERT_OK_EQ(path_is_root_at(fd, "../"), expected);
+        ASSERT_OK_POSITIVE(path_is_root_at(fd, "/"));
+        ASSERT_OK_POSITIVE(path_is_root_at(fd, "/."));
+        ASSERT_OK_EQ(path_is_root_at(fd, "/./.."), expected);
+        ASSERT_OK_EQ(path_is_root_at(fd, "/.."), expected);
+        ASSERT_OK_EQ(path_is_root_at(fd, "/../"), expected);
+        ASSERT_OK_EQ(path_is_root_at(fd, "/../."), expected);
+        ASSERT_OK_EQ(path_is_root_at(fd, "/../.."), expected);
+
+        ASSERT_OK_ZERO(path_is_root_at(fd, "usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "./usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "../usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "/usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "/./usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "/../usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "/.././usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "/../../usr"));
+
+        safe_close(fd);
+        ASSERT_OK_ERRNO(fd = open("/../", O_CLOEXEC|O_PATH|O_DIRECTORY|O_NOFOLLOW));
+
+        ASSERT_OK_EQ(path_is_root_at(fd, NULL), expected);
+        ASSERT_OK_EQ(path_is_root_at(fd, ""), expected);
+        ASSERT_OK_EQ(path_is_root_at(fd, "."), expected);
+        ASSERT_OK_EQ(path_is_root_at(fd, "./.."), expected);
+        ASSERT_OK_EQ(path_is_root_at(fd, "../"), expected);
+        ASSERT_OK_POSITIVE(path_is_root_at(fd, "/"));
+        ASSERT_OK_POSITIVE(path_is_root_at(fd, "/."));
+        ASSERT_OK_EQ(path_is_root_at(fd, "/./.."), expected);
+        ASSERT_OK_EQ(path_is_root_at(fd, "/.."), expected);
+        ASSERT_OK_EQ(path_is_root_at(fd, "/../"), expected);
+        ASSERT_OK_EQ(path_is_root_at(fd, "/../."), expected);
+        ASSERT_OK_EQ(path_is_root_at(fd, "/../.."), expected);
+
+        ASSERT_OK_ZERO(path_is_root_at(fd, "usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "./usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "../usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "/usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "/./usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "/../usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "/.././usr"));
+        ASSERT_OK_ZERO(path_is_root_at(fd, "/../../usr"));
+}
+
+TEST(path_is_root_at) {
+        int r;
+
+        test_path_is_root_at_one(true);
+
+        r = detach_mount_namespace();
+        if (r < 0)
+                return (void) log_tests_skipped_errno(r, "Failed to detach mount namespace");
+
+        /* Interestingly, even after bind mount a path on "/", still "/" points to the previous root
+         * directory, but "/../" points to the new root directory. Hence, path_is_root("/") is true but
+         * path_is_root("/../") is false. Such spurious situation is resolved after chroot()ing to the new
+         * root directory. */
+        ASSERT_OK(mount_nofollow_verbose(LOG_DEBUG, "/", "/", NULL, MS_BIND|MS_REC, NULL));
+        log_debug("/* %s: bind mount(\"/\", \"/\") */", __func__);
+        test_path_is_root_at_one(false);
+
+        /* chroot("/") does not change anything. */
+        ASSERT_OK_ERRNO(chroot("/"));
+        log_debug("/* %s: chroot(\"/\") */", __func__);
+        test_path_is_root_at_one(false);
+
+        /* chdir("/") neither change anything. */
+        ASSERT_OK_ERRNO(chdir("/"));
+        log_debug("/* %s: chdir(\"/\") */", __func__);
+        test_path_is_root_at_one(false);
+
+        /* chdir("/../") neither change anything. */
+        ASSERT_OK_ERRNO(chdir("/../"));
+        log_debug("/* %s: chdir(\"/../\") */", __func__);
+        test_path_is_root_at_one(false);
+
+        /* After chroot("/../"), both "/" and "/../" point to the new root directory. */
+        ASSERT_OK_ERRNO(chroot("/../"));
+        log_debug("/* %s: chroot(\"/../\") */", __func__);
+        test_path_is_root_at_one(true);
+
+        /* chdir("/../") does not change anything. */
+        ASSERT_OK_ERRNO(chdir("/../"));
+        log_debug("/* %s: chdir(\"/../\") again */", __func__);
+        test_path_is_root_at_one(true);
+
+        /* bind mounting to non-root directory has no problem, of course. */
+        _cleanup_(rm_rf_physical_and_freep) char *tmp = NULL;
+        ASSERT_OK(mkdtemp_malloc("/tmp/test-path_is_root-XXXXXX", &tmp));
+        ASSERT_OK(mount_nofollow_verbose(LOG_DEBUG, "/", tmp, NULL, MS_BIND|MS_REC, NULL));
+        log_debug("/* %s: bind mount(\"/\", \"%s\") */", __func__, tmp);
+        test_path_is_root_at_one(true);
+
+        ASSERT_OK_ERRNO(chdir(tmp));
+        log_debug("/* %s: chdir(\"%s\") */", __func__, tmp);
+        test_path_is_root_at_one(true);
+
+        ASSERT_OK_ERRNO(chroot(tmp));
+        log_debug("/* %s: chroot(\"%s\") */", __func__, tmp);
+        test_path_is_root_at_one(true);
+
+        ASSERT_OK_ERRNO(chdir(tmp));
+        log_debug("/* %s: chdir(\"%s\") again */", __func__, tmp);
+        test_path_is_root_at_one(true);
+}
+
+TEST(fds_inode_and_mount_same) {
         _cleanup_close_ int fd1 = -EBADF, fd2 = -EBADF, fd3 = -EBADF, fd4 = -EBADF;
 
         fd1 = open("/sys", O_CLOEXEC|O_PATH|O_DIRECTORY|O_NOFOLLOW);
@@ -691,11 +803,8 @@ TEST(fds_are_same_mount) {
         if (fd1 < 0 || fd2 < 0 || fd3 < 0 || fd4 < 0)
                 return (void) log_tests_skipped_errno(errno, "Failed to open /sys or /proc or /");
 
-        if (fds_are_same_mount(fd1, fd4) > 0 && fds_are_same_mount(fd2, fd4) > 0)
-                return (void) log_tests_skipped("Cannot test fds_are_same_mount() as /sys and /proc are not mounted");
-
-        assert_se(fds_are_same_mount(fd1, fd2) == 0);
-        assert_se(fds_are_same_mount(fd2, fd3) > 0);
+        assert_se(fds_inode_and_mount_same(fd1, fd2) == 0);
+        assert_se(fds_inode_and_mount_same(fd2, fd3) > 0);
 }
 
 TEST(fd_get_path) {
@@ -812,6 +921,54 @@ TEST(fd_get_path) {
         ASSERT_STREQ(p, q);
 
         assert_se(chdir(saved_cwd) >= 0);
+}
+
+TEST(fd_vet_accmode) {
+        _cleanup_(unlink_tempfilep) char name[] = "/tmp/test-fd-accmode.XXXXXX";
+        _cleanup_close_ int fd_rw = -EBADF, fd_ro = -EBADF, fd_wo = -EBADF, fd_opath = -EBADF;
+
+        ASSERT_OK(fd_rw = mkostemp_safe(name));
+        ASSERT_OK_ZERO(fd_vet_accmode(fd_rw, O_RDONLY));
+        ASSERT_OK_ZERO(fd_vet_accmode(fd_rw, O_WRONLY));
+        ASSERT_OK_POSITIVE(fd_vet_accmode(fd_rw, O_RDWR));
+
+        ASSERT_OK_ERRNO(fd_ro = open(name, O_RDONLY | O_CLOEXEC));
+        ASSERT_OK_POSITIVE(fd_vet_accmode(fd_ro, O_RDONLY));
+        ASSERT_ERROR(fd_vet_accmode(fd_ro, O_WRONLY), EPROTOTYPE);
+        ASSERT_ERROR(fd_vet_accmode(fd_ro, O_RDWR), EPROTOTYPE);
+
+        ASSERT_OK_ERRNO(fd_wo = open(name, O_WRONLY | O_CLOEXEC));
+        ASSERT_ERROR(fd_vet_accmode(fd_wo, O_RDONLY), EPROTOTYPE);
+        ASSERT_OK_POSITIVE(fd_vet_accmode(fd_wo, O_WRONLY));
+        ASSERT_ERROR(fd_vet_accmode(fd_wo, O_RDWR), EPROTOTYPE);
+
+        ASSERT_OK_ERRNO(fd_opath = open(name, O_PATH | O_CLOEXEC));
+        ASSERT_ERROR(fd_vet_accmode(fd_opath, O_RDONLY), EBADFD);
+        ASSERT_ERROR(fd_vet_accmode(fd_opath, O_WRONLY), EBADFD);
+        ASSERT_ERROR(fd_vet_accmode(fd_opath, O_RDWR), EBADFD);
+}
+
+TEST(fd_is_writable) {
+        _cleanup_(unlink_tempfilep) char name[] = "/tmp/test-fd-writable.XXXXXX";
+        _cleanup_close_ int fd_ro = -EBADF, fd_wo = -EBADF, fd_rw = -EBADF, fd_path = -EBADF;
+
+        ASSERT_OK(fd_rw = mkostemp_safe(name));
+        ASSERT_OK_POSITIVE(fd_is_writable(fd_rw));
+
+        ASSERT_OK(fd_ro = open(name, O_RDONLY | O_CLOEXEC));
+        ASSERT_OK_ZERO(fd_is_writable(fd_ro));
+
+        ASSERT_OK(fd_wo = open(name, O_WRONLY | O_CLOEXEC));
+        ASSERT_OK_POSITIVE(fd_is_writable(fd_wo));
+
+        ASSERT_OK(fd_path = open(name, O_PATH | O_CLOEXEC));
+        ASSERT_OK_ZERO(fd_is_writable(fd_path));
+
+        ASSERT_SIGNAL(fd_is_writable(-1), SIGABRT);
+
+        safe_close(fd_ro);
+        ASSERT_ERROR(fd_is_writable(fd_ro), EBADF);
+        TAKE_FD(fd_ro);
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

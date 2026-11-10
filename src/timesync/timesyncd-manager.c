@@ -10,8 +10,10 @@
 
 #include "sd-bus.h"
 #include "sd-daemon.h"
+#include "sd-json.h"
 #include "sd-messages.h"
 #include "sd-network.h"
+#include "sd-varlink.h"
 
 #include "alloc-util.h"
 #include "clock-util.h"
@@ -23,6 +25,7 @@
 #include "format-util.h"
 #include "fs-util.h"
 #include "hashmap.h"
+#include "in-addr-util.h"
 #include "list.h"
 #include "log.h"
 #include "logarithm.h"
@@ -30,6 +33,8 @@
 #include "random-util.h"
 #include "ratelimit.h"
 #include "resolve-private.h"
+#include "resolve-varlink-util.h"
+#include "resolved-def.h"
 #include "socket-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -244,7 +249,7 @@ static int manager_adjust_clock(Manager *m, double offset, int leap_sec) {
 
         /* For small deltas, tell the kernel to gradually adjust the system clock to the NTP time, larger
          * deltas are just directly set. */
-        if (fabs(offset) < NTP_MAX_ADJUST) {
+        if (ABS(offset) < NTP_MAX_ADJUST) {
                 tmx = (struct timex) {
                         .modes = ADJ_STATUS | ADJ_NANO | ADJ_OFFSET | ADJ_TIMECONST | ADJ_MAXERROR | ADJ_ESTERROR,
                         .status = STA_PLL,
@@ -337,14 +342,16 @@ static bool manager_sample_spike_detection(Manager *m, double offset, double del
         j = 0;
         FOREACH_ELEMENT(sample, m->samples)
                 j += pow(sample->offset - m->samples[idx_min].offset, 2);
-        m->samples_jitter = sqrt(j / (ELEMENTSOF(m->samples) - 1));
+
+        size_t n = ELEMENTSOF(m->samples);
+        m->samples_jitter = sqrt(j / (n - 1));
 
         /* ignore samples when resyncing */
         if (m->poll_resync)
                 return false;
 
         /* always accept offset if we are farther off than the round-trip delay */
-        if (fabs(offset) > delay)
+        if (ABS(offset) > delay)
                 return false;
 
         /* we need a few samples before looking at them */
@@ -352,11 +359,11 @@ static bool manager_sample_spike_detection(Manager *m, double offset, double del
                 return false;
 
         /* do not accept anything worse than the maximum possible error of the best sample */
-        if (fabs(offset) > m->samples[idx_min].delay)
+        if (ABS(offset) > m->samples[idx_min].delay)
                 return true;
 
         /* compare the difference between the current offset to the previous offset and jitter */
-        return fabs(offset - m->samples[idx_cur].offset) > 3 * jitter;
+        return ABS(offset - m->samples[idx_cur].offset) > 3 * jitter;
 }
 
 static void manager_adjust_poll(Manager *m, double offset, bool spike) {
@@ -369,20 +376,20 @@ static void manager_adjust_poll(Manager *m, double offset, bool spike) {
         }
 
         /* set to minimal poll interval */
-        if (!spike && fabs(offset) > NTP_ACCURACY_SEC) {
+        if (!spike && ABS(offset) > NTP_ACCURACY_SEC) {
                 m->poll_interval_usec = m->poll_interval_min_usec;
                 return;
         }
 
         /* increase polling interval */
-        if (fabs(offset) < NTP_ACCURACY_SEC * 0.25) {
+        if (ABS(offset) < NTP_ACCURACY_SEC * 0.25) {
                 if (m->poll_interval_usec < m->poll_interval_max_usec)
                         m->poll_interval_usec *= 2;
                 return;
         }
 
         /* decrease polling interval */
-        if (spike || fabs(offset) > NTP_ACCURACY_SEC * 0.75) {
+        if (spike || ABS(offset) > NTP_ACCURACY_SEC * 0.75) {
                 if (m->poll_interval_usec > m->poll_interval_min_usec)
                         m->poll_interval_usec /= 2;
                 return;
@@ -435,7 +442,7 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
         }
 
         /* Too short packet? */
-        if (iov.iov_len < sizeof(struct ntp_msg)) {
+        if ((size_t) len < sizeof(struct ntp_msg)) {
                 log_warning("Invalid response from server. Disconnecting.");
                 return manager_connect(m);
         }
@@ -778,6 +785,119 @@ static int manager_resolve_handler(sd_resolve_query *q, int ret, const struct ad
         return manager_begin(m);
 }
 
+static int manager_resolve_varlink_reply(
+                sd_varlink *link,
+                sd_json_variant *parameters,
+                const char *error_id,
+                sd_varlink_reply_flags_t flags,
+                void *userdata) {
+
+        Manager *m = ASSERT_PTR(userdata);
+        int r;
+
+        assert(m->current_server_name);
+
+        _unused_ _cleanup_(sd_varlink_unrefp) sd_varlink *link_free = TAKE_PTR(m->resolve_varlink);
+
+        if (!isempty(error_id)) {
+                log_debug("Failed to resolve %s: %s", m->current_server_name->string, error_id);
+
+                /* Try next one */
+                return manager_connect(m);
+        }
+
+        _cleanup_(resolve_hostname_reply_done) ResolveHostnameReply reply = {};
+        r = dispatch_resolve_hostname_reply(/* name = */ NULL, parameters, SD_JSON_LOG, &reply);
+        if (r < 0) {
+                log_warning_errno(r, "Failed to parse reply for %s, ignoring: %m", m->current_server_name->string);
+
+                return manager_connect(m);
+        }
+
+        FOREACH_ARRAY(entry, reply.addresses, reply.n_addresses) {
+                _cleanup_free_ char *pretty = NULL;
+                union sockaddr_union sa = {};
+                ServerAddress *a;
+
+                if (!IN_SET(entry->family, AF_INET, AF_INET6)) {
+                        log_debug("Ignoring unsuitable address protocol for %s.", m->current_server_name->string);
+                        continue;
+                }
+
+                r = sockaddr_set_in_addr(&sa, entry->family, &entry->in_addr.address, 123);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to convert address for %s, trying next host: %m", m->current_server_name->string);
+                        return manager_connect(m);
+                }
+
+                /* Only link-local addresses need a scope, setting it on a global one pins us to one interface. */
+                if (entry->family == AF_INET6 && in6_addr_is_link_local(&entry->in_addr.address.in6))
+                        sa.in6.sin6_scope_id = entry->ifindex;
+
+                r = server_address_new(m->current_server_name, &a, &sa, sockaddr_len(&sa));
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to add server address, trying next host: %m");
+                        return manager_connect(m);
+                }
+
+                (void) server_address_pretty(a, &pretty);
+                log_debug("Resolved address %s for %s.", strna(pretty), m->current_server_name->string);
+        }
+
+        if (!m->current_server_name->addresses) {
+                log_error("Failed to find suitable address for host %s.", m->current_server_name->string);
+
+                /* Try next host */
+                return manager_connect(m);
+        }
+
+        manager_set_server_address(m, m->current_server_name->addresses);
+
+        return manager_begin(m);
+}
+
+/* Resolve the current server name through resolved's Varlink interface. This returns 0 if resolved is
+ * unavailable */
+static int manager_resolve_varlink(Manager *m) {
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *link = NULL;
+        int r;
+
+        assert(m);
+        assert(m->current_server_name);
+
+        r = sd_varlink_connect_address(&link, "/run/systemd/resolve/io.systemd.Resolve");
+        if (r < 0) {
+                log_debug_errno(r, "Failed to connect to systemd-resolved, using getaddrinfo(): %m");
+                return 0;
+        }
+
+        (void) sd_varlink_set_description(link, "timesyncd-resolve");
+        (void) sd_varlink_set_relative_timeout(link, SD_RESOLVED_QUERY_TIMEOUT_USEC);
+
+        r = sd_varlink_attach_event(link, m->event, SD_EVENT_PRIORITY_NORMAL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to attach Varlink connection to event loop: %m");
+
+        r = sd_varlink_bind_reply(link, manager_resolve_varlink_reply);
+        if (r < 0)
+                return log_error_errno(r, "Failed to bind Varlink reply callback: %m");
+
+        sd_varlink_set_userdata(link, m);
+
+        /* Ask resolved to skip DNSSEC validation as long as our clock is not synchronized yet. */
+        r = sd_varlink_invokebo(
+                        link,
+                        "io.systemd.Resolve.ResolveHostname",
+                        SD_JSON_BUILD_PAIR_STRING("name", m->current_server_name->string),
+                        SD_JSON_BUILD_PAIR_CONDITION(!socket_ipv6_is_enabled(), "family", SD_JSON_BUILD_INTEGER(AF_INET)),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("flags", m->synchronized ? 0 : SD_RESOLVED_NO_VALIDATE));
+        if (r < 0)
+                return log_error_errno(r, "Failed to call ResolveHostname(): %m");
+
+        m->resolve_varlink = TAKE_PTR(link);
+        return 1;
+}
+
 static int manager_retry_connect(sd_event_source *source, usec_t usec, void *userdata) {
         Manager *m = ASSERT_PTR(userdata);
 
@@ -866,19 +986,26 @@ int manager_connect(Manager *m) {
                         manager_set_server_name(m, f);
                 }
 
-                /* Tell the resolver to reread /etc/resolv.conf, in
-                 * case it changed. */
-                res_init();
-
                 /* Flush out any previously resolved addresses */
                 server_name_flush_addresses(m->current_server_name);
 
                 log_debug("Resolving %s...", m->current_server_name->string);
 
+                /* Prefer resolved's varlink interface. If that's unavailable, then fall through to getaddrinfo below. */
+                r = manager_resolve_varlink(m);
+                if (r < 0)
+                        return r;
+                if (r > 0)
+                        return 1;
+
+                /* Tell the resolver to reread /etc/resolv.conf, in
+                 * case it changed. */
+                res_init();
+
                 struct addrinfo hints = {
                         .ai_flags = AI_NUMERICSERV|AI_ADDRCONFIG,
                         .ai_socktype = SOCK_DGRAM,
-                        .ai_family = socket_ipv6_is_supported() ? AF_UNSPEC : AF_INET,
+                        .ai_family = socket_ipv6_is_enabled() ? AF_UNSPEC : AF_INET,
                 };
 
                 r = resolve_getaddrinfo(m->resolve, &m->resolve_query, m->current_server_name->string, "123", &hints, manager_resolve_handler, NULL, m);
@@ -899,6 +1026,7 @@ void manager_disconnect(Manager *m) {
         assert(m);
 
         m->resolve_query = sd_resolve_query_unref(m->resolve_query);
+        m->resolve_varlink = sd_varlink_close_unref(m->resolve_varlink);
 
         m->event_timer = sd_event_source_unref(m->event_timer);
 
@@ -911,7 +1039,7 @@ void manager_disconnect(Manager *m) {
         (void) sd_notify(false, "STATUS=Idle.");
 }
 
-void manager_flush_server_names(Manager  *m, ServerType t) {
+void manager_flush_server_names(Manager *m, ServerType t) {
         assert(m);
 
         if (t == SERVER_SYSTEM)
@@ -966,19 +1094,19 @@ Manager* manager_free(Manager *m) {
         return mfree(m);
 }
 
-static int manager_network_read_link_servers(Manager *m) {
+static bool manager_network_read_link_servers(Manager *m) {
         _cleanup_strv_free_ char **ntp = NULL;
         bool changed = false;
         int r;
 
         assert(m);
 
+        bool existing = m->link_servers;
+
         r = sd_network_get_ntp(&ntp);
-        if (r < 0 && r != -ENODATA) {
-                if (r == -ENOMEM)
-                        log_oom();
-                else
-                        log_debug_errno(r, "Failed to get link NTP servers: %m");
+        if (r < 0) {
+                if (!IN_SET(r, -ENOENT, -ENODATA))
+                        log_error_errno(r, "Failed to get link NTP servers: %m");
                 goto clear;
         }
 
@@ -1025,7 +1153,7 @@ static int manager_network_read_link_servers(Manager *m) {
 
 clear:
         manager_flush_server_names(m, SERVER_LINK);
-        return r;
+        return existing; /* return true if there were existing servers. */
 }
 
 static bool manager_is_connected(Manager *m) {
@@ -1033,7 +1161,7 @@ static bool manager_is_connected(Manager *m) {
 
         /* Return true when the manager is sending a request, resolving a server name, or
          * in a poll interval. */
-        return m->server_socket >= 0 || m->resolve_query || m->event_timer;
+        return m->server_socket >= 0 || m->resolve_query || m->resolve_varlink || m->event_timer;
 }
 
 static int manager_network_event_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
@@ -1043,7 +1171,6 @@ static int manager_network_event_handler(sd_event_source *s, int fd, uint32_t re
 
         sd_network_monitor_flush(m->network_monitor);
 
-        /* When manager_network_read_link_servers() failed, we assume that the servers are changed. */
         changed = manager_network_read_link_servers(m);
 
         /* check if the machine is online */
@@ -1200,7 +1327,7 @@ int manager_setup_save_time_event(Manager *m) {
                         m,
                         SD_EVENT_PRIORITY_NORMAL,
                         "save-time",
-                        /* force_reset = */ false);
+                        /* force_reset= */ false);
         if (r < 0)
                 return log_error_errno(r, "Failed to reset event source for saving time: %m");
 
@@ -1216,7 +1343,7 @@ static int manager_save_time_and_rearm(Manager *m, usec_t t) {
          * clock, but otherwise uses the specified timestamp. Note that whenever we acquire an NTP sync the
          * specified timestamp value might be more accurate than the system clock, since the latter is
          * subject to slow adjustments. */
-        r = touch_file(TIMESYNCD_CLOCK_FILE, /* parents = */ false, t, UID_INVALID, GID_INVALID, MODE_INVALID);
+        r = touch_file(TIMESYNCD_CLOCK_FILE, /* parents= */ false, t, UID_INVALID, GID_INVALID, MODE_INVALID);
         if (r < 0)
                 log_debug_errno(r, "Failed to update "TIMESYNCD_CLOCK_FILE", ignoring: %m");
 

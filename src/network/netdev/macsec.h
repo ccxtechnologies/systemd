@@ -4,7 +4,6 @@
 #include <linux/if_macsec.h>
 #include <net/ethernet.h>
 
-#include "forward.h"
 #include "netdev.h"
 #include "sparse-endian.h"
 

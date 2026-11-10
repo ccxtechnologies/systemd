@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <stdio.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "id128-util.h"
 #include "image-policy.h"
 #include "log.h"
@@ -14,7 +16,7 @@
 #include "main-func.h"
 #include "mount-util.h"
 #include "parse-argument.h"
-#include "pretty-print.h"
+#include "verbs.h"
 
 static char *arg_root = NULL;
 static char *arg_image = NULL;
@@ -26,106 +28,63 @@ STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_image_policy, image_policy_freep);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-machine-id-setup", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s [OPTIONS...]\n"
-               "\n%2$sInitialize /etc/machine-id from a random source.%4$s\n"
-               "\n%3$sCommands:%4$s\n"
-               "     --commit               Commit transient ID\n"
-               "  -h --help                 Show this help\n"
-               "     --version              Show package version\n"
-               "\n%3$sOptions:%4$s\n"
-               "     --root=PATH            Operate on an alternate filesystem root\n"
-               "     --image=PATH           Operate on disk image as filesystem root\n"
-               "     --image-policy=POLICY  Specify disk image dissection policy\n"
-               "     --print                Print used machine ID\n"
-               "\nSee the %5$s for details.\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_underline(),
-               ansi_normal(),
-               link);
-
-        return 0;
-}
+COMMAND(
+        "systemd-machine-id-setup\0",
+        "Initialize /etc/machine-id from a random source.",
+        .man_pages = "systemd-machine-id-setup(1)\0",
+);
 
 static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_ROOT,
-                ARG_IMAGE,
-                ARG_IMAGE_POLICY,
-                ARG_COMMIT,
-                ARG_PRINT,
-        };
-
-        static const struct option options[] = {
-                { "help",         no_argument,       NULL, 'h'              },
-                { "version",      no_argument,       NULL, ARG_VERSION      },
-                { "root",         required_argument, NULL, ARG_ROOT         },
-                { "image",        required_argument, NULL, ARG_IMAGE        },
-                { "image-policy", required_argument, NULL, ARG_IMAGE_POLICY },
-                { "commit",       no_argument,       NULL, ARG_COMMIT       },
-                { "print",        no_argument,       NULL, ARG_PRINT        },
-                {}
-        };
-
-        int c, r;
-
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_GROUP("Commands"): {}
 
-                case ARG_VERSION:
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_ROOT:
-                        r = parse_path_argument(optarg, true, &arg_root);
-                        if (r < 0)
-                                return r;
-                        break;
-
-                case ARG_IMAGE:
-                        r = parse_path_argument(optarg, false, &arg_image);
-                        if (r < 0)
-                                return r;
-                        break;
-
-                case ARG_IMAGE_POLICY:
-                        r = parse_image_policy_argument(optarg, &arg_image_policy);
-                        if (r < 0)
-                                return r;
-                        break;
-
-                case ARG_COMMIT:
+                OPTION_LONG("commit", NULL, "Commit transient ID"):
                         arg_commit = true;
                         break;
 
-                case ARG_PRINT:
+                OPTION_GROUP("Options"): {}
+
+                OPTION_LONG("root", "PATH", "Operate on an alternate filesystem root"):
+                        r = parse_path_argument(opts.arg, true, &arg_root);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("image", "PATH", "Operate on disk image as filesystem root"):
+                        r = parse_path_argument(opts.arg, false, &arg_image);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("image-policy", "POLICY", "Specify disk image dissection policy"):
+                        r = parse_image_policy_argument(opts.arg, &arg_image_policy);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("print", NULL, "Print used machine ID"):
                         arg_print = true;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (optind < argc)
+        if (option_parser_get_n_args(&opts) > 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Extraneous arguments");
 
@@ -139,6 +98,12 @@ static int run(int argc, char *argv[]) {
         _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
         _cleanup_(umount_and_freep) char *mounted_dir = NULL;
         int r;
+
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        TPM2_NOTE(suggested);
 
         log_setup();
 
@@ -189,7 +154,7 @@ static int run(int argc, char *argv[]) {
         } else {
                 sd_id128_t id;
 
-                r = machine_id_setup(arg_root, SD_ID128_NULL, /* flags = */ 0, &id);
+                r = machine_id_setup(arg_root, SD_ID128_NULL, /* flags= */ 0, &id);
                 if (r < 0)
                         return r;
 

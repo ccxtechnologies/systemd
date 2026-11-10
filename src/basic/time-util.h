@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include <limits.h>
 #include <time.h>
 
 #include "forward.h"
@@ -54,6 +55,18 @@ typedef enum TimestampStyle {
 #define NSEC_PER_MONTH ((nsec_t) (2629800ULL*NSEC_PER_SEC))
 #define USEC_PER_YEAR ((usec_t) (31557600ULL*USEC_PER_SEC))
 #define NSEC_PER_YEAR ((nsec_t) (31557600ULL*NSEC_PER_SEC))
+
+enum {
+        WEEKDAY_MON,
+        WEEKDAY_TUE,
+        WEEKDAY_WED,
+        WEEKDAY_THU,
+        WEEKDAY_FRI,
+        WEEKDAY_SAT,
+        WEEKDAY_SUN,
+        _WEEKDAY_MAX,
+        _WEEKDAY_INVALID = -EINVAL,
+};
 
 /* We assume a maximum timezone length of 6. TZNAME_MAX is not defined on Linux, but glibc internally initializes this
  * to 6. Let's rely on that. */
@@ -113,6 +126,7 @@ struct timespec* timespec_store(struct timespec *ts, usec_t u);
 struct timespec* timespec_store_nsec(struct timespec *ts, nsec_t n);
 
 #define TIMESPEC_STORE(u) timespec_store(&(struct timespec) {}, (u))
+#define TIMESPEC_STORE_NSEC(n) timespec_store_nsec(&(struct timespec) {}, (n))
 
 usec_t timeval_load(const struct timeval *tv) _pure_;
 struct timeval* timeval_store(struct timeval *tv, usec_t u);
@@ -123,13 +137,17 @@ char* format_timestamp_style(char *buf, size_t l, usec_t t, TimestampStyle style
 char* format_timestamp_relative_full(char *buf, size_t l, usec_t t, clockid_t clock, bool implicit_left) _warn_unused_result_;
 char* format_timespan(char *buf, size_t l, usec_t t, usec_t accuracy) _warn_unused_result_;
 
+/* Returns the abbreviated English weekday name for wd in Mon=0 … Sun=6 order
+ * (matching systemd's weekdays_bits layout). */
+const char* weekday_to_string(int i);
+
 _warn_unused_result_
 static inline char* format_timestamp_relative(char *buf, size_t l, usec_t t) {
-        return format_timestamp_relative_full(buf, l, t, CLOCK_REALTIME, /* implicit_left = */ false);
+        return format_timestamp_relative_full(buf, l, t, CLOCK_REALTIME, /* implicit_left= */ false);
 }
 _warn_unused_result_
 static inline char* format_timestamp_relative_monotonic(char *buf, size_t l, usec_t t) {
-        return format_timestamp_relative_full(buf, l, t, CLOCK_MONOTONIC, /* implicit_left = */ false);
+        return format_timestamp_relative_full(buf, l, t, CLOCK_MONOTONIC, /* implicit_left= */ false);
 }
 
 _warn_unused_result_
@@ -149,6 +167,8 @@ static inline char* format_timestamp(char *buf, size_t l, usec_t t) {
 #define FORMAT_TIMESTAMP_STYLE(t, style) \
         format_timestamp_style((char[FORMAT_TIMESTAMP_MAX]){}, FORMAT_TIMESTAMP_MAX, t, style)
 
+const char* get_tzname(bool dst);
+int parse_gmtoff(const char *t, long *ret);
 int parse_timestamp(const char *t, usec_t *ret);
 
 int parse_sec(const char *t, usec_t *ret);
@@ -163,15 +183,41 @@ static inline bool timezone_is_valid(const char *name, int log_level) {
         return verify_timezone(name, log_level) >= 0;
 }
 
+void reset_timezonep(char **p);
+char* save_timezone(void);
+#define SAVE_TIMEZONE                                                   \
+        _unused_ _cleanup_(reset_timezonep)                             \
+             char *_saved_timezone_ = save_timezone()
+
 bool clock_supported(clockid_t clock);
 
-usec_t usec_shift_clock(usec_t, clockid_t from, clockid_t to);
+usec_t usec_shift_clock(usec_t x, clockid_t from, clockid_t to);
 
 int get_timezone(char **ret);
+int get_timezone_prefer_env(char **ret);
 const char* etc_localtime(void);
 
 int mktime_or_timegm_usec(struct tm *tm, bool utc, usec_t *ret);
 int localtime_or_gmtime_usec(usec_t t, bool utc, struct tm *ret);
+
+int parse_calendar_date_full(const char *s, bool allow_pre_epoch, usec_t *ret_usec, struct tm *ret_tm);
+
+static inline int parse_calendar_date(const char *s, usec_t *ret) {
+        return parse_calendar_date_full(s, /* allow_pre_epoch= */ false, ret, NULL);
+}
+
+#define BIRTH_DATE_UNSET                        \
+        (const struct tm) {                     \
+                .tm_year = INT_MIN,             \
+        }
+
+#define BIRTH_DATE_IS_SET(tm) ((tm).tm_year != INT_MIN)
+
+static inline int parse_birth_date(const char *s, struct tm *ret) {
+        return parse_calendar_date_full(s, /* allow_pre_epoch= */ true, NULL, ret);
+}
+
+uint64_t sysconf_clock_ticks_cached(void);
 
 uint32_t usec_to_jiffies(usec_t usec);
 usec_t jiffies_to_usec(uint32_t jiffies);
@@ -205,19 +251,7 @@ static inline usec_t usec_sub_signed(usec_t timestamp, int64_t delta) {
         return usec_sub_unsigned(timestamp, (usec_t) delta);
 }
 
-static inline int usleep_safe(usec_t usec) {
-        /* usleep() takes useconds_t that is (typically?) uint32_t. Also, usleep() may only support the
-         * range [0, 1000000]. See usleep(3). Let's override usleep() with clock_nanosleep().
-         *
-         * ⚠️ Note we are not using plain nanosleep() here, since that operates on CLOCK_REALTIME, not
-         *    CLOCK_MONOTONIC! */
-
-        if (usec == 0)
-                return 0;
-
-        /* `clock_nanosleep()` does not use `errno`, but returns positive error codes. */
-        return -clock_nanosleep(CLOCK_MONOTONIC, 0, TIMESPEC_STORE(usec), NULL);
-}
+int usleep_safe(usec_t usec);
 
 /* The last second we can format is 31. Dec 9999, 1s before midnight, because otherwise we'd enter 5 digit
  * year territory. However, since we want to stay away from this in all timezones we take one day off. */
@@ -236,5 +270,4 @@ static inline int usleep_safe(usec_t usec) {
 
 int time_change_fd(void);
 
-const char* timestamp_style_to_string(TimestampStyle t) _const_;
-TimestampStyle timestamp_style_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(timestamp_style, TimestampStyle);

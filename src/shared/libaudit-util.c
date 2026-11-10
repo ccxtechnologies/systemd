@@ -2,7 +2,6 @@
 
 #include <linux/audit.h>
 #include <linux/netlink.h>
-#include <stdio.h>
 #include <sys/socket.h>
 
 #include "errno-util.h"
@@ -12,6 +11,36 @@
 #include "log.h"
 #include "socket-util.h"
 
+#if HAVE_AUDIT
+static DLSYM_PROTOTYPE(audit_close) = NULL;
+DLSYM_PROTOTYPE(audit_log_acct_message) = NULL;
+DLSYM_PROTOTYPE(audit_log_user_avc_message) = NULL;
+DLSYM_PROTOTYPE(audit_log_user_comm_message) = NULL;
+static DLSYM_PROTOTYPE(audit_open) = NULL;
+#endif
+
+int dlopen_libaudit(int log_level) {
+#if HAVE_AUDIT
+        static void *libaudit_dl = NULL;
+
+        LIBAUDIT_NOTE(suggested);
+
+        return dlopen_many_sym_or_warn(
+                        &libaudit_dl,
+                        "libaudit.so.1",
+                        log_level,
+                        DLSYM_ARG(audit_close),
+                        DLSYM_ARG(audit_log_acct_message),
+                        DLSYM_ARG(audit_log_user_avc_message),
+                        DLSYM_ARG(audit_log_user_comm_message),
+                        DLSYM_ARG(audit_open));
+#else
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libaudit support is not compiled in.");
+#endif
+}
+
+#if HAVE_AUDIT
 static int try_audit_request(int fd) {
         struct iovec iov;
         struct msghdr mh;
@@ -49,13 +78,18 @@ static int try_audit_request(int fd) {
 
         return msg.err.error;
 }
+#endif
 
 bool use_audit(void) {
+#if HAVE_AUDIT
         static int cached_use = -1;
         int r;
 
         if (cached_use >= 0)
                 return cached_use;
+
+        if (dlopen_libaudit(LOG_DEBUG) < 0)
+                return (cached_use = false);
 
         _cleanup_close_ int fd = socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK, NETLINK_AUDIT);
         if (fd < 0) {
@@ -83,12 +117,15 @@ bool use_audit(void) {
         }
 
         return cached_use;
+#else
+        return false;
+#endif
 }
 
 int close_audit_fd(int fd) {
 #if HAVE_AUDIT
         if (fd >= 0)
-                audit_close(fd);
+                sym_audit_close(fd);
 #else
         assert(fd < 0);
 #endif
@@ -97,8 +134,14 @@ int close_audit_fd(int fd) {
 
 int open_audit_fd_or_warn(void) {
 #if HAVE_AUDIT
+        int r;
+
+        r = dlopen_libaudit(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
         /* If the kernel lacks netlink or audit support, don't worry about it. */
-        int fd = audit_open();
+        int fd = sym_audit_open();
         if (fd < 0)
                 return log_full_errno(ERRNO_IS_NOT_SUPPORTED(errno) ? LOG_DEBUG : LOG_WARNING,
                                       errno, "Failed to connect to audit log, ignoring: %m");

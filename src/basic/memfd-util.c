@@ -1,17 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sched.h>
 #include <stdio.h>
-#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
+#include "io-util.h"
 #include "memfd-util.h"
+#include "process-util.h"
 #include "string-util.h"
-#include "utf8.h"
 
 int memfd_create_wrapper(const char *name, unsigned mode) {
         unsigned mode_compat;
@@ -36,26 +35,23 @@ int memfd_create_wrapper(const char *name, unsigned mode) {
 
 int memfd_new_full(const char *name, unsigned extra_flags) {
         _cleanup_free_ char *g = NULL;
+        int r;
 
         if (!name) {
-                char pr[TASK_COMM_LEN] = {};
 
                 /* If no name is specified we generate one. We include
                  * a hint indicating our library implementation, and
                  * add the thread name to it */
 
-                assert_se(prctl(PR_GET_NAME, (unsigned long) pr) >= 0);
+                _cleanup_free_ char *comm = NULL;
+                r = pid_get_comm(/* pid= */ 0, &comm);
+                if (r < 0)
+                        return r;
 
-                if (isempty(pr))
+                if (isempty(comm))
                         name = "sd";
                 else {
-                        _cleanup_free_ char *e = NULL;
-
-                        e = utf8_escape_invalid(pr);
-                        if (!e)
-                                return -ENOMEM;
-
-                        g = strjoin("sd-", e);
+                        g = strjoin("sd-", comm);
                         if (!g)
                                 return -ENOMEM;
 
@@ -100,8 +96,25 @@ int memfd_get_sealed(int fd) {
         if (r < 0)
                 return r;
 
-        /* We ignore F_SEAL_EXEC here to support older kernels. */
+        /* We ignore F_SEAL_EXEC here to support older kernels.
+         * It is supported since kernel v6.3 (6fd7353829cafc4067aad9eea0dc95da67e7df16). */
         return FLAGS_SET(seals, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE);
+}
+
+int memfd_set_sealed_gracefully(int fd) {
+        int r;
+
+        r = memfd_set_sealed(fd);
+        if (r != -EPERM)
+                return r;
+
+        /* Already sealed? Check if required seals are set. */
+        r = memfd_get_sealed(fd);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -EPERM; /* Propagate the original error. */
+        return 0;
 }
 
 int memfd_get_size(int fd, uint64_t *ret) {
@@ -137,11 +150,9 @@ int memfd_new_and_seal(const char *name, const void *data, size_t sz) {
                 return fd;
 
         if (sz > 0) {
-                ssize_t n = pwrite(fd, data, sz, 0);
-                if (n < 0)
-                        return -errno;
-                if ((size_t) n != sz)
-                        return -EIO;
+                r = pwrite_full(fd, data, sz, 0);
+                if (r < 0)
+                        return r;
         }
 
         r = memfd_set_sealed(fd);

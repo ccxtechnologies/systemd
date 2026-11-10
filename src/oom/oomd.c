@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
-
 #include "sd-event.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
@@ -17,81 +16,50 @@
 #include "oomd-manager.h"
 #include "oomd-manager-bus.h"
 #include "parse-util.h"
-#include "pretty-print.h"
 #include "psi-util.h"
+#include "verbs.h"
 
 static bool arg_dry_run = false;
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-oomd", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...]\n\n"
-               "Run the userspace out-of-memory (OOM) killer.\n\n"
-               "  -h --help                 Show this help\n"
-               "     --version              Show package version\n"
-               "     --dry-run              Only print destructive actions instead of doing them\n"
-               "     --bus-introspect=PATH  Write D-Bus XML introspection data\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               link);
-
-        return 0;
-}
+COMMAND(
+        "systemd-oomd\0",
+        "Run the userspace out-of-memory (OOM) killer.",
+        .man_pages = "systemd-oomd(8)\0",
+);
 
 static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_DRY_RUN,
-                ARG_BUS_INTROSPECT,
-        };
-
-        static const struct option options[] = {
-                { "help",           no_argument,       NULL, 'h'                },
-                { "version",        no_argument,       NULL, ARG_VERSION        },
-                { "dry-run",        no_argument,       NULL, ARG_DRY_RUN        },
-                { "bus-introspect", required_argument, NULL, ARG_BUS_INTROSPECT },
-                {}
-        };
-
-        int c;
-
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_DRY_RUN:
+                OPTION('n', "dry-run", NULL,
+                       "Only print destructive actions instead of doing them"):
                         arg_dry_run = true;
                         break;
 
-                case ARG_BUS_INTROSPECT:
+                OPTION_LONG("bus-introspect", "PATH",
+                            "Write D-Bus XML introspection data"):
                         return bus_introspect_implementations(
                                         stdout,
-                                        optarg,
+                                        opts.arg,
                                         BUS_IMPLEMENTATIONS(&manager_object,
                                                             &log_control_object));
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (optind < argc)
+        if (option_parser_get_n_args(&opts) > 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "This program takes no arguments.");
 

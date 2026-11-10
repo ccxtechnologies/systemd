@@ -51,7 +51,7 @@
       <filename>/usr/lib/udev/rules.d</filename> and <filename>/usr/local/lib/udev/rules.d</filename>, the
       volatile runtime directory <filename>/run/udev/rules.d</filename> and the local administration
       directory <filename>/etc/udev/rules.d</filename>.  All rules files are collectively sorted and
-      processed in lexical order, regardless of the directories in which they live. However, files with
+      processed in lexicographic order, regardless of the directories in which they live. However, files with
       identical filenames replace each other. Files in <filename>/etc/</filename> have the highest priority,
       files in <filename>/run/</filename> take precedence over files with the same name under
       <filename>/usr/</filename>. This can be used to override a system-supplied rules file with a local
@@ -61,7 +61,10 @@
       ignored.</para>
 
       <para>Every line in the rules file contains at least one key-value pair.
-      Except for empty lines or lines beginning with <literal>#</literal>, which are ignored.
+      A line ending with a backslash (<literal>\</literal>) is joined with the following line,
+      and the result is processed as a single line.
+      Lines beginning with <literal>#</literal> are ignored, even within a continuation.
+      An empty or whitespace-only line ends a pending continuation and is otherwise ignored.
       There are two kinds of keys: match and assignment.
       If all match keys match against their values, the rule gets applied and the
       assignment keys get the specified values assigned.</para>
@@ -727,6 +730,14 @@ SUBSYSTEM=="net", OPTIONS="log_level=debug"</programlisting></para>
                     udev rules by inserting this option.</para>
 
                     <xi:include href="version-info.xml" xpointer="v258"/>
+                  </listitem>
+                </varlistentry>
+                <varlistentry>
+                  <term><option>dump-json</option></term>
+                  <listitem>
+                    <para>Similar to <option>dump</option>, but dump the status of the event in JSON format.</para>
+
+                    <xi:include href="version-info.xml" xpointer="v259"/>
                   </listitem>
                 </varlistentry>
               </variablelist>

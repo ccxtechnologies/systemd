@@ -7,7 +7,8 @@
 
 typedef struct Manager {
         sd_event *event;
-        sd_bus *bus;
+        sd_bus *api_bus;              /* this is where we offer our services */
+        sd_bus *system_bus;           /* this is where we talk to system services on, for example PK or so */
 
         Hashmap *machines;
         Hashmap *machines_by_unit;    /* This hashmap only tracks machines where a system-level encapsulates
@@ -31,14 +32,16 @@ typedef struct Manager {
 
         sd_varlink_server *varlink_userdb_server;
         sd_varlink_server *varlink_machine_server;
+        sd_varlink_server *varlink_resolve_hook_server;
+        Set *query_filter_subscriptions;
 
-        RuntimeScope runtime_scope; /* for now: always RUNTIME_SCOPE_SYSTEM */
+        RuntimeScope runtime_scope;
+        char *state_dir;
 } Manager;
 
 int manager_add_machine(Manager *m, const char *name, Machine **ret);
+int manager_get_unit_by_pidref(Manager *m, const PidRef *pidref, char **ret_unit, char **ret_subgroup);
 int manager_get_machine_by_pidref(Manager *m, const PidRef *pidref, Machine **ret);
-
-extern const BusObjectImplementation manager_object;
 
 int match_reloading(sd_bus_message *message, void *userdata, sd_bus_error *error);
 int match_unit_removed(sd_bus_message *message, void *userdata, sd_bus_error *error);
@@ -48,8 +51,8 @@ int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *err
 int manager_stop_unit(Manager *manager, const char *unit, sd_bus_error *error, char **job);
 int manager_kill_unit(Manager *manager, const char *unit, const char *subgroup, int signo, sd_bus_error *error);
 int manager_unref_unit(Manager *m, const char *unit, sd_bus_error *error);
-int manager_unit_is_active(Manager *manager, const char *unit, sd_bus_error *reterr_errno);
-int manager_job_is_active(Manager *manager, const char *path, sd_bus_error *reterr_errno);
+int manager_unit_is_active(Manager *manager, const char *unit, sd_bus_error *reterr_error);
+int manager_job_is_active(Manager *manager, const char *path, sd_bus_error *reterr_error);
 
 int manager_find_machine_for_uid(Manager *m, uid_t host_uid, Machine **ret_machine, uid_t *ret_internal_uid);
 int manager_find_machine_for_gid(Manager *m, gid_t host_gid, Machine **ret_machine, gid_t *ret_internal_gid);

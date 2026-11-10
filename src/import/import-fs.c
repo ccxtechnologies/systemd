@@ -1,15 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <locale.h>
 #include <unistd.h>
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
-#include "ansi-color.h"
 #include "btrfs-util.h"
 #include "build.h"
 #include "copy.h"
 #include "discover-image.h"
+#include "dlopen-note.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "import-common.h"
@@ -17,7 +18,7 @@
 #include "install-file.h"
 #include "log.h"
 #include "main-func.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "parse-argument.h"
 #include "path-util.h"
 #include "ratelimit.h"
@@ -35,9 +36,16 @@ static bool arg_btrfs_subvol = true;
 static bool arg_btrfs_quota = true;
 static bool arg_sync = true;
 static bool arg_direct = false;
-static const char *arg_image_root = NULL;
+static char *arg_image_root = NULL;
 static ImageClass arg_class = IMAGE_MACHINE;
 static RuntimeScope arg_runtime_scope = _RUNTIME_SCOPE_INVALID;
+
+STATIC_DESTRUCTOR_REGISTER(arg_image_root, freep);
+
+COMMAND(
+        "systemd-import-fs\0",
+        "Import container images from file system directories.",
+);
 
 typedef struct ProgressInfo {
         RateLimit limit;
@@ -45,6 +53,7 @@ typedef struct ProgressInfo {
         uint64_t size;
         bool started;
         bool logged_incomplete;
+        uint64_t bps;
 } ProgressInfo;
 
 static void progress_info_free(ProgressInfo *p) {
@@ -72,8 +81,10 @@ static void progress_show(ProgressInfo *p) {
 
         if (p->size == 0)
                 log_info("Copying tree, currently at '%s'...", p->path);
-        else
+        else if (p->bps == UINT64_MAX)
                 log_info("Copying tree, currently at '%s' (@%s)...", p->path, FORMAT_BYTES(p->size));
+        else
+                log_info("Copying tree, currently at '%s' (@%s, %s/s)...", p->path, FORMAT_BYTES(p->size), FORMAT_BYTES(p->bps));
 }
 
 static int progress_path(const char *path, const struct stat *st, void *userdata) {
@@ -90,20 +101,23 @@ static int progress_path(const char *path, const struct stat *st, void *userdata
         return 0;
 }
 
-static int progress_bytes(uint64_t nbytes, void *userdata) {
+static int progress_bytes(uint64_t nbytes, uint64_t bps, void *userdata) {
         ProgressInfo *p = ASSERT_PTR(userdata);
 
         assert(p->size != UINT64_MAX);
 
         p->size += nbytes;
+        p->bps = bps;
 
         progress_show(p);
         return 0;
 }
 
-static int import_fs(int argc, char *argv[], void *userdata) {
+VERB(verb_import_fs, "run", "DIRECTORY [NAME]\0", 2, 3, 0,
+     "Import a directory");
+static int verb_import_fs(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(rm_rf_subvolume_and_freep) char *temp_path = NULL;
-        _cleanup_(progress_info_free) ProgressInfo progress = {};
+        _cleanup_(progress_info_free) ProgressInfo progress = { .bps = UINT64_MAX };
         _cleanup_free_ char *l = NULL, *final_path = NULL;
         const char *path = NULL, *local = NULL, *dest = NULL;
         _cleanup_close_ int open_fd = -EBADF;
@@ -217,7 +231,8 @@ static int import_fs(int argc, char *argv[], void *userdata) {
                         r = copy_directory_at_full(
                                         fd, NULL,
                                         AT_FDCWD, dest,
-                                        COPY_REFLINK|
+                                        /* override_uid= */ UID_INVALID,
+                                        /* override_gid= */ GID_INVALID,
                                         COPY_SAME_MOUNT|
                                         COPY_HARDLINKS|
                                         COPY_SIGINT|
@@ -232,7 +247,7 @@ static int import_fs(int argc, char *argv[], void *userdata) {
                         return log_error_errno(r, "Failed to copy directory: %m");
         }
 
-        r = import_mangle_os_tree(dest);
+        r = import_mangle_os_tree(dest, /* userns_fd= */ -EBADF, /* flags= */ 0);
         if (r < 0)
                 return r;
 
@@ -257,157 +272,106 @@ static int import_fs(int argc, char *argv[], void *userdata) {
         return 0;
 }
 
-static int help(int argc, char *argv[], void *userdata) {
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
-        printf("%1$s [OPTIONS...] {COMMAND} ...\n"
-               "\n%4$sImport container images from a file system directories.%5$s\n"
-               "\n%2$sCommands:%3$s\n"
-               "  run DIRECTORY [NAME]        Import a directory\n"
-               "\n%2$sOptions:%3$s\n"
-               "  -h --help                   Show this help\n"
-               "     --version                Show package version\n"
-               "     --force                  Force creation of image\n"
-               "     --image-root=PATH        Image root directory\n"
-               "     --read-only              Create a read-only image\n"
-               "     --direct                 Import directly to specified directory\n"
-               "     --btrfs-subvol=BOOL      Controls whether to create a btrfs subvolume\n"
-               "                              instead of a directory\n"
-               "     --btrfs-quota=BOOL       Controls whether to set up quota for btrfs\n"
-               "                              subvolume\n"
-               "     --sync=BOOL              Controls whether to sync() before completing\n"
-               "     --class=CLASS            Select image class (machine, sysext, confext,\n"
-               "                              portable)\n",
-               program_invocation_short_name,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal());
-
-        return 0;
-}
-
-static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_FORCE,
-                ARG_IMAGE_ROOT,
-                ARG_READ_ONLY,
-                ARG_DIRECT,
-                ARG_BTRFS_SUBVOL,
-                ARG_BTRFS_QUOTA,
-                ARG_SYNC,
-                ARG_CLASS,
-        };
-
-        static const struct option options[] = {
-                { "help",            no_argument,       NULL, 'h'                 },
-                { "version",         no_argument,       NULL, ARG_VERSION         },
-                { "force",           no_argument,       NULL, ARG_FORCE           },
-                { "image-root",      required_argument, NULL, ARG_IMAGE_ROOT      },
-                { "read-only",       no_argument,       NULL, ARG_READ_ONLY       },
-                { "direct",          no_argument,       NULL, ARG_DIRECT          },
-                { "btrfs-subvol",    required_argument, NULL, ARG_BTRFS_SUBVOL    },
-                { "btrfs-quota",     required_argument, NULL, ARG_BTRFS_QUOTA     },
-                { "sync",            required_argument, NULL, ARG_SYNC            },
-                { "class",           required_argument, NULL, ARG_CLASS           },
-                {}
-        };
-
-        int c, r;
-
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
         assert(argv);
+        assert(ret_args);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help(0, NULL, NULL);
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_FORCE:
+                OPTION_LONG("force", NULL, "Force creation of image"):
                         arg_force = true;
                         break;
 
-                case ARG_IMAGE_ROOT:
-                        arg_image_root = optarg;
+                OPTION_LONG("image-root", "PATH", "Image root directory"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_image_root);
+                        if (r < 0)
+                                return r;
                         break;
 
-                case ARG_READ_ONLY:
+                OPTION_LONG("read-only", NULL, "Create a read-only image"):
                         arg_read_only = true;
                         break;
 
-                case ARG_DIRECT:
+                OPTION_LONG("direct", NULL, "Import directly to specified directory"):
                         arg_direct = true;
                         break;
 
-                case ARG_BTRFS_SUBVOL:
-                        r = parse_boolean_argument("--btrfs-subvol=", optarg, &arg_btrfs_subvol);
+                OPTION_LONG("btrfs-subvol", "BOOL",
+                            "Controls whether to create a btrfs subvolume instead of a directory"):
+                        r = parse_boolean_argument("--btrfs-subvol=", opts.arg, &arg_btrfs_subvol);
                         if (r < 0)
                                 return r;
-
                         break;
 
-                case ARG_BTRFS_QUOTA:
-                        r = parse_boolean_argument("--btrfs-quota=", optarg, &arg_btrfs_quota);
+                OPTION_LONG("btrfs-quota", "BOOL",
+                            "Controls whether to set up quota for btrfs subvolume"):
+                        r = parse_boolean_argument("--btrfs-quota=", opts.arg, &arg_btrfs_quota);
                         if (r < 0)
                                 return r;
-
                         break;
 
-                case ARG_SYNC:
-                        r = parse_boolean_argument("--sync=", optarg, &arg_sync);
+                OPTION_LONG("sync", "BOOL", "Controls whether to sync() before completing"):
+                        r = parse_boolean_argument("--sync=", opts.arg, &arg_sync);
                         if (r < 0)
                                 return r;
-
                         break;
 
-                case ARG_CLASS:
-                        arg_class = image_class_from_string(optarg);
+                OPTION_LONG("class", "CLASS",
+                            "Select image class (machine, sysext, confext, portable)"):
+                        arg_class = image_class_from_string(opts.arg);
                         if (arg_class < 0)
-                                return log_error_errno(arg_class, "Failed to parse --class= argument: %s", optarg);
-
+                                return log_error_errno(arg_class, "Failed to parse --class= argument: %s", opts.arg);
                         break;
 
-                case '?':
-                        return -EINVAL;
+                OPTION_COMMON_SYSTEM:
+                        arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
+                        break;
 
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_USER:
+                        arg_runtime_scope = RUNTIME_SCOPE_USER;
+                        break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (!arg_image_root)
-                arg_image_root = image_root_to_string(arg_class);
+        if (!arg_image_root) {
+                r = image_root_pick(arg_runtime_scope < 0 ? RUNTIME_SCOPE_SYSTEM : arg_runtime_scope, arg_class, /* runtime= */ false, &arg_image_root);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to pick image root: %m");
+        }
 
+        *ret_args = option_parser_get_args(&opts);
         return 1;
-}
-
-static int import_fs_main(int argc, char *argv[]) {
-
-        static const Verb verbs[] = {
-                { "help", VERB_ANY, VERB_ANY, 0, help      },
-                { "run",  2,        3,        0, import_fs },
-                {}
-        };
-
-        return dispatch_verb(argc, argv, verbs, NULL);
 }
 
 static int run(int argc, char *argv[]) {
         int r;
 
+        LIBSELINUX_NOTE(recommended);
+
         setlocale(LC_ALL, "");
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
-        return import_fs_main(argc, argv);
+        return dispatch_verb(args, NULL);
 }
 
 DEFINE_MAIN_FUNCTION(run);

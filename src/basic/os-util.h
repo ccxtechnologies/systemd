@@ -14,8 +14,7 @@ typedef enum ImageClass {
         _IMAGE_CLASS_INVALID = -EINVAL,
 } ImageClass;
 
-const char* image_class_to_string(ImageClass cl) _const_;
-ImageClass image_class_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(image_class, ImageClass);
 
 /* The *_extension_release flavours will look for /usr/lib/extension-release/extension-release.NAME
  * for sysext images and for /etc/extension-release.d/extension-release.NAME for confext images
@@ -28,6 +27,7 @@ int path_is_extension_tree(ImageClass image_class, const char *path, const char 
 static inline int path_is_os_tree(const char *path) {
         return path_is_extension_tree(_IMAGE_CLASS_INVALID, path, NULL, false);
 }
+int fd_is_os_tree(int fd);
 
 int open_extension_release(const char *root, ImageClass image_class, const char *extension, bool relax_extension_release_check, char **ret_path, int *ret_fd);
 int open_extension_release_at(int rfd, ImageClass image_class, const char *extension, bool relax_extension_release_check, char **ret_path, int *ret_fd);
@@ -55,3 +55,6 @@ int load_os_release_pairs_with_prefix(const char *root, const char *prefix, char
 int os_release_support_ended(const char *support_end, bool quiet, usec_t *ret_eol);
 
 const char* os_release_pretty_name(const char *pretty_name, const char *name);
+
+bool use_fancy_name(const char *fancy_name);
+char *unescape_fancy_name(char **fancy_name);

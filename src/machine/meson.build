@@ -7,7 +7,7 @@ endif
 systemd_machined_sources = files(
         'machined.c'
 )
-systemd_machined_extract_sources = files(
+systemd_machined_export_sources = files(
         'image.c',
         'image-dbus.c',
         'image-varlink.c',
@@ -16,6 +16,7 @@ systemd_machined_extract_sources = files(
         'machine.c',
         'machined-core.c',
         'machined-dbus.c',
+        'machined-resolve-hook.c',
         'machined-varlink.c',
         'operation.c',
 )
@@ -24,8 +25,8 @@ executables += [
         libexec_template + {
                 'name' : 'systemd-machined',
                 'dbus' : true,
-                'sources' : systemd_machined_sources + systemd_machined_extract_sources,
-                'extract' : systemd_machined_extract_sources,
+                'sources' : systemd_machined_sources,
+                'export' : systemd_machined_export_sources,
         },
         executable_template + {
                 'name' : 'machinectl',
@@ -35,13 +36,11 @@ executables += [
                         liblz4_cflags,
                         libxz_cflags,
                         libzstd_cflags,
-                        threads,
                 ],
         },
         test_template + {
                 'sources' : files('test-machine-tables.c'),
-                'objects' : ['systemd-machined'],
-                'dependencies': threads,
+                'import' : ['systemd-machined'],
         },
 ]
 
@@ -49,5 +48,8 @@ install_data('org.freedesktop.machine1.conf',
              install_dir : dbuspolicydir)
 install_data('org.freedesktop.machine1.service',
              install_dir : dbussystemservicedir)
+install_data('org.freedesktop.machine1.service-for-session',
+             install_dir : dbussessionservicedir,
+             rename : 'org.freedesktop.machine1.service')
 install_data('org.freedesktop.machine1.policy',
              install_dir : polkitpolicydir)

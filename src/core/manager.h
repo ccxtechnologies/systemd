@@ -3,19 +3,25 @@
 
 #include "sd-event.h"
 
+#include "bpf-restrict-fsaccess.h"
 #include "cgroup.h"
 #include "common-signal.h"
 #include "execute.h"
-#include "forward.h"
+#include "core-forward.h"
 #include "log.h"
 #include "path-lookup.h"
 #include "show-status.h"
+#include "transaction.h"
 #include "unit.h"
 
 struct libmnt_monitor;
 
-/* Enforce upper limit how many names we allow */
+/* Enforce upper limit on how many names we allow */
 #define MANAGER_MAX_NAMES 131072 /* 128K */
+
+/* Enforce upper limit on the number of patterns/states requested over IPC */
+#define MANAGER_MAX_PATTERNS_PER_CALL 4096U
+#define MANAGER_MAX_STATES_PER_CALL 256U
 
 /* On sigrtmin+18, private commands */
 enum {
@@ -72,6 +78,18 @@ typedef enum ManagerObjective {
  * 6. TIMESTAMP_USERSPACE is the timestamp of when the manager was started.
  *
  * 7. TIMESTAMP_INITRD_* are set only when the system is booted with an initrd.
+ *
+ * 8. TIMESTAMP_SHUTDOWN_START and TIMESTAMP_SHUTDOWN_FINISH bracket the unit-stopping phase during the
+ *    current shutdown (the latter is also propagated across soft-reboot).
+ *
+ * 9. TIMESTAMP_PREVIOUS_SHUTDOWN_START, TIMESTAMP_PREVIOUS_SHUTDOWN_FINISH,
+ *    TIMESTAMP_PREVIOUS_SHUTDOWN_LATE_START and TIMESTAMP_PREVIOUS_SHUTDOWN_LATE_FINISH describe the
+ *    shutdown of the *previous* boot: either restored from the LUO payload after a kexec-based live
+ *    update, or carried over from the current cycle's SHUTDOWN_START/FINISH across a soft-reboot. The
+ *    LATE_* ones are taken by systemd-shutdown and hence only set for the kexec case. Like
+ *    TIMESTAMP_FIRMWARE/LOADER/KERNEL they refer to events before the current systemd cycle took over,
+ *    hence they are kept distinct from the current cycle's SHUTDOWN_START/FINISH instead of overwriting
+ *    them.
  */
 
 typedef enum ManagerTimestamp {
@@ -98,6 +116,12 @@ typedef enum ManagerTimestamp {
         MANAGER_TIMESTAMP_INITRD_UNITS_LOAD_FINISH,
 
         MANAGER_TIMESTAMP_SHUTDOWN_START,
+        MANAGER_TIMESTAMP_SHUTDOWN_FINISH,
+
+        MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_START,
+        MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_FINISH,
+        MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_LATE_START,
+        MANAGER_TIMESTAMP_PREVIOUS_SHUTDOWN_LATE_FINISH,
 
         _MANAGER_TIMESTAMP_MAX,
         _MANAGER_TIMESTAMP_INVALID = -EINVAL,
@@ -147,8 +171,9 @@ typedef struct UnitDefaults {
         int oom_score_adjust;
         bool oom_score_adjust_set;
 
-        CGroupPressureWatch memory_pressure_watch;
-        usec_t memory_pressure_threshold_usec;
+        bool memory_zswap_writeback;
+
+        CGroupPressure pressure[_PRESSURE_RESOURCE_MAX];
 
         char *smack_process_label;
 
@@ -173,7 +198,7 @@ typedef struct Manager {
         LIST_HEAD(Unit, load_queue); /* this is actually more a stack than a queue, but uh. */
 
         /* Jobs that need to be run */
-        struct Prioq *run_queue;
+        Prioq *run_queue;
 
         /* Units and jobs that have not yet been announced via
          * D-Bus. When something about a job changes it is added here
@@ -235,6 +260,11 @@ typedef struct Manager {
 
         /* A set which contains all currently failed units */
         Set *failed_units;
+
+        uint64_t last_transaction_id;
+
+        /* IDs of transactions that once encountered ordering cycle */
+        Set *transactions_with_cycle;
 
         sd_event_source *run_queue_event_source;
 
@@ -311,28 +341,32 @@ typedef struct Manager {
         sd_bus_track *subscribed;
         char **subscribed_as_strv;
 
+        /* Set once bus_setup_api() succeeded for the current API bus connection, i.e. after any
+         * subscriptions deserialized from a previous reload/reexec were coldplugged. Unset when the
+         * connection is torn down. */
+        bool api_bus_ready;
+
         /* The bus id of API bus acquired through org.freedesktop.DBus.GetId, which before deserializing
          * subscriptions we'd use to verify the bus is still the same instance as before. */
         sd_id128_t bus_id, deserialized_bus_id;
 
         /* This is used during reloading: before the reload we queue
-         * the reply message here, and afterwards we send it */
-        sd_bus_message *pending_reload_message;
+         * the reply message here, and afterwards we send it.
+         * It can be either a D-Bus message or a Varlink message, but not both. */
+        sd_bus_message *pending_reload_message_dbus;
+        sd_varlink *pending_reload_message_vl;
 
         Hashmap *watch_bus;  /* D-Bus names => Unit object n:1 */
 
-        bool send_reloading_done;
-
         uint32_t current_job_id;
-        uint32_t default_unit_job_id;
 
         /* Data specific to the Automount subsystem */
         int dev_autofs_fd;
 
         /* Data specific to the cgroup subsystem */
         Hashmap *cgroup_unit;
-        CGroupMask cgroup_supported;
         char *cgroup_root;
+        CGroupMask cgroup_supported;
 
         /* Notifications from cgroups, when the unified hierarchy is used is done via inotify. */
         int cgroup_inotify_fd;
@@ -364,6 +398,8 @@ typedef struct Manager {
         /* Flags */
         bool dispatching_load_queue;
         int may_dispatch_stop_notify_queue; /* tristate */
+
+        bool send_reloading_done;
 
         /* Have we already sent out the READY=1 notification? */
         bool ready_sent;
@@ -463,25 +499,55 @@ typedef struct Manager {
          * systemd-oomd to report changes in ManagedOOM settings (systemd client - oomd server). */
         sd_varlink *managed_oom_varlink;
 
+        sd_varlink_server *metrics_varlink_server;
+
         /* Reference to RestrictFileSystems= BPF program */
         struct restrict_fs_bpf *restrict_fs;
+
+        /* Reference to RestrictFileSystemAccess= BPF LSM program */
+        RestrictFileSystemAccess restrict_filesystem_access;
+
+        /* Raw BPF FDs extracted from the skeleton after attach. The kernel
+         * reference chain (link FD -> bpf_link -> bpf_prog -> bpf_map) keeps
+         * programs attached and map data alive. The .bss map FD is used for
+         * targeted writes (clearing initramfs_s_dev after switch_root). */
+        int restrict_fsaccess_link_fds[_RESTRICT_FILESYSTEM_ACCESS_LINK_MAX];
+        int restrict_fsaccess_bss_map_fd;
+
+        /* Whether the ptrace seccomp filter is installed in this process; it survives execve() */
+        bool restrict_fsaccess_ptrace_filter;
+        /* The link FDs came from an older version, whose .bss layout differs from ours. */
+        bool restrict_fsaccess_foreign_bss;
 
         /* Allow users to configure a rate limit for Reload()/Reexecute() operations */
         RateLimit reload_reexec_ratelimit;
         /* Dump*() are slow, so always rate limit them to 10 per 10 minutes */
         RateLimit dump_ratelimit;
 
-        sd_event_source *memory_pressure_event_source;
+        /* Rate limit for the manager event loop */
+        RateLimit event_loop_ratelimit;
+
+        sd_event_source *pressure_event_source[_PRESSURE_RESOURCE_MAX];
 
         /* For NFTSet= */
-        FirewallContext *fw_ctx;
+        sd_netlink *nfnl;
 
         /* Pin the systemd-executor binary, so that it never changes until re-exec, ensuring we don't have
          * serialization/deserialization compatibility issues during upgrades. */
-        char *executor_path;
         int executor_fd;
 
         unsigned soft_reboots_count;
+
+        /* When LUO is enabled we can count consecutive kexec reboots. */
+        unsigned kexec_count;
+
+        /* The number of successfully completed configuration reloads. */
+        uint64_t reload_count;
+
+        /* Monotonic counter for fdstore entries propagated to a NOTIFY_SOCKET supervisor. Each propagated
+         * fd is sent upstream using this index as the FDNAME. The mapping (index -> unit_id + original fdname)
+         * is pushed alongside as a JSON memfd named "systemd-fdstore-mapping". */
+        uint64_t fd_store_upstream_next_index;
 
         /* Original ambient capabilities when we were initialized */
         uint64_t saved_ambient_set;
@@ -508,11 +574,24 @@ static inline usec_t manager_default_timeout_abort_usec(Manager *m) {
 
 usec_t manager_default_timeout(RuntimeScope scope);
 
-int manager_new(RuntimeScope scope, ManagerTestRunFlags test_run_flags, Manager **m);
+int manager_new(RuntimeScope scope, ManagerTestRunFlags test_run_flags, Manager **ret);
 Manager* manager_free(Manager *m);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_free);
 
-int manager_startup(Manager *m, FILE *serialization, FDSet *fds, const char *root);
+/* One entry parsed out of the upstream "systemd-fdstore-mapping" memfd. Pairs the numeric index from the
+ * JSON map to the (unit-id, original fdname) the fd was originally stored as. */
+typedef struct ListenFDsTag {
+        char *unit_id;
+        char *fdname;
+        uint64_t index;
+} ListenFDsTag;
+
+ListenFDsTag* listen_fds_tag_free(ListenFDsTag *t);
+DEFINE_TRIVIAL_CLEANUP_FUNC(ListenFDsTag*, listen_fds_tag_free);
+
+extern const struct hash_ops fd_to_listen_fds_tag_hash_ops;
+
+int manager_startup(Manager *m, FILE *serialization, FDSet *fds, Hashmap *named_listen_fds, const char *root);
 
 Job *manager_get_job(Manager *m, uint32_t id);
 Unit *manager_get_unit(Manager *m, const char *name);
@@ -522,8 +601,20 @@ int manager_get_job_from_dbus_path(Manager *m, const char *s, Job **_j);
 bool manager_unit_cache_should_retry_load(Unit *u);
 int manager_load_unit_prepare(Manager *m, const char *name, const char *path, sd_bus_error *e, Unit **ret);
 int manager_load_unit(Manager *m, const char *name, const char *path, sd_bus_error *e, Unit **ret);
-int manager_load_startable_unit_or_warn(Manager *m, const char *name, const char *path, Unit **ret);
+int manager_dispatch_external_fd_to_unit(Manager *m, const char *unit_id, const char *fdname, uint64_t index, int fd, const char *log_context);
+int manager_load_startable_unit_or_warn(Manager *m, const char *name, const char *path, int log_level, Unit **ret);
 int manager_load_unit_from_dbus_path(Manager *m, const char *s, sd_bus_error *e, Unit **_u);
+
+int manager_add_jobs(
+                Manager *m,
+                JobType type,
+                char * const *names,
+                bool reload_if_possible,
+                JobMode mode,
+                TransactionAddFlags extra_flags,
+                Set *affected_jobs,
+                sd_bus_error *reterr_error,
+                Set *ret_jobs);
 
 int manager_add_job_full(
                 Manager *m,
@@ -532,18 +623,18 @@ int manager_add_job_full(
                 JobMode mode,
                 TransactionAddFlags extra_flags,
                 Set *affected_jobs,
-                sd_bus_error *error,
+                sd_bus_error *reterr_error,
                 Job **ret);
 int manager_add_job(
                 Manager *m,
                 JobType type,
                 Unit *unit,
                 JobMode mode,
-                sd_bus_error *error,
+                sd_bus_error *reterr_error,
                 Job **ret);
 
 int manager_add_job_by_name(Manager *m, JobType type, const char *name, JobMode mode, Set *affected_jobs, sd_bus_error *e, Job **ret);
-int manager_add_job_by_name_and_warn(Manager *m, JobType type, const char *name, JobMode mode, Set *affected_jobs, Job **ret);
+int manager_add_job_by_name_or_warn(Manager *m, JobType type, const char *name, JobMode mode, Set *affected_jobs, Job **ret);
 int manager_propagate_reload(Manager *m, Unit *unit, JobMode mode, sd_bus_error *e);
 
 void manager_clear_jobs(Manager *m);
@@ -552,7 +643,7 @@ void manager_unwatch_pidref(Manager *m, const PidRef *pid);
 
 unsigned manager_dispatch_load_queue(Manager *m);
 
-int manager_setup_memory_pressure_event_source(Manager *m);
+int manager_setup_pressure_event_source(Manager *m, PressureResource t);
 
 int manager_default_environment(Manager *m);
 int manager_transient_environment_add(Manager *m, char **plus);
@@ -619,14 +710,11 @@ void manager_restore_original_log_target(Manager *m);
 const char* manager_get_confirm_spawn(Manager *m);
 void manager_disable_confirm_spawn(void);
 
-const char* manager_state_to_string(ManagerState m) _const_;
-ManagerState manager_state_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(manager_state, ManagerState);
 
-const char* manager_objective_to_string(ManagerObjective m) _const_;
-ManagerObjective manager_objective_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(manager_objective, ManagerObjective);
 
-const char* manager_timestamp_to_string(ManagerTimestamp m) _const_;
-ManagerTimestamp manager_timestamp_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(manager_timestamp, ManagerTimestamp);
 ManagerTimestamp manager_timestamp_initrd_mangle(ManagerTimestamp s);
 
 usec_t manager_get_watchdog(Manager *m, WatchdogType t);
@@ -637,7 +725,11 @@ int manager_override_watchdog_pretimeout_governor(Manager *m, const char *govern
 
 LogTarget manager_get_executor_log_target(Manager *m);
 
+void manager_log_caller(Manager *manager, PidRef *caller, const char *method);
+
 int manager_allocate_idle_pipe(Manager *m);
+
+int update_first_boot_file(bool b);
 
 void unit_defaults_init(UnitDefaults *defaults, RuntimeScope scope);
 void unit_defaults_done(UnitDefaults *defaults);

@@ -77,7 +77,7 @@ testcase_sanity() {
     create_dummy_container "$template"
     # Create a simple image from the just created container template
     image="$(mktemp /var/lib/machines/TEST-13-NSPAWN.image-XXX.img)"
-    dd if=/dev/zero of="$image" bs=1M count=256
+    truncate -s 384M "$image"
     mkfs.ext4 "$image"
     mkdir -p /mnt
     mount -o loop "$image" /mnt
@@ -90,45 +90,50 @@ testcase_sanity() {
     # --template=
     root="$(mktemp -u -d /var/lib/machines/TEST-13-NSPAWN.sanity.XXX)"
     coverage_create_nspawn_dropin "$root"
-    (! systemd-nspawn --directory="$root" bash -xec 'echo hello')
+    (! systemd-nspawn --register=no --directory="$root" bash -xec 'echo hello')
     # Initialize $root from $template (the $root directory must not exist, hence
     # the `mktemp -u` above)
-    systemd-nspawn --directory="$root" --template="$template" bash -xec 'echo hello'
-    systemd-nspawn --directory="$root" bash -xec 'echo hello; touch /initialized'
+    systemd-nspawn --register=no --directory="$root" --template="$template" bash -xec 'echo hello'
+    systemd-nspawn --register=no --directory="$root" bash -xec 'echo hello; touch /initialized'
     test -e "$root/initialized"
     # Check if the $root doesn't get re-initialized once it's not empty
-    systemd-nspawn --directory="$root" --template="$template" bash -xec 'echo hello'
+    systemd-nspawn --register=no --directory="$root" --template="$template" bash -xec 'echo hello'
     test -e "$root/initialized"
 
-    systemd-nspawn --directory="$root" --ephemeral bash -xec 'touch /ephemeral'
+    systemd-nspawn --register=no --directory="$root" --ephemeral bash -xec 'touch /ephemeral'
     test ! -e "$root/ephemeral"
-    (! systemd-nspawn --directory="$root" \
+    (! systemd-nspawn --register=no \
+                      --directory="$root" \
                       --read-only \
                       bash -xec 'touch /nope')
     test ! -e "$root/nope"
-    systemd-nspawn --image="$image" bash -xec 'echo hello'
+    systemd-nspawn --register=no --image="$image" bash -xec 'echo hello'
 
     # --volatile=
     touch "$root/usr/has-usr"
     # volatile(=yes): rootfs is tmpfs, /usr/ from the OS tree is mounted read only
-    systemd-nspawn --directory="$root"\
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --volatile \
                    bash -xec 'test -e /usr/has-usr; touch /usr/read-only && exit 1; touch /nope'
     test ! -e "$root/nope"
     test ! -e "$root/usr/read-only"
-    systemd-nspawn --directory="$root"\
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --volatile=yes \
                    bash -xec 'test -e /usr/has-usr; touch /usr/read-only && exit 1; touch /nope'
     test ! -e "$root/nope"
     test ! -e "$root/usr/read-only"
     # volatile=state: rootfs is read-only, /var/ is tmpfs
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --volatile=state \
                    bash -xec 'test -e /usr/has-usr; mountpoint /var; touch /read-only && exit 1; touch /var/nope'
     test ! -e "$root/read-only"
     test ! -e "$root/var/nope"
     # volatile=overlay: tmpfs overlay is mounted over rootfs
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --volatile=overlay \
                    bash -xec 'test -e /usr/has-usr; touch /nope; touch /var/also-nope; touch /usr/nope-too'
     test ! -e "$root/nope"
@@ -138,27 +143,31 @@ testcase_sanity() {
     # --volatile= with -U
     touch "$root/usr/has-usr"
     # volatile(=yes): rootfs is tmpfs, /usr/ from the OS tree is mounted read only
-    systemd-nspawn --directory="$root"\
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --volatile \
                    -U \
                    bash -xec 'test -e /usr/has-usr; touch /usr/read-only && exit 1; touch /nope'
     test ! -e "$root/nope"
     test ! -e "$root/usr/read-only"
-    systemd-nspawn --directory="$root"\
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --volatile=yes \
                    -U \
                    bash -xec 'test -e /usr/has-usr; touch /usr/read-only && exit 1; touch /nope'
     test ! -e "$root/nope"
     test ! -e "$root/usr/read-only"
     # volatile=state: rootfs is read-only, /var/ is tmpfs
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --volatile=state \
                    -U \
                    bash -xec 'test -e /usr/has-usr; mountpoint /var; touch /read-only && exit 1; touch /var/nope'
     test ! -e "$root/read-only"
     test ! -e "$root/var/nope"
     # volatile=overlay: tmpfs overlay is mounted over rootfs
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --volatile=overlay \
                    -U \
                    bash -xec 'test -e /usr/has-usr; touch /nope; touch /var/also-nope; touch /usr/nope-too'
@@ -167,13 +176,16 @@ testcase_sanity() {
     test ! -e "$root/usr/nope-too"
 
     # --machine=, --hostname=
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --machine="foo-bar.baz" \
                    bash -xec '[[ $(hostname) == foo-bar.baz ]]'
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --hostname="hello.world.tld" \
                    bash -xec '[[ $(hostname) == hello.world.tld ]]'
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --machine="foo-bar.baz" \
                    --hostname="hello.world.tld" \
                    bash -xec '[[ $(hostname) == hello.world.tld ]]'
@@ -181,19 +193,20 @@ testcase_sanity() {
     # --uuid=
     rm -f "$root/etc/machine-id"
     uuid="deadbeef-dead-dead-beef-000000000000"
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --uuid="$uuid" \
                    bash -xec "[[ \$container_uuid == $uuid ]]"
 
     # --as-pid2
-    systemd-nspawn --directory="$root" bash -xec '[[ $$ -eq 1 ]]'
-    systemd-nspawn --directory="$root" --as-pid2 bash -xec '[[ $$ -eq 2 ]]'
+    systemd-nspawn --register=no --directory="$root" bash -xec '[[ $$ -eq 1 ]]'
+    systemd-nspawn --register=no --directory="$root" --as-pid2 bash -xec '[[ $$ -eq 2 ]]'
 
-    # --user=
+    # --uid=
     # "Fake" getent passwd's bare minimum, so we don't have to pull it in
     # with all the DSO shenanigans
     cat >"$root/bin/getent" <<\EOF
-#!/bin/bash
+#!/usr/bin/env bash
 
 if [[ $# -eq 0 ]]; then
     :
@@ -208,28 +221,35 @@ EOF
     # bash will end up loading libnss_systemd.so which breaks when libnss_systemd.so is built with sanitizers
     # as bash isn't invoked with the necessary environment variables for that.
     useradd --root="$root" --uid 1000 --user-group --create-home testuser
-    systemd-nspawn --directory="$root" bash -xec '[[ $USER == root ]]'
-    systemd-nspawn --directory="$root" --user=testuser bash -xec '[[ $USER == testuser ]]'
+    systemd-nspawn --register=no --directory="$root" bash -xec '[[ $USER == root ]]'
+    systemd-nspawn --register=no --directory="$root" --uid=testuser bash -xec '[[ $USER == testuser ]]'
+    # Backward compat: --user NAME (space-separated) and --user=testuser should still work
+    systemd-nspawn --register=no --directory="$root" --user testuser bash -xec '[[ $USER == testuser ]]'
+    systemd-nspawn --register=no --directory="$root" --user=testuser bash -xec '[[ $USER == testuser ]]'
 
     # --settings= + .nspawn files
     mkdir -p /run/systemd/nspawn/
     uuid="deadbeef-dead-dead-beef-000000000000"
     echo -ne "[Exec]\nMachineID=deadbeef-dead-dead-beef-111111111111" >/run/systemd/nspawn/foo-bar.nspawn
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --machine=foo-bar \
                    --settings=yes \
                    bash -xec '[[ $container_uuid == deadbeef-dead-dead-beef-111111111111 ]]'
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --machine=foo-bar \
                    --uuid="$uuid" \
                    --settings=yes \
                    bash -xec "[[ \$container_uuid == $uuid ]]"
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --machine=foo-bar \
                    --uuid="$uuid" \
                    --settings=override \
                    bash -xec '[[ $container_uuid == deadbeef-dead-dead-beef-111111111111 ]]'
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --machine=foo-bar \
                    --uuid="$uuid" \
                    --settings=trusted \
@@ -240,7 +260,8 @@ EOF
     touch "$tmpdir/1/one" "$tmpdir/2/two" "$tmpdir/3/three"
     touch "$tmpdir/foo"
     # --bind=
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    ${COVERAGE_BUILD_DIR:+--bind="$COVERAGE_BUILD_DIR"} \
                    --bind="$tmpdir:/foo" \
                    --bind="$tmpdir:/also-foo:noidmap,norbind" \
@@ -248,7 +269,8 @@ EOF
     # --bind= recursive
     rm -f "$tmpdir/bar"
     mount --bind "$tmpdir/1" "$tmpdir/2"
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    ${COVERAGE_BUILD_DIR:+--bind="$COVERAGE_BUILD_DIR"} \
                    --bind="$tmpdir:/foo" \
                    --bind="$tmpdir:/also-foo:noidmap,norbind" \
@@ -256,46 +278,52 @@ EOF
     umount "$tmpdir/2"
     test -e "$tmpdir/bar"
     # --bind-ro=
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --bind-ro="$tmpdir:/foo" \
                    --bind-ro="$tmpdir:/bar:noidmap,norbind" \
                    bash -xec 'test -e /foo/foo; touch /foo/baz && exit 1; touch /bar && exit 1; true'
     # --inaccessible=
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --inaccessible=/var \
                    bash -xec 'touch /var/foo && exit 1; true'
     # --tmpfs=
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --tmpfs=/var:rw,nosuid,noexec \
                    bash -xec 'touch /var/nope'
     test ! -e "$root/var/nope"
     # --overlay=
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --overlay="$tmpdir/1:$tmpdir/2:$tmpdir/3:/var" \
                    bash -xec 'test -e /var/one; test -e /var/two; test -e /var/three; touch /var/foo'
     test -e "$tmpdir/3/foo"
     # --overlay-ro=
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --overlay-ro="$tmpdir/1:$tmpdir/2:$tmpdir/3:/var" \
                    bash -xec 'test -e /var/one; test -e /var/two; test -e /var/three; touch /var/nope && exit 1; true'
     test ! -e "$tmpdir/3/nope"
     rm -fr "$tmpdir"
 
     # --port (sanity only)
-    systemd-nspawn --network-veth --directory="$root" --port=80 --port=90 true
-    systemd-nspawn --network-veth --directory="$root" --port=80:8080 true
-    systemd-nspawn --network-veth --directory="$root" --port=tcp:80 true
-    systemd-nspawn --network-veth --directory="$root" --port=tcp:80:8080 true
-    systemd-nspawn --network-veth --directory="$root" --port=udp:80 true
-    systemd-nspawn --network-veth --directory="$root" --port=udp:80:8080 --port=tcp:80:8080 true
-    (! systemd-nspawn --network-veth --directory="$root" --port= true)
-    (! systemd-nspawn --network-veth --directory="$root" --port=-1 true)
-    (! systemd-nspawn --network-veth --directory="$root" --port=: true)
-    (! systemd-nspawn --network-veth --directory="$root" --port=icmp:80:8080 true)
-    (! systemd-nspawn --network-veth --directory="$root" --port=tcp::8080 true)
-    (! systemd-nspawn --network-veth --directory="$root" --port=8080: true)
+    systemd-nspawn --register=no --network-veth --directory="$root" --port=80 --port=90 true
+    systemd-nspawn --register=no --network-veth --directory="$root" --port=80:8080 true
+    systemd-nspawn --register=no --network-veth --directory="$root" --port=tcp:80 true
+    systemd-nspawn --register=no --network-veth --directory="$root" --port=tcp:80:8080 true
+    systemd-nspawn --register=no --network-veth --directory="$root" --port=udp:80 true
+    systemd-nspawn --register=no --network-veth --directory="$root" --port=udp:80:8080 --port=tcp:80:8080 true
+    (! systemd-nspawn --register=no --network-veth --directory="$root" --port= true)
+    (! systemd-nspawn --register=no --network-veth --directory="$root" --port=-1 true)
+    (! systemd-nspawn --register=no --network-veth --directory="$root" --port=: true)
+    (! systemd-nspawn --register=no --network-veth --directory="$root" --port=icmp:80:8080 true)
+    (! systemd-nspawn --register=no --network-veth --directory="$root" --port=tcp::8080 true)
+    (! systemd-nspawn --register=no --network-veth --directory="$root" --port=8080: true)
     # Exercise adding/removing ports from an interface
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --network-veth \
                    --port=6667 \
                    --port=80:8080 \
@@ -305,13 +333,15 @@ EOF
 
     # --load-credential=, --set-credential=
     echo "foo bar" >/tmp/cred.path
-    systemd-nspawn --directory="$root" \
+    systemd-nspawn --register=no \
+                   --directory="$root" \
                    --load-credential=cred.path:/tmp/cred.path \
                    --set-credential="cred.set:hello world" \
                    bash -xec '[[ "$(</run/host/credentials/cred.path)" == "foo bar" ]]; [[ "$(</run/host/credentials/cred.set)" == "hello world" ]]'
-    # Combine with --user to ensure creds are still readable
-    systemd-nspawn --directory="$root" \
-                   --user=testuser \
+    # Combine with --uid to ensure creds are still readable
+    systemd-nspawn --register=no \
+                   --directory="$root" \
+                   --uid=testuser \
                    --no-new-privileges=yes \
                    --load-credential=cred.path:/tmp/cred.path \
                    --set-credential="cred.set:hello world" \
@@ -319,9 +349,9 @@ EOF
     rm -f /tmp/cred.path
 
     # Assorted tests
-    systemd-nspawn --directory="$root" --suppress-sync=yes bash -xec 'echo hello'
+    systemd-nspawn --register=no --directory="$root" --suppress-sync=yes bash -xec 'echo hello'
     systemd-nspawn --capability=help
-    systemd-nspawn --directory="$root" --capability=all bash -xec 'echo hello'
+    systemd-nspawn --register=no --directory="$root" --capability=all bash -xec 'echo hello'
     systemd-nspawn --resolv-conf=help
     systemd-nspawn --timezone=help
 
@@ -367,6 +397,52 @@ EOF
     (! systemd-nspawn --volatile="")
     (! systemd-nspawn --volatile=-1)
     (! systemd-nspawn --rlimit==)
+}
+
+testcase_check_default_inaccessible_paths() {
+    local root container inaccessible_paths path exp
+
+    # Taken from src/nspawn/nspawn-mount.c:mount_all()
+    inaccessible_paths=(
+        "/proc/kallsyms"
+        "/proc/keys"
+        "/proc/sysrq-trigger"
+        "/proc/timer_list"
+    )
+
+    # /proc/kcore may not exist on some kernels, e.g. Alpine/Nura.
+    if [[ -e /proc/kcore ]]; then
+        inaccessible_paths+=(
+            "/proc/kcore"
+        )
+    fi
+
+    root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.default_inaccessible_paths.XXX)"
+    container="$(basename "$root")"
+    create_dummy_container "$root"
+
+    # Each inaccessible path should have zeroed permissions, which stat's %a reports as a single 0
+    for path in "${inaccessible_paths[@]}"; do
+        systemd-nspawn --register=no --directory="$root" \
+                       bash -xec "ls -l $path; [[ \$(stat --format=%a $path) -eq 0 ]]"
+    done
+
+    # SYSTEMD_NSPAWN_API_VFS_WRITABLE=yes mounts certain API directories under /sys/ and /proc/sys/
+    # as writable, and it also skips the path masking (by dropping the MOUNT_APPLY_APIVFS_RO flag)
+    for path in "${inaccessible_paths[@]}"; do
+        exp="$(stat --format=%a "$path")"
+        SYSTEMD_NSPAWN_API_VFS_WRITABLE=yes systemd-nspawn --register=no --directory="$root" \
+                       bash -xec "ls -l $path; [[ \$(stat --format=%a $path) -eq $exp ]]"
+    done
+
+    # SYSTEMD_NSPAWN_API_VFS_WRITABLE=network mounts only /proc/sys/net/ as writable but doesn't
+    # drop the MOUNT_APPLY_APIVFS_RO flag, so the masking should still apply
+    for path in "${inaccessible_paths[@]}"; do
+        SYSTEMD_NSPAWN_API_VFS_WRITABLE=network systemd-nspawn --register=no --directory="$root" \
+                       bash -xec "ls -l $path; [[ \$(stat --format=%a $path) -eq 0 ]]"
+    done
+
+    rm -fr "$root"
 }
 
 nspawn_settings_cleanup() {
@@ -456,7 +532,7 @@ Port=tcp:60
 Port=udp:60:61
 EOF
     cat >"$root/entrypoint.sh" <<\EOF
-#!/bin/bash
+#!/usr/bin/env bash
 set -ex
 
 env
@@ -508,7 +584,7 @@ ip link | grep wl-renamed1
 EOF
     fi
 
-    timeout 30 systemd-nspawn --directory="$root"
+    timeout --foreground 30 systemd-nspawn --directory="$root"
 
     # And now for stuff that needs to run separately
     #
@@ -783,7 +859,7 @@ testcase_rootidmap() {
     root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.rootidmap-path.XXX)"
     # Create ext4 image, as ext4 supports idmapped-mounts.
     mkdir -p /tmp/rootidmap/bind
-    dd if=/dev/zero of=/tmp/rootidmap/ext4.img bs=4k count=2048
+    truncate -s $((4096*2048)) /tmp/rootidmap/ext4.img
     mkfs.ext4 /tmp/rootidmap/ext4.img
     mount /tmp/rootidmap/ext4.img /tmp/rootidmap/bind
     trap "rootidmap_cleanup /tmp/rootidmap/" RETURN
@@ -827,7 +903,7 @@ testcase_owneridmap() {
     root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.owneridmap-path.XXX)"
     # Create ext4 image, as ext4 supports idmapped-mounts.
     mkdir -p /tmp/owneridmap/bind
-    dd if=/dev/zero of=/tmp/owneridmap/ext4.img bs=4k count=2048
+    truncate -s $((4096*2048)) /tmp/owneridmap/ext4.img
     mkfs.ext4 /tmp/owneridmap/ext4.img
     mount /tmp/owneridmap/ext4.img /tmp/owneridmap/bind
     trap "owneridmap_cleanup /tmp/owneridmap/" RETURN
@@ -840,11 +916,11 @@ testcase_owneridmap() {
 
     create_dummy_container "$root"
 
-    # --user=
+    # --uid=
     # "Fake" getent passwd's bare minimum, so we don't have to pull it in
     # with all the DSO shenanigans
     cat >"$root/bin/getent" <<\EOF
-#!/bin/bash
+#!/usr/bin/env bash
 
 if [[ $# -eq 0 ]]; then
     :
@@ -866,10 +942,10 @@ EOF
             systemd-nspawn --register=no \
                            --directory="$root" \
                            -U \
-                           --user=testuser \
+                           --uid=testuser \
                            --bind=/tmp/owneridmap/bind:/home/testuser:owneridmap \
                            ${COVERAGE_BUILD_DIR:+--bind="$COVERAGE_BUILD_DIR"} \
-                           /usr/bin/bash -c "$cmd" |& tee nspawn.out; then
+                           bash -c "$cmd" |& tee nspawn.out; then
         if grep -q "Failed to map ids for bind mount.*: Function not implemented" nspawn.out; then
             echo "idmapped mounts are not supported, skipping the test..."
             return 0
@@ -899,6 +975,115 @@ testcase_notification_socket() {
     rm -fr "$root"
 }
 
+testcase_socket_activation() {
+    # Verify that the socket activation environment variables are properly propagated into the
+    # container, i.e. that $LISTEN_FDNAMES survives, and that $LISTEN_PID refers to the process that
+    # actually ends up running the payload (PID 2 when --as-pid2 is used).
+    # https://github.com/systemd/systemd/issues/43764
+    local root entrypoint socket1 socket2 nspawn
+
+    root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.socket-activation.XXX)"
+    create_dummy_container "$root"
+    entrypoint="$root/entrypoint.sh"
+    socket1="/run/TEST-13-NSPAWN-socket-activation-1.sock"
+    socket2="/run/TEST-13-NSPAWN-socket-activation-2.sock"
+    rm -f "$socket1" "$socket2"
+
+    cat >"$entrypoint" <<\EOF
+#!/usr/bin/env bash
+set -ex
+
+env | grep '^LISTEN_'
+test "$LISTEN_FDS" = "${EXPECTED_FDS:-1}"
+test "${LISTEN_FDNAMES-unset}" = "$EXPECTED_FDNAMES"
+if [[ -v EXPECTED_PID ]]; then
+    test "$LISTEN_PID" = "$EXPECTED_PID"
+    # $LISTEN_PIDFDID must not refer to a different process than $LISTEN_PID
+    test "${LISTEN_PIDFDID-unset}" = "unset"
+else
+    test "$LISTEN_PID" = "$$"
+fi
+for ((fd = 3; fd < 3 + LISTEN_FDS; fd++)); do
+    test -S "/proc/self/fd/$fd"
+done
+if [[ ! -v EXPECTED_PID ]]; then
+    # sd_listen_fds() only accepts the fds if both $LISTEN_PID and $LISTEN_PIDFDID refer to the calling
+    # process. exec keeps both our PID and our pidfd inode ID.
+    exec /usr/bin/test-fdstore listen exit
+fi
+EOF
+    chmod +x "$entrypoint"
+
+    nspawn=(systemd-nspawn --register=no --directory="$root")
+
+    # Without --as-pid2 the payload is PID 1 in the container...
+    systemd-socket-activate --listen="$socket1" --fdname=hoge --now -- \
+        "${nspawn[@]}" --setenv=EXPECTED_FDNAMES=hoge "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # ...and with --as-pid2 it's PID 2, as the stub PID 1 forks it off.
+    systemd-socket-activate --listen="$socket1" --fdname=hoge --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDNAMES=hoge "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # Multiple file descriptors are passed on in order
+    systemd-socket-activate --listen="$socket1" --listen="$socket2" --fdname=hoge --fdname=fuga --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDS=2 --setenv=EXPECTED_FDNAMES=hoge:fuga \
+                       "${entrypoint##"$root"}"
+    rm -f "$socket1" "$socket2"
+
+    # Escape sequences in $LISTEN_FDNAMES are resolved the same way sd_listen_fds_with_names() does, and the
+    # names are escaped again when passed on, so that the payload ends up with the same names
+    systemd-socket-activate --listen="$socket1" --listen="$socket2" \
+                            --fdname='ho\ge' --fdname='fu\\ga' --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDS=2 --setenv='EXPECTED_FDNAMES=hoge:fu\\ga' \
+                       "${entrypoint##"$root"}"
+    rm -f "$socket1" "$socket2"
+
+    # The prefix nspawn adds to the names of fd store entries it forwards upstream is stripped again, but
+    # only if nspawn actually forwards fd store entries, i.e. it has an upstream fd store
+    systemd-socket-activate --listen="$socket1" --fdname=payload-hoge --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDNAMES=payload-hoge "${entrypoint##"$root"}"
+    rm -f "$socket1"
+    systemd-run --wait --pipe -p Type=notify -p NotifyAccess=all -p FileDescriptorStoreMax=1 -- \
+        bash -c 'exec systemd-socket-activate -E NOTIFY_SOCKET -E FDSTORE "$@"' _ \
+            --listen="$socket1" --fdname=payload-hoge --now -- \
+            "${nspawn[@]}" --keep-unit --as-pid2 --setenv=EXPECTED_FDNAMES=hoge "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # $LISTEN_FDNAMES is not passed on if it is not set, ...
+    systemd-socket-activate --listen="$socket1" --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDNAMES=unset "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # ...doesn't match the number of file descriptors, ...
+    systemd-socket-activate --listen="$socket1" --fdname=hoge --fdname=fuga --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDNAMES=unset "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # ...cannot be parsed, ...
+    # shellcheck disable=SC1003
+    systemd-socket-activate --listen="$socket1" --fdname='hoge\' --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDNAMES=unset "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # ...or contains invalid names
+    systemd-socket-activate --listen="$socket1" --fdname=$'ho\tge' --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDNAMES=unset "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # An explicit --setenv= takes precedence over the socket activation variables, and $LISTEN_PIDFDID is
+    # not set if $LISTEN_PID is overridden
+    systemd-socket-activate --listen="$socket1" --fdname=hoge --now -- \
+        "${nspawn[@]}" --as-pid2 \
+                       --setenv=LISTEN_FDNAMES=override --setenv=EXPECTED_FDNAMES=override \
+                       --setenv=LISTEN_PID=4711 --setenv=EXPECTED_PID=4711 \
+                       "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    rm -fr "$root"
+}
+
 testcase_os_release() {
     local root entrypoint os_release_source
 
@@ -906,7 +1091,8 @@ testcase_os_release() {
     create_dummy_container "$root"
     entrypoint="$root/entrypoint.sh"
     cat >"$entrypoint" <<\EOF
-#!/usr/bin/bash -ex
+#!/usr/bin/env bash
+set -ex
 
 . /tmp/os-release
 [[ -n "${ID:-}" && "$ID" != "$container_host_id" ]] && exit 1
@@ -953,7 +1139,7 @@ testcase_machinectl_bind() {
     cat >"$service_path" <<EOF
 [Service]
 Type=notify
-ExecStart=systemd-nspawn --directory="$root" --notify-ready=no /usr/bin/bash -xec "$cmd"
+ExecStart=systemd-nspawn --directory="$root" --notify-ready=no bash -xec "$cmd"
 EOF
 
     systemctl daemon-reload
@@ -1114,9 +1300,44 @@ matrix_run_one() {
                        ip a | grep -v -E '^1: lo.*UP'
     ip netns del nspawn_test
 
+    # test --network-namespace-path works when combined with --private-users=pick
+    ip netns add nspawn_test
+    ip netns exec nspawn_test ip link add foo type dummy
+
+    if [[ "$IS_USERNS_SUPPORTED" == "yes" && "$api_vfs_writable" == "no" ]]; then
+        SYSTEMD_NSPAWN_USE_CGNS="$use_cgns" SYSTEMD_NSPAWN_API_VFS_WRITABLE="$api_vfs_writable" \
+            systemd-nspawn --register=no \
+                           --directory="$root" \
+                           --private-users=pick \
+                           --network-namespace-path=/run/netns/nspawn_test \
+                           ip link show dev foo
+    fi
+
+    ip netns del nspawn_test
+
     rm -fr "$root"
 
     return 0
+}
+
+testcase_ping_group_range() {
+    local range root
+
+    if [[ "$IS_USERNS_SUPPORTED" == "no" ]]; then
+        echo "Skipping user namespace test..."
+        return 0
+    fi
+
+    root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.ping-group-range.XXX)"
+    create_dummy_container "$root"
+    trap 'rm -fr "$root"' RETURN ERR
+
+    range="$(systemd-nspawn --pipe --register=no \
+                            --directory="$root" \
+                            --private-network \
+                            --private-users=pick \
+                            cat /proc/sys/net/ipv4/ping_group_range)"
+    assert_eq "${range//[[:space:]]/ }" "0 65535"
 }
 
 testcase_api_vfs() {
@@ -1279,7 +1500,10 @@ testcase_unpriv() {
 }
 
 testcase_fuse() {
-    if [[ "$(cat <>/dev/fuse 2>&1)" != 'cat: -: Operation not permitted' ]]; then
+    # On some kernels reading from /dev/fuse without an attached connection blocks indefinitely
+    # rather than returning EPERM, so guard the probe with a short timeout and skip the test
+    # whenever we don't get the expected error string.
+    if [[ "$(timeout --foreground 5 cat <>/dev/fuse 2>&1)" != 'cat: -: Operation not permitted' ]]; then
         echo "FUSE is not supported, skipping the test..."
         return 0
     fi
@@ -1310,7 +1534,7 @@ testcase_fuse() {
     #    "cat: -: Operation not permitted"                   # pass the test; opened but not read
     #    "bash: line 1: /dev/fuse: Operation not permitted"  # fail the test; could not open
     #    ""                                                  # fail the test; reading worked
-    [[ "$(systemd-nspawn --pipe --directory="$root" \
+    [[ "$(timeout --foreground 30 systemd-nspawn --register=no --pipe --directory="$root" \
               bash -c 'cat <>/dev/fuse' 2>&1)" == 'cat: -: Operation not permitted' ]]
 
     rm -fr "$root"
@@ -1319,7 +1543,7 @@ testcase_fuse() {
 testcase_unpriv_fuse() {
     # Same as above, but for unprivileged operation.
 
-    if [[ "$(cat <>/dev/fuse 2>&1)" != 'cat: -: Operation not permitted' ]]; then
+    if [[ "$(timeout --foreground 5 cat <>/dev/fuse 2>&1)" != 'cat: -: Operation not permitted' ]]; then
         echo "FUSE is not supported, skipping the test..."
         return 0
     fi
@@ -1338,7 +1562,7 @@ testcase_unpriv_fuse() {
     create_dummy_ddi "$tmpdir" "$name"
     chown --recursive testuser: "$tmpdir"
 
-    [[ "$(run0 -u testuser --pipe systemd-run \
+    [[ "$(timeout --foreground 60 run0 -u testuser --pipe systemd-run \
               --user \
               --pipe \
               --property=Delegate=yes \
@@ -1350,7 +1574,7 @@ testcase_unpriv_fuse() {
 }
 
 test_tun() {
-    systemd-nspawn "$@" bash -xec '[[ -c /dev/net/tun ]]; [[ "$(stat /dev/net/tun --format=%u)" == 0 ]]; [[ "$(stat /dev/net/tun --format=%g)" == 0 ]]'
+    systemd-nspawn --register=no "$@" bash -xec '[[ -c /dev/net/tun ]]; [[ "$(stat /dev/net/tun --format=%u)" == 0 ]]; [[ "$(stat /dev/net/tun --format=%g)" == 0 ]]'
 
     # check if the owner of the host device is unchanged, see issue #34243.
     [[ "$(stat /dev/net/tun --format=%u)" == 0 ]]
@@ -1359,7 +1583,7 @@ test_tun() {
     # Without DeviceAllow= for /dev/net/tun, see issue #35116.
     systemd-run \
         --wait -p Environment=SYSTEMD_LOG_LEVEL=debug -p DevicePolicy=closed -p DeviceAllow="char-pts rw" \
-        systemd-nspawn "$@" bash -xec '[[ ! -e /dev/net/tun ]]'
+        systemd-nspawn --register=no "$@" bash -xec '[[ ! -e /dev/net/tun ]]'
 
     [[ "$(stat /dev/net/tun --format=%u)" == 0 ]]
     [[ "$(stat /dev/net/tun --format=%g)" == 0 ]]
@@ -1430,7 +1654,7 @@ testcase_link_journal_host() {
     root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.link-journal.XXX)"
     create_dummy_container "$root"
 
-    systemd-id128 new > "$root"/etc/machine-id
+    systemd-id128 new >"$root"/etc/machine-id
 
     hoge="/var/log/journal/$(cat "$root"/etc/machine-id)/"
     mkdir -p "$hoge"
@@ -1439,7 +1663,7 @@ testcase_link_journal_host() {
 
     for i in no yes pick; do
         systemd-nspawn \
-            --directory="$root" --private-users="$i" --link-journal=host \
+            --register=no --directory="$root" --private-users="$i" --link-journal=host \
             bash -xec 'p="/var/log/journal/$(cat /etc/machine-id)"; mountpoint "$p"; [[ "$(stat "$p" --format=%u)" == 0 ]]; touch "$p/hoge"'
 
         [[ "$(stat "${hoge}/hoge" --format=%u)" == 0 ]]
@@ -1447,6 +1671,85 @@ testcase_link_journal_host() {
     done
 
     rm -fr "$root" "$hoge"
+}
+
+testcase_volatile_link_journal_no_userns() {
+    local root machine_id journal_dir acl_output
+
+    root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.volatile-journal.XXX)"
+    create_dummy_container "$root"
+
+    machine_id="$(systemd-id128 new)"
+    echo "$machine_id" >"$root/etc/machine-id"
+
+    journal_dir="/var/log/journal/$machine_id"
+    mkdir -p "$journal_dir"
+    chown root:root "$journal_dir"
+
+    systemd-nspawn --register=no \
+                   --directory="$root" \
+                   --boot \
+                   --volatile=yes \
+                   --link-journal=host \
+                   systemd.unit=systemd-tmpfiles-setup.service
+
+    local gid
+    gid="$(stat -c '%g' "$journal_dir")"
+
+    # Ensure GID is not 4294967295 (GID_INVALID)
+    [[ "$gid" != "4294967295" ]]
+
+    # Ensure the directory is owned by a valid user (root or systemd-journal
+    # group). The GID should be either 0 (root) or the systemd-journal GID, not
+    # some bombastically large number
+    [[ "$gid" -lt 65535 ]]
+
+    # Ensure the invalid GID doesn't appear in ACLs
+    acl_output="$(getfacl "$journal_dir" || true)"
+    grep -q "4294967295" <<< "$acl_output" && exit 1
+
+    rm -fr "$root" "$journal_dir"
+}
+
+testcase_boot_param_split() {
+    local root outdir
+
+    root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.boot-param-split.XXX)"
+    outdir="$(mktemp -d)"
+    create_dummy_container "$root"
+
+    # Replace the init binary with a stub that records the argv and environment nspawn passes to it,
+    # so we can verify that kernel-cmdline-style KEY=VALUE arguments are split between PID 1's
+    # environment and argv the same way the kernel splits them.
+    mkdir -p "$root/usr/lib/systemd"
+    cat >"$root/usr/lib/systemd/systemd" <<'EOF'
+#!/bin/bash
+set -e
+printf '%s\n' "$@" >/output/argv
+env >/output/env
+EOF
+    chmod +x "$root/usr/lib/systemd/systemd"
+
+    # Cover the assignments that should land in env (FOO=bar, baz-qux=hello → baz_qux), the
+    # dotted assignments that should stay as argv (systemd.unit=…, some.thing=…), and the malformed
+    # entries that look env-like but must also stay as argv: empty key (=value), key starting with
+    # a digit (123=foo), key with characters that aren't valid in an env var name (foo!=bar).
+    systemd-nspawn --register=no \
+                   --directory="$root" \
+                   --bind="$outdir:/output" \
+                   --boot \
+                   FOO=bar baz-qux=hello systemd.unit=foo.target some.thing=yes plain-arg \
+                   =empty-key 123=leading-digit 'foo!=bad-char'
+
+    diff <(printf 'systemd.unit=foo.target\nsome.thing=yes\nplain-arg\n=empty-key\n123=leading-digit\nfoo!=bad-char\n') "$outdir/argv"
+    grep '^FOO=bar$' >/dev/null "$outdir/env"
+    grep '^baz_qux=hello$' >/dev/null "$outdir/env"
+    (! grep -E '^(systemd\.unit|some\.thing)=' >/dev/null "$outdir/env")
+    (! grep -E '^(FOO|baz_qux)=' >/dev/null "$outdir/argv")
+    (! grep -E '^(123|foo!?)=' >/dev/null "$outdir/env")
+    (! grep -E '^=' >/dev/null "$outdir/env")
+
+    rm -fr "$root" "$outdir"
 }
 
 testcase_cap_net_bind_service() {

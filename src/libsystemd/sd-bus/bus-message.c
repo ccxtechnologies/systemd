@@ -17,7 +17,7 @@
 #include "utf8.h"
 
 static int message_append_basic(sd_bus_message *m, char type, const void *p, const void **stored);
-static int message_parse_fields(sd_bus_message *m);
+static int message_parse_fields(sd_bus_message *m, bool got_ctrunc);
 
 static void* adjust_pointer(const void *p, void *old_base, size_t sz, void *new_base) {
 
@@ -142,7 +142,7 @@ static sd_bus_message* message_free(sd_bus_message *m) {
         return mfree(m);
 }
 
-static void* message_extend_fields(sd_bus_message *m, size_t sz, bool add_offset) {
+static void* message_extend_fields(sd_bus_message *m, size_t sz) {
         void *op, *np;
         size_t old_size, new_size, start;
 
@@ -195,13 +195,6 @@ static void* message_extend_fields(sd_bus_message *m, size_t sz, bool add_offset
 
         m->free_header = true;
 
-        if (add_offset) {
-                if (m->n_header_offsets >= ELEMENTSOF(m->header_offsets))
-                        goto poison;
-
-                m->header_offsets[m->n_header_offsets++] = new_size - sizeof(BusMessageHeader);
-        }
-
         return (uint8_t*) np + start;
 
 poison:
@@ -233,7 +226,7 @@ static int message_append_field_string(
         /* Signature "(yv)" where the variant contains "s" */
 
         /* (field id byte + (signature length + signature 's' + NUL) + (string length + string + NUL)) */
-        p = message_extend_fields(m, 4 + 4 + l + 1, false);
+        p = message_extend_fields(m, 4 + 4 + l + 1);
         if (!p)
                 return -ENOMEM;
 
@@ -274,7 +267,7 @@ static int message_append_field_signature(
         /* Signature "(yv)" where the variant contains "g" */
 
         /* (field id byte + (signature length + signature 'g' + NUL) + (string length + string + NUL)) */
-        p = message_extend_fields(m, 4 + 1 + l + 1, false);
+        p = message_extend_fields(m, 4 + 1 + l + 1);
         if (!p)
                 return -ENOMEM;
 
@@ -301,7 +294,7 @@ static int message_append_field_uint32(sd_bus_message *m, uint64_t h, uint32_t x
                 return -EINVAL;
 
         /* (field id byte + (signature length + signature 'u' + NUL) + value) */
-        p = message_extend_fields(m, 4 + 4, false);
+        p = message_extend_fields(m, 4 + 4);
         if (!p)
                 return -ENOMEM;
 
@@ -359,10 +352,12 @@ static int message_from_header(
         /* Note that we are happy with unknown flags in the flags header! */
 
         a = ALIGN(sizeof(sd_bus_message));
+        /* Silence static analyzers, ALIGN cannot overflow for sizeof() */
+        assert(a != SIZE_MAX);
 
         if (label) {
                 label_sz = strlen(label);
-                a += label_sz + 1;
+                assert_se(INC_SAFE(&a, label_sz + 1));
         }
 
         m = malloc0(a);
@@ -408,12 +403,15 @@ int bus_message_from_malloc(
                 size_t length,
                 int *fds,
                 size_t n_fds,
+                bool got_ctrunc,
                 const char *label,
                 sd_bus_message **ret) {
 
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         size_t sz;
         int r;
+
+        assert(ret);
 
         r = message_from_header(
                         bus,
@@ -437,7 +435,7 @@ int bus_message_from_malloc(
         m->iovec = m->iovec_fixed;
         m->iovec[0] = IOVEC_MAKE(buffer, length);
 
-        r = message_parse_fields(m);
+        r = message_parse_fields(m, got_ctrunc);
         if (r < 0)
                 return r;
 
@@ -461,6 +459,8 @@ _public_ int sd_bus_message_new(
         /* Creation of messages with _SD_BUS_MESSAGE_TYPE_INVALID is allowed. */
         assert_return(type < _SD_BUS_MESSAGE_TYPE_MAX, -EINVAL);
 
+        /* Silence static analyzers, ALIGN cannot overflow for sizeof() */
+        assert(ALIGN(sizeof(sd_bus_message)) != SIZE_MAX);
         sd_bus_message *t = malloc0(ALIGN(sizeof(sd_bus_message)) + sizeof(BusMessageHeader));
         if (!t)
                 return -ENOMEM;
@@ -700,12 +700,12 @@ _public_ int sd_bus_message_new_method_errno(
                 sd_bus_message *call,
                 sd_bus_message **ret,
                 int error,
-                const sd_bus_error *p) {
+                const sd_bus_error *e) {
 
         _cleanup_(sd_bus_error_free) sd_bus_error berror = SD_BUS_ERROR_NULL;
 
-        if (sd_bus_error_is_set(p))
-                return sd_bus_message_new_method_error(call, ret, p);
+        if (sd_bus_error_is_set(e))
+                return sd_bus_message_new_method_error(call, ret, e);
 
         sd_bus_error_set_errno(&berror, error);
 
@@ -1361,7 +1361,7 @@ int message_append_basic(sd_bus_message *m, char type, const void *p, const void
 
                 p = strempty(p);
 
-                if (!signature_is_valid(p, /* allow_dict_entry = */ true))
+                if (!signature_is_valid(p, /* allow_dict_entry= */ true))
                         return -EINVAL;
 
                 align = 1;
@@ -1491,9 +1491,6 @@ _public_ int sd_bus_message_append_string_iovec(
                 const struct iovec *iov,
                 unsigned n /* should be size_t, but is API now… 😞 */) {
 
-        size_t size;
-        unsigned i;
-        char *p;
         int r;
 
         assert_return(m, -EINVAL);
@@ -1501,13 +1498,16 @@ _public_ int sd_bus_message_append_string_iovec(
         assert_return(iov || n == 0, -EINVAL);
         assert_return(!m->poisoned, -ESTALE);
 
-        size = iovec_total_size(iov, n);
+        size_t size = iovec_total_size(iov, n);
+        if (size == SIZE_MAX)
+                return -ENOBUFS;
 
+        char *p;
         r = sd_bus_message_append_string_space(m, size, &p);
         if (r < 0)
                 return r;
 
-        for (i = 0; i < n; i++) {
+        for (unsigned i = 0; i < n; i++) {
 
                 if (iov[i].iov_base)
                         memcpy(p, iov[i].iov_base, iov[i].iov_len);
@@ -2153,9 +2153,6 @@ _public_ int sd_bus_message_append_array_iovec(
                 const struct iovec *iov,
                 unsigned n /* should be size_t, but is API now… 😞 */) {
 
-        size_t size;
-        unsigned i;
-        void *p;
         int r;
 
         assert_return(m, -EINVAL);
@@ -2164,13 +2161,16 @@ _public_ int sd_bus_message_append_array_iovec(
         assert_return(iov || n == 0, -EINVAL);
         assert_return(!m->poisoned, -ESTALE);
 
-        size = iovec_total_size(iov, n);
+        size_t size = iovec_total_size(iov, n);
+        if (size == SIZE_MAX)
+                return -ENOBUFS;
 
+        void *p;
         r = sd_bus_message_append_array_space(m, type, size, &p);
         if (r < 0)
                 return r;
 
-        for (i = 0; i < n; i++) {
+        for (unsigned i = 0; i < n; i++) {
 
                 if (iov[i].iov_base)
                         memcpy(p, iov[i].iov_base, iov[i].iov_len);
@@ -2204,13 +2204,13 @@ _public_ int sd_bus_message_append_array_memfd(
         assert_return(!m->sealed, -EPERM);
         assert_return(!m->poisoned, -ESTALE);
 
-        r = memfd_set_sealed(memfd);
+        r = memfd_set_sealed_gracefully(memfd);
         if (r < 0)
                 return r;
 
         copy_fd = fcntl(memfd, F_DUPFD_CLOEXEC, 3);
         if (copy_fd < 0)
-                return copy_fd;
+                return -errno;
 
         r = memfd_get_size(memfd, &real_size);
         if (r < 0)
@@ -2218,7 +2218,7 @@ _public_ int sd_bus_message_append_array_memfd(
 
         if (offset == 0 && size == UINT64_MAX)
                 size = real_size;
-        else if (offset + size > real_size)
+        else if (size > real_size || offset > real_size - size)
                 return -EMSGSIZE;
 
         align = bus_type_get_alignment(type);
@@ -2231,6 +2231,9 @@ _public_ int sd_bus_message_append_array_memfd(
                 return -EINVAL;
 
         if (size % sz != 0)
+                return -EINVAL;
+
+        if (size == 0)
                 return -EINVAL;
 
         if (size > (uint64_t) UINT32_MAX)
@@ -2248,11 +2251,13 @@ _public_ int sd_bus_message_append_array_memfd(
         if (!part)
                 return -ENOMEM;
 
-        part->memfd = copy_fd;
+        if (m->body_size > UINT32_MAX - size)
+                return -EMSGSIZE;
+
+        part->memfd = TAKE_FD(copy_fd);
         part->memfd_offset = offset;
         part->sealed = true;
         part->size = size;
-        copy_fd = -EBADF;
 
         m->body_size += size;
         message_extend_containers(m, size);
@@ -2279,13 +2284,13 @@ _public_ int sd_bus_message_append_string_memfd(
         assert_return(!m->sealed, -EPERM);
         assert_return(!m->poisoned, -ESTALE);
 
-        r = memfd_set_sealed(memfd);
+        r = memfd_set_sealed_gracefully(memfd);
         if (r < 0)
                 return r;
 
-        copy_fd = fcntl(memfd, FD_CLOEXEC, 3);
+        copy_fd = fcntl(memfd, F_DUPFD_CLOEXEC, 3);
         if (copy_fd < 0)
-                return copy_fd;
+                return -errno;
 
         r = memfd_get_size(memfd, &real_size);
         if (r < 0)
@@ -2293,7 +2298,7 @@ _public_ int sd_bus_message_append_string_memfd(
 
         if (offset == 0 && size == UINT64_MAX)
                 size = real_size;
-        else if (offset + size > real_size)
+        else if (size > real_size || offset > real_size - size)
                 return -EMSGSIZE;
 
         /* We require this to be NUL terminated */
@@ -2333,11 +2338,13 @@ _public_ int sd_bus_message_append_string_memfd(
         if (!part)
                 return -ENOMEM;
 
-        part->memfd = copy_fd;
+        if (m->body_size > UINT32_MAX - size)
+                return -EMSGSIZE;
+
+        part->memfd = TAKE_FD(copy_fd);
         part->memfd_offset = offset;
         part->sealed = true;
         part->size = size;
-        copy_fd = -EBADF;
 
         m->body_size += size;
         message_extend_containers(m, size);
@@ -3897,7 +3904,8 @@ static int message_skip_fields(
                 sd_bus_message *m,
                 size_t *ri,
                 uint32_t array_size,
-                const char **signature) {
+                const char **signature,
+                unsigned depth) {
 
         size_t original_index;
         int r;
@@ -3905,6 +3913,9 @@ static int message_skip_fields(
         assert(m);
         assert(ri);
         assert(signature);
+
+        if (depth >= BUS_CONTAINER_DEPTH)
+                return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Maximum container nesting depth reached, refusing.");
 
         original_index = *ri;
 
@@ -3986,7 +3997,7 @@ static int message_skip_fields(
                                 if (r < 0)
                                         return r;
 
-                                r = message_skip_fields(m, ri, nas, (const char**) &s);
+                                r = message_skip_fields(m, ri, nas, (const char**) &s, depth + 1);
                                 if (r < 0)
                                         return r;
                         }
@@ -4000,7 +4011,7 @@ static int message_skip_fields(
                         if (r < 0)
                                 return r;
 
-                        r = message_skip_fields(m, ri, UINT32_MAX, (const char**) &s);
+                        r = message_skip_fields(m, ri, UINT32_MAX, &s, depth + 1);
                         if (r < 0)
                                 return r;
 
@@ -4018,7 +4029,7 @@ static int message_skip_fields(
                                 strncpy(sig, *signature + 1, l);
                                 sig[l] = '\0';
 
-                                r = message_skip_fields(m, ri, UINT32_MAX, (const char**) &s);
+                                r = message_skip_fields(m, ri, UINT32_MAX, (const char**) &s, depth + 1);
                                 if (r < 0)
                                         return r;
                         }
@@ -4029,8 +4040,8 @@ static int message_skip_fields(
         }
 }
 
-static int message_parse_fields(sd_bus_message *m) {
-        uint32_t unix_fds = 0;
+static int message_parse_fields(sd_bus_message *m, bool got_ctrunc) {
+        uint32_t n_unix_fds_declared = 0;
         bool unix_fds_set = false;
         int r;
 
@@ -4183,7 +4194,7 @@ static int message_parse_fields(sd_bus_message *m) {
                         if (!streq(signature, "u"))
                                 return -EBADMSG;
 
-                        r = message_peek_field_uint32(m, &ri, item_size, &unix_fds);
+                        r = message_peek_field_uint32(m, &ri, item_size, &n_unix_fds_declared);
                         if (r < 0)
                                 return -EBADMSG;
 
@@ -4191,14 +4202,36 @@ static int message_parse_fields(sd_bus_message *m) {
                         break;
 
                 default:
-                        r = message_skip_fields(m, &ri, UINT32_MAX, (const char **) &signature);
+                        r = message_skip_fields(m, &ri, UINT32_MAX, &signature, 0);
                 }
                 if (r < 0)
                         return r;
         }
 
-        if (m->n_fds != unix_fds)
-                return -EBADMSG;
+        /* Validate that the number of fds we actually received via SCM_RIGHTS matches (or is compatible
+         * with) the number declared in the message header.
+         *
+         * Normally these must match exactly. However, when MSG_CTRUNC was set during recvmsg(), the kernel
+         * might have truncated the fd array (e.g., due to LSM denials blocking fd passing). In that case,
+         * we also accept fewer fds than declared. Any attempt to actually use a truncated fd will fail later
+         * when sd_bus_message_read_basic() finds the fd index out of range. Too many fds is always wrong. */
+        if (m->n_fds > n_unix_fds_declared)
+                return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "Received a bus message with too many fds: %" PRIu32 " received vs. %" PRIu32 " declared.",
+                                       m->n_fds, n_unix_fds_declared);
+
+        if (m->n_fds < n_unix_fds_declared) {
+                if (!got_ctrunc)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                               "Received a bus message with too few fds: %" PRIu32 " received vs. %" PRIu32 " declared.",
+                                               m->n_fds, n_unix_fds_declared);
+
+                log_debug("Received a bus message with MSG_CTRUNC set with %" PRIu32 " fds received vs. %" PRIu32 " declared.",
+                          m->n_fds, n_unix_fds_declared);
+
+        } else if (got_ctrunc)
+                return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "Received a bus message with truncated control data, refusing.");
 
         switch (m->header->type) {
 
@@ -4302,6 +4335,7 @@ int bus_message_get_blob(sd_bus_message *m, void **buffer, size_t *sz) {
 _public_ int sd_bus_message_read_strv_extend(sd_bus_message *m, char ***l) {
         char type;
         const char *contents, *s;
+        size_t n;
         int r;
 
         assert(m);
@@ -4318,9 +4352,10 @@ _public_ int sd_bus_message_read_strv_extend(sd_bus_message *m, char ***l) {
         if (r <= 0)
                 return r;
 
+        n = strv_length(*l);
         /* sd_bus_message_read_basic() does content validation for us. */
         while ((r = sd_bus_message_read_basic(m, *contents, &s)) > 0) {
-                r = strv_extend(l, s);
+                r = strv_extend_with_size(l, &n, s);
                 if (r < 0)
                         return r;
         }

@@ -10,6 +10,8 @@
 #include "device-internal.h"
 #include "device-private.h"
 #include "device-util.h"
+#include "errno-util.h"
+#include "escape.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -376,6 +378,14 @@ static int device_amend(sd_device *device, const char *key, const char *value) {
                         return log_device_debug_errno(device, r, "sd-device: Failed to parse udev database version '%s': %m", value);
         } else {
                 r = device_add_property_internal(device, key, value);
+                if (r == -EINVAL) {
+                        _cleanup_free_ char *escaped_key = cescape(key), *escaped_value = cescape(value);
+
+                        log_device_debug_errno(device, r,
+                                               "sd-device: Failed to add property '%s=%s', ignoring: %m",
+                                               strnull(escaped_key), strnull(escaped_value));
+                        return 0;
+                }
                 if (r < 0)
                         return log_device_debug_errno(device, r, "sd-device: Failed to add property '%s=%s': %m", key, value);
         }
@@ -451,8 +461,6 @@ static int device_verify(sd_device *device) {
                                                       "sd-device: Failed to set driver subsystem: %m");
         }
 
-        device->sealed = true;
-
         return 0;
 }
 
@@ -467,6 +475,8 @@ int device_new_from_strv(sd_device **ret, char **strv) {
         r = device_new_aux(&device);
         if (r < 0)
                 return r;
+
+        device_seal(device);
 
         STRV_FOREACH(key, strv) {
                 r = device_append(device, *key, &major, &minor);
@@ -501,6 +511,8 @@ int device_new_from_nulstr(sd_device **ret, char *nulstr, size_t len) {
         r = device_new_aux(&device);
         if (r < 0)
                 return r;
+
+        device_seal(device);
 
         for (size_t i = 0; i < len; ) {
                 char *key;
@@ -651,7 +663,7 @@ int device_clone_with_db(sd_device *device, sd_device **ret) {
                 return r;
 
         /* Seal device to prevent reading the uevent file, as the device may have been already removed. */
-        dest->sealed = true;
+        device_seal(dest);
 
         /* Copy syspath, then also devname, sysname or sysnum can be obtained. */
         r = device_set_syspath(dest, device->syspath, false);
@@ -684,7 +696,7 @@ int device_clone_with_db(sd_device *device, sd_device **ret) {
         }
 
         /* Finally, read the udev database. */
-        r = device_read_db_internal(dest, /* force = */ true);
+        r = device_read_db_internal(dest, /* force= */ true);
         if (r < 0)
                 return r;
 
@@ -692,20 +704,46 @@ int device_clone_with_db(sd_device *device, sd_device **ret) {
         return 0;
 }
 
-void device_cleanup_tags(sd_device *device) {
+int device_copy_all_tags(sd_device *dest, sd_device *src) {
+        int r;
+
+        assert(dest);
+
+        if (!src)
+                return 0;
+
+        FOREACH_DEVICE_TAG(src, tag) {
+                r = device_add_tag(dest, tag, /* both= */ false);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+int device_cleanup_tags(sd_device *device, sd_device *original) {
+        int r;
+
         assert(device);
 
-        device->all_tags = set_free(device->all_tags);
+        _cleanup_set_free_ Set *saved = TAKE_PTR(device->all_tags);
         device->current_tags = set_free(device->current_tags);
         device->property_tags_outdated = true;
         device->tags_generation++;
+
+        r = device_copy_all_tags(device, original);
+        if (r < 0) {
+                set_free_and_replace(device->all_tags, saved);
+                return r;
+        }
+
+        return 0;
 }
 
 void device_cleanup_devlinks(sd_device *device) {
         assert(device);
 
-        set_free(device->devlinks);
-        device->devlinks = NULL;
+        device->devlinks = set_free(device->devlinks);
         device->property_devlinks_outdated = true;
         device->devlinks_generation++;
 }
@@ -742,23 +780,11 @@ static int device_tag(sd_device *device, const char *tag, bool add) {
         return 0;
 }
 
-int device_tag_index(sd_device *device, sd_device *device_old, bool add) {
-        int r = 0, k;
+int device_tag_index(sd_device *device, bool add) {
+        int r = 0;
 
-        if (add && device_old)
-                /* delete possible left-over tags */
-                FOREACH_DEVICE_TAG(device_old, tag)
-                        if (!sd_device_has_tag(device, tag)) {
-                                k = device_tag(device_old, tag, false);
-                                if (r >= 0 && k < 0)
-                                        r = k;
-                        }
-
-        FOREACH_DEVICE_TAG(device, tag) {
-                k = device_tag(device, tag, add);
-                if (r >= 0 && k < 0)
-                        r = k;
-        }
+        FOREACH_DEVICE_TAG(device, tag)
+                RET_GATHER(r, device_tag(device, tag, add));
 
         return r;
 }
@@ -897,7 +923,7 @@ int device_update_db(sd_device *device) {
                         fprintf(f, "Q:%s\n", ct); /* Current tag */
 
                 /* Always write the latest database version here, instead of the value stored in
-                 * device->database_version, as which may be 0. */
+                 * device->database_version. */
                 fputs("V:" STRINGIFY(LATEST_UDEV_DATABASE_VERSION) "\n", f);
         }
 

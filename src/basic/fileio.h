@@ -30,6 +30,7 @@ typedef enum {
         READ_FULL_FILE_WARN_WORLD_READABLE = 1 << 3, /* if regular file, log at LOG_WARNING level if access mode above 0700 */
         READ_FULL_FILE_CONNECT_SOCKET      = 1 << 4, /* if socket inode, connect to it and read off it */
         READ_FULL_FILE_FAIL_WHEN_LARGER    = 1 << 5, /* fail loading if file is larger than specified size */
+        READ_FULL_FILE_VERIFY_REGULAR      = 1 << 6, /* before reading, verify this is a regular file */
 } ReadFullFileFlags;
 
 int fdopen_unlocked(int fd, const char *options, FILE **ret);
@@ -44,7 +45,10 @@ static inline int write_string_stream(FILE *f, const char *line, WriteStringFile
         return write_string_stream_full(f, line, flags, NULL);
 }
 
-int write_string_file_full(int dir_fd, const char *fn, const char *line, WriteStringFileFlags flags, const struct timespec *ts, const char *label_fn);
+int write_string_file_full_label(int dir_fd, const char *fn, const char *line, WriteStringFileFlags flags, const struct timespec *ts, const char *label_fn, LabelContext *label_context);
+static inline int write_string_file_full(int dir_fd, const char *fn, const char *line, WriteStringFileFlags flags, const struct timespec *ts, const char *label_fn) {
+        return write_string_file_full_label(dir_fd, fn, line, flags, ts, label_fn, /* label_context= */ NULL);
+}
 static inline int write_string_file_at(int dir_fd, const char *fn, const char *line, WriteStringFileFlags flags) {
         return write_string_file_full(dir_fd, fn, line, flags, NULL, NULL);
 }
@@ -55,12 +59,17 @@ static inline int write_string_file(const char *fn, const char *line, WriteStrin
         return write_string_file_at(AT_FDCWD, fn, line, flags);
 }
 int write_string_filef(const char *fn, WriteStringFileFlags flags, const char *format, ...) _printf_(3, 4);
+int write_string_filef_at(int dir_fd, const char *fn, WriteStringFileFlags flags, const char *format, ...) _printf_(4, 5);
 
 int write_base64_file_at(int dir_fd, const char *fn, const struct iovec *data, WriteStringFileFlags flags);
 
 int read_one_line_file_at(int dir_fd, const char *filename, char **ret);
 static inline int read_one_line_file(const char *filename, char **ret) {
         return read_one_line_file_at(AT_FDCWD, filename, ret);
+}
+int read_boolean_file_at(int dir_fd, const char *filename);
+static inline int read_boolean_file(const char *filename) {
+        return read_boolean_file_at(AT_FDCWD, filename);
 }
 int read_full_file_full(int dir_fd, const char *filename, uint64_t offset, size_t size, ReadFullFileFlags flags, const char *bind_name, char **ret_contents, size_t *ret_size);
 static inline int read_full_file_at(int dir_fd, const char *filename, char **ret_contents, size_t *ret_size) {
@@ -92,7 +101,7 @@ int script_get_shebang_interpreter(const char *path, char **ret);
 
 int get_proc_field(const char *path, const char *key, char **ret);
 
-DIR* xopendirat(int dir_fd, const char *name, int flags);
+DIR* xopendirat(int dir_fd, const char *path, int flags);
 
 typedef enum XfopenFlags {
         XFOPEN_UNLOCKED = 1 << 0, /* call __fsetlocking(FSETLOCKING_BYCALLER) after opened */
@@ -162,3 +171,10 @@ int safe_fgetc(FILE *f, char *ret);
 int warn_file_is_world_accessible(const char *filename, struct stat *st, const char *unit, unsigned line);
 
 int fopen_mode_to_flags(const char *mode);
+
+typedef enum WriteDataFileFlags {
+        WRITE_DATA_FILE_MKDIR_0755 = 1 << 0,
+        WRITE_DATA_FILE_MODE_0400  = 1 << 1,
+} WriteDataFileFlags;
+
+int write_data_file_atomic_at(int dir_fd, const char *path, const struct iovec *iovec, WriteDataFileFlags flags);

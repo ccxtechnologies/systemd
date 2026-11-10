@@ -2,7 +2,6 @@
  * Copyright © 2020 VMware, Inc. */
 #pragma once
 
-#include "forward.h"
 #include "qdisc.h"
 
 typedef struct HeavyHitterFilter {
@@ -14,4 +13,4 @@ typedef struct HeavyHitterFilter {
 DEFINE_QDISC_CAST(HHF, HeavyHitterFilter);
 extern const QDiscVTable hhf_vtable;
 
-CONFIG_PARSER_PROTOTYPE(config_parse_heavy_hitter_filter_packet_limit);
+CONFIG_PARSER_PROTOTYPE(config_parse_hhf_packet_limit);

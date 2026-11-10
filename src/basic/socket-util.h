@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <linux/if_ether.h>
-#include <linux/if_infiniband.h>
 #include <linux/if_packet.h>
 #include <linux/netlink.h>
 #include <linux/vm_sockets.h>
@@ -29,8 +27,8 @@ union sockaddr_union {
         struct sockaddr_ll ll;
         struct sockaddr_vm vm;
 
-        /* Ensure there is enough space to store Infiniband addresses */
-        uint8_t ll_buffer[offsetof(struct sockaddr_ll, sll_addr) + CONST_MAX(ETH_ALEN, INFINIBAND_ALEN)];
+        /* Ensure there is enough space to store an arbitrary hardware address, e.g. Infiniband */
+        uint8_t ll_buffer[offsetof(struct sockaddr_ll, sll_addr) + HW_ADDR_MAX_SIZE];
 
         /* Ensure there is enough space after the AF_UNIX sun_path for one more NUL byte, just to be sure that the path
          * component is always followed by at least one NUL byte. */
@@ -53,18 +51,9 @@ typedef struct SocketAddress {
         int protocol;
 } SocketAddress;
 
-typedef enum SocketAddressBindIPv6Only {
-        SOCKET_ADDRESS_DEFAULT,
-        SOCKET_ADDRESS_BOTH,
-        SOCKET_ADDRESS_IPV6_ONLY,
-        _SOCKET_ADDRESS_BIND_IPV6_ONLY_MAX,
-        _SOCKET_ADDRESS_BIND_IPV6_ONLY_INVALID = -EINVAL,
-} SocketAddressBindIPv6Only;
-
 #define socket_address_family(a) ((a)->sockaddr.sa.sa_family)
 
-const char* socket_address_type_to_string(int t) _const_;
-int socket_address_type_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(socket_address_type, int);
 
 int sockaddr_un_unlink(const struct sockaddr_un *sa);
 
@@ -74,21 +63,8 @@ static inline int socket_address_unlink(const SocketAddress *a) {
 
 bool socket_address_can_accept(const SocketAddress *a) _pure_;
 
-int socket_address_listen(
-                const SocketAddress *a,
-                int flags,
-                int backlog,
-                SocketAddressBindIPv6Only only,
-                const char *bind_to_device,
-                bool reuse_port,
-                bool free_bind,
-                bool transparent,
-                mode_t directory_mode,
-                mode_t socket_mode,
-                const char *label);
-
 int socket_address_verify(const SocketAddress *a, bool strict) _pure_;
-int socket_address_print(const SocketAddress *a, char **p);
+int socket_address_print(const SocketAddress *a, char **ret);
 bool socket_address_matches_fd(const SocketAddress *a, int fd);
 
 bool socket_address_equal(const SocketAddress *a, const SocketAddress *b) _pure_;
@@ -108,12 +84,7 @@ int getsockname_pretty(int fd, char **ret);
 
 int socknameinfo_pretty(const struct sockaddr *sa, socklen_t salen, char **_ret);
 
-const char* socket_address_bind_ipv6_only_to_string(SocketAddressBindIPv6Only b) _const_;
-SocketAddressBindIPv6Only socket_address_bind_ipv6_only_from_string(const char *s) _pure_;
-SocketAddressBindIPv6Only socket_address_bind_ipv6_only_or_bool_from_string(const char *s);
-
-int netlink_family_to_string_alloc(int b, char **s);
-int netlink_family_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP_WITH_FALLBACK(netlink_family, int);
 
 bool sockaddr_equal(const union sockaddr_union *a, const union sockaddr_union *b);
 
@@ -126,8 +97,7 @@ static inline int fd_increase_rxbuf(int fd, size_t n) {
         return fd_set_rcvbuf(fd, n, true);
 }
 
-int ip_tos_to_string_alloc(int i, char **s);
-int ip_tos_from_string(const char *s);
+DECLARE_STRING_TABLE_LOOKUP_WITH_FALLBACK(ip_tos, int);
 
 typedef enum {
         IFNAME_VALID_ALTERNATIVE = 1 << 0, /* Allow "altnames" too */
@@ -148,28 +118,6 @@ int getpeergroups(int fd, gid_t **ret);
 int getpeerpidfd(int fd);
 int getpeerpidref(int fd, PidRef *ret);
 
-ssize_t send_many_fds_iov_sa(
-                int transport_fd,
-                int *fds_array, size_t n_fds_array,
-                const struct iovec *iov, size_t iovlen,
-                const struct sockaddr *sa, socklen_t len,
-                int flags);
-static inline ssize_t send_many_fds_iov(
-                int transport_fd,
-                int *fds_array, size_t n_fds_array,
-                const struct iovec *iov, size_t iovlen,
-                int flags) {
-
-        return send_many_fds_iov_sa(transport_fd, fds_array, n_fds_array, iov, iovlen, NULL, 0, flags);
-}
-static inline int send_many_fds(
-                int transport_fd,
-                int *fds_array,
-                size_t n_fds_array,
-                int flags) {
-
-        return send_many_fds_iov_sa(transport_fd, fds_array, n_fds_array, NULL, 0, NULL, 0, flags);
-}
 ssize_t send_one_fd_iov_sa(
                 int transport_fd,
                 int fd,
@@ -184,8 +132,6 @@ int send_one_fd_sa(int transport_fd,
 #define send_one_fd(transport_fd, fd, flags) send_one_fd_iov_sa(transport_fd, fd, NULL, 0, NULL, 0, flags)
 ssize_t receive_one_fd_iov(int transport_fd, struct iovec *iov, size_t iovlen, int flags, int *ret_fd);
 int receive_one_fd(int transport_fd, int flags);
-ssize_t receive_many_fds_iov(int transport_fd, struct iovec *iov, size_t iovlen, int **ret_fds_array, size_t *ret_n_fds_array, int flags);
-int receive_many_fds(int transport_fd, int **ret_fds_array, size_t *ret_n_fds_array, int flags);
 
 ssize_t next_datagram_size_fd(int fd);
 
@@ -231,9 +177,7 @@ void* cmsg_find_and_copy_data(struct msghdr *mh, int level, int type, void *buf,
         }
 
 size_t sockaddr_ll_len(const struct sockaddr_ll *sa);
-
 size_t sockaddr_un_len(const struct sockaddr_un *sa);
-
 size_t sockaddr_len(const union sockaddr_union *sa);
 
 int socket_ioctl_fd(void);
@@ -317,10 +261,12 @@ int socket_address_equal_unix(const char *a, const char *b);
  * authoritative. */
 #define SOMAXCONN_DELUXE INT_MAX
 
-int vsock_get_local_cid(unsigned *ret);
-
 int netlink_socket_get_multicast_groups(int fd, size_t *ret_len, uint32_t **ret_groups);
 
 int socket_get_cookie(int fd, uint64_t *ret);
 
 void cmsg_close_all(struct msghdr *mh);
+
+int tos_to_priority(uint8_t tos);
+
+int socket_xattr_supported(void);

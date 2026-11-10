@@ -6,7 +6,6 @@
  */
 
 #include <fcntl.h>
-#include <getopt.h>
 #include <linux/bsg.h>
 #include <linux/hdreg.h>
 #include <scsi/sg.h>
@@ -14,19 +13,29 @@
 #include <string.h>
 #include <sys/ioctl.h>
 
+#include "sd-json.h"
+
 #include "build.h"
 #include "device-nodes.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "log.h"
 #include "main-func.h"
+#include "strv.h"
 #include "udev-util.h"
 #include "unaligned.h"
+#include "verbs.h"
 
 #define COMMAND_TIMEOUT_MSEC (30 * 1000)
 
 static bool arg_export = false;
 static const char *arg_device = NULL;
+
+COMMAND(
+        "ata_id\0",
+        "Identify ATA storage devices.",
+        .argspec = "DEVICE\0",
+);
 
 static int disk_scsi_inquiry_command(
                 int fd,
@@ -357,39 +366,34 @@ static int disk_identify(int fd,
 }
 
 static int parse_argv(int argc, char *argv[]) {
-        static const struct option options[] = {
-                { "export",   no_argument, NULL, 'x' },
-                { "help",     no_argument, NULL, 'h' },
-                { "version",  no_argument, NULL, 'v' },
-                {}
-        };
-        int c;
+        assert(argc >= 0);
+        assert(argv);
 
-        while ((c = getopt_long(argc, argv, "xh", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
-                case 'x':
+
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
+                        return version();
+
+                OPTION('x', "export", NULL,
+                       "Print values as environment keys"):
                         arg_export = true;
                         break;
-                case 'h':
-                        printf("%s [OPTIONS...] DEVICE\n\n"
-                               "  -x --export    Print values as environment keys\n"
-                               "  -h --help      Show this help text\n"
-                               "     --version   Show package version\n",
-                               program_invocation_short_name);
-                        return 0;
-                case 'v':
-                        return version();
-                case '?':
-                        return -EINVAL;
-                default:
-                        assert_not_reached();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (!argv[optind])
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "DEVICE argument missing.");
+        char **args = option_parser_get_args(&opts);
+        if (strv_length(args) != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Need exactly one DEVICE argument.");
 
-        arg_device = argv[optind];
+        arg_device = args[0];
         return 1;
 }
 

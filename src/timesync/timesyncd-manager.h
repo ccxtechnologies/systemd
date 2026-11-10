@@ -33,7 +33,7 @@ typedef struct Manager {
 
         RateLimit ratelimit;
         bool exhausted_servers;
-        bool have_fallbacks;
+        bool fallback_set; /* Indicate if FallbackNTP= is explicitly configured. */
 
         /* network */
         sd_event_source *network_event_source;
@@ -41,6 +41,7 @@ typedef struct Manager {
 
         /* peer */
         sd_resolve_query *resolve_query;
+        sd_varlink *resolve_varlink;
         sd_event_source *event_receive;
         ServerName *current_server_name;
         ServerAddress *current_server_address;

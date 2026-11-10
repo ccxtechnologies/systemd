@@ -13,13 +13,11 @@
 #include "path-lookup.h"
 #include "path-util.h"
 #include "string-util.h"
-#include "strv-fundamental.h"
 #include "strv.h"
 #include "systemctl.h"
 #include "systemctl-daemon-reload.h"
 #include "systemctl-enable.h"
 #include "systemctl-start-unit.h"
-#include "systemctl-sysv-compat.h"
 #include "systemctl-util.h"
 #include "unit-name.h"
 #include "verbs.h"
@@ -81,7 +79,7 @@ static int normalize_names(char **names) {
         return 0;
 }
 
-int verb_enable(int argc, char *argv[], void *userdata) {
+int verb_enable(int argc, char *argv[], uintptr_t data, void *userdata) {
         const char *verb = ASSERT_PTR(argv[0]);
         _cleanup_strv_free_ char **names = NULL;
         int carries_install_info = -1;
@@ -97,19 +95,6 @@ int verb_enable(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return r;
 
-        r = enable_sysv_units(verb, names);
-        if (r < 0)
-                return r;
-
-        /* If the operation was fully executed by the SysV compat, let's finish early */
-        if (strv_isempty(names)) {
-                if (arg_no_reload || install_client_side())
-                        return 0;
-
-                r = daemon_reload(ACTION_RELOAD, /* graceful= */ false);
-                return r > 0 ? 0 : r;
-        }
-
         if (streq(verb, "disable"))
                 r = normalize_names(names);
         else if (streq(verb, "link"))
@@ -119,41 +104,7 @@ int verb_enable(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return r;
 
-        if (install_client_side()) {
-                UnitFileFlags flags;
-                InstallChange *changes = NULL;
-                size_t n_changes = 0;
-
-                CLEANUP_ARRAY(changes, n_changes, install_changes_free);
-
-                flags = unit_file_flags_from_args();
-
-                if (streq(verb, "enable")) {
-                        r = unit_file_enable(arg_runtime_scope, flags, arg_root, names, &changes, &n_changes);
-                        carries_install_info = r;
-                } else if (streq(verb, "disable")) {
-                        r = unit_file_disable(arg_runtime_scope, flags, arg_root, names, &changes, &n_changes);
-                        carries_install_info = r;
-                } else if (streq(verb, "reenable")) {
-                        r = unit_file_reenable(arg_runtime_scope, flags, arg_root, names, &changes, &n_changes);
-                        carries_install_info = r;
-                } else if (streq(verb, "link"))
-                        r = unit_file_link(arg_runtime_scope, flags, arg_root, names, &changes, &n_changes);
-                else if (streq(verb, "preset"))
-                        r = unit_file_preset(arg_runtime_scope, flags, arg_root, names, arg_preset_mode, &changes, &n_changes);
-                else if (streq(verb, "mask"))
-                        r = unit_file_mask(arg_runtime_scope, flags, arg_root, names, &changes, &n_changes);
-                else if (streq(verb, "unmask"))
-                        r = unit_file_unmask(arg_runtime_scope, flags, arg_root, names, &changes, &n_changes);
-                else if (streq(verb, "revert"))
-                        r = unit_file_revert(arg_runtime_scope, arg_root, names, &changes, &n_changes);
-                else
-                        assert_not_reached();
-
-                install_changes_dump(r, verb, changes, n_changes, arg_quiet);
-                if (r < 0)
-                        return r;
-        } else {
+        if (install_client_side() == INSTALL_CLIENT_SIDE_NO) {
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL, *m = NULL;
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
                 bool expect_carries_install_info = false;
@@ -275,6 +226,40 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                 if (warn_trigger_operation && !arg_quiet && !arg_no_warn)
                         STRV_FOREACH(unit, names)
                                 warn_triggering_units(bus, *unit, warn_trigger_operation, warn_trigger_ignore_masked);
+        } else {
+                UnitFileFlags flags;
+                InstallChange *changes = NULL;
+                size_t n_changes = 0;
+
+                CLEANUP_ARRAY(changes, n_changes, install_changes_free);
+
+                flags = unit_file_flags_from_args();
+
+                if (streq(verb, "enable")) {
+                        r = unit_file_enable(arg_runtime_scope, flags, arg_root, names, &changes, &n_changes);
+                        carries_install_info = r;
+                } else if (streq(verb, "disable")) {
+                        r = unit_file_disable(arg_runtime_scope, flags, arg_root, names, &changes, &n_changes);
+                        carries_install_info = r;
+                } else if (streq(verb, "reenable")) {
+                        r = unit_file_reenable(arg_runtime_scope, flags, arg_root, names, &changes, &n_changes);
+                        carries_install_info = r;
+                } else if (streq(verb, "link"))
+                        r = unit_file_link(arg_runtime_scope, flags, arg_root, names, &changes, &n_changes);
+                else if (streq(verb, "preset"))
+                        r = unit_file_preset(arg_runtime_scope, flags, arg_root, names, arg_preset_mode, &changes, &n_changes);
+                else if (streq(verb, "mask"))
+                        r = unit_file_mask(arg_runtime_scope, flags, arg_root, names, &changes, &n_changes);
+                else if (streq(verb, "unmask"))
+                        r = unit_file_unmask(arg_runtime_scope, flags, arg_root, names, &changes, &n_changes);
+                else if (streq(verb, "revert"))
+                        r = unit_file_revert(arg_runtime_scope, arg_root, names, &changes, &n_changes);
+                else
+                        assert_not_reached();
+
+                r = install_changes_dump(r, verb, changes, n_changes, arg_quiet);
+                if (r < 0)
+                        return r;
         }
 
         if (carries_install_info == 0 && !ignore_carries_install_info)
@@ -334,7 +319,7 @@ int verb_enable(int argc, char *argv[], void *userdata) {
         if (arg_now) {
                 _cleanup_strv_free_ char **new_args = NULL;
                 const char *start_verb;
-                bool accept_path, prohibit_templates;
+                bool accept_path, prohibit_templates, dead_ok = false;
 
                 if (streq(verb, "enable")) {
                         start_verb = "start";
@@ -344,6 +329,7 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                         start_verb = "stop";
                         accept_path = false;
                         prohibit_templates = false;
+                        dead_ok = true;  /* If the service is not running anyway, no need to stop it. */
                 } else if (streq(verb, "reenable")) {
                         /* Note that we use try-restart here. This matches the semantics of reenable better,
                          * and allows us to glob template units. */
@@ -354,9 +340,20 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "--now can only be used with verb enable, disable, reenable, or mask.");
 
-                if (install_client_side())
-                        return log_error_errno(SYNTHETIC_ERRNO(EREMOTE),
-                                               "--now cannot be used when systemd is not running or in conjunction with --root=/--global, refusing.");
+                switch (install_client_side()) {
+                case INSTALL_CLIENT_SIDE_NO:
+                        break;
+                case INSTALL_CLIENT_SIDE_OVERRIDE:
+                case INSTALL_CLIENT_SIDE_OFFLINE:
+                case INSTALL_CLIENT_SIDE_NOT_BOOTED:
+                        if (!dead_ok)
+                                log_warning("Cannot %s unit with --now when systemd is not running, ignoring.", start_verb);
+                        return 0;
+                case INSTALL_CLIENT_SIDE_ARG_ROOT:
+                        return log_error_errno(SYNTHETIC_ERRNO(EREMOTE), "--now cannot be used with --root=.");
+                case INSTALL_CLIENT_SIDE_GLOBAL_SCOPE:
+                        return log_error_errno(SYNTHETIC_ERRNO(EREMOTE), "--now cannot be used with --global.");
+                }
 
                 assert(bus);
 
@@ -393,7 +390,7 @@ int verb_enable(int argc, char *argv[], void *userdata) {
 
                                 assert(!STR_IN_SET(start_verb, "start", "restart"));
 
-                                r = unit_name_replace_instance_full(unit_name, "*", /* accept_glob = */ true, &globbed);
+                                r = unit_name_replace_instance_full(unit_name, "*", /* accept_glob= */ true, &globbed);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to glob unit name '%s': %m", unit_name);
 
@@ -404,7 +401,7 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                                 return log_oom();
                 }
 
-                return verb_start(strv_length(new_args), new_args, userdata);
+                return verb_start(strv_length(new_args), new_args, data, userdata);
         }
 
         return 0;

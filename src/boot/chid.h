@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #pragma once
 
-#include "chid-fundamental.h" /* IWYU pragma: export */
 #include "efi.h"
+
+#include "../fundamental/chid.h" /* IWYU pragma: export */
 
 /* A .hwids PE section consists of a series of 'Device' structures. A 'Device' structure binds a CHID to some
  * resource, for now only Devicetree blobs. Designed to be extensible to other types of resources, should the
@@ -98,4 +99,8 @@ static inline const char* device_get_fwid(const void *base, const Device *device
         return off == 0 ? NULL : (const char *) ((const uint8_t *) base + off);
 }
 
-EFI_STATUS chid_match(const void *chids_buffer, size_t chids_length, uint32_t match_type, const Device **ret_device);
+EFI_STATUS chid_match(
+                const void *hwid_buffer,
+                size_t hwid_length,
+                uint32_t match_type,
+                const Device **ret_device);

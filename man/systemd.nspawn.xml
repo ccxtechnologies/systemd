@@ -302,6 +302,23 @@
       </varlistentry>
 
       <varlistentry>
+        <term><varname>PrivateUsersDelegate=</varname></term>
+
+        <listitem><para>Takes a non-negative integer. Configures delegation of additional 64K UID/GID ranges
+        into the container's user namespace for use by nested containers. When set to a value greater than
+        zero, the
+        <citerefentry><refentrytitle>systemd-nsresourced.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+        varlink socket will be bind-mounted into the container so that processes inside the container can
+        allocate further user namespaces from the delegated ranges. This is equivalent to the
+        <option>--private-users-delegate=</option> command line switch. Requires
+        <varname>PrivateUsers=managed</varname>. Defaults to 0. See
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+        for details.</para>
+
+        <xi:include href="version-info.xml" xpointer="v260"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>NotifyReady=</varname></term>
 
         <listitem><para>Configures support for notifications from the container's init process.  This is equivalent to
@@ -321,6 +338,18 @@
         details.</para>
 
         <xi:include href="version-info.xml" xpointer="v235"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>RestrictAddressFamilies=</varname></term>
+
+        <listitem><para>Restricts the socket address families accessible to the container. This is equivalent
+        to the <option>--restrict-address-families=</option> command line switch, and takes the same list
+        parameter. See
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
+        details.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -553,9 +582,11 @@
         <term><varname>PrivateUsersOwnership=</varname></term>
 
         <listitem><para>Configures whether the ownership of the files and directories in the container tree
-        shall be adjusted to the UID/GID range used, if necessary and user namespacing is enabled. This is
-        equivalent to the <option>--private-users-ownership=</option> command line switch. This option is
-        privileged (see above).</para>
+        shall be adjusted to the UID/GID range used, if necessary. This is equivalent to the
+        <option>--private-users-ownership=</option> command line switch. This option is privileged (see
+        above). Defaults to <literal>auto</literal> if <varname>PrivateUsers=pick</varname> or
+        <varname>PrivateUsers=managed</varname> is used. This option has no effect if user namespacing is
+        not used.</para>
 
         <xi:include href="version-info.xml" xpointer="v249"/></listitem>
       </varlistentry>
@@ -583,6 +614,26 @@
         switch.</para>
 
         <xi:include href="version-info.xml" xpointer="v226"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>NamespacePath=</varname></term>
+
+        <listitem><para>Takes the path to a file representing a kernel
+        network namespace that the container shall run in. The specified path
+        should refer to a (possibly bind-mounted) network namespace file, as
+        exposed by the kernel below <filename>/proc/$PID/ns/net</filename>.
+        This makes the container enter the given network namespace. One of the
+        typical use cases is to give a network namespace under
+        <filename>/run/netns</filename> created by <citerefentry
+        project='man-pages'><refentrytitle>ip-netns</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
+        for example, <varname>NamespacePath=/run/netns/foo</varname>.
+        Note that this option cannot be used together with other
+        network-related options, such as <varname>Private=</varname>
+        or <varname>Interface=</varname>. This option corresponds to the
+        <option>--network-namespace-path</option> command line switch.</para>
+
+        <xi:include href="version-info.xml" xpointer="v259"/></listitem>
       </varlistentry>
 
       <varlistentry>

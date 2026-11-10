@@ -14,7 +14,7 @@ interfaces.
 
 For a verbose explanation of `systemd-resolved.service`'s domain routing logic,
 see its [man
-page](https://www.freedesktop.org/software/systemd/man/systemd-resolved.service.html). This
+page](https://www.freedesktop.org/software/systemd/man/latest/systemd-resolved.service.html). This
 document is supposed to provide examples to use the concepts for the specific
 purpose of managing VPN DNS configuration.
 
@@ -98,13 +98,13 @@ interfaces are "merged": domains existing on one but not the other will "just
 work" and vice versa.
 
 And one more note: the domain routing logic implemented is a tiny bit more
-complex that what described above: if there two interfaces have search domains
-that are suffix of each other, and a name is looked up that matches both, the
-interface with the longer match will win and get the lookup routed to is DNS
+complex than what is described above: if two interfaces have search domains
+that are suffixes of each other, and a name is looked up that matches both, the
+interface with the longer match will win and get the lookup routed to its DNS
 servers. Only if the match has the same length, then both will be used in
 parallel. Example: one interface has `~foo.example.com` as routing domain, and
-another one `example.com` has search domain. A lookup for
-`waldo.foo.example.com` is the exclusively routed to the first interface's DNS
+another one has `example.com` as search domain. A lookup for
+`waldo.foo.example.com` is exclusively routed to the first interface's DNS
 server, since it matches by three suffix labels instead of just two. The fact
 that the matching length is taken into consideration for the routing decision
 is particularly relevant if you have one interface with the `~.` routing domain
@@ -184,14 +184,14 @@ the configuration to `systemd-resolved.service`? There are three relevant
 interfaces:
 
 1. Ideally, you use D-Bus and talk to [`systemd-resolved.service`'s D-Bus
-   API](https://www.freedesktop.org/software/systemd/man/org.freedesktop.resolve1.html)
+   API](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.resolve1.html)
    directly. Use `SetLinkDomains()` to set the per-interface search and routing
    domains on the interfaces you manage, and `SetLinkDefaultRoute()` to manage
    the `default-route` boolean, all on the `org.freedesktop.resolve1.Manager`
    interface of the `/org/freedesktop/resolve1` object.
 
 2. If that's not in the cards, you may shell out to
-   [`resolvectl`](https://www.freedesktop.org/software/systemd/man/resolvectl.html),
+   [`resolvectl`](https://www.freedesktop.org/software/systemd/man/latest/resolvectl.html),
    which is a thin wrapper around the D-Bus interface mentioned above. Use
    `resolvectl domain <iface> …` to set the search/routing domains and
    `resolvectl default-route <iface> …` to set the `default-route` boolean.

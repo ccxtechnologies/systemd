@@ -1,12 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdlib.h>
+
 #include "sd-event.h"
 
-#include "resolved-dns-answer.h"
-#include "resolved-dns-packet.h"
+#include "dns-answer.h"
+#include "dns-packet.h"
+#include "dns-question.h"
+#include "dns-rr.h"
 #include "resolved-dns-query.h"
-#include "resolved-dns-question.h"
-#include "resolved-dns-rr.h"
 #include "resolved-dns-scope.h"
 #include "resolved-dns-search-domain.h"
 #include "resolved-dns-server.h"
@@ -83,7 +85,7 @@ TEST(dns_query_new_multi_question_different_domain) {
         ASSERT_NULL(query);
 }
 
-#if HAVE_LIBIDN || HAVE_LIBIDN2
+#if HAVE_LIBIDN2
 TEST(dns_query_new_same_utf8_and_idna) {
         Manager manager = {};
         _cleanup_(dns_question_unrefp) DnsQuestion *q_utf8 = NULL, *q_idna = NULL;
@@ -432,7 +434,7 @@ TEST(dns_query_process_cname_one_success_match_dname) {
         dns_resource_key_unref(key);
 }
 
-#if HAVE_LIBIDN || HAVE_LIBIDN2
+#if HAVE_LIBIDN2
 TEST(dns_query_process_cname_one_success_match_dname_utf8_same) {
         Manager manager = {};
         _cleanup_(dns_question_unrefp) DnsQuestion *q_utf8 = NULL, *q_idna = NULL;
@@ -520,7 +522,7 @@ TEST(dns_query_process_cname_one_success_match_dname_utf8_different) {
         ASSERT_EQ(query->n_cname_redirects, 1u);
 
         ASSERT_EQ(dns_question_size(query->collected_questions), 2u);
-        ASSERT_NULL(query->question_utf8);
+        ASSERT_EQ(dns_question_size(query->question_utf8), 1u);
         ASSERT_EQ(dns_question_size(query->question_idna), 1u);
 
         key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_A, "www.\xF0\x9F\x98\xB1.com");
@@ -531,6 +533,11 @@ TEST(dns_query_process_cname_one_success_match_dname_utf8_different) {
         key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_A, "www.xn--tl8h.com");
         ASSERT_NOT_NULL(key);
         ASSERT_TRUE(dns_question_contains_key(query->collected_questions, key));
+        dns_resource_key_unref(key);
+
+        key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_A, "www.\xF0\x9F\x98\xB1.com");
+        ASSERT_NOT_NULL(key);
+        ASSERT_TRUE(dns_question_contains_key(query->question_utf8, key));
         dns_resource_key_unref(key);
 
         key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_A, "www.v2.xn--tl8h.com");
@@ -856,7 +863,7 @@ static void exercise_dns_query_go(GoConfig *cfg, void (*check_query)(DnsQuery *q
         ASSERT_NOT_NULL(query);
         ASSERT_TRUE(dns_query_go(query));
 
-        if (check_query != NULL)
+        if (check_query)
                 check_query(query);
 }
 
@@ -890,4 +897,10 @@ TEST(dns_query_go) {
         exercise_dns_query_go(&cfg, NULL);
 }
 
-DEFINE_TEST_MAIN(LOG_DEBUG);
+static int intro(void) {
+        /* Disable hooks in order to make test cases hermetic */
+        ASSERT_OK_ERRNO(setenv("SYSTEMD_RESOLVED_HOOK", "0", /* overwrite= */ false));
+        return EXIT_SUCCESS;
+}
+
+DEFINE_TEST_MAIN_WITH_INTRO(LOG_DEBUG, intro);

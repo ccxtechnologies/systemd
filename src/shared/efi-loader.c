@@ -8,6 +8,7 @@
 #include "log.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "proc-cmdline.h"
 #include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -280,13 +281,6 @@ int efi_measured_uki(int log_level) {
          * being used, but it measured things into a different PCR than we are configured for in
          * userspace. (i.e. we expect PCR 11 being used for this by both sd-stub and us) */
 
-        r = secure_getenv_bool("SYSTEMD_FORCE_MEASURE"); /* Give user a chance to override the variable test,
-                                                          * for debugging purposes */
-        if (r >= 0)
-                return (cached = r);
-        if (r != -ENXIO)
-                log_debug_errno(r, "Failed to parse $SYSTEMD_FORCE_MEASURE, ignoring: %m");
-
         if (!efi_has_tpm2())
                 return (cached = 0);
 
@@ -305,6 +299,70 @@ int efi_measured_uki(int log_level) {
                 return log_full_errno(log_level, SYNTHETIC_ERRNO(EREMOTE),
                                       "Kernel stub measured kernel image into PCR %u, which is different than expected %i.",
                                       pcr_nr, TPM2_PCR_KERNEL_BOOT);
+
+        return (cached = 1);
+#else
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP), "Compiled without support for EFI");
+#endif
+}
+
+int efi_measured_os(int log_level) {
+#if ENABLE_EFI
+        static int cached = -1;
+        int r;
+
+        /* Returns if we shall enable our measurement machinery */
+
+        if (cached >= 0)
+                return cached;
+
+        r = secure_getenv_bool("SYSTEMD_FORCE_MEASURE"); /* Give user a chance to override the variable test,
+                                                          * for debugging purposes */
+        if (r >= 0)
+                return (cached = r);
+        if (r != -ENXIO)
+                log_debug_errno(r, "Failed to parse $SYSTEMD_FORCE_MEASURE, ignoring: %m");
+
+        bool b;
+        r = proc_cmdline_get_bool("systemd.tpm2_measured_os", /* flags= */ 0, &b);
+        if (r > 0)
+                return (cached = b);
+        if (r < 0)
+                log_debug_errno(r, "Failed to parse systemd.tpm2_measured_os= kernel command line argument, ignoring: %m");
+
+        /* If nothing is explicitly configured, just assume that if we booted with a measured UKI we also want a measured OS */
+        return (cached = efi_measured_uki(log_level));
+#else
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP), "Compiled without support for EFI");
+#endif
+}
+
+int efi_measured_smbios(int log_level) {
+#if ENABLE_EFI
+        _cleanup_free_ char *pcr_string = NULL;
+        static int cached = -1;
+        unsigned pcr_nr;
+        int r;
+
+        if (cached >= 0)
+                return cached;
+
+        /* Whether sd-boot or sd-stub measured the SMBIOS table (types 1, 2, and 11) into PCR 1. The loader
+         * sets the variable only if all of these structures were measured. Firmware does not do this for
+         * OEM strings: edk2's SmbiosMeasurementDxe zeros type 11 before hashing. */
+
+        r = efi_get_variable_string(EFI_LOADER_VARIABLE_STR("LoaderPcrSMBIOS"), &pcr_string);
+        if (r == -ENOENT)
+                return (cached = 0);
+        if (r < 0)
+                return log_full_errno(log_level, r, "Failed to get LoaderPcrSMBIOS EFI variable: %m");
+
+        r = safe_atou(pcr_string, &pcr_nr);
+        if (r < 0)
+                return log_full_errno(log_level, r, "Failed to parse LoaderPcrSMBIOS EFI variable: %s", pcr_string);
+        if (pcr_nr != TPM2_PCR_PLATFORM_CONFIG)
+                return log_full_errno(log_level, SYNTHETIC_ERRNO(EREMOTE),
+                                      "Loader measured SMBIOS into PCR %u, but PCR %i is expected.", pcr_nr, TPM2_PCR_PLATFORM_CONFIG);
 
         return (cached = 1);
 #else
@@ -407,4 +465,15 @@ bool efi_loader_entry_name_valid(const char *s) {
                 return false;
 
         return in_charset(s, ALPHANUMERICAL "+-_.@");
+}
+
+bool efi_loader_entry_title_valid(const char *s) {
+        return string_is_safe(s, /* flags= */ 0);
+}
+
+bool efi_loader_entry_resource_filename_valid(const char *s) {
+        /* Validates file names so that they are safe for their inclusion in boot loader type #1
+         * entries. i.e. may not contain CCs, and should be ASCII */
+
+        return string_is_safe(s, STRING_ASCII|STRING_FILENAME);
 }

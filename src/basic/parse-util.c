@@ -7,6 +7,8 @@
 #include <sys/socket.h>
 
 #include "alloc-util.h"
+#include "capability-list.h"
+#include "capability-util.h"
 #include "errno-list.h"
 #include "extract-word.h"
 #include "locale-util.h"
@@ -61,7 +63,7 @@ int parse_tristate_full(const char *v, const char *third, int *ret) {
         return 0;
 }
 
-int parse_pid(const char *s, pid_t* ret_pid) {
+int parse_pid(const char *s, pid_t *ret) {
         unsigned long ul = 0;
         pid_t pid;
         int r;
@@ -80,8 +82,8 @@ int parse_pid(const char *s, pid_t* ret_pid) {
         if (!pid_is_valid(pid))
                 return -ERANGE;
 
-        if (ret_pid)
-                *ret_pid = pid;
+        if (ret)
+                *ret = pid;
         return 0;
 }
 
@@ -124,6 +126,8 @@ int parse_ifindex(const char *s) {
 int parse_mtu(int family, const char *s, uint32_t *ret) {
         uint64_t u, m;
         int r;
+
+        assert(ret);
 
         r = parse_size(s, 1024, &u);
         if (r < 0)
@@ -374,6 +378,9 @@ int parse_user_shell(const char *s, char **ret_sh, bool *ret_copy) {
         char *sh;
         int r;
 
+        assert(ret_sh);
+        assert(ret_copy);
+
         if (path_is_absolute(s) && path_is_normalized(s)) {
                 sh = strdup(s);
                 if (!sh)
@@ -473,6 +480,8 @@ int safe_atou_full(const char *s, unsigned base, unsigned *ret_u) {
 int safe_atou_bounded(const char *s, unsigned min, unsigned max, unsigned *ret) {
         unsigned v;
         int r;
+
+        assert(ret);
 
         r = safe_atou(s, &v);
         if (r < 0)
@@ -575,6 +584,8 @@ int safe_atou8_full(const char *s, unsigned base, uint8_t *ret) {
         unsigned u;
         int r;
 
+        assert(ret);
+
         r = safe_atou_full(s, base, &u);
         if (r < 0)
                 return r;
@@ -588,6 +599,8 @@ int safe_atou8_full(const char *s, unsigned base, uint8_t *ret) {
 int safe_atou16_full(const char *s, unsigned base, uint16_t *ret) {
         unsigned u;
         int r;
+
+        assert(ret);
 
         r = safe_atou_full(s, base, &u);
         if (r < 0)
@@ -643,7 +656,7 @@ int safe_atod(const char *s, double *ret_d) {
                 return -EINVAL;
 
         if (ret_d)
-                *ret_d = (double) d;
+                *ret_d = d;
 
         return 0;
 }
@@ -651,6 +664,9 @@ int safe_atod(const char *s, double *ret_d) {
 int parse_fractional_part_u(const char **p, size_t digits, unsigned *res) {
         unsigned val = 0;
         const char *s;
+
+        assert(p);
+        assert(res);
 
         s = *p;
 
@@ -683,10 +699,12 @@ int parse_fractional_part_u(const char **p, size_t digits, unsigned *res) {
         return 0;
 }
 
-int parse_nice(const char *p, int *ret) {
+int parse_nice(const char *s, int *ret) {
         int n, r;
 
-        r = safe_atoi(p, &n);
+        assert(ret);
+
+        r = safe_atoi(s, &n);
         if (r < 0)
                 return r;
 
@@ -701,6 +719,8 @@ int parse_ip_port(const char *s, uint16_t *ret) {
         uint16_t l;
         int r;
 
+        assert(ret);
+
         r = safe_atou16_full(s, SAFE_ATO_REFUSE_LEADING_WHITESPACE, &l);
         if (r < 0)
                 return r;
@@ -708,7 +728,7 @@ int parse_ip_port(const char *s, uint16_t *ret) {
         if (l == 0)
                 return -EINVAL;
 
-        *ret = (uint16_t) l;
+        *ret = l;
 
         return 0;
 }
@@ -716,6 +736,9 @@ int parse_ip_port(const char *s, uint16_t *ret) {
 int parse_ip_port_range(const char *s, uint16_t *low, uint16_t *high, bool allow_zero) {
         unsigned l, h;
         int r;
+
+        assert(low);
+        assert(high);
 
         r = parse_range(s, &l, &h);
         if (r < 0)
@@ -756,16 +779,17 @@ int parse_oom_score_adjust(const char *s, int *ret) {
 int store_loadavg_fixed_point(unsigned long i, unsigned long f, loadavg_t *ret) {
         assert(ret);
 
-        if (i >= (~0UL << LOADAVG_PRECISION_BITS))
+        /* Validate both parts *before* shifting them, so that the shifts themselves cannot overflow.
+         * Rejecting f >= 100 is equivalent to the old check of the shifted value against
+         * LOADAVG_FIXED_POINT_1_0, since DIV_ROUND_UP(99 << 11, 100) == 2028 and
+         * DIV_ROUND_UP(100 << 11, 100) == 2048. */
+        if (i > (~0UL >> LOADAVG_PRECISION_BITS))
                 return -ERANGE;
 
-        i = i << LOADAVG_PRECISION_BITS;
-        f = DIV_ROUND_UP((f << LOADAVG_PRECISION_BITS), 100);
-
-        if (f >= LOADAVG_FIXED_POINT_1_0)
+        if (f >= 100)
                 return -ERANGE;
 
-        *ret = i | f;
+        *ret = (i << LOADAVG_PRECISION_BITS) | DIV_ROUND_UP(f << LOADAVG_PRECISION_BITS, 100);
         return 0;
 }
 
@@ -808,4 +832,40 @@ bool nft_identifier_valid(const char *id) {
                 return false;
 
         return in_charset(id + 1, ALPHANUMERICAL "/\\_.");
+}
+
+int parse_capability_set(const char *s, uint64_t initial, uint64_t *current) {
+        int r;
+
+        assert(s);
+        assert(current);
+
+        if (isempty(s)) {
+                *current = CAP_MASK_UNSET;
+                return 1;
+        }
+
+        bool invert = false;
+        if (s[0] == '~') {
+                invert = true;
+                s++;
+        }
+
+        uint64_t parsed;
+        r = capability_set_from_string(s, &parsed);
+        if (r < 0)
+                return r;
+
+        if (parsed == 0 || *current == initial)
+                /* "~" or uninitialized data -> replace */
+                *current = invert ? all_capabilities() & ~parsed : parsed;
+        else {
+                /* previous data -> merge */
+                if (invert)
+                        *current &= ~parsed;
+                else
+                        *current |= parsed;
+        }
+
+        return r;
 }

@@ -28,10 +28,37 @@ static void test_network_two(const char *ifname,
 
         ASSERT_OK(parse_cmdline_item(key1, value1, &context));
         ASSERT_OK(parse_cmdline_item(key2, value2, &context));
+        context_finalize_bootif(&context);
         ASSERT_OK(context_merge_networks(&context));
         ASSERT_NOT_NULL((network = network_get(&context, ifname)));
         ASSERT_OK(network_format(network, &output));
         ASSERT_STREQ(output, expected);
+}
+
+static void test_network_three(const char *ifname,
+                               const char *key1, const char *value1,
+                               const char *key2, const char *value2,
+                               const char *key3, const char *value3,
+                               const char *expected) {
+        _cleanup_(context_clear) Context context = {};
+        _cleanup_free_ char *output = NULL;
+        Network *network;
+
+        log_debug("/* %s(%s=%s, %s=%s, %s=%s) */", __func__, key1, value1, key2, value2, key3, value3);
+
+        ASSERT_OK(parse_cmdline_item(key1, value1, &context));
+        ASSERT_OK(parse_cmdline_item(key2, value2, &context));
+        ASSERT_OK(parse_cmdline_item(key3, value3, &context));
+        context_finalize_bootif(&context);
+        ASSERT_OK(context_merge_networks(&context));
+
+        network = network_get(&context, ifname);
+        if (expected) {
+                ASSERT_NOT_NULL(network);
+                ASSERT_OK(network_format(network, &output));
+                ASSERT_STREQ(output, expected);
+        } else
+                ASSERT_NULL(network);
 }
 
 static void test_netdev_one(const char *ifname, const char *key, const char *value, const char *expected) {
@@ -209,6 +236,51 @@ int main(int argc, char *argv[]) {
                          "\n[Address]\n"
                          "Address=192.168.0.10/24\n"
                          "Peer=192.168.0.2\n"
+                         "\n[Route]\n"
+                         "Gateway=192.168.0.1\n"
+                         );
+
+        test_network_one("eth0", "ip", "192.168.0.10::192.168.0.1:255.255.255.0::eth0:on:10.10.10.10:10.10.10.11:10.10.10.161",
+                         "[Match]\n"
+                         "Name=eth0\n"
+                         "\n[Link]\n"
+                         "\n[Network]\n"
+                         "DHCP=yes\n"
+                         "DNS=10.10.10.10\n"
+                         "DNS=10.10.10.11\n"
+                         "NTP=10.10.10.161\n"
+                         "\n[DHCP]\n"
+                         "\n[Address]\n"
+                         "Address=192.168.0.10/24\n"
+                         "\n[Route]\n"
+                         "Gateway=192.168.0.1\n"
+                         );
+
+        test_network_one("eth0", "ip", "192.168.0.10::192.168.0.1:255.255.255.0::eth0:on:10.10.10.10::10.10.10.161",
+                         "[Match]\n"
+                         "Name=eth0\n"
+                         "\n[Link]\n"
+                         "\n[Network]\n"
+                         "DHCP=yes\n"
+                         "DNS=10.10.10.10\n"
+                         "NTP=10.10.10.161\n"
+                         "\n[DHCP]\n"
+                         "\n[Address]\n"
+                         "Address=192.168.0.10/24\n"
+                         "\n[Route]\n"
+                         "Gateway=192.168.0.1\n"
+                         );
+
+        test_network_one("eth0", "ip", "192.168.0.10::192.168.0.1:255.255.255.0::eth0:on:::10.10.10.161",
+                         "[Match]\n"
+                         "Name=eth0\n"
+                         "\n[Link]\n"
+                         "\n[Network]\n"
+                         "DHCP=yes\n"
+                         "NTP=10.10.10.161\n"
+                         "\n[DHCP]\n"
+                         "\n[Address]\n"
+                         "Address=192.168.0.10/24\n"
                          "\n[Route]\n"
                          "Gateway=192.168.0.1\n"
                          );
@@ -527,6 +599,62 @@ int main(int argc, char *argv[]) {
                          "\n[Route]\n"
                          "Gateway=192.168.0.1\n"
                          );
+
+        test_network_two("BOOTIF",
+                         "ip", "::::hogehoge:BOOTIF:dhcp",
+                         "BOOTIF", "01-00:11:22:33:44:55",
+                         "[Match]\n"
+                         "MACAddress=00:11:22:33:44:55\n"
+                         "\n[Link]\n"
+                         "\n[Network]\n"
+                         "DHCP=ipv4\n"
+                         "\n[DHCP]\n"
+                         "Hostname=hogehoge\n"
+                         );
+
+        test_network_two("BOOTIF",
+                         "ip", "::::hogehoge:BOOTIF:dhcp",
+                         "BOOTIF", "00:11:22:33:44:55",
+                         "[Match]\n"
+                         "MACAddress=00:11:22:33:44:55\n"
+                         "\n[Link]\n"
+                         "\n[Network]\n"
+                         "DHCP=ipv4\n"
+                         "\n[DHCP]\n"
+                         "Hostname=hogehoge\n"
+                         );
+
+        test_network_two("BOOTIF",
+                         "ip", "::::hogehoge:BOOTIF:dhcp",
+                         "BOOTIF", "01-00-11-22-33-44-55",
+                         "[Match]\n"
+                         "MACAddress=00:11:22:33:44:55\n"
+                         "\n[Link]\n"
+                         "\n[Network]\n"
+                         "DHCP=ipv4\n"
+                         "\n[DHCP]\n"
+                         "Hostname=hogehoge\n"
+                         );
+
+        test_network_three("BOOTIF",
+                           "ip", "::::hogehoge:BOOTIF:dhcp",
+                           "BOOTIF", "01-00:11:22:33:44:55",
+                           "rd.bootif", "1",
+                           "[Match]\n"
+                           "MACAddress=00:11:22:33:44:55\n"
+                           "\n[Link]\n"
+                           "\n[Network]\n"
+                           "DHCP=ipv4\n"
+                           "\n[DHCP]\n"
+                           "Hostname=hogehoge\n"
+                           );
+
+        test_network_three("BOOTIF",
+                           "ip", "::::hogehoge:BOOTIF:dhcp",
+                           "BOOTIF", "01-00:11:22:33:44:55",
+                           "rd.bootif", "0",
+                           NULL
+                           );
 
         return 0;
 }

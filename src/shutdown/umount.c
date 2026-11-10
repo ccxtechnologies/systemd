@@ -24,9 +24,9 @@
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "parse-util.h"
+#include "pidref.h"
 #include "process-util.h"
 #include "random-util.h"
-#include "signal-util.h"
 #include "stat-util.h"
 #include "string-util.h"
 #include "umount.h"
@@ -69,17 +69,17 @@ int mount_points_list_get(FILE *f, MountPoint **head) {
                 bool try_remount_ro, is_api_vfs, is_network;
                 _cleanup_free_ MountPoint *m = NULL;
 
-                r = mnt_table_next_fs(table, iter, &fs);
+                r = sym_mnt_table_next_fs(table, iter, &fs);
                 if (r == 1) /* EOF */
                         break;
                 if (r < 0)
                         return log_error_errno(r, "Failed to get next entry from /proc/self/mountinfo: %m");
 
-                path = mnt_fs_get_target(fs);
+                path = sym_mnt_fs_get_target(fs);
                 if (!path)
                         continue;
 
-                fstype = mnt_fs_get_fstype(fs);
+                fstype = sym_mnt_fs_get_fstype(fs);
 
                 /* Combine the generic VFS options with the FS-specific options. Duplicates are not a problem
                  * here, because the only options that should come up twice are typically ro/rw, which are
@@ -87,9 +87,9 @@ int mount_points_list_get(FILE *f, MountPoint **head) {
                  *
                  * Even if there are duplicates later in mount_option_mangle() they shouldn't hurt anyways as
                  * they override each other. */
-                if (!strextend_with_separator(&options, ",", mnt_fs_get_vfs_options(fs)))
+                if (!strextend_with_separator(&options, ",", sym_mnt_fs_get_vfs_options(fs)))
                         return log_oom();
-                if (!strextend_with_separator(&options, ",", mnt_fs_get_fs_options(fs)))
+                if (!strextend_with_separator(&options, ",", sym_mnt_fs_get_fs_options(fs)))
                         return log_oom();
 
                 /* Ignore mount points we can't unmount because they are API or because we are keeping them
@@ -122,7 +122,7 @@ int mount_points_list_get(FILE *f, MountPoint **head) {
                          * were when the filesystem was mounted, except for the desired changes. So we
                          * reconstruct both here and adjust them for the later remount call too. */
 
-                        r = mnt_fs_get_propagation(fs, &remount_flags);
+                        r = sym_mnt_fs_get_propagation(fs, &remount_flags);
                         if (r < 0) {
                                 log_warning_errno(r, "mnt_fs_get_propagation() failed for %s, ignoring: %m", path);
                                 continue;
@@ -250,23 +250,20 @@ static void log_umount_blockers(const char *mnt) {
 
 static int remount_with_timeout(MountPoint *m, bool last_try) {
         _cleanup_close_pair_ int pfd[2] = EBADF_PAIR;
-        _cleanup_(sigkill_nowaitp) pid_t pid = 0;
+        _cleanup_(pidref_done_sigkill_nowait) PidRef pidref = PIDREF_NULL;
         int r;
-
-        BLOCK_SIGNALS(SIGCHLD);
 
         assert(m);
 
-        r = pipe2(pfd, O_CLOEXEC|O_NONBLOCK);
-        if (r < 0)
-                return r;
+        if (pipe2(pfd, O_CLOEXEC|O_NONBLOCK) < 0)
+                return -errno;
 
         /* Due to the possibility of a remount operation hanging, we fork a child process and set a
          * timeout. If the timeout lapses, the assumption is that the particular remount failed. */
-        r = safe_fork_full("(sd-remount)",
+        r = pidref_safe_fork_full("(sd-remount)",
                            NULL,
                            pfd, ELEMENTSOF(pfd),
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_LOG|FORK_REOPEN_LOG, &pid);
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_LOG|FORK_REOPEN_LOG, &pidref);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -275,10 +272,10 @@ static int remount_with_timeout(MountPoint *m, bool last_try) {
                 log_info("Remounting '%s' read-only with options '%s'.", m->path, strempty(m->remount_options));
 
                 /* Start the mount operation here in the child */
-                r = mount(NULL, m->path, NULL, m->remount_flags, m->remount_options);
+                r = RET_NERRNO(mount(/* source= */ NULL, m->path, /* filesystemtype= */ NULL, m->remount_flags, m->remount_options));
                 if (r < 0)
                         log_full_errno(last_try ? LOG_ERR : LOG_INFO,
-                                       errno,
+                                       r,
                                        "Failed to remount '%s' read-only: %m",
                                        m->path);
 
@@ -287,41 +284,47 @@ static int remount_with_timeout(MountPoint *m, bool last_try) {
 
         pfd[1] = safe_close(pfd[1]);
 
-        r = wait_for_terminate_with_timeout(pid, DEFAULT_TIMEOUT_USEC);
+        siginfo_t si;
+        r = pidref_wait_for_terminate_full(&pidref, DEFAULT_TIMEOUT_USEC, &si);
         if (r == -ETIMEDOUT)
-                log_error_errno(r, "Remounting '%s' timed out, issuing SIGKILL to PID " PID_FMT ".", m->path, pid);
-        else if (r == -EPROTO) {
+                log_error_errno(r, "Remounting '%s' timed out, issuing SIGKILL to PID " PID_FMT ".", m->path, pidref.pid);
+        else if (r < 0)
+                log_error_errno(r, "Remounting '%s' failed unexpectedly, couldn't wait for child process " PID_FMT ": %m", m->path, pidref.pid);
+        else if (si.si_code != CLD_EXITED || si.si_status != 0) {
                 /* Try to read error code from child */
-                if (read(pfd[0], &r, sizeof(r)) == sizeof(r))
-                        log_debug_errno(r, "Remounting '%s' failed abnormally, child process " PID_FMT " failed: %m", m->path, pid);
+                r = read_errno(pfd[0]);
+                if (r < 0 && r != -EIO)
+                        log_debug_errno(r,
+                                        "Remounting '%s' failed abnormally, child process " PID_FMT " failed: %m",
+                                        m->path, pidref.pid);
                 else
-                        r = log_debug_errno(EPROTO, "Remounting '%s' failed abnormally, child process " PID_FMT " aborted or exited non-zero.", m->path, pid);
-                TAKE_PID(pid); /* child exited (just not as we expected) hence don't kill anymore */
-        } else if (r < 0)
-                log_error_errno(r, "Remounting '%s' failed unexpectedly, couldn't wait for child process " PID_FMT ": %m", m->path, pid);
+                        r = log_debug_errno(
+                                        SYNTHETIC_ERRNO(EPROTO),
+                                        "Remounting '%s' failed abnormally, child process " PID_FMT " aborted or exited non-zero.",
+                                        m->path, pidref.pid);
+
+                pidref_done(&pidref); /* child exited (just not as we expected) hence don't kill anymore */
+        }
 
         return r;
 }
 
 static int umount_with_timeout(MountPoint *m, bool last_try) {
         _cleanup_close_pair_ int pfd[2] = EBADF_PAIR;
-        _cleanup_(sigkill_nowaitp) pid_t pid = 0;
+        _cleanup_(pidref_done_sigkill_nowait) PidRef pidref = PIDREF_NULL;
         int r;
-
-        BLOCK_SIGNALS(SIGCHLD);
 
         assert(m);
 
-        r = pipe2(pfd, O_CLOEXEC|O_NONBLOCK);
-        if (r < 0)
-                return r;
+        if (pipe2(pfd, O_CLOEXEC|O_NONBLOCK) < 0)
+                return -errno;
 
         /* Due to the possibility of a umount operation hanging, we fork a child process and set a
          * timeout. If the timeout lapses, the assumption is that the particular umount failed. */
-        r = safe_fork_full("(sd-umount)",
+        r = pidref_safe_fork_full("(sd-umount)",
                            NULL,
                            pfd, ELEMENTSOF(pfd),
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_LOG|FORK_REOPEN_LOG, &pid);
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_LOG|FORK_REOPEN_LOG, &pidref);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -349,18 +352,27 @@ static int umount_with_timeout(MountPoint *m, bool last_try) {
 
         pfd[1] = safe_close(pfd[1]);
 
-        r = wait_for_terminate_with_timeout(pid, DEFAULT_TIMEOUT_USEC);
+        siginfo_t si;
+        r = pidref_wait_for_terminate_full(&pidref, DEFAULT_TIMEOUT_USEC, &si);
         if (r == -ETIMEDOUT)
-                log_error_errno(r, "Unmounting '%s' timed out, issuing SIGKILL to PID " PID_FMT ".", m->path, pid);
-        else if (r == -EPROTO) {
+                log_error_errno(r, "Unmounting '%s' timed out, issuing SIGKILL to PID " PID_FMT ".", m->path, pidref.pid);
+        else if (r < 0)
+                log_error_errno(r, "Unmounting '%s' failed unexpectedly, couldn't wait for child process " PID_FMT ": %m", m->path, pidref.pid);
+        else if (si.si_code != CLD_EXITED || si.si_status != 0) {
                 /* Try to read error code from child */
-                if (read(pfd[0], &r, sizeof(r)) == sizeof(r))
-                        log_debug_errno(r, "Unmounting '%s' failed abnormally, child process " PID_FMT " failed: %m", m->path, pid);
+                r = read_errno(pfd[0]);
+                if (r < 0 && r != -EIO)
+                        log_debug_errno(r,
+                                        "Unmounting '%s' failed abnormally, child process " PID_FMT " failed: %m",
+                                        m->path, pidref.pid);
                 else
-                        r = log_debug_errno(EPROTO, "Unmounting '%s' failed abnormally, child process " PID_FMT " aborted or exited non-zero.", m->path, pid);
-                TAKE_PID(pid); /* It died, but abnormally, no purpose in killing */
-        } else if (r < 0)
-                log_error_errno(r, "Unmounting '%s' failed unexpectedly, couldn't wait for child process " PID_FMT ": %m", m->path, pid);
+                        r = log_debug_errno(
+                                        SYNTHETIC_ERRNO(EPROTO),
+                                        "Unmounting '%s' failed abnormally, child process " PID_FMT " aborted or exited non-zero.",
+                                        m->path, pidref.pid);
+
+                pidref_done(&pidref); /* It died, but abnormally, no purpose in killing */
+        }
 
         return r;
 }

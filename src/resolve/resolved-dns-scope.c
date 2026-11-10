@@ -7,20 +7,21 @@
 
 #include "af-list.h"
 #include "alloc-util.h"
+#include "dns-answer.h"
 #include "dns-domain.h"
+#include "dns-packet.h"
+#include "dns-question.h"
+#include "dns-rr.h"
 #include "dns-type.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "hostname-util.h"
+#include "json-util.h"
 #include "log.h"
 #include "random-util.h"
-#include "resolved-dns-answer.h"
 #include "resolved-dns-browse-services.h"
 #include "resolved-dns-delegate.h"
-#include "resolved-dns-packet.h"
 #include "resolved-dns-query.h"
-#include "resolved-dns-question.h"
-#include "resolved-dns-rr.h"
 #include "resolved-dns-scope.h"
 #include "resolved-dns-search-domain.h"
 #include "resolved-dns-server.h"
@@ -75,6 +76,7 @@ int dns_scope_new(
                 .protocol = protocol,
                 .family = family,
                 .resend_timeout = MULTICAST_RESEND_TIMEOUT_MIN_USEC,
+                .cache.cache_max = m->cache_max[protocol],
 
                 /* Enforce ratelimiting for the multicast protocols */
                 .ratelimit = { MULTICAST_RATELIMIT_INTERVAL_USEC, MULTICAST_RATELIMIT_BURST },
@@ -473,6 +475,12 @@ static int dns_scope_socket(
                 r = setsockopt_int(fd, IPPROTO_TCP, TCP_NODELAY, true);
                 if (r < 0)
                         return r;
+        }
+
+        if (s->delegate && s->delegate->fwmark > 0) {
+                r = setsockopt_int(fd, SOL_SOCKET, SO_MARK, s->delegate->fwmark);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to set firewall mark on DNS socket: %m");
         }
 
         bool addr_is_nonlocal = s->link &&
@@ -1315,6 +1323,7 @@ int dns_scope_notify_conflict(DnsScope *scope, DnsResourceRecord *rr) {
         int r;
 
         assert(scope);
+        assert(scope->protocol == DNS_PROTOCOL_LLMNR);
         assert(rr);
 
         /* We don't send these queries immediately. Instead, we queue them, and send them after some jitter
@@ -1388,6 +1397,14 @@ void dns_scope_check_conflicts(DnsScope *scope, DnsPacket *p) {
                  * found one, we won't check any further */
                 r = dns_zone_check_conflicts(&scope->zone, rr);
                 if (r != 0)
+                        continue;
+
+                /* Advisory conflict queries only exist in LLMNR (RFC 4795, section 4.2). In mDNS several
+                 * responders may legitimately answer for the same name (e.g. the SRP advertising proxies
+                 * of Thread border routers), only conflicts with our own records matter (RFC 6762,
+                 * section 9), and queries must not have the AA bit set (RFC 6762, section 18.4). Every
+                 * responder would answer the advisory again, which we'd take as yet another conflict. */
+                if (scope->protocol != DNS_PROTOCOL_LLMNR)
                         continue;
 
                 /* Check for conflicts against the local cache. If so,
@@ -1522,6 +1539,42 @@ static int on_announcement_timeout(sd_event_source *s, usec_t usec, void *userda
         scope->announce_event_source = sd_event_source_disable_unref(scope->announce_event_source);
 
         (void) dns_scope_announce(scope, false);
+        return 0;
+}
+
+int dns_scope_send_goodbye(DnsScope *scope, DnsAnswer *answer) {
+        _cleanup_(dns_packet_unrefp) DnsPacket *p = NULL;
+        int r;
+
+        assert(scope);
+        assert(answer);
+
+        /* Sends an unsolicited response withdrawing the specified RRs, which are expected to be flagged as
+         * goodbye (TTL 0), without touching anything else published in the zone. */
+
+        if (scope->protocol != DNS_PROTOCOL_MDNS)
+                return 0;
+
+        r = sd_event_get_state(scope->manager->event);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to get event loop state: %m");
+
+        /* If this is called on exit, through manager_free() -> link_free(), then we cannot announce. */
+        if (r == SD_EVENT_FINISHED)
+                return 0;
+
+        if (dns_answer_isempty(answer))
+                return 0;
+
+        r = dns_scope_make_reply_packet(scope, /* id= */ 0, DNS_RCODE_SUCCESS, /* q= */ NULL, answer,
+                                        /* soa= */ NULL, /* tentative= */ false, &p);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to build reply packet: %m");
+
+        r = dns_scope_emit_udp(scope, -EBADF, AF_UNSPEC, p);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to send reply packet: %m");
+
         return 0;
 }
 
@@ -1793,24 +1846,26 @@ bool dns_scope_is_default_route(DnsScope *scope) {
                 return true;
 }
 
-int dns_scope_dump_cache_to_json(DnsScope *scope, sd_json_variant **ret) {
+int dns_scope_to_json(DnsScope *scope, bool with_cache, sd_json_variant **ret) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *cache = NULL;
         int r;
 
         assert(scope);
         assert(ret);
 
-        r = dns_cache_dump_to_json(&scope->cache, &cache);
-        if (r < 0)
-                return r;
+        if (with_cache) {
+                r = dns_cache_dump_to_json(&scope->cache, &cache);
+                if (r < 0)
+                        return r;
+        }
 
         return sd_json_buildo(
                         ret,
-                        SD_JSON_BUILD_PAIR_STRING("protocol", dns_protocol_to_string(scope->protocol)),
+                        JSON_BUILD_PAIR_ENUM("protocol", dns_protocol_to_string(scope->protocol)),
                         SD_JSON_BUILD_PAIR_CONDITION(scope->family != AF_UNSPEC, "family", SD_JSON_BUILD_INTEGER(scope->family)),
                         SD_JSON_BUILD_PAIR_CONDITION(!!scope->link, "ifindex", SD_JSON_BUILD_INTEGER(dns_scope_ifindex(scope))),
                         SD_JSON_BUILD_PAIR_CONDITION(!!scope->link, "ifname", SD_JSON_BUILD_STRING(dns_scope_ifname(scope))),
-                        SD_JSON_BUILD_PAIR_VARIANT("cache", cache),
+                        SD_JSON_BUILD_PAIR_CONDITION(with_cache, "cache", SD_JSON_BUILD_VARIANT(cache)),
                         SD_JSON_BUILD_PAIR_CONDITION(scope->protocol == DNS_PROTOCOL_DNS,
                                                      "dnssec",
                                                      SD_JSON_BUILD_STRING(dnssec_mode_to_string(scope->dnssec_mode))),

@@ -4,8 +4,10 @@
 
 #include "alloc-util.h"
 #include "daemon-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "log.h"
+#include "parse-util.h"
 #include "string-util.h"
 #include "time-util.h"
 
@@ -14,13 +16,14 @@ int notify_remove_fd_warn(const char *name) {
 
         assert(name);
 
-        r = sd_notifyf(/* unset_environment = */ false,
+        r = sd_notifyf(/* unset_environment= */ false,
                        "FDSTOREREMOVE=1\n"
                        "FDNAME=%s", name);
         if (r < 0)
-                return log_warning_errno(r,
-                                         "Failed to remove file descriptor \"%s\" from the store, ignoring: %m",
-                                         name);
+                return log_full_errno(
+                                ERRNO_IS_NEG_DISCONNECT(r) ? LOG_DEBUG : LOG_WARNING, r,
+                                "Failed to remove file descriptor \"%s\" from the store, ignoring: %m",
+                                name);
 
         return 0;
 }
@@ -62,7 +65,7 @@ int notify_push_fd(int fd, const char *name) {
         /* Remove existing fds with the same name in fdstore. */
         (void) notify_remove_fd_warn(name);
 
-        return sd_pid_notify_with_fds(0, /* unset_environment = */ false, state, &fd, 1);
+        return sd_pid_notify_with_fds(0, /* unset_environment= */ false, state, &fd, 1);
 }
 
 int notify_push_fdf(int fd, const char *format, ...) {
@@ -82,10 +85,31 @@ int notify_push_fdf(int fd, const char *format, ...) {
         return notify_push_fd(fd, name);
 }
 
+bool fdstore_detected(void) {
+        static int cached = -1;
+        int r;
+
+        if (cached >= 0)
+                return cached;
+
+        const char *e = getenv("FDSTORE");
+        if (isempty(e))
+                return (cached = 0);
+
+        unsigned u;
+        r = safe_atou(e, &u);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to parse 'FDSTORE=%s', ignoring: %m", e);
+                return (cached = 0);
+        }
+
+        return (cached = u > 0);
+}
+
 int notify_reloading_full(const char *status) {
         int r;
 
-        r = sd_notifyf(/* unset_environment = */ false,
+        r = sd_notifyf(/* unset_environment= */ false,
                        "RELOADING=1\n"
                        "MONOTONIC_USEC=" USEC_FMT
                        "%s%s",

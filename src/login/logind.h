@@ -153,15 +153,15 @@ int manager_add_user_by_uid(Manager *m, uid_t uid, User **ret_user);
 int manager_add_inhibitor(Manager *m, const char* id, Inhibitor **ret_inhibitor);
 
 int manager_process_seat_device(Manager *m, sd_device *d);
-int manager_process_button_device(Manager *m, sd_device *d);
+int manager_process_button_device(Manager *m, sd_device *d, Button **ret_button);
 
 int manager_spawn_autovt(Manager *m, unsigned vtnr);
 
 bool manager_shall_kill(Manager *m, const char *user);
 
-int manager_get_idle_hint(Manager *m, dual_timestamp *t);
+bool manager_get_idle_hint(Manager *m, dual_timestamp *ret_timestamp);
 
-int manager_get_user_by_pid(Manager *m, pid_t pid, User **user);
+int manager_get_user_by_pid(Manager *m, pid_t pid, User **ret);
 int manager_get_session_by_pidref(Manager *m, const PidRef *pid, Session **ret);
 int manager_get_session_by_leader(Manager *m, const PidRef *pid, Session **ret);
 
@@ -171,11 +171,12 @@ bool manager_is_on_external_power(void);
 bool manager_all_buttons_ignored(Manager *m);
 
 /* gperf lookup function */
-const struct ConfigPerfItem* logind_gperf_lookup(const char *key, GPERF_LEN_TYPE length);
+const struct ConfigPerfItem* logind_gperf_lookup(const char *str, GPERF_LEN_TYPE length);
 
 int manager_set_lid_switch_ignore(Manager *m, usec_t until);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_n_autovts);
+CONFIG_PARSER_PROTOTYPE(config_parse_kill_exclude_users);
 CONFIG_PARSER_PROTOTYPE(config_parse_tmpfs_size);
 
 int manager_setup_wall_message_timer(Manager *m);

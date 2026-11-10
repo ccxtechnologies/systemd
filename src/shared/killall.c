@@ -53,7 +53,7 @@ static bool is_in_survivor_cgroup(const PidRef *pid) {
 
         assert(pidref_is_set(pid));
 
-        r = cg_pidref_get_path(/* controller= */ NULL, pid, &cgroup_path);
+        r = cg_pidref_get_path(pid, &cgroup_path);
         if (r == -EUNATCH) {
                 log_warning_errno(r, "Process " PID_FMT " appears to originate in foreign namespace, ignoring.", pid->pid);
                 return true;
@@ -64,9 +64,6 @@ static bool is_in_survivor_cgroup(const PidRef *pid) {
         }
 
         r = cg_get_xattr_bool(cgroup_path, "user.survive_final_kill_signal");
-        /* user xattr support was added to kernel v5.7, try with the trusted namespace as a fallback */
-        if (ERRNO_IS_NEG_XATTR_ABSENT(r))
-                r = cg_get_xattr_bool(cgroup_path, "trusted.survive_final_kill_signal");
         if (r < 0 && !ERRNO_IS_NEG_XATTR_ABSENT(r))
                 log_debug_errno(r,
                                 "Failed to get survive_final_kill_signal xattr of %s, ignoring: %m",

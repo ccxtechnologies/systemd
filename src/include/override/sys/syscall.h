@@ -9,9 +9,9 @@
  */
 #pragma once
 
-#include_next <sys/syscall.h>
+#include_next <sys/syscall.h>   /* IWYU pragma: export */
 
-#ifdef ARCH_MIPS
+#ifdef __mips__
 #include <asm/sgidefs.h>
 #endif
 
@@ -49,80 +49,10 @@
 #    if defined(__ILP32__)
 #    else
 #    endif
-#  elif !defined(missing_arch_template)
+#  else
 #    warning "Current architecture is missing from the template"
 #    define missing_arch_template 1
 #  endif
-
-#ifndef __IGNORE_close_range
-#  if defined(__aarch64__)
-#    define systemd_NR_close_range 436
-#  elif defined(__alpha__)
-#    define systemd_NR_close_range 546
-#  elif defined(__arc__) || defined(__tilegx__)
-#    define systemd_NR_close_range 436
-#  elif defined(__arm__)
-#    define systemd_NR_close_range 436
-#  elif defined(__i386__)
-#    define systemd_NR_close_range 436
-#  elif defined(__ia64__)
-#    define systemd_NR_close_range 1460
-#  elif defined(__loongarch_lp64)
-#    define systemd_NR_close_range 436
-#  elif defined(__m68k__)
-#    define systemd_NR_close_range 436
-#  elif defined(_MIPS_SIM)
-#    if _MIPS_SIM == _MIPS_SIM_ABI32
-#      define systemd_NR_close_range 4436
-#    elif _MIPS_SIM == _MIPS_SIM_NABI32
-#      define systemd_NR_close_range 6436
-#    elif _MIPS_SIM == _MIPS_SIM_ABI64
-#      define systemd_NR_close_range 5436
-#    else
-#      error "Unknown MIPS ABI"
-#    endif
-#  elif defined(__hppa__)
-#    define systemd_NR_close_range 436
-#  elif defined(__powerpc__)
-#    define systemd_NR_close_range 436
-#  elif defined(__riscv)
-#    if __riscv_xlen == 32
-#      define systemd_NR_close_range 436
-#    elif __riscv_xlen == 64
-#      define systemd_NR_close_range 436
-#    else
-#      error "Unknown RISC-V ABI"
-#    endif
-#  elif defined(__s390__)
-#    define systemd_NR_close_range 436
-#  elif defined(__sh__)
-#    define systemd_NR_close_range 436
-#  elif defined(__sparc__)
-#    define systemd_NR_close_range 436
-#  elif defined(__x86_64__)
-#    if defined(__ILP32__)
-#      define systemd_NR_close_range (436 | /* __X32_SYSCALL_BIT */ 0x40000000)
-#    else
-#      define systemd_NR_close_range 436
-#    endif
-#  elif !defined(missing_arch_template)
-#    warning "close_range() syscall number is unknown for your architecture"
-#  endif
-
-/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
-#  if defined __NR_close_range && __NR_close_range >= 0
-#    if defined systemd_NR_close_range
-static_assert(__NR_close_range == systemd_NR_close_range, "");
-#    endif
-#  else
-#    if defined __NR_close_range
-#      undef __NR_close_range
-#    endif
-#    if defined systemd_NR_close_range && systemd_NR_close_range >= 0
-#      define __NR_close_range systemd_NR_close_range
-#    endif
-#  endif
-#endif
 
 #ifndef __IGNORE_fchmodat2
 #  if defined(__aarch64__)
@@ -194,72 +124,72 @@ static_assert(__NR_fchmodat2 == systemd_NR_fchmodat2, "");
 #  endif
 #endif
 
-#ifndef __IGNORE_mount_setattr
+#ifndef __IGNORE_kexec_file_load
 #  if defined(__aarch64__)
-#    define systemd_NR_mount_setattr 442
+#    define systemd_NR_kexec_file_load 294
 #  elif defined(__alpha__)
-#    define systemd_NR_mount_setattr 552
+#    define systemd_NR_kexec_file_load -1
 #  elif defined(__arc__) || defined(__tilegx__)
-#    define systemd_NR_mount_setattr 442
+#    define systemd_NR_kexec_file_load 294
 #  elif defined(__arm__)
-#    define systemd_NR_mount_setattr 442
+#    define systemd_NR_kexec_file_load 401
 #  elif defined(__i386__)
-#    define systemd_NR_mount_setattr 442
+#    define systemd_NR_kexec_file_load -1
 #  elif defined(__ia64__)
-#    define systemd_NR_mount_setattr 1466
+#    define systemd_NR_kexec_file_load -1
 #  elif defined(__loongarch_lp64)
-#    define systemd_NR_mount_setattr 442
+#    define systemd_NR_kexec_file_load 294
 #  elif defined(__m68k__)
-#    define systemd_NR_mount_setattr 442
+#    define systemd_NR_kexec_file_load -1
 #  elif defined(_MIPS_SIM)
 #    if _MIPS_SIM == _MIPS_SIM_ABI32
-#      define systemd_NR_mount_setattr 4442
+#      define systemd_NR_kexec_file_load -1
 #    elif _MIPS_SIM == _MIPS_SIM_NABI32
-#      define systemd_NR_mount_setattr 6442
+#      define systemd_NR_kexec_file_load -1
 #    elif _MIPS_SIM == _MIPS_SIM_ABI64
-#      define systemd_NR_mount_setattr 5442
+#      define systemd_NR_kexec_file_load -1
 #    else
 #      error "Unknown MIPS ABI"
 #    endif
 #  elif defined(__hppa__)
-#    define systemd_NR_mount_setattr 442
+#    define systemd_NR_kexec_file_load 355
 #  elif defined(__powerpc__)
-#    define systemd_NR_mount_setattr 442
+#    define systemd_NR_kexec_file_load 382
 #  elif defined(__riscv)
 #    if __riscv_xlen == 32
-#      define systemd_NR_mount_setattr 442
+#      define systemd_NR_kexec_file_load 294
 #    elif __riscv_xlen == 64
-#      define systemd_NR_mount_setattr 442
+#      define systemd_NR_kexec_file_load 294
 #    else
 #      error "Unknown RISC-V ABI"
 #    endif
 #  elif defined(__s390__)
-#    define systemd_NR_mount_setattr 442
+#    define systemd_NR_kexec_file_load 381
 #  elif defined(__sh__)
-#    define systemd_NR_mount_setattr 442
+#    define systemd_NR_kexec_file_load -1
 #  elif defined(__sparc__)
-#    define systemd_NR_mount_setattr 442
+#    define systemd_NR_kexec_file_load -1
 #  elif defined(__x86_64__)
 #    if defined(__ILP32__)
-#      define systemd_NR_mount_setattr (442 | /* __X32_SYSCALL_BIT */ 0x40000000)
+#      define systemd_NR_kexec_file_load (320 | /* __X32_SYSCALL_BIT */ 0x40000000)
 #    else
-#      define systemd_NR_mount_setattr 442
+#      define systemd_NR_kexec_file_load 320
 #    endif
 #  elif !defined(missing_arch_template)
-#    warning "mount_setattr() syscall number is unknown for your architecture"
+#    warning "kexec_file_load() syscall number is unknown for your architecture"
 #  endif
 
 /* may be an (invalid) negative number due to libseccomp, see PR 13319 */
-#  if defined __NR_mount_setattr && __NR_mount_setattr >= 0
-#    if defined systemd_NR_mount_setattr
-static_assert(__NR_mount_setattr == systemd_NR_mount_setattr, "");
+#  if defined __NR_kexec_file_load && __NR_kexec_file_load >= 0
+#    if defined systemd_NR_kexec_file_load
+static_assert(__NR_kexec_file_load == systemd_NR_kexec_file_load, "");
 #    endif
 #  else
-#    if defined __NR_mount_setattr
-#      undef __NR_mount_setattr
+#    if defined __NR_kexec_file_load
+#      undef __NR_kexec_file_load
 #    endif
-#    if defined systemd_NR_mount_setattr && systemd_NR_mount_setattr >= 0
-#      define __NR_mount_setattr systemd_NR_mount_setattr
+#    if defined systemd_NR_kexec_file_load && systemd_NR_kexec_file_load >= 0
+#      define __NR_kexec_file_load systemd_NR_kexec_file_load
 #    endif
 #  endif
 #endif
@@ -330,76 +260,6 @@ static_assert(__NR_open_tree_attr == systemd_NR_open_tree_attr, "");
 #    endif
 #    if defined systemd_NR_open_tree_attr && systemd_NR_open_tree_attr >= 0
 #      define __NR_open_tree_attr systemd_NR_open_tree_attr
-#    endif
-#  endif
-#endif
-
-#ifndef __IGNORE_openat2
-#  if defined(__aarch64__)
-#    define systemd_NR_openat2 437
-#  elif defined(__alpha__)
-#    define systemd_NR_openat2 547
-#  elif defined(__arc__) || defined(__tilegx__)
-#    define systemd_NR_openat2 437
-#  elif defined(__arm__)
-#    define systemd_NR_openat2 437
-#  elif defined(__i386__)
-#    define systemd_NR_openat2 437
-#  elif defined(__ia64__)
-#    define systemd_NR_openat2 1461
-#  elif defined(__loongarch_lp64)
-#    define systemd_NR_openat2 437
-#  elif defined(__m68k__)
-#    define systemd_NR_openat2 437
-#  elif defined(_MIPS_SIM)
-#    if _MIPS_SIM == _MIPS_SIM_ABI32
-#      define systemd_NR_openat2 4437
-#    elif _MIPS_SIM == _MIPS_SIM_NABI32
-#      define systemd_NR_openat2 6437
-#    elif _MIPS_SIM == _MIPS_SIM_ABI64
-#      define systemd_NR_openat2 5437
-#    else
-#      error "Unknown MIPS ABI"
-#    endif
-#  elif defined(__hppa__)
-#    define systemd_NR_openat2 437
-#  elif defined(__powerpc__)
-#    define systemd_NR_openat2 437
-#  elif defined(__riscv)
-#    if __riscv_xlen == 32
-#      define systemd_NR_openat2 437
-#    elif __riscv_xlen == 64
-#      define systemd_NR_openat2 437
-#    else
-#      error "Unknown RISC-V ABI"
-#    endif
-#  elif defined(__s390__)
-#    define systemd_NR_openat2 437
-#  elif defined(__sh__)
-#    define systemd_NR_openat2 437
-#  elif defined(__sparc__)
-#    define systemd_NR_openat2 437
-#  elif defined(__x86_64__)
-#    if defined(__ILP32__)
-#      define systemd_NR_openat2 (437 | /* __X32_SYSCALL_BIT */ 0x40000000)
-#    else
-#      define systemd_NR_openat2 437
-#    endif
-#  elif !defined(missing_arch_template)
-#    warning "openat2() syscall number is unknown for your architecture"
-#  endif
-
-/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
-#  if defined __NR_openat2 && __NR_openat2 >= 0
-#    if defined systemd_NR_openat2
-static_assert(__NR_openat2 == systemd_NR_openat2, "");
-#    endif
-#  else
-#    if defined __NR_openat2
-#      undef __NR_openat2
-#    endif
-#    if defined systemd_NR_openat2 && systemd_NR_openat2 >= 0
-#      define __NR_openat2 systemd_NR_openat2
 #    endif
 #  endif
 #endif

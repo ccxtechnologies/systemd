@@ -3,13 +3,11 @@
 set -ex
 set -o pipefail
 
-if ! env --block-signal=SIGUSR1 true 2> /dev/null ; then
+if ! env --block-signal=SIGUSR1 true 2>/dev/null; then
     echo "env tool too old, can't block signals, skipping test." >&2
     echo OK >/testok
     exit 0
 fi
-
-systemd-analyze log-level debug
 
 UNIT="test-sigqueue-$RANDOM.service"
 
@@ -29,7 +27,5 @@ P=$(systemctl show -P MainPID "$UNIT")
 test "$(grep SigQ: /proc/"$P"/status | cut -d: -f2 | cut -d/ -f1)" -eq 6
 
 systemctl stop $UNIT
-
-systemd-analyze log-level info
 
 touch /testok

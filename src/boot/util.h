@@ -2,7 +2,7 @@
 #pragma once
 
 #include "efi.h"
-#include "memory-util-fundamental.h"
+#include "memory-util.h"
 
 #if SD_BOOT
 
@@ -12,7 +12,7 @@
 extern uint8_t __executable_start[];
 
 DISABLE_WARNING_REDUNDANT_DECLS;
-void free(void *p);
+void free(void *p); /* NOLINT (readability-redundant-declaration,readability-inconsistent-declaration-parameter-name) */
 REENABLE_WARNING;
 
 static inline void freep(void *p) {
@@ -46,10 +46,16 @@ static inline void *xmalloc_multiply(size_t n, size_t size) {
 /* Use malloc attribute as this never returns p like userspace realloc. */
 _malloc_ _alloc_(3) _returns_nonnull_ _warn_unused_result_
 static inline void *xrealloc(void *p, size_t old_size, size_t new_size) {
+        assert(p || old_size == 0);
+
         void *t = xmalloc(new_size);
-        new_size = MIN(old_size, new_size);
-        if (new_size > 0)
-                memcpy(t, p, new_size);
+
+        size_t size = MIN(old_size, new_size);
+        if (size > 0) {
+                assert(p);
+                memcpy(t, p, size);
+        }
+
         free(p);
         return t;
 }
@@ -90,6 +96,13 @@ static inline Pages xmalloc_pages(
         };
 }
 
+Pages xmalloc_aligned_pages(
+                EFI_ALLOCATE_TYPE type,
+                EFI_MEMORY_TYPE memory_type,
+                size_t n_pages,
+                size_t alignment,
+                EFI_PHYSICAL_ADDRESS addr);
+
 static inline Pages xmalloc_initrd_pages(size_t n_pages) {
         /* The original native x86 boot protocol of the Linux kernel was not 64bit safe, hence we try to
          * allocate memory for the initrds below the 4G boundary on x86, since we don't know early enough
@@ -120,11 +133,12 @@ static inline Pages xmalloc_initrd_pages(size_t n_pages) {
 }
 
 void convert_efi_path(char16_t *path);
-char16_t *xstr8_to_path(const char *stra);
+char16_t *xstr8_to_path(const char *str8);
 char16_t *mangle_stub_cmdline(char16_t *cmdline);
 
 EFI_STATUS chunked_read(EFI_FILE *file, size_t *size, void *buf);
-EFI_STATUS file_read(EFI_FILE *dir, const char16_t *name, uint64_t offset, size_t size, char **content, size_t *content_size);
+EFI_STATUS file_read(EFI_FILE *dir, const char16_t *name, uint64_t offset, size_t size, char **ret, size_t *ret_size);
+EFI_STATUS load_file_from_simple_filesystem(const EFI_DEVICE_PATH *device_path, char **file_buffer, size_t *file_size);
 EFI_STATUS file_handle_read(EFI_FILE *handle, uint64_t offset, size_t size, char **ret, size_t *ret_size);
 
 static inline void file_closep(EFI_FILE **handle) {
@@ -146,6 +160,7 @@ static inline void unload_imagep(EFI_HANDLE *image) {
 #define GUID_FORMAT_VAL(g) (g).Data1, (g).Data2, (g).Data3, (g).Data4[0], (g).Data4[1], \
         (g).Data4[2], (g).Data4[3], (g).Data4[4], (g).Data4[5], (g).Data4[6], (g).Data4[7]
 
+void set_attribute_safe(size_t attr);
 void print_at(size_t x, size_t y, size_t attr, const char16_t *str);
 void clear_screen(size_t attr);
 
@@ -153,6 +168,7 @@ typedef int (*compare_pointer_func_t)(const void *a, const void *b);
 void sort_pointer_array(void **array, size_t n_members, compare_pointer_func_t compare);
 
 EFI_STATUS get_file_info(EFI_FILE *handle, EFI_FILE_INFO **ret, size_t *ret_size);
+EFI_STATUS get_volume_ro(EFI_FILE *handle, bool *ret);
 EFI_STATUS readdir(EFI_FILE *handle, EFI_FILE_INFO **buffer, size_t *buffer_size);
 
 bool is_ascii(const char16_t *f);
@@ -248,3 +264,7 @@ char16_t *get_extra_dir(const EFI_DEVICE_PATH *file_path);
 #endif
 
 char16_t *url_replace_last_component(const char16_t *url, const char16_t *filename);
+
+static inline bool EFI_STATUS_IS_WRITE_REFUSED(EFI_STATUS status) {
+        return IN_SET(status, EFI_WRITE_PROTECTED, EFI_DEVICE_ERROR, EFI_ACCESS_DENIED);
+}

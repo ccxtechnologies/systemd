@@ -5,19 +5,19 @@
 
 #include "af-list.h"
 #include "alloc-util.h"
+#include "dns-answer.h"
 #include "dns-domain.h"
+#include "dns-packet.h"
+#include "dns-question.h"
+#include "dns-rr.h"
 #include "errno-list.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "glyph-util.h"
 #include "log.h"
 #include "random-util.h"
-#include "resolved-dns-answer.h"
 #include "resolved-dns-cache.h"
-#include "resolved-dns-packet.h"
 #include "resolved-dns-query.h"
-#include "resolved-dns-question.h"
-#include "resolved-dns-rr.h"
 #include "resolved-dns-scope.h"
 #include "resolved-dns-server.h"
 #include "resolved-dns-stream.h"
@@ -326,6 +326,8 @@ int dns_transaction_new(
                 r = hashmap_replace(s->transactions_by_key, first->key, first);
                 if (r < 0) {
                         LIST_REMOVE(transactions_by_key, first, t);
+                        hashmap_remove(s->manager->dns_transactions, UINT_TO_PTR(t->id));
+                        t->id = 0;
                         return r;
                 }
         }
@@ -786,8 +788,20 @@ static int dns_transaction_emit_tcp(DnsTransaction *t) {
 
                         assert(t->server);
                         r = dnstls_stream_connect_tls(s, t->server);
-                        if (r < 0)
+                        if (r < 0) {
+                                /* If libcrypto is not available treat this like a TLS connection loss, so
+                                 * that opportunistic DNS-over-TLS downgrades to plaintext instead of
+                                 * re-selecting a TLS feature level and failing on every attempt. */
+                                if (r == -EOPNOTSUPP) {
+                                        log_struct_once(LOG_WARNING,
+                                                        LOG_MESSAGE_ID(SD_MESSAGE_MISSING_DEPENDENCY_STR),
+                                                        LOG_ITEM("FEATURE=DNS-over-TLS"),
+                                                        LOG_MESSAGE("DNS-over-TLS has been requested but the required TLS libraries (libssl/libcrypto) are not installed."));
+                                        dns_server_packet_lost(t->server, IPPROTO_TCP, t->current_feature_level);
+                                        return -ECONNREFUSED;
+                                }
                                 return r;
+                        }
                 }
 #endif
 
@@ -833,6 +847,14 @@ static void dns_transaction_cache_answer(DnsTransaction *t) {
 
         /* If validation is turned off for this transaction, but DNSSEC is on, then let's not cache this */
         if (FLAGS_SET(t->query_flags, SD_RESOLVED_NO_VALIDATE) && t->scope->dnssec_mode != DNSSEC_NO)
+                return;
+
+        /* Same if the reply could not be validated merely because the query went out without DO (e.g. a
+         * bypass query without DO, or one sent while the server was degraded): later lookups may send DO
+         * and validate again, and nothing guarantees that the cache gets flushed before they do. */
+        if (t->server &&
+            t->answer_dnssec_result == DNSSEC_INCOMPATIBLE_SERVER &&
+            dns_server_dnssec_supported(t->server))
                 return;
 
         /* Packet from localhost? */
@@ -988,8 +1010,8 @@ static void dns_transaction_process_dnssec(DnsTransaction *t) {
         if (t->answer_dnssec_result == DNSSEC_INCOMPATIBLE_SERVER &&
             t->scope->dnssec_mode == DNSSEC_YES) {
 
-                /*  We are not in automatic downgrade mode, and the server is bad. Let's try a different server, maybe
-                 *  that works. */
+                /* We are not in automatic downgrade mode, and the server is bad. Let's try a different server, maybe
+                 * that works. */
 
                 if (dns_transaction_limited_retry(t))
                         return;
@@ -1008,7 +1030,8 @@ static void dns_transaction_process_dnssec(DnsTransaction *t) {
                 return;
         }
 
-        if (t->answer_dnssec_result == DNSSEC_INCOMPATIBLE_SERVER)
+        /* Don't blame the server if the query merely went out below DO, it may support DNSSEC just fine. */
+        if (t->answer_dnssec_result == DNSSEC_INCOMPATIBLE_SERVER && !dns_server_dnssec_supported(t->server))
                 dns_server_warn_downgrade(t->server);
 
         dns_transaction_cache_answer(t);
@@ -1476,7 +1499,7 @@ static int on_dns_packet(sd_event_source *s, int fd, uint32_t revents, void *use
                         assert_se(sd_event_now(t->scope->manager->event, CLOCK_BOOTTIME, &usec) >= 0);
                         dns_server_packet_lost(t->server, IPPROTO_UDP, t->current_feature_level);
 
-                        dns_transaction_close_connection(t, /* use_graveyard = */ false);
+                        dns_transaction_close_connection(t, /* use_graveyard= */ false);
 
                         if (dns_transaction_limited_retry(t)) /* Try a different server */
                                 return 0;
@@ -1583,6 +1606,17 @@ static int on_transaction_timeout(sd_event_source *s, usec_t usec, void *userdat
                 case DNS_PROTOCOL_DNS:
                         assert(t->server);
                         dns_server_packet_lost(t->server, t->stream ? IPPROTO_TCP : IPPROTO_UDP, t->current_feature_level);
+
+                        /* If the server's feature level changed meanwhile (packet loss degraded it, or the
+                         * grace period ended), the retry goes out at a different level, possibly with or
+                         * without DO. Use a new connection and ID for it, like
+                         * dns_transaction_maybe_restart() does, so that a late reply to an earlier attempt
+                         * cannot pass for a reply to the retry. Close the connection first, while t->sent
+                         * still refers to the packet that may be queued on it. */
+                        if (t->current_feature_level != dns_server_possible_feature_level(t->server)) {
+                                dns_transaction_close_connection(t, /* use_graveyard= */ true);
+                                dns_transaction_shuffle_id(t);
+                        }
                         break;
 
                 case DNS_PROTOCOL_LLMNR:
@@ -1798,9 +1832,16 @@ static int dns_transaction_prepare(DnsTransaction *t, usec_t ts) {
                 /* For the initial attempt or when no stale data is requested, disable serve stale
                  * and answer the question from the cache (honors ttl property).
                  * On the second attempt, if StaleRetentionSec is greater than zero,
-                 * try to answer the question using stale date (honors until property) */
+                 * try to answer the question using stale data (honors until property).
+                 *
+                 * Serving stale data is a fallback for unicast DNS, where a retry means the configured
+                 * server did not respond. The link-local protocols have no such server: a retry there
+                 * means no peer answered, and for mDNS RFC 6762 treats TTL expiry as a presence signal.
+                 * Hence never serve stale data on those scopes. */
                 uint64_t query_flags = t->query_flags;
-                if (t->n_attempts == 1 || t->scope->manager->stale_retention_usec == 0)
+                if (t->n_attempts == 1 ||
+                    t->scope->protocol != DNS_PROTOCOL_DNS ||
+                    t->scope->manager->stale_retention_usec == 0)
                         query_flags |= SD_RESOLVED_NO_STALE;
 
                 r = dns_cache_lookup(
@@ -2073,8 +2114,8 @@ static int dns_transaction_make_packet(DnsTransaction *t) {
         } else {
                 r = dns_packet_new_query(
                                 &p, t->scope->protocol,
-                                /* min_alloc_dsize = */ 0,
-                                /* dnssec_checking_disabled = */ !FLAGS_SET(t->query_flags, SD_RESOLVED_NO_VALIDATE) &&
+                                /* min_alloc_dsize= */ 0,
+                                /* dnssec_checking_disabled= */ !FLAGS_SET(t->query_flags, SD_RESOLVED_NO_VALIDATE) &&
                                                   t->scope->dnssec_mode != DNSSEC_NO);
                 if (r < 0)
                         return r;
@@ -2427,10 +2468,25 @@ static bool dns_transaction_dnssec_supported(DnsTransaction *t) {
         if (!t->server)
                 return true;
 
-        /* Note that we do not check the feature level actually used for the transaction but instead the feature level
-         * the server is known to support currently, as the transaction feature level might be lower than what the
-         * server actually supports, since we might have downgraded this transaction's feature level because we got a
-         * SERVFAIL earlier and wanted to check whether downgrading fixes it. */
+        /* Same if the answer came from the cache on a retry: server and feature level are then stale. */
+        if (t->answer_source != DNS_TRANSACTION_NETWORK)
+                return true;
+
+        /* A query sent below DO cannot get RRSIGs back, whatever the server is capable of, e.g. after
+         * packet loss degraded the server or a SERVFAIL clamped this transaction. Validating it can only
+         * fail, so treat it like a reply from a server without DNSSEC. Except in strict mode, where
+         * unsigned data is only an error if it needed signing (negative trust anchors, insecure
+         * delegations), so leave that to validation, as dns_server_dnssec_supported() does.
+         *
+         * A bypass query goes out as the client built it, hence it's the client's DO bit that counts there,
+         * not the feature level. Note that we cannot look at t->sent for this: dns_packet_do() only works on
+         * extracted packets, and we never extract the packets we send. (If the client's packet has
+         * trailing garbage, extraction drops its OPT RR, so we see no DO here even if the copy we send
+         * carries it.) */
+        if (t->scope->dnssec_mode != DNSSEC_YES &&
+            !(t->bypass ? dns_packet_do(t->bypass) :
+                          DNS_SERVER_FEATURE_LEVEL_IS_DNSSEC(t->current_feature_level)))
+                return false;
 
         return dns_server_dnssec_supported(t->server);
 }
@@ -2621,7 +2677,10 @@ int dns_transaction_request_dnssec_keys(DnsTransaction *t) {
                                         continue;
 
                                 /* If we were looking for the DS RR, don't request it again. */
-                                if (dns_transaction_key(t)->type == DNS_TYPE_DS)
+                                r = dns_name_equal(dns_resource_key_name(dns_transaction_key(t)), dns_resource_key_name(rr->key));
+                                if (r < 0)
+                                        return r;
+                                if (r > 0 && dns_transaction_key(t)->type == DNS_TYPE_DS)
                                         continue;
                         }
 
@@ -2836,13 +2895,18 @@ static int dns_transaction_validate_dnskey_by_ds(DnsTransaction *t) {
         DNS_ANSWER_FOREACH_ITEM(item, t->answer) {
 
                 r = dnssec_verify_dnskey_by_ds_search(item->rr, t->validated_keys);
-                if (r < 0)
+                if (r < 0 && r != -EOPNOTSUPP)
                         return r;
                 if (r == 0)
                         continue;
 
-                /* If so, the DNSKEY is validated too. */
-                r = dns_answer_add_extend(&t->validated_keys, item->rr, item->ifindex, item->flags|DNS_ANSWER_AUTHENTICATED, item->rrsig);
+                /* If so, the DNSKEY is validated too, but only mark it authenticated if the DS verification
+                 * succeeded with a known algorithm. */
+                if (r == -EOPNOTSUPP)
+                        r = dns_answer_add_extend(&t->validated_keys, item->rr, item->ifindex, item->flags, NULL);
+                else
+                        r = dns_answer_add_extend(&t->validated_keys, item->rr, item->ifindex, item->flags|DNS_ANSWER_AUTHENTICATED, item->rrsig);
+
                 if (r < 0)
                         return r;
         }
@@ -3259,6 +3323,12 @@ static int dns_transaction_copy_validated(DnsTransaction *t) {
                 if (DNS_TRANSACTION_IS_LIVE(dt->state))
                         continue;
 
+                /* Some of the validated keys may not be authenticated, but are still useful to report
+                 * insecure answers when the domain is signed only by unsupported algorithms. */
+                r = dns_answer_extend(&t->validated_keys, dt->validated_keys);
+                if (r < 0)
+                        return r;
+
                 if (!FLAGS_SET(dt->answer_query_flags, SD_RESOLVED_AUTHENTICATED))
                         continue;
 
@@ -3286,7 +3356,9 @@ static int dnssec_validate_records(
         DnsResourceRecord *rr;
         int r;
 
+        assert(have_nsec);
         assert(nvalidations);
+        assert(validated);
 
         /* Returns negative on error, 0 if validation failed, 1 to restart validation, 2 when finished. */
 
@@ -3478,6 +3550,23 @@ static int dnssec_validate_records(
 
                 /* https://datatracker.ietf.org/doc/html/rfc6840#section-5.2 */
                 if (result == DNSSEC_UNSUPPORTED_ALGORITHM) {
+                        if (rr->key->type == DNS_TYPE_DNSKEY) {
+                                /* This is a DNSKEY we cannot authenticate, but it might still be the best
+                                 * offer from the resolver. Add it to the validated keys in case it's the
+                                 * best we can find, but do not mark it as authenticated.
+                                 */
+
+                                r = dns_answer_copy_by_key(&t->validated_keys, t->answer, rr->key, 0, NULL);
+                                if (r < 0)
+                                        return r;
+
+                                /* Some of the DNSKEYs we just added might already have been revoked,
+                                 * remove them again in that case. */
+                                r = dns_transaction_invalidate_revoked_keys(t);
+                                if (r < 0)
+                                        return r;
+                        }
+
                         r = dns_answer_move_by_key(validated, &t->answer, rr->key, 0, NULL);
                         if (r < 0)
                                 return r;
@@ -3585,9 +3674,11 @@ int dns_transaction_validate_dnssec(DnsTransaction *t) {
                 return 0;
 
         if (!dns_transaction_dnssec_supported_full(t)) {
-                /* The server does not support DNSSEC, or doesn't augment responses with RRSIGs. */
+                /* The server does not support DNSSEC, or doesn't augment responses with RRSIGs, or this
+                 * query or an auxiliary one went out without DO. */
                 t->answer_dnssec_result = DNSSEC_INCOMPATIBLE_SERVER;
-                log_debug("Not validating response for %" PRIu16 ", used server feature level does not support DNSSEC.", t->id);
+                log_debug("Not validating response for %" PRIu16 ", the server does not support DNSSEC, or the "
+                          "query or an auxiliary one was sent without DO.", t->id);
                 return 0;
         }
 

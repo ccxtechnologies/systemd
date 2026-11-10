@@ -6,10 +6,6 @@
 #include "efivars.h"
 #include "time-util.h"
 
-#if HAVE_OPENSSL
-#include <openssl/err.h>
-#endif
-
 #include "sd-id128.h"
 #include "sd-json.h"
 #include "sd-varlink.h"
@@ -19,6 +15,7 @@
 #include "chattr-util.h"
 #include "copy.h"
 #include "creds-util.h"
+#include "crypto-util.h"
 #include "efi-api.h"
 #include "env-util.h"
 #include "errno-util.h"
@@ -27,20 +24,23 @@
 #include "find-esp.h"
 #include "format-util.h"
 #include "fs-util.h"
+#include "initrd-util.h"
 #include "io-util.h"
 #include "json-util.h"
 #include "log.h"
 #include "memory-util.h"
-#include "mkdir-label.h"
-#include "openssl-util.h"
+#include "mkdir.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "proc-cmdline.h"
 #include "random-util.h"
 #include "recurse-dir.h"
 #include "sparse-endian.h"
 #include "stat-util.h"
+#include "string-table.h"
 #include "string-util.h"
 #include "tmpfile-util.h"
+#include "tpm2-pcr.h"
 #include "tpm2-util.h"
 #include "user-util.h"
 
@@ -125,6 +125,34 @@ int open_credentials_dir(void) {
         return RET_NERRNO(open(d, O_CLOEXEC|O_DIRECTORY));
 }
 
+int get_system_credentials_dir(const char **ret) {
+        int r;
+
+        assert(ret);
+
+        /* Note that for system credentials the environment variable we honour is just for debugging purpose
+         * (unlike for the per-service credential path env var where it's key part of the protocol). */
+        r = get_credentials_dir_internal("SYSTEMD_SYSTEM_CREDENTIALS_DIRECTORY", ret);
+        if (r >= 0 || r != -ENXIO)
+                return r;
+
+        *ret = SYSTEM_CREDENTIALS_DIRECTORY;
+        return 0;
+}
+
+int get_encrypted_system_credentials_dir(const char **ret) {
+        int r;
+
+        assert(ret);
+
+        r = get_credentials_dir_internal("SYSTEMD_ENCRYPTED_SYSTEM_CREDENTIALS_DIRECTORY", ret);
+        if (r >= 0 || r != -ENXIO)
+                return r;
+
+        *ret = ENCRYPTED_SYSTEM_CREDENTIALS_DIRECTORY;
+        return 0;
+}
+
 int read_credential(const char *name, void **ret, size_t *ret_size) {
         _cleanup_free_ char *fn = NULL;
         const char *d;
@@ -152,7 +180,7 @@ int read_credential(const char *name, void **ret, size_t *ret_size) {
 }
 
 int read_credential_with_decryption(const char *name, void **ret, size_t *ret_size) {
-        _cleanup_(iovec_done_erase) struct iovec ret_iovec = {};
+        _cleanup_(iovec_done_erase) struct iovec decrypted = {};
         _cleanup_(erase_and_freep) void *data = NULL;
         _cleanup_free_ char *fn = NULL;
         size_t sz = 0;
@@ -190,16 +218,20 @@ int read_credential_with_decryption(const char *name, void **ret, size_t *ret_si
         if (!fn)
                 return log_oom();
 
+        /* Encrypted credentials are stored as Base64, unlike the plaintext credentials checked above. */
         r = read_full_file_full(
                         AT_FDCWD, fn,
-                        UINT64_MAX, SIZE_MAX,
-                        READ_FULL_FILE_SECURE,
+                        UINT64_MAX, CREDENTIAL_ENCRYPTED_SIZE_MAX,
+                        READ_FULL_FILE_SECURE|READ_FULL_FILE_UNBASE64|READ_FULL_FILE_FAIL_WHEN_LARGER,
                         NULL,
                         (char**) &data, &sz);
         if (r == -ENOENT)
                 goto not_found;
+        if (r == -E2BIG)
+                return log_error_errno(r, "Encrypted credential '%s' exceeds the size limit.", name);
         if (r < 0)
-                return log_error_errno(r, "Failed to read encrypted credential data: %m");
+                return log_error_errno(
+                                r, "Failed to read or Base64-decode encrypted credential '%s': %m", name);
 
         if (geteuid() != 0)
                 r = ipc_decrypt_credential(
@@ -208,7 +240,7 @@ int read_credential_with_decryption(const char *name, void **ret, size_t *ret_si
                                 getuid(),
                                 &IOVEC_MAKE(data, sz),
                                 CREDENTIAL_ANY_SCOPE,
-                                &ret_iovec);
+                                &decrypted);
         else
                 r = decrypt_credential_and_warn(
                                 name,
@@ -218,14 +250,20 @@ int read_credential_with_decryption(const char *name, void **ret, size_t *ret_si
                                 getuid(),
                                 &IOVEC_MAKE(data, sz),
                                 CREDENTIAL_ANY_SCOPE,
-                                &ret_iovec);
+                                &decrypted);
         if (r < 0)
                 return r;
 
+        /* Match read_credential(): without a size output, the caller expects a string. */
+        if (!ret_size && decrypted.iov_len > 0 && memchr(decrypted.iov_base, 0, decrypted.iov_len))
+                return log_error_errno(
+                                SYNTHETIC_ERRNO(EBADMSG),
+                                "Decrypted credential '%s' contains embedded NUL bytes, refusing.", name);
+
         if (ret)
-                *ret = TAKE_PTR(ret_iovec.iov_base);
+                *ret = TAKE_PTR(decrypted.iov_base);
         if (ret_size)
-                *ret_size = ret_iovec.iov_len;
+                *ret_size = decrypted.iov_len;
 
         return 1; /* found */
 
@@ -245,6 +283,8 @@ int read_credential_strings_many_internal(
         _cleanup_free_ void *b = NULL;
         bool all = true;
         int r, ret = 0;
+
+        assert(first_value);
 
         /* Reads a bunch of credentials into the specified buffers. If the specified buffers are already
          * non-NULL frees them if a credential is found. Only supports string-based credentials
@@ -309,6 +349,9 @@ int get_credential_user_password(const char *username, char **ret_password, bool
         _cleanup_free_ char *cn = NULL;
         int r;
 
+        assert(ret_password);
+        assert(ret_is_hashed);
+
         /* Try to pick up the password for this account via the credentials logic */
         cn = strjoin("passwd.hashed-password.", username);
         if (!cn)
@@ -334,6 +377,39 @@ int get_credential_user_password(const char *username, char **ret_password, bool
         *ret_password = TAKE_PTR(creds_password);
 
         return r;
+}
+
+static const char* const credential_boot_policy_table[_CRED_BOOT_POLICY_MAX] = {
+        [CRED_BOOT_STRICT]  = "strict",
+        [CRED_BOOT_TOFU]    = "tofu",
+        [CRED_BOOT_RELAXED] = "relaxed",
+        [CRED_BOOT_OFF]     = "off",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(credential_boot_policy, CredentialBootPolicy);
+
+bool credential_boot_policy_accepts_null(CredentialBootPolicy policy, bool first_boot, bool have_tpm2, bool secure_boot) {
+
+        /* Decides whether a null-key encrypted credential (which offers neither confidentiality nor
+         * authenticity) may be accepted, given the configured policy and the current system state. */
+
+        switch (policy) {
+
+        case CRED_BOOT_STRICT:
+                return false;
+
+        case CRED_BOOT_TOFU:
+                return first_boot || !have_tpm2;
+
+        case CRED_BOOT_RELAXED:
+                return !secure_boot || !have_tpm2;
+
+        case CRED_BOOT_OFF:
+                return true;
+
+        default:
+                assert_not_reached();
+        }
 }
 
 #if HAVE_OPENSSL
@@ -393,6 +469,8 @@ static int make_credential_host_secret(
         if (fd < 0)
                 return log_debug_errno(fd, "Failed to create temporary file for credential host secret: %m");
 
+        CLEANUP_TMPFILE_AT(dfd, t);
+
         r = chattr_secret(fd, 0);
         if (r < 0)
                 log_debug_errno(r, "Failed to set file attributes for secrets file, ignoring: %m");
@@ -405,29 +483,22 @@ static int make_credential_host_secret(
 
         r = crypto_random_bytes(buf.data, sizeof(buf.data));
         if (r < 0)
-                goto fail;
+                return r;
 
         r = loop_write(fd, &buf, sizeof(buf));
         if (r < 0)
-                goto fail;
+                return r;
 
-        if (fchmod(fd, 0400) < 0) {
-                r = -errno;
-                goto fail;
-        }
-
-        if (fsync(fd) < 0) {
-                r = -errno;
-                goto fail;
-        }
+        if (fchmod(fd, 0400) < 0)
+                return -errno;
 
         warn_not_encrypted(fd, flags, dirname, fn);
 
         r = link_tmpfile_at(fd, dfd, t, fn, LINK_TMPFILE_SYNC);
-        if (r < 0) {
-                log_debug_errno(r, "Failed to link host key into place: %m");
-                goto fail;
-        }
+        if (r < 0)
+                return log_debug_errno(r, "Failed to link host key into place: %m");
+
+        t = mfree(t); /* disarm CLEANUP_TMPFILE_AT() */
 
         if (ret) {
                 void *copy;
@@ -440,12 +511,6 @@ static int make_credential_host_secret(
         }
 
         return 0;
-
-fail:
-        if (t && unlinkat(dfd, t, 0) < 0)
-                log_debug_errno(errno, "Failed to remove temporary credential key: %m");
-
-        return r;
 }
 
 int get_credential_host_secret(CredentialSecretFlags flags, struct iovec *ret) {
@@ -466,14 +531,13 @@ int get_credential_host_secret(CredentialSecretFlags flags, struct iovec *ret) {
                 if (!path_is_absolute(e))
                         return -EINVAL;
 
-                r = path_extract_directory(e, &_dirname);
+                r = path_split_prefix_filename(e, &_dirname, &_filename);
                 if (r < 0)
                         return r;
+                if (r == O_DIRECTORY)
+                        return -EINVAL;
 
-                r = path_extract_filename(e, &_filename);
-                if (r < 0)
-                        return r;
-
+                /* We validate that the path is absolute above, hence dirname must be extractable. */
                 dirname = _dirname;
                 filename = _filename;
         } else {
@@ -484,7 +548,8 @@ int get_credential_host_secret(CredentialSecretFlags flags, struct iovec *ret) {
         assert(dirname);
         assert(filename);
 
-        mkdir_parents(dirname, 0755);
+        (void) mkdir_parents(dirname, 0755);
+
         dfd = open_mkdir(dirname, O_CLOEXEC, 0755);
         if (dfd < 0)
                 return log_debug_errno(dfd, "Failed to create or open directory '%s': %m", dirname);
@@ -591,6 +656,8 @@ int get_credential_host_secret(CredentialSecretFlags flags, struct iovec *ret) {
                 /* Hmm, this secret is from somewhere else. Let's delete the file. Let's first acquire a lock
                  * to ensure we are the only ones accessing the file while we delete it. */
 
+                log_notice("'%s/%s' comes from a different machine ID, deleting.", dirname, filename);
+
                 if (flock(fd, LOCK_EX) < 0)
                         return log_debug_errno(errno,
                                                "Failed to flock %s/%s: %m", dirname, filename);
@@ -669,6 +736,12 @@ struct _packed_ tpm2_public_key_credential_header {
         /* Followed by NUL bytes until next 8 byte boundary */
 };
 
+struct _packed_ tpm2_pinned_srk_credential_header {
+        le32_t size;          /* Size of pinned SRK */
+        uint8_t data[];       /* Pinned SRK */
+        /* Followed by NUL bytes until next 8 byte boundary */
+};
+
 struct _packed_ scoped_credential_header {
         le64_t flags;         /* SCOPE_HASH_DATA_BASE_FLAGS for now */
 };
@@ -711,6 +784,7 @@ static int sha256_hash_host_and_tpm2_key(
 
         _cleanup_(EVP_MD_CTX_freep) EVP_MD_CTX *md = NULL;
         unsigned l;
+        int r;
 
         assert(iovec_is_valid(host_key));
         assert(iovec_is_valid(tpm2_key));
@@ -718,22 +792,26 @@ static int sha256_hash_host_and_tpm2_key(
 
         /* Combines the host key and the TPM2 HMAC hash into a SHA256 hash value we'll use as symmetric encryption key. */
 
-        md = EVP_MD_CTX_new();
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
+        md = sym_EVP_MD_CTX_new();
         if (!md)
                 return log_oom();
 
-        if (EVP_DigestInit_ex(md, EVP_sha256(), NULL) != 1)
+        if (sym_EVP_DigestInit_ex(md, sym_EVP_sha256(), NULL) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to initial SHA256 context.");
 
-        if (iovec_is_set(host_key) && EVP_DigestUpdate(md, host_key->iov_base, host_key->iov_len) != 1)
+        if (iovec_is_set(host_key) && sym_EVP_DigestUpdate(md, host_key->iov_base, host_key->iov_len) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to hash host key.");
 
-        if (iovec_is_set(tpm2_key) && EVP_DigestUpdate(md, tpm2_key->iov_base, tpm2_key->iov_len) != 1)
+        if (iovec_is_set(tpm2_key) && sym_EVP_DigestUpdate(md, tpm2_key->iov_base, tpm2_key->iov_len) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to hash TPM2 key.");
 
-        assert(EVP_MD_CTX_size(md) == SHA256_DIGEST_LENGTH);
+        assert(sym_EVP_MD_CTX_get_size(md) == SHA256_DIGEST_LENGTH);
 
-        if (EVP_DigestFinal_ex(md, ret, &l) != 1)
+        if (sym_EVP_DigestFinal_ex(md, ret, &l) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to finalize SHA256 hash.");
 
         assert(l == SHA256_DIGEST_LENGTH);
@@ -744,6 +822,7 @@ static int mangle_uid_into_key(
                 uid_t uid,
                 uint8_t md[static SHA256_DIGEST_LENGTH]) {
 
+        _cleanup_free_ struct passwd *pw = NULL;
         sd_id128_t mid;
         int r;
 
@@ -754,12 +833,9 @@ static int mangle_uid_into_key(
          * (specifically, UID, user name, machine ID) with the key we'd otherwise use for system credentials,
          * and use the resulting hash as actual encryption key. */
 
-        errno = 0;
-        struct passwd *pw = getpwuid(uid);
-        if (!pw)
-                return log_error_errno(
-                                IN_SET(errno, 0, ENOENT) ? SYNTHETIC_ERRNO(ESRCH) : errno,
-                                "Failed to resolve UID " UID_FMT ": %m", uid);
+        r = getpwuid_malloc(uid, &pw);
+        if (r < 0)
+                return log_error_errno(r, "Failed to resolve UID "UID_FMT": %m", uid);
 
         r = sd_id128_get_machine(&mid);
         if (r < 0)
@@ -806,7 +882,7 @@ int encrypt_credential_and_warn(
                 CredentialFlags flags,
                 struct iovec *ret) {
 
-        _cleanup_(iovec_done) struct iovec tpm2_blob = {}, tpm2_policy_hash = {}, iv = {}, pubkey = {};
+        _cleanup_(iovec_done) struct iovec tpm2_blob = {}, tpm2_srk = {}, tpm2_policy_hash = {}, iv = {}, pubkey = {};
         _cleanup_(iovec_done_erase) struct iovec tpm2_key = {}, output = {}, host_key = {};
         _cleanup_(EVP_CIPHER_CTX_freep) EVP_CIPHER_CTX *context = NULL;
         _cleanup_free_ struct metadata_credential_header *m = NULL;
@@ -823,26 +899,19 @@ int encrypt_credential_and_warn(
         assert(iovec_is_valid(input));
         assert(ret);
 
-        if (!sd_id128_in_set(with_key,
-                             _CRED_AUTO,
-                             _CRED_AUTO_INITRD,
-                             _CRED_AUTO_SCOPED,
-                             CRED_AES256_GCM_BY_HOST,
-                             CRED_AES256_GCM_BY_HOST_SCOPED,
-                             CRED_AES256_GCM_BY_TPM2_HMAC,
-                             CRED_AES256_GCM_BY_TPM2_HMAC_WITH_PK,
-                             CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC,
-                             CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED,
-                             CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK,
-                             CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED,
-                             CRED_AES256_GCM_BY_NULL))
+        /* Only one of these two flags may be set at the same time */
+        assert(!FLAGS_SET(flags, CREDENTIAL_ALLOW_NULL) || !FLAGS_SET(flags, CREDENTIAL_REFUSE_NULL));
+
+        CLEANUP_ERASE(md);
+
+        if (!CRED_KEY_IS_VALID(with_key) && !CRED_KEY_IS_AUTO(with_key))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid key type: " SD_ID128_FORMAT_STR, SD_ID128_FORMAT_VAL(with_key));
 
         if (name && !credential_name_valid(name))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid credential name: %s", name);
 
-        if (not_after != USEC_INFINITY && timestamp != USEC_INFINITY && not_after < timestamp)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Credential is invalidated before it is valid (" USEC_FMT " < " USEC_FMT ").", not_after, timestamp);
+        if (not_after != USEC_INFINITY && timestamp != USEC_INFINITY && not_after <= timestamp)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Credential is invalidated before or when it becomes valid (" USEC_FMT " <= " USEC_FMT ").", not_after, timestamp);
 
         if (DEBUG_LOGGING) {
                 char buf[FORMAT_TIMESTAMP_MAX];
@@ -855,71 +924,55 @@ int encrypt_credential_and_warn(
                         log_debug("Including not-after timestamp '%s' in encrypted credential.", format_timestamp(buf, sizeof(buf), not_after));
         }
 
-        if (sd_id128_in_set(with_key,
-                            _CRED_AUTO_SCOPED,
-                            CRED_AES256_GCM_BY_HOST_SCOPED,
-                            CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED,
-                            CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED)) {
+        if (CRED_KEY_IS_SCOPED(with_key)) {
                 if (!uid_is_valid(uid))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Scoped credential key type "SD_ID128_FORMAT_STR" selected, but no UID specified.", SD_ID128_FORMAT_VAL(with_key));
         } else
                 uid = UID_INVALID;
 
-        if (sd_id128_in_set(with_key,
-                            _CRED_AUTO,
-                            _CRED_AUTO_SCOPED,
-                            CRED_AES256_GCM_BY_HOST,
-                            CRED_AES256_GCM_BY_HOST_SCOPED,
-                            CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC,
-                            CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED,
-                            CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK,
-                            CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED)) {
+        if (CRED_KEY_WANTS_HOST(with_key) || CRED_KEY_REQUIRES_HOST(with_key)) {
 
                 r = get_credential_host_secret(
                                 CREDENTIAL_SECRET_GENERATE|
                                 CREDENTIAL_SECRET_WARN_NOT_ENCRYPTED|
-                                (sd_id128_in_set(with_key, _CRED_AUTO, _CRED_AUTO_SCOPED) ? CREDENTIAL_SECRET_FAIL_ON_TEMPORARY_FS : 0),
+                                (CRED_KEY_WANTS_HOST(with_key) ? CREDENTIAL_SECRET_FAIL_ON_TEMPORARY_FS : 0),
                                 &host_key);
-                if (r == -ENOMEDIUM && sd_id128_in_set(with_key, _CRED_AUTO, _CRED_AUTO_SCOPED))
+                if (r == -ENOMEDIUM && CRED_KEY_WANTS_HOST(with_key))
                         log_debug_errno(r, "Credential host secret location on temporary file system, not using.");
                 else if (r < 0)
                         return log_error_errno(r, "Failed to determine local credential host secret: %m");
         }
 
+        if (tpm2_hash_pcr_mask == UINT32_MAX)
+                tpm2_hash_pcr_mask = 0;
+        if (tpm2_pubkey_pcr_mask == UINT32_MAX)
+                tpm2_pubkey_pcr_mask = UINT32_C(1) << TPM2_PCR_KERNEL_BOOT;
+
 #if HAVE_TPM2
         bool try_tpm2;
-        if (sd_id128_in_set(with_key, _CRED_AUTO, _CRED_AUTO_INITRD, _CRED_AUTO_SCOPED)) {
+        if (CRED_KEY_WANTS_TPM2(with_key)) {
                 /* If automatic mode is selected lets see if a TPM2 it is present. If we are running in a
                  * container tpm2_support will detect this, and will return a different flag combination of
                  * TPM2_SUPPORT_FULL, effectively skipping the use of TPM2 when inside one. */
 
-                try_tpm2 = tpm2_is_fully_supported();
+                try_tpm2 = tpm2_is_mostly_supported();
                 if (!try_tpm2)
                         log_debug("System lacks TPM2 support or running in a container, not attempting to use TPM2.");
         } else
-                try_tpm2 = sd_id128_in_set(with_key,
-                                           CRED_AES256_GCM_BY_TPM2_HMAC,
-                                           CRED_AES256_GCM_BY_TPM2_HMAC_WITH_PK,
-                                           CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC,
-                                           CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED,
-                                           CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK,
-                                           CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED);
+                try_tpm2 = CRED_KEY_REQUIRES_TPM2(with_key);
 
         if (try_tpm2) {
-                if (sd_id128_in_set(with_key,
-                                    _CRED_AUTO,
-                                    _CRED_AUTO_INITRD,
-                                    _CRED_AUTO_SCOPED,
-                                    CRED_AES256_GCM_BY_TPM2_HMAC_WITH_PK,
-                                    CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK,
-                                    CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED)) {
+                /* If the firmware does not support TPMs, then UKI measurements are not going to work, hence
+                 * PCR 11 public key stuff cannot work. Because of that, if PK is only wanted (but not
+                 * required) we won't try it. */
+                if ((CRED_KEY_WANTS_TPM2_PK(with_key) && tpm2_is_fully_supported()) || CRED_KEY_REQUIRES_TPM2_PK(with_key)) {
 
                         /* Load public key for PCR policies, if one is specified, or explicitly requested */
 
                         r = tpm2_load_pcr_public_key(tpm2_pubkey_path, &pubkey.iov_base, &pubkey.iov_len);
                         if (r < 0) {
-                                if (tpm2_pubkey_path || r != -ENOENT || !sd_id128_in_set(with_key, _CRED_AUTO, _CRED_AUTO_INITRD, _CRED_AUTO_SCOPED))
+                                if (r != -ENOENT || tpm2_pubkey_path || CRED_KEY_REQUIRES_TPM2_PK(with_key))
                                         return log_error_errno(r, "Failed to read TPM PCR public key: %m");
 
                                 log_debug_errno(r, "Failed to read TPM2 PCR public key, proceeding without: %m");
@@ -937,6 +990,8 @@ int encrypt_credential_and_warn(
                 r = tpm2_get_best_pcr_bank(tpm2_context, tpm2_hash_pcr_mask | tpm2_pubkey_pcr_mask, &tpm2_pcr_bank);
                 if (r < 0)
                         return log_error_errno(r, "Could not find best pcr bank: %m");
+
+                log_debug("Selected literal PCR mask: 0x%x, PK PCR mask: 0x%x", tpm2_hash_pcr_mask, tpm2_pubkey_pcr_mask);
 
                 TPML_PCR_SELECTION tpm2_hash_pcr_selection;
                 tpm2_tpml_pcr_selection_from_mask(tpm2_hash_pcr_mask, tpm2_pcr_bank, &tpm2_hash_pcr_selection);
@@ -959,6 +1014,7 @@ int encrypt_credential_and_warn(
                                 tpm2_hash_pcr_values,
                                 tpm2_n_hash_pcr_values,
                                 iovec_is_set(&pubkey) ? &public : NULL,
+                                /* pubkey_policy_ref= */ NULL,
                                 /* use_pin= */ false,
                                 /* pcrlock_policy= */ NULL,
                                 &tpm2_policy);
@@ -978,7 +1034,7 @@ int encrypt_credential_and_warn(
                               &blobs,
                               &n_blobs,
                               &tpm2_primary_alg,
-                              /* ret_srk= */ NULL);
+                              CRED_KEY_WANTS_TPM2_PINNED_SRK(with_key) || CRED_KEY_REQUIRES_TPM2_PINNED_SRK(with_key) ? &tpm2_srk : NULL);
                 if (r < 0) {
                         if (sd_id128_equal(with_key, _CRED_AUTO_INITRD))
                                 log_warning("TPM2 present and used, but we didn't manage to talk to it. Credential will be refused if SecureBoot is enabled.");
@@ -986,29 +1042,31 @@ int encrypt_credential_and_warn(
                                 return log_error_errno(r, "Failed to seal to TPM2: %m");
 
                         log_notice_errno(r, "TPM2 sealing didn't work, continuing without TPM2: %m");
+                } else {
+                        if (!iovec_memdup(&IOVEC_MAKE(tpm2_policy.buffer, tpm2_policy.size), &tpm2_policy_hash))
+                                return log_oom();
+
+                        assert(n_blobs == 1);
+                        tpm2_blob = TAKE_STRUCT(blobs[0]);
+
+                        assert(tpm2_blob.iov_len <= CREDENTIAL_FIELD_SIZE_MAX);
+                        assert(tpm2_policy_hash.iov_len <= CREDENTIAL_FIELD_SIZE_MAX);
+                        assert(tpm2_srk.iov_len <= CREDENTIAL_FIELD_SIZE_MAX);
                 }
-
-                if (!iovec_memdup(&IOVEC_MAKE(tpm2_policy.buffer, tpm2_policy.size), &tpm2_policy_hash))
-                        return log_oom();
-
-                assert(n_blobs == 1);
-                tpm2_blob = TAKE_STRUCT(blobs[0]);
-
-                assert(tpm2_blob.iov_len <= CREDENTIAL_FIELD_SIZE_MAX);
-                assert(tpm2_policy_hash.iov_len <= CREDENTIAL_FIELD_SIZE_MAX);
         }
 #endif
 
-        if (sd_id128_in_set(with_key, _CRED_AUTO, _CRED_AUTO_INITRD, _CRED_AUTO_SCOPED)) {
+        if (CRED_KEY_IS_AUTO(with_key)) {
                 /* Let's settle the key type in auto mode now. */
+                assert(!iovec_is_set(&tpm2_key) || iovec_is_set(&tpm2_srk));
 
                 if (iovec_is_set(&host_key) && iovec_is_set(&tpm2_key))
                         id = iovec_is_set(&pubkey) ? (sd_id128_equal(with_key, _CRED_AUTO_SCOPED) ?
-                                                      CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED : CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK)
+                                                      CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED_PINNED_SRK : CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_PINNED_SRK)
                                                    : (sd_id128_equal(with_key, _CRED_AUTO_SCOPED) ?
-                                                      CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED : CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC);
+                                                      CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED_PINNED_SRK : CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_PINNED_SRK);
                 else if (iovec_is_set(&tpm2_key) && !sd_id128_equal(with_key, _CRED_AUTO_SCOPED))
-                        id = iovec_is_set(&pubkey) ? CRED_AES256_GCM_BY_TPM2_HMAC_WITH_PK : CRED_AES256_GCM_BY_TPM2_HMAC;
+                        id = iovec_is_set(&pubkey) ? CRED_AES256_GCM_BY_TPM2_HMAC_WITH_PK_PINNED_SRK : CRED_AES256_GCM_BY_TPM2_HMAC_PINNED_SRK;
                 else if (iovec_is_set(&host_key))
                         id = sd_id128_equal(with_key, _CRED_AUTO_SCOPED) ? CRED_AES256_GCM_BY_HOST_SCOPED : CRED_AES256_GCM_BY_HOST;
                 else if (sd_id128_equal(with_key, _CRED_AUTO_INITRD))
@@ -1019,8 +1077,12 @@ int encrypt_credential_and_warn(
         } else
                 id = with_key;
 
-        if (sd_id128_equal(id, CRED_AES256_GCM_BY_NULL) && !FLAGS_SET(flags, CREDENTIAL_ALLOW_NULL))
-                log_warning("Using a null key for encryption and signing. Confidentiality or authenticity will not be provided.");
+        if (sd_id128_equal(id, CRED_AES256_GCM_BY_NULL)) {
+                if (FLAGS_SET(flags, CREDENTIAL_REFUSE_NULL))
+                        return log_error_errno(SYNTHETIC_ERRNO(EHWPOISON), "Attempted to encrypt with null key, but this is disallowed.");
+                if (!FLAGS_SET(flags, CREDENTIAL_ALLOW_NULL))
+                        log_warning("Using a null key for encryption and signing. Confidentiality or authenticity will not be provided.");
+        }
 
         /* Let's now take the host key and the TPM2 key and hash it together, to use as encryption key for the data */
         r = sha256_hash_host_and_tpm2_key(&host_key, &tpm2_key, md);
@@ -1033,16 +1095,20 @@ int encrypt_credential_and_warn(
                         return r;
         }
 
-        assert_se(cc = EVP_aes_256_gcm());
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
 
-        ksz = EVP_CIPHER_key_length(cc);
+        assert_se(cc = sym_EVP_aes_256_gcm());
+
+        ksz = sym_EVP_CIPHER_get_key_length(cc);
         assert(ksz == sizeof(md));
 
-        bsz = EVP_CIPHER_block_size(cc);
+        bsz = sym_EVP_CIPHER_get_block_size(cc);
         assert(bsz > 0);
         assert((size_t) bsz <= CREDENTIAL_FIELD_SIZE_MAX);
 
-        ivsz = EVP_CIPHER_iv_length(cc);
+        ivsz = sym_EVP_CIPHER_get_iv_length(cc);
         if (ivsz > 0) {
                 assert((size_t) ivsz <= CREDENTIAL_FIELD_SIZE_MAX);
 
@@ -1051,26 +1117,29 @@ int encrypt_credential_and_warn(
                         return log_error_errno(r, "Failed to acquired randomized IV: %m");
         }
 
-        tsz = 16; /* FIXME: On OpenSSL 3 there is EVP_CIPHER_CTX_get_tag_length(), until then let's hardcode this */
-
-        context = EVP_CIPHER_CTX_new();
+        context = sym_EVP_CIPHER_CTX_new();
         if (!context)
-                return log_error_errno(SYNTHETIC_ERRNO(ENOMEM), "Failed to allocate encryption object: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to allocate encryption object");
 
-        if (EVP_EncryptInit_ex(context, cc, NULL, md, iv.iov_base) != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to initialize encryption context: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+        if (sym_EVP_EncryptInit_ex(context, cc, NULL, md, iv.iov_base) != 1)
+                return log_openssl_errors(LOG_ERR, "Failed to initialize encryption context");
+
+        tsz = sym_EVP_CIPHER_CTX_get_tag_length(context);
+        if (tsz <= 0 || (size_t) tsz > CREDENTIAL_FIELD_SIZE_MAX)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid tag size reported by OpenSSL.");
 
         /* Just an upper estimate */
         output.iov_len =
                 ALIGN8(offsetof(struct encrypted_credential_header, iv) + ivsz) +
                 ALIGN8(iovec_is_set(&tpm2_key) ? offsetof(struct tpm2_credential_header, policy_hash_and_blob) + tpm2_blob.iov_len + tpm2_policy_hash.iov_len : 0) +
                 ALIGN8(iovec_is_set(&pubkey) ? offsetof(struct tpm2_public_key_credential_header, data) + pubkey.iov_len : 0) +
+                ALIGN8(iovec_is_set(&tpm2_srk) ? offsetof(struct tpm2_pinned_srk_credential_header, data) + tpm2_srk.iov_len : 0) +
                 ALIGN8(uid_is_valid(uid) ? sizeof(struct scoped_credential_header) : 0) +
                 ALIGN8(offsetof(struct metadata_credential_header, name) + strlen_ptr(name)) +
                 input->iov_len + 2U * (size_t) bsz +
                 tsz;
+        /* Silence static analyzers */
+        assert(output.iov_len >= input->iov_len);
 
         output.iov_base = malloc0(output.iov_len);
         if (!output.iov_base)
@@ -1113,6 +1182,16 @@ int encrypt_credential_and_warn(
                 p += ALIGN8(offsetof(struct tpm2_public_key_credential_header, data) + pubkey.iov_len);
         }
 
+        if (iovec_is_set(&tpm2_srk)) {
+                struct tpm2_pinned_srk_credential_header *z;
+
+                z = (struct tpm2_pinned_srk_credential_header*) ((uint8_t*) output.iov_base + p);
+                z->size = htole32(tpm2_srk.iov_len);
+                memcpy(z->data, tpm2_srk.iov_base, tpm2_srk.iov_len);
+
+                p += ALIGN8(offsetof(struct tpm2_pinned_srk_credential_header, data) + tpm2_srk.iov_len);
+        }
+
         if (uid_is_valid(uid)) {
                 struct scoped_credential_header *w;
 
@@ -1123,9 +1202,8 @@ int encrypt_credential_and_warn(
         }
 
         /* Pass the encrypted + TPM2 header + scoped header as AAD */
-        if (EVP_EncryptUpdate(context, NULL, &added, output.iov_base, p) != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to write AAD data: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+        if (sym_EVP_EncryptUpdate(context, NULL, &added, output.iov_base, p) != 1)
+                return log_openssl_errors(LOG_ERR, "Failed to write AAD data");
 
         /* Now construct the metadata header */
         ml = strlen_ptr(name);
@@ -1139,27 +1217,24 @@ int encrypt_credential_and_warn(
         memcpy_safe(m->name, name, ml);
 
         /* And encrypt the metadata header */
-        if (EVP_EncryptUpdate(context, (uint8_t*) output.iov_base + p, &added, (const unsigned char*) m, ALIGN8(offsetof(struct metadata_credential_header, name) + ml)) != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to encrypt metadata header: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+        if (sym_EVP_EncryptUpdate(context, (uint8_t*) output.iov_base + p, &added, (const unsigned char*) m, ALIGN8(offsetof(struct metadata_credential_header, name) + ml)) != 1)
+                return log_openssl_errors(LOG_ERR, "Failed to encrypt metadata header");
 
         assert(added >= 0);
         assert((size_t) added <= output.iov_len - p);
         p += added;
 
         /* Then encrypt the plaintext */
-        if (EVP_EncryptUpdate(context, (uint8_t*) output.iov_base + p, &added, input->iov_base, input->iov_len) != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to encrypt data: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+        if (sym_EVP_EncryptUpdate(context, (uint8_t*) output.iov_base + p, &added, input->iov_base, input->iov_len) != 1)
+                return log_openssl_errors(LOG_ERR, "Failed to encrypt data");
 
         assert(added >= 0);
         assert((size_t) added <= output.iov_len - p);
         p += added;
 
         /* Finalize */
-        if (EVP_EncryptFinal_ex(context, (uint8_t*) output.iov_base + p, &added) != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to finalize data encryption: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+        if (sym_EVP_EncryptFinal_ex(context, (uint8_t*) output.iov_base + p, &added) != 1)
+                return log_openssl_errors(LOG_ERR, "Failed to finalize data encryption");
 
         assert(added >= 0);
         assert((size_t) added <= output.iov_len - p);
@@ -1168,9 +1243,8 @@ int encrypt_credential_and_warn(
         assert(p <= output.iov_len - tsz);
 
         /* Append tag */
-        if (EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_GCM_GET_TAG, tsz, (uint8_t*) output.iov_base + p) != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to get tag: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+        if (sym_EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_GCM_GET_TAG, tsz, (uint8_t*) output.iov_base + p) != 1)
+                return log_openssl_errors(LOG_ERR, "Failed to get tag");
 
         p += tsz;
         assert(p <= output.iov_len);
@@ -1185,6 +1259,75 @@ int encrypt_credential_and_warn(
         }
 
         *ret = TAKE_STRUCT(output);
+        return 0;
+}
+
+static CredentialBootPolicy query_credential_boot_policy(void) {
+        static CredentialBootPolicy cached = _CRED_BOOT_POLICY_INVALID;
+        _cleanup_free_ char *value = NULL;
+        int r;
+
+        if (cached >= 0)
+                return cached;
+
+        /* default to RELAXED if invalid or unset */
+        cached = CRED_BOOT_RELAXED;
+        r = proc_cmdline_get_key("systemd.credentials_boot_policy", PROC_CMDLINE_STRIP_RD_PREFIX, &value);
+        if (r < 0)
+                log_debug_errno(r, "Failed to read systemd.credentials_boot_policy= from kernel command line, ignoring: %m");
+        else if (r > 0) {
+                CredentialBootPolicy p = credential_boot_policy_from_string(value);
+                if (p < 0)
+                        log_warning("Invalid systemd.credentials_boot_policy= value '%s', ignoring.", value);
+                else
+                        cached = p;
+        }
+
+        return cached;
+}
+
+static int check_null_key_policy(CredentialFlags flags) {
+        if (FLAGS_SET(flags, CREDENTIAL_REFUSE_NULL))
+                return log_error_errno(SYNTHETIC_ERRNO(EHWPOISON),
+                                       "Credential uses null key, but that's not allowed, refusing.");
+
+        if (FLAGS_SET(flags, CREDENTIAL_ALLOW_NULL))
+                return 0;
+
+        /* So this is a credential encrypted with a zero length key. We support this to cover for the
+         * case where neither a host key not a TPM2 are available (specifically: initrd environments
+         * where the host key is not yet accessible and no TPM2 chip exists at all), to minimize
+         * different codeflow for TPM2 and non-TPM2 codepaths. Of course, credentials encoded this
+         * way offer no confidentiality nor authenticity. Because of that it's important we refuse to
+         * use them on systems that actually *do* have a TPM2 chip – if we are in SecureBoot
+         * mode. Otherwise an attacker could hand us credentials like this and we'd use them thinking
+         * they are trusted, even though they are not.
+         *
+         * Which conditions actually lead us to accept a null-key credential is configurable via
+         * systemd.credentials_boot_policy=, which also covers the first boot case (before any key
+         * exists yet); the decision itself is made in credential_boot_policy_accepts_null(). */
+
+        CredentialBootPolicy policy = query_credential_boot_policy();
+
+        bool have_tpm2 = efi_has_tpm2(), secure_boot = is_efi_secure_boot();
+        /* in_first_boot() can return <0 on error: use the safe default in this case (not-first-boot). */
+        bool first_boot = in_first_boot() > 0;
+
+        if (!credential_boot_policy_accepts_null(policy, first_boot, have_tpm2, secure_boot))
+                return log_error_errno(SYNTHETIC_ERRNO(EHWPOISON),
+                                       "Credential uses null key, but systemd.credentials_boot_policy=%s refuses it here (TPM2=%s, SecureBoot=%s, first boot=%s).",
+                                       credential_boot_policy_to_string(policy),
+                                       yes_no(have_tpm2), yes_no(secure_boot), yes_no(first_boot));
+
+        /* Accepting a null-key credential on a tpm2 host is undesired so keep it auditable */
+        if (have_tpm2 && !first_boot)
+                log_warning("Credential uses null key intended for use when TPM2 is absent, but TPM2 is present! "
+                            "Accepting anyway, under systemd.credentials_boot_policy=%s.",
+                            credential_boot_policy_to_string(policy));
+        else
+                log_debug("Credential uses null key, accepted under systemd.credentials_boot_policy=%s.",
+                          credential_boot_policy_to_string(policy));
+
         return 0;
 }
 
@@ -1204,13 +1347,31 @@ int decrypt_credential_and_warn(
         struct encrypted_credential_header *h;
         struct metadata_credential_header *m;
         uint8_t md[SHA256_DIGEST_LENGTH];
-        bool with_tpm2, with_tpm2_pk, with_host_key, with_null, with_scope;
         const EVP_CIPHER *cc;
+        uint32_t tag_size;
         size_t p, hs;
-        int r, added;
+        int r, added, tsz;
 
         assert(iovec_is_valid(input));
         assert(ret);
+
+        /* Only one of these two flags may be set at the same time */
+        assert(!FLAGS_SET(flags, CREDENTIAL_ALLOW_NULL) || !FLAGS_SET(flags, CREDENTIAL_REFUSE_NULL));
+
+        CLEANUP_ERASE(md);
+
+        /* Relevant error codes:
+         *
+         *   -EBADMSG      → Corrupted file, or unparsable PCR signature file
+         *   -EOPNOTSUPP   → Unsupported file type (could be: requires TPM but we have no TPM)
+         *   -EHOSTDOWN    → Need PCR signature file, but couldn't find it
+         *   -EHWPOISON    → Attempt to unlock with NULL key and either CREDENTIAL_ALLOW_REFUSE is on, or CREDENTIAL_ALLOW_NULL is off, but the system has a TPM and SecureBoot is on
+         *   -EMEDIUMTYPE  → File has unexpected scope, i.e. user-scoped credential is attempted to be unlocked in system scope, or vice versa
+         *   -EDESTADDRREQ → Credential is incorrectly named (i.e. the authenticated name does not match the actual name)
+         *   -ESTALE       → Credential's validity has passed
+         *   -ESRCH        → User specified for scope does not exist on this system
+         *
+         *   (plus the various error codes tpm2_unseal() returns) */
 
         h = (struct encrypted_credential_header*) input->iov_base;
 
@@ -1218,42 +1379,26 @@ int decrypt_credential_and_warn(
         if (input->iov_len < sizeof(h->id))
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Encrypted file too short.");
 
-        with_host_key = sd_id128_in_set(h->id, CRED_AES256_GCM_BY_HOST, CRED_AES256_GCM_BY_HOST_SCOPED, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED);
-        with_tpm2_pk = sd_id128_in_set(h->id, CRED_AES256_GCM_BY_TPM2_HMAC_WITH_PK, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED);
-        with_tpm2 = sd_id128_in_set(h->id, CRED_AES256_GCM_BY_TPM2_HMAC, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED) || with_tpm2_pk;
-        with_null = sd_id128_equal(h->id, CRED_AES256_GCM_BY_NULL);
-        with_scope = sd_id128_in_set(h->id, CRED_AES256_GCM_BY_HOST_SCOPED, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED, CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED);
-
-        if (!with_host_key && !with_tpm2 && !with_null)
+        if (!CRED_KEY_IS_VALID(h->id))
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Unknown encryption format, or corrupted data.");
 
-        if (with_tpm2_pk) {
+        if (CRED_KEY_REQUIRES_TPM2_PK(h->id)) {
                 r = tpm2_load_pcr_signature(tpm2_signature_path, &signature_json);
+                if (r == -ENOENT)
+                        return log_error_errno(SYNTHETIC_ERRNO(EHOSTDOWN), "Couldn't find PCR signature file: %m");
+                if (r == -EBADMSG)
+                        return log_error_errno(r, "PCR signature file is malformed.");
                 if (r < 0)
-                        return log_error_errno(r, "Failed to load pcr signature: %m");
+                        return log_error_errno(r, "Failed to load PCR signature: %m");
         }
 
-        if (with_null && !FLAGS_SET(flags, CREDENTIAL_ALLOW_NULL)) {
-                /* So this is a credential encrypted with a zero length key. We support this to cover for the
-                 * case where neither a host key not a TPM2 are available (specifically: initrd environments
-                 * where the host key is not yet accessible and no TPM2 chip exists at all), to minimize
-                 * different codeflow for TPM2 and non-TPM2 codepaths. Of course, credentials encoded this
-                 * way offer no confidentiality nor authenticity. Because of that it's important we refuse to
-                 * use them on systems that actually *do* have a TPM2 chip – if we are in SecureBoot
-                 * mode. Otherwise an attacker could hand us credentials like this and we'd use them thinking
-                 * they are trusted, even though they are not. */
-
-                if (efi_has_tpm2()) {
-                        if (is_efi_secure_boot())
-                                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
-                                                       "Credential uses fixed key for fallback use when TPM2 is absent — but TPM2 is present, and SecureBoot is enabled, refusing.");
-
-                        log_warning("Credential uses fixed key for use when TPM2 is absent, but TPM2 is present! Accepting anyway, since SecureBoot is disabled.");
-                } else
-                        log_debug("Credential uses fixed key for use when TPM2 is absent, and TPM2 indeed is absent. Accepting.");
+        if (sd_id128_equal(h->id, CRED_AES256_GCM_BY_NULL)) {
+                r = check_null_key_policy(flags);
+                if (r < 0)
+                        return r;
         }
 
-        if (with_scope) {
+        if (CRED_KEY_IS_SCOPED(h->id)) {
                 if (!uid_is_valid(uid))
                         return log_error_errno(SYNTHETIC_ERRNO(EMEDIUMTYPE), "Encrypted file is scoped to a user, but no user selected.");
         } else {
@@ -1275,28 +1420,32 @@ int decrypt_credential_and_warn(
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Unexpected block size in header.");
         if (le32toh(h->iv_size) > CREDENTIAL_FIELD_SIZE_MAX)
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "IV size too large.");
-        if (le32toh(h->tag_size) != 16) /* FIXME: On OpenSSL 3, let's verify via EVP_CIPHER_CTX_get_tag_length() */
+
+        tag_size = le32toh(h->tag_size);
+        if (tag_size == 0 || tag_size > CREDENTIAL_FIELD_SIZE_MAX)
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Unexpected tag size in header.");
 
         /* Ensure we have space for the full header now (we don't know the size of the name hence this is a
          * lower limit only) */
         if (input->iov_len <
             ALIGN8(offsetof(struct encrypted_credential_header, iv) + le32toh(h->iv_size)) +
-            ALIGN8(with_tpm2 ? offsetof(struct tpm2_credential_header, policy_hash_and_blob) : 0) +
-            ALIGN8(with_tpm2_pk ? offsetof(struct tpm2_public_key_credential_header, data) : 0) +
-            ALIGN8(with_scope ? sizeof(struct scoped_credential_header) : 0) +
+            ALIGN8(CRED_KEY_REQUIRES_TPM2(h->id) ? offsetof(struct tpm2_credential_header, policy_hash_and_blob) : 0) +
+            ALIGN8(CRED_KEY_REQUIRES_TPM2_PK(h->id) ? offsetof(struct tpm2_public_key_credential_header, data) : 0) +
+            ALIGN8(CRED_KEY_REQUIRES_TPM2_PINNED_SRK(h->id) ? offsetof(struct tpm2_pinned_srk_credential_header, data) : 0) +
+            ALIGN8(CRED_KEY_IS_SCOPED(h->id) ? sizeof(struct scoped_credential_header) : 0) +
             ALIGN8(offsetof(struct metadata_credential_header, name)) +
-            le32toh(h->tag_size))
+            tag_size)
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Encrypted file too short.");
 
         p = ALIGN8(offsetof(struct encrypted_credential_header, iv) + le32toh(h->iv_size));
 
-        if (with_tpm2) {
+        if (CRED_KEY_REQUIRES_TPM2(h->id)) {
 #if HAVE_TPM2
                 struct tpm2_credential_header* t = (struct tpm2_credential_header*) ((uint8_t*) input->iov_base + p);
-                struct tpm2_public_key_credential_header *z = NULL;
+                struct tpm2_public_key_credential_header *z_pubkey = NULL;
+                struct tpm2_pinned_srk_credential_header *z_srk = NULL;
 
-                if (!TPM2_PCR_MASK_VALID(t->pcr_mask))
+                if (!TPM2_PCR_MASK_VALID(le64toh(t->pcr_mask)))
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "TPM2 PCR mask out of range.");
                 if (!tpm2_hash_alg_to_string(le16toh(t->pcr_bank)))
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "TPM2 PCR bank invalid or not supported");
@@ -1312,34 +1461,54 @@ int decrypt_credential_and_warn(
                 if (input->iov_len <
                     p +
                     ALIGN8(offsetof(struct tpm2_credential_header, policy_hash_and_blob) + le32toh(t->blob_size) + le32toh(t->policy_hash_size)) +
-                    ALIGN8(with_tpm2_pk ? offsetof(struct tpm2_public_key_credential_header, data) : 0) +
-                    ALIGN8(with_scope ? sizeof(struct scoped_credential_header) : 0) +
+                    ALIGN8(CRED_KEY_REQUIRES_TPM2_PK(h->id) ? offsetof(struct tpm2_public_key_credential_header, data) : 0) +
+                    ALIGN8(CRED_KEY_REQUIRES_TPM2_PINNED_SRK(h->id) ? offsetof(struct tpm2_pinned_srk_credential_header, data) : 0) +
+                    ALIGN8(CRED_KEY_IS_SCOPED(h->id) ? sizeof(struct scoped_credential_header) : 0) +
                     ALIGN8(offsetof(struct metadata_credential_header, name)) +
-                    le32toh(h->tag_size))
+                    tag_size)
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Encrypted file too short.");
 
                 p += ALIGN8(offsetof(struct tpm2_credential_header, policy_hash_and_blob) +
                             le32toh(t->blob_size) +
                             le32toh(t->policy_hash_size));
 
-                if (with_tpm2_pk) {
-                        z = (struct tpm2_public_key_credential_header*) ((uint8_t*) input->iov_base + p);
+                if (CRED_KEY_REQUIRES_TPM2_PK(h->id)) {
+                        z_pubkey = (struct tpm2_public_key_credential_header*) ((uint8_t*) input->iov_base + p);
 
-                        if (!TPM2_PCR_MASK_VALID(le64toh(z->pcr_mask)) || le64toh(z->pcr_mask) == 0)
+                        if (!TPM2_PCR_MASK_VALID(le64toh(z_pubkey->pcr_mask)) || le64toh(z_pubkey->pcr_mask) == 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "TPM2 PCR mask out of range.");
-                        if (le32toh(z->size) > PUBLIC_KEY_MAX)
+                        if (le32toh(z_pubkey->size) > PUBLIC_KEY_MAX)
                                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Unexpected public key size.");
 
                         if (input->iov_len <
                             p +
-                            ALIGN8(offsetof(struct tpm2_public_key_credential_header, data) + le32toh(z->size)) +
-                            ALIGN8(with_scope ? sizeof(struct scoped_credential_header) : 0) +
+                            ALIGN8(offsetof(struct tpm2_public_key_credential_header, data) + le32toh(z_pubkey->size)) +
+                            ALIGN8(CRED_KEY_REQUIRES_TPM2_PINNED_SRK(h->id) ? offsetof(struct tpm2_pinned_srk_credential_header, data) : 0) +
+                            ALIGN8(CRED_KEY_IS_SCOPED(h->id) ? sizeof(struct scoped_credential_header) : 0) +
                             ALIGN8(offsetof(struct metadata_credential_header, name)) +
-                            le32toh(h->tag_size))
+                            tag_size)
                                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Encrypted file too short.");
 
                         p += ALIGN8(offsetof(struct tpm2_public_key_credential_header, data) +
-                                    le32toh(z->size));
+                                    le32toh(z_pubkey->size));
+                }
+
+                if (CRED_KEY_REQUIRES_TPM2_PINNED_SRK(h->id)) {
+                        z_srk = (struct tpm2_pinned_srk_credential_header*) ((uint8_t*) input->iov_base + p);
+
+                        if (le32toh(z_srk->size) > CREDENTIAL_FIELD_SIZE_MAX)
+                                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Unexpected pinned SRK size.");
+
+                        if (input->iov_len <
+                            p +
+                            ALIGN8(offsetof(struct tpm2_pinned_srk_credential_header, data) + le32toh(z_srk->size)) +
+                            ALIGN8(CRED_KEY_IS_SCOPED(h->id) ? sizeof(struct scoped_credential_header) : 0) +
+                            ALIGN8(offsetof(struct metadata_credential_header, name)) +
+                            tag_size)
+                                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Encrypted file too short.");
+
+                        p += ALIGN8(offsetof(struct tpm2_pinned_srk_credential_header, data) +
+                                    le32toh(z_srk->size));
                 }
 
                 _cleanup_(tpm2_context_unrefp) Tpm2Context *tpm2_context = NULL;
@@ -1347,13 +1516,12 @@ int decrypt_credential_and_warn(
                 if (r < 0)
                         return r;
 
-                 // TODO: Add the SRK data to the credential structure so it can be plumbed
-                 // through and used to verify the TPM session.
                 r = tpm2_unseal(tpm2_context,
                                 le64toh(t->pcr_mask),
                                 le16toh(t->pcr_bank),
-                                z ? &IOVEC_MAKE(z->data, le32toh(z->size)) : NULL,
-                                z ? le64toh(z->pcr_mask) : 0,
+                                z_pubkey ? &IOVEC_MAKE(z_pubkey->data, le32toh(z_pubkey->size)) : NULL,
+                                /* pubkey_policy_ref= */ NULL,
+                                z_pubkey ? le64toh(z_pubkey->pcr_mask) : 0,
                                 signature_json,
                                 /* pin= */ NULL,
                                 /* pcrlock_policy= */ NULL,
@@ -1362,12 +1530,16 @@ int decrypt_credential_and_warn(
                                 /* n_blobs= */ 1,
                                 &IOVEC_MAKE(t->policy_hash_and_blob + le32toh(t->blob_size), le32toh(t->policy_hash_size)),
                                 /* n_known_policy_hash= */ 1,
-                                /* srk= */ NULL,
+                                z_srk ? &IOVEC_MAKE(z_srk->data, le32toh(z_srk->size)) : NULL,
                                 &tpm2_key);
                 if (r == -EREMOTE)
-                        return log_error_errno(r, "TPM key integrity check failed. Key enrolled in superblock most likely does not belong to this TPM.");
+                        return log_error_errno(r, "TPM key integrity check failed. Key most likely does not belong to this TPM.");
+                if (r == -EADDRNOTAVAIL)
+                        return log_error_errno(r, "NV index referenced by key is missing, unwritten, or unusable, it could be for another system.");
+                if (r == -EUCLEAN)
+                        return log_error_errno(r, "PCR values kept changing while unsealing the TPM2 secret, giving up. Something on this system extends a PCR continuously.");
                 if (ERRNO_IS_NEG_TPM2_UNSEAL_BAD_PCR(r))
-                        return log_error_errno(r, "TPM policy does not match current system state. Either system has been tempered with or policy out-of-date: %m");
+                        return log_error_errno(r, "TPM policy does not match current system state. Either system has been tampered with or policy out-of-date: %m");
                 if (r < 0)
                         return log_error_errno(r, "Failed to unseal secret using TPM2: %m");
 #else
@@ -1375,7 +1547,7 @@ int decrypt_credential_and_warn(
 #endif
         }
 
-        if (with_scope) {
+        if (CRED_KEY_IS_SCOPED(h->id)) {
                 struct scoped_credential_header* sh = (struct scoped_credential_header*) ((uint8_t*) input->iov_base + p);
 
                 if (le64toh(sh->flags) != SCOPE_HASH_DATA_BASE_FLAGS)
@@ -1385,82 +1557,92 @@ int decrypt_credential_and_warn(
                     p +
                     sizeof(struct scoped_credential_header) +
                     ALIGN8(offsetof(struct metadata_credential_header, name)) +
-                    le32toh(h->tag_size))
+                    tag_size)
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Encrypted file too short.");
 
                 p += sizeof(struct scoped_credential_header);
         }
 
-        if (with_host_key) {
+        if (CRED_KEY_REQUIRES_HOST(h->id)) {
                 r = get_credential_host_secret(/* flags= */ 0, &host_key);
                 if (r < 0)
                         return log_error_errno(r, "Failed to determine local credential key: %m");
         }
 
-        if (with_null && !FLAGS_SET(flags, CREDENTIAL_ALLOW_NULL))
+        if (sd_id128_equal(h->id, CRED_AES256_GCM_BY_NULL) && !FLAGS_SET(flags, CREDENTIAL_ALLOW_NULL))
                 log_warning("Warning: using a null key for decryption and authentication. Confidentiality or authenticity are not provided.");
 
-        sha256_hash_host_and_tpm2_key(&host_key, &tpm2_key, md);
+        r = sha256_hash_host_and_tpm2_key(&host_key, &tpm2_key, md);
+        if (r < 0)
+                return r;
 
-        if (with_scope) {
+        if (CRED_KEY_IS_SCOPED(h->id)) {
                 r = mangle_uid_into_key(uid, md);
                 if (r < 0)
                         return r;
         }
 
-        assert_se(cc = EVP_aes_256_gcm());
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
+        assert_se(cc = sym_EVP_aes_256_gcm());
 
         /* Make sure cipher expectations match the header */
-        if (EVP_CIPHER_key_length(cc) != (int) le32toh(h->key_size))
+        if (sym_EVP_CIPHER_get_key_length(cc) != (int) le32toh(h->key_size))
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Unexpected key size in header.");
-        if (EVP_CIPHER_block_size(cc) != (int) le32toh(h->block_size))
+        if (sym_EVP_CIPHER_get_block_size(cc) != (int) le32toh(h->block_size))
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Unexpected block size in header.");
 
-        context = EVP_CIPHER_CTX_new();
+        context = sym_EVP_CIPHER_CTX_new();
         if (!context)
-                return log_error_errno(SYNTHETIC_ERRNO(ENOMEM), "Failed to allocate decryption object: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+                return log_openssl_errors(LOG_ERR, "Failed to allocate decryption object");
 
-        if (EVP_DecryptInit_ex(context, cc, NULL, NULL, NULL) != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to initialize decryption context: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+        if (sym_EVP_DecryptInit_ex(context, cc, NULL, NULL, NULL) != 1)
+                return log_openssl_errors(LOG_ERR, "Failed to initialize decryption context");
 
-        if (EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_GCM_SET_IVLEN, le32toh(h->iv_size), NULL) != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to set IV size on decryption context: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+        tsz = sym_EVP_CIPHER_CTX_get_tag_length(context);
+        if (tsz <= 0 || (size_t) tsz > CREDENTIAL_FIELD_SIZE_MAX)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid tag size reported by OpenSSL.");
+        if (tag_size != (uint32_t) tsz)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Unexpected tag size in header.");
 
-        if (EVP_DecryptInit_ex(context, NULL, NULL, md, h->iv) != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to set IV and key: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+        if (sym_EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_GCM_SET_IVLEN, le32toh(h->iv_size), NULL) != 1)
+                return log_openssl_errors(LOG_ERR, "Failed to set IV size on decryption context");
 
-        if (EVP_DecryptUpdate(context, NULL, &added, input->iov_base, p) != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to write AAD data: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+        if (sym_EVP_DecryptInit_ex(context, NULL, NULL, md, h->iv) != 1)
+                return log_openssl_errors(LOG_ERR, "Failed to set IV and key");
 
-        plaintext.iov_base = malloc(input->iov_len - p - le32toh(h->tag_size));
+        if (sym_EVP_DecryptUpdate(context, NULL, &added, input->iov_base, p) != 1)
+                return log_openssl_errors(LOG_ERR, "Failed to write AAD data");
+
+        plaintext.iov_base = malloc(input->iov_len - p - tag_size);
         if (!plaintext.iov_base)
                 return -ENOMEM;
 
-        if (EVP_DecryptUpdate(
+        if (sym_EVP_DecryptUpdate(
                             context,
                             plaintext.iov_base,
                             &added,
                             (uint8_t*) input->iov_base + p,
-                            input->iov_len - p - le32toh(h->tag_size)) != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to decrypt data: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+                            input->iov_len - p - tag_size) != 1)
+                return log_openssl_errors(LOG_ERR, "Failed to decrypt data");
 
         assert(added >= 0);
-        assert((size_t) added <= input->iov_len - p - le32toh(h->tag_size));
+        assert((size_t) added <= input->iov_len - p - tag_size);
         plaintext.iov_len = added;
 
-        if (EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_GCM_SET_TAG, le32toh(h->tag_size), (uint8_t*) input->iov_base + input->iov_len - le32toh(h->tag_size)) != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to set tag: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+        if (sym_EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_GCM_SET_TAG, tag_size, (uint8_t*) input->iov_base + input->iov_len - tag_size) != 1)
+                return log_openssl_errors(LOG_ERR, "Failed to set tag");
 
-        if (EVP_DecryptFinal_ex(context, (uint8_t*) plaintext.iov_base + plaintext.iov_len, &added) != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Decryption failed (incorrect key?): %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+        if (sym_EVP_DecryptFinal_ex(context, (uint8_t*) plaintext.iov_base + plaintext.iov_len, &added) != 1) {
+                log_openssl_errors(LOG_ERR, "Decryption failed (incorrect key?)");
+                /* A GCM tag/authentication mismatch (wrong key or corrupted blob) is the common case here
+                 * and typically leaves the OpenSSL error queue empty, so we can't rely on the translated
+                 * errno. Return -EBADMSG unconditionally: it's this function's documented "corrupted file"
+                 * code, and credentials_varlink_error_table[] maps it to io.systemd.Credentials.BadFormat. */
+                return -EBADMSG;
+        }
 
         plaintext.iov_len += added;
 
@@ -1497,7 +1679,7 @@ int decrypt_credential_and_warn(
                         if (r < 0 && r != -ENXIO)
                                 log_debug_errno(r, "Failed to parse $SYSTEMD_CREDENTIAL_VALIDATE_NAME: %m");
                         if (r != 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(EREMOTE), "Embedded credential name '%s' does not match filename '%s', refusing.", embedded_name, validate_name);
+                                return log_error_errno(SYNTHETIC_ERRNO(EDESTADDRREQ), "Embedded credential name '%s' does not match filename '%s', refusing.", embedded_name, validate_name);
 
                         log_debug("Embedded credential name '%s' does not match expected name '%s', but configured to use credential anyway.", embedded_name, validate_name);
                 }
@@ -1581,11 +1763,12 @@ int ipc_encrypt_credential(const char *name, usec_t timestamp, usec_t not_after,
                         &reply,
                         &error_id,
                         SD_JSON_BUILD_PAIR_CONDITION(!!name, "name", SD_JSON_BUILD_STRING(name)),
-                        SD_JSON_BUILD_PAIR("data", SD_JSON_BUILD_VARIANT(jinput)),
+                        SD_JSON_BUILD_PAIR_VARIANT("data", jinput),
                         SD_JSON_BUILD_PAIR_CONDITION(timestamp != USEC_INFINITY, "timestamp", SD_JSON_BUILD_UNSIGNED(timestamp)),
                         SD_JSON_BUILD_PAIR_CONDITION(not_after != USEC_INFINITY, "notAfter",  SD_JSON_BUILD_UNSIGNED(not_after)),
                         SD_JSON_BUILD_PAIR_CONDITION(!FLAGS_SET(flags, CREDENTIAL_ANY_SCOPE), "scope", SD_JSON_BUILD_STRING(uid_is_valid(uid) ? "user" : "system")),
                         SD_JSON_BUILD_PAIR_CONDITION(uid_is_valid(uid), "uid", SD_JSON_BUILD_UNSIGNED(uid)),
+                        SD_JSON_BUILD_PAIR_CONDITION((flags & (CREDENTIAL_ALLOW_NULL|CREDENTIAL_REFUSE_NULL)) != 0, "allowNull", SD_JSON_BUILD_BOOLEAN(flags & CREDENTIAL_ALLOW_NULL)),
                         SD_JSON_BUILD_PAIR_BOOLEAN("allowInteractiveAuthentication", FLAGS_SET(flags, CREDENTIAL_IPC_ALLOW_INTERACTIVE)));
         if (r < 0)
                 return log_error_errno(r, "Failed to call Encrypt() varlink call.");
@@ -1640,7 +1823,7 @@ int ipc_decrypt_credential(const char *validate_name, usec_t validate_timestamp,
                         &reply,
                         &error_id,
                         SD_JSON_BUILD_PAIR_CONDITION(!!validate_name, "name", SD_JSON_BUILD_STRING(validate_name)),
-                        SD_JSON_BUILD_PAIR("blob", SD_JSON_BUILD_VARIANT(jinput)),
+                        SD_JSON_BUILD_PAIR_VARIANT("blob", jinput),
                         SD_JSON_BUILD_PAIR_CONDITION(validate_timestamp != USEC_INFINITY, "timestamp", SD_JSON_BUILD_UNSIGNED(validate_timestamp)),
                         SD_JSON_BUILD_PAIR_CONDITION(!FLAGS_SET(flags, CREDENTIAL_ANY_SCOPE), "scope", SD_JSON_BUILD_STRING(uid_is_valid(uid) ? "user" : "system")),
                         SD_JSON_BUILD_PAIR_CONDITION(uid_is_valid(uid), "uid", SD_JSON_BUILD_UNSIGNED(uid)),
@@ -1648,16 +1831,9 @@ int ipc_decrypt_credential(const char *validate_name, usec_t validate_timestamp,
         if (r < 0)
                 return log_error_errno(r, "Failed to call Decrypt() varlink call.");
         if (!isempty(error_id))  {
-                if (streq(error_id, "io.systemd.Credentials.BadFormat"))
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Bad credential format.");
-                if (streq(error_id, "io.systemd.Credentials.NameMismatch"))
-                        return log_error_errno(SYNTHETIC_ERRNO(EREMOTE), "Name in credential doesn't match expectations.");
-                if (streq(error_id, "io.systemd.Credentials.TimeMismatch"))
-                        return log_error_errno(SYNTHETIC_ERRNO(ESTALE), "Outside of credential validity time window.");
-                if (streq(error_id, "io.systemd.Credentials.NoSuchUser"))
-                        return log_error_errno(SYNTHETIC_ERRNO(ESRCH), "No such user.");
-                if (streq(error_id, "io.systemd.Credentials.BadScope"))
-                        return log_error_errno(SYNTHETIC_ERRNO(EMEDIUMTYPE), "Scope mismtach.");
+                const CredentialsVarlinkError *e = credentials_varlink_error_by_id(error_id);
+                if (e)
+                        return log_error_errno(SYNTHETIC_ERRNO(e->errnum), "%s", e->msg);
 
                 return log_error_errno(sd_varlink_error_to_errno(error_id, reply), "Failed to decrypt: %s", error_id);
         }
@@ -1689,8 +1865,7 @@ int get_global_boot_credentials_path(char **ret) {
                         /* path= */ NULL,
                         /* unprivileged_mode= */ false,
                         &path,
-                        /* ret_uuid= */ NULL,
-                        /* ret_devid= */ NULL);
+                        /* ret_fd= */ NULL);
         if (r < 0) {
                 if (r != -ENOKEY)
                         return log_error_errno(r, "Failed to find XBOOTLDR partition: %m");
@@ -1700,11 +1875,7 @@ int get_global_boot_credentials_path(char **ret) {
                                 /* path= */ NULL,
                                 /* unprivileged_mode= */ false,
                                 &path,
-                                /* ret_part= */ NULL,
-                                /* ret_pstart= */ NULL,
-                                /* ret_psize= */ NULL,
-                                /* ret_uuid= */ NULL,
-                                /* ret_devid= */ NULL);
+                                /* ret_fd= */ NULL);
                 if (r < 0) {
                         if (r != -ENOKEY)
                                 return log_error_errno(r, "Failed to find ESP partition: %m");
@@ -1789,15 +1960,12 @@ int pick_up_credentials(const PickUpCredential *table, size_t n_table_entry) {
                 return log_error_errno(credential_dir_fd, "Failed to open credentials directory: %m");
 
         _cleanup_free_ DirectoryEntries *des = NULL;
-        r = readdir_all(credential_dir_fd, RECURSE_DIR_SORT|RECURSE_DIR_IGNORE_DOT|RECURSE_DIR_ENSURE_TYPE, &des);
+        r = readdir_all(credential_dir_fd, RECURSE_DIR_SORT|RECURSE_DIR_IGNORE_DOT|RECURSE_DIR_MUST_BE_REGULAR, &des);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate credentials: %m");
 
         FOREACH_ARRAY(i, des->entries, des->n_entries) {
                 struct dirent *de = *i;
-
-                if (de->d_type != DT_REG)
-                        continue;
 
                 FOREACH_ARRAY(t, table, n_table_entry) {
                         r = pick_up_credential_one(credential_dir_fd, de->d_name, t);
@@ -1809,4 +1977,41 @@ int pick_up_credentials(const PickUpCredential *table, size_t n_table_entry) {
         }
 
         return ret;
+}
+
+static const CredentialsVarlinkError credentials_varlink_error_table[] = {
+        { "io.systemd.Credentials.BadFormat",              EBADMSG,      "Bad credential format." },
+        { "io.systemd.Credentials.NameMismatch",           EDESTADDRREQ, "Name in credential doesn't match expectations." },
+        { "io.systemd.Credentials.TimeMismatch",           ESTALE,       "Outside of credential validity time window." },
+        { "io.systemd.Credentials.NoSuchUser",             ESRCH,        "No such user." },
+        { "io.systemd.Credentials.BadScope",               EMEDIUMTYPE,  "Scope mismatch." },
+        { "io.systemd.Credentials.CantFindPCRSignature",   EHOSTDOWN,    "PCR signature required for decryption, but could not be found." },
+        { "io.systemd.Credentials.NullKeyNotAllowed",      EHWPOISON,    "The key was encrypted with a null key, but that's not allowed during decryption." },
+        { "io.systemd.Credentials.KeyBelongsToOtherTPM",   EREMOTE,      "The TPM integrity check for this key failed, key probably belongs to another TPM, or was corrupted." },
+        { "io.systemd.Credentials.TPMInDictionaryLockout", ENOLCK,       "The TPM is in dictionary lockout mode, cannot operate." },
+        { "io.systemd.Credentials.UnexpectedPCRState",     EPERM,        "Unexpected TPM PCR state of the system." },
+        { "io.systemd.Credentials.PCRsKeptChanging",       EUCLEAN,      "PCR values kept changing while unsealing the TPM2 secret, something on this system extends a PCR continuously." },
+        { "io.systemd.Credentials.NVIndexUnusable",        EADDRNOTAVAIL, "The NV index referenced by the key is missing, unwritten, or unusable, it could be for another system." },
+};
+
+const CredentialsVarlinkError* credentials_varlink_error_by_id(const char *id) {
+        assert(id);
+
+        FOREACH_ELEMENT(i, credentials_varlink_error_table)
+                if (streq(id, i->id))
+                        return i;
+
+        return NULL;
+}
+
+const CredentialsVarlinkError* credentials_varlink_error_by_errno(int errnum) {
+        assert(errnum != 0);
+
+        errnum = ABS(errnum);
+
+        FOREACH_ELEMENT(i, credentials_varlink_error_table)
+                if (errnum == i->errnum)
+                        return i;
+
+        return NULL;
 }

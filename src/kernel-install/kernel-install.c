@@ -1,18 +1,20 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <stdlib.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include "sd-json.h"
+
+#include "ansi-color.h"
 #include "argv-util.h"
 #include "boot-entry.h"
 #include "bootspec.h"
 #include "build.h"
 #include "chase.h"
 #include "conf-files.h"
-#include "dirent-util.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "env-file.h"
 #include "env-util.h"
 #include "exec-util.h"
@@ -31,9 +33,9 @@
 #include "mount-util.h"
 #include "parse-argument.h"
 #include "path-util.h"
-#include "pretty-print.h"
 #include "recurse-dir.h"
 #include "rm-rf.h"
+#include "specifier.h"
 #include "stat-util.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -51,12 +53,27 @@ static char *arg_root = NULL;
 static char *arg_image = NULL;
 static ImagePolicy *arg_image_policy = NULL;
 static bool arg_legend = true;
+static BootEntryTokenType arg_entry_token_type = BOOT_ENTRY_TOKEN_AUTO;
+static char *arg_entry_token = NULL;
+static BootEntryType arg_boot_entry_type = _BOOT_ENTRY_TYPE_INVALID;
 
 STATIC_DESTRUCTOR_REGISTER(arg_esp_path, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_xbootldr_path, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_image_policy, image_policy_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_entry_token, freep);
+
+COMMAND(
+        "kernel-install\0",
+        "Add and remove kernel and initrd images to and from the boot partition.",
+        .footer = "This program may also be invoked as 'installkernel':\n"
+                  "  installkernel [OPTION…] VERSION VMLINUZ [MAP] [INSTALLATION-DIR]\n"
+                  "(The optional arguments are passed by kernel build system, but ignored.)",
+        .man_pages = "kernel-install(8)\0",
+        .pager_flags = &arg_pager_flags,
+        .flags = COMMAND_HELP_SEPARATE,  /* the verb table is very wide */
+);
 
 typedef enum Action {
         ACTION_ADD,
@@ -103,13 +120,28 @@ typedef struct Context {
         char **initrds;
         char *initrd_generator;
         char *uki_generator;
+        char *entry_name_format;
+        char *entry_name;
         char *staging_area;
         char **plugins;
         char **argv;
         char **envp;
 } Context;
 
-#define CONTEXT_NULL (Context) { .rfd = -EBADF }
+/* Longest filename suffix plugins append to the entry name (from 90-uki-copy.install) */
+#define ENTRY_NAME_SUFFIX_MAX STRLEN(".efi.extra.d")
+
+#define DEFAULT_ENTRY_NAME_FORMAT "%e-%v"
+
+#define CONTEXT_NULL                                                    \
+        (Context) {                                                     \
+                .rfd = XAT_FDROOT,                                      \
+                .action = _ACTION_INVALID,                              \
+                .kernel_image_type = _KERNEL_IMAGE_TYPE_INVALID,        \
+                .layout = _LAYOUT_INVALID,                              \
+                .entry_type = _BOOT_ENTRY_TYPE_INVALID,                 \
+                .entry_token_type = _BOOT_ENTRY_TOKEN_TYPE_INVALID,     \
+        }
 
 static void context_done(Context *c) {
         assert(c);
@@ -124,6 +156,8 @@ static void context_done(Context *c) {
         strv_free(c->initrds);
         free(c->initrd_generator);
         free(c->uki_generator);
+        free(c->entry_name_format);
+        free(c->entry_name);
         if (c->action == ACTION_INSPECT)
                 free(c->staging_area);
         else
@@ -140,10 +174,10 @@ static int context_copy(const Context *source, Context *ret) {
 
         assert(source);
         assert(ret);
-        assert(source->rfd >= 0 || source->rfd == AT_FDCWD);
+        assert(wildcard_fd_is_valid(source->rfd));
 
         _cleanup_(context_done) Context copy = (Context) {
-                .rfd = AT_FDCWD,
+                .rfd = source->rfd,
                 .action = source->action,
                 .machine_id = source->machine_id,
                 .machine_id_is_random = source->machine_id_is_random,
@@ -188,6 +222,9 @@ static int context_copy(const Context *source, Context *ret) {
         r = strdup_to(&copy.uki_generator, source->uki_generator);
         if (r < 0)
                 return r;
+        r = strdup_to(&copy.entry_name_format, source->entry_name_format);
+        if (r < 0)
+                return r;
         r = strdup_to(&copy.staging_area, source->staging_area);
         if (r < 0)
                 return r;
@@ -222,9 +259,9 @@ static int context_open_root(Context *c) {
         if (r > 0)
                 return 0;
 
-        c->rfd = open(empty_to_root(arg_root), O_CLOEXEC | O_DIRECTORY | O_PATH);
+        c->rfd = open(arg_root, O_CLOEXEC | O_DIRECTORY | O_PATH);
         if (c->rfd < 0)
-                return log_error_errno(errno, "Failed to open root directory '%s': %m", empty_to_root(arg_root));
+                return log_error_errno(errno, "Failed to open root directory '%s': %m", arg_root);
 
         return 0;
 }
@@ -314,6 +351,63 @@ static int context_set_uki_generator(Context *c, const char *s, const char *sour
         return context_set_string(s, source, "UKI_GENERATOR", &c->uki_generator);
 }
 
+static int context_set_entry_name_format(Context *c, const char *s, const char *source) {
+        assert(c);
+        return context_set_string(s, source, "ENTRY_NAME_FORMAT", &c->entry_name_format);
+}
+
+static int context_resolve_entry_name(Context *c) {
+        assert(c);
+
+        if (c->entry_name)
+                return 0;
+
+        const Specifier table[] = {
+                { 'e', specifier_string,           c->entry_token },
+                { 'm', specifier_id128,            &c->machine_id },
+                { 'v', specifier_string,           c->version ?: "KERNEL_VERSION" },
+                { 'a', specifier_architecture,     NULL },
+                { 'A', specifier_os_image_version, NULL },
+                { 'B', specifier_os_build_id,      NULL },
+                { 'H', specifier_hostname,         NULL },
+                { 'l', specifier_short_hostname,   NULL },
+                { 'q', specifier_pretty_hostname,  NULL },
+                { 'M', specifier_os_image_id,      NULL },
+                { 'o', specifier_os_id,            NULL },
+                { 'w', specifier_os_version_id,    NULL },
+                { 'W', specifier_os_variant_id,    NULL },
+                {}
+        };
+
+        _cleanup_free_ char *resolved = NULL;
+        int r;
+
+        r = specifier_printf(
+                        c->entry_name_format ?: DEFAULT_ENTRY_NAME_FORMAT,
+                        NAME_MAX - ENTRY_NAME_SUFFIX_MAX,
+                        table,
+                        arg_root,
+                        /* userdata= */ c,
+                        &resolved);
+        if (r < 0)
+                return log_error_errno(r, "Failed to expand entry name format '%s': %m",
+                                       c->entry_name_format ?: DEFAULT_ENTRY_NAME_FORMAT);
+
+        if (isempty(resolved))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Entry name format '%s' resolved to empty string.",
+                                       c->entry_name_format ?: DEFAULT_ENTRY_NAME_FORMAT);
+
+        if (!filename_is_valid(resolved))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Entry name format '%s' resolved to invalid filename: %s",
+                                       c->entry_name_format ?: DEFAULT_ENTRY_NAME_FORMAT, resolved);
+
+        c->entry_name = TAKE_PTR(resolved);
+        log_debug("Using entry name: %s", c->entry_name);
+        return 0;
+}
+
 static int context_set_version(Context *c, const char *s) {
         assert(c);
 
@@ -336,7 +430,7 @@ static int context_set_path(Context *c, const char *s, const char *source, const
                 return 0;
 
         if (c->rfd >= 0) {
-                r = chaseat(c->rfd, s, CHASE_AT_RESOLVE_IN_ROOT, &p, /* ret_fd = */ NULL);
+                r = chaseat(c->rfd, c->rfd, s, /* flags= */ 0, &p, /* ret_fd= */ NULL);
                 if (r < 0)
                         return log_warning_errno(r, "Failed to chase path %s for %s specified via %s, ignoring: %m",
                                                  s, name, source);
@@ -384,7 +478,7 @@ static int context_set_path_strv(Context *c, char* const* strv, const char *sour
                 char *p;
 
                 if (c->rfd >= 0) {
-                        r = chaseat(c->rfd, *s, CHASE_AT_RESOLVE_IN_ROOT, &p, /* ret_fd = */ NULL);
+                        r = chaseat(c->rfd, c->rfd, *s, /* flags= */ 0, &p, /* ret_fd= */ NULL);
                         if (r < 0)
                                 return log_warning_errno(r, "Failed to chase path %s for %s specified via %s: %m",
                                                          *s, name, source);
@@ -429,20 +523,6 @@ static int context_set_initrds(Context *c, char* const* strv) {
         return context_set_path_strv(c, strv, "command line", "initrds", &c->initrds);
 }
 
-static int context_set_entry_type(Context *c, const char *s) {
-        assert(c);
-        BootEntryType e;
-        if (isempty(s) || streq(s, "all")) {
-                c->entry_type = _BOOT_ENTRY_TYPE_INVALID;
-                return 0;
-        }
-        e = boot_entry_type_from_string(s);
-        if (e < 0)
-                return log_error_errno(e, "Invalid entry type: %s", s);
-        c->entry_type = e;
-        return 1;
-}
-
 static int context_load_environment(Context *c) {
         assert(c);
 
@@ -450,23 +530,28 @@ static int context_load_environment(Context *c) {
         (void) context_set_boot_root(c, getenv("BOOT_ROOT"), "environment");
         (void) context_set_conf_root(c, getenv("KERNEL_INSTALL_CONF_ROOT"), "environment");
         (void) context_set_plugins(c, getenv("KERNEL_INSTALL_PLUGINS"), "environment");
+        (void) context_set_entry_name_format(c, getenv("KERNEL_INSTALL_ENTRY_NAME_FORMAT"), "environment");
         return 0;
 }
 
 static int context_load_install_conf(Context *c) {
         _cleanup_free_ char *machine_id = NULL, *boot_root = NULL, *layout = NULL,
-                            *initrd_generator = NULL, *uki_generator = NULL;
+                            *initrd_generator = NULL, *uki_generator = NULL,
+                            *entry_name_format = NULL;
         int r;
 
         assert(c);
 
-        r = load_kernel_install_conf(arg_root,
-                                     c->conf_root,
-                                     &machine_id,
-                                     &boot_root,
-                                     &layout,
-                                     &initrd_generator,
-                                     &uki_generator);
+        r = load_kernel_install_conf_at(
+                        c->conf_root ? NULL : arg_root,
+                        c->conf_root ? XAT_FDROOT : c->rfd,
+                        c->conf_root,
+                        &machine_id,
+                        &boot_root,
+                        &layout,
+                        &initrd_generator,
+                        &uki_generator,
+                        &entry_name_format);
         if (r <= 0)
                 return r;
 
@@ -475,6 +560,7 @@ static int context_load_install_conf(Context *c) {
         (void) context_set_layout(c, layout, "config");
         (void) context_set_initrd_generator(c, initrd_generator, "config");
         (void) context_set_uki_generator(c, uki_generator, "config");
+        (void) context_set_entry_name_format(c, entry_name_format, "config");
 
         log_debug("Loaded config.");
         return 0;
@@ -503,7 +589,7 @@ static int context_load_machine_info(Context *c) {
                 return 0;
         }
 
-        r = chase_and_fopenat_unlocked(c->rfd, path, CHASE_AT_RESOLVE_IN_ROOT, "re", NULL, &f);
+        r = chase_and_fopenat_unlocked(c->rfd, c->rfd, path, /* chase_flags= */ 0, "re", NULL, &f);
         if (r == -ENOENT)
                 return 0;
         if (r < 0)
@@ -567,12 +653,11 @@ static int context_acquire_xbootldr(Context *c) {
         assert(!c->boot_root);
 
         r = find_xbootldr_and_warn_at(
-                        /* rfd = */ c->rfd,
-                        /* path = */ arg_xbootldr_path,
+                        /* rfd= */ c->rfd,
+                        /* path= */ arg_xbootldr_path,
                         /* unprivileged_mode= */ -1,
-                        /* ret_path = */ &c->boot_root,
-                        /* ret_uuid = */ NULL,
-                        /* ret_devid = */ NULL);
+                        /* ret_path= */ &c->boot_root,
+                        /* ret_fd= */ NULL);
         if (r == -ENOKEY) {
                 log_debug_errno(r, "Couldn't find an XBOOTLDR partition.");
                 return 0;
@@ -593,15 +678,11 @@ static int context_acquire_esp(Context *c) {
         assert(!c->boot_root);
 
         r = find_esp_and_warn_at(
-                        /* rfd = */ c->rfd,
-                        /* path = */ arg_esp_path,
+                        /* rfd= */ c->rfd,
+                        /* path= */ arg_esp_path,
                         /* unprivileged_mode= */ -1,
-                        /* ret_path = */ &c->boot_root,
-                        /* ret_part = */ NULL,
-                        /* ret_pstart = */ NULL,
-                        /* ret_psize = */ NULL,
-                        /* ret_uuid = */ NULL,
-                        /* ret_devid = */ NULL);
+                        /* ret_path= */ &c->boot_root,
+                        /* ret_fd= */ NULL);
         if (r == -ENOKEY) {
                 log_debug_errno(r, "Couldn't find EFI system partition, ignoring.");
                 return 0;
@@ -636,7 +717,7 @@ static int context_ensure_boot_root(Context *c) {
 
         /* If all else fails, use /boot. */
         if (c->rfd >= 0) {
-                r = chaseat(c->rfd, "/boot", CHASE_AT_RESOLVE_IN_ROOT, &c->boot_root, /* ret_fd = */ NULL);
+                r = chaseat(c->rfd, c->rfd, "/boot", 0, &c->boot_root, /* ret_fd= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to chase '/boot/': %m");
         } else {
@@ -685,7 +766,7 @@ static int context_load_plugins(Context *c) {
                         &c->plugins,
                         ".install",
                         c->rfd,
-                        CONF_FILES_EXECUTABLE | CONF_FILES_REGULAR | CONF_FILES_FILTER_MASKED,
+                        CONF_FILES_EXECUTABLE | CONF_FILES_REGULAR | CONF_FILES_FILTER_MASKED | CONF_FILES_WARN,
                         STRV_MAKE_CONST("/etc/kernel/install.d", "/usr/lib/kernel/install.d"));
         if (r < 0)
                 return log_error_errno(r, "Failed to find plugins: %m");
@@ -693,10 +774,15 @@ static int context_load_plugins(Context *c) {
         return 0;
 }
 
-static int context_init(Context *c) {
+static int context_setup(Context *c) {
         int r;
 
         assert(c);
+
+        if (c->kernel_image_type < 0)
+                c->kernel_image_type = KERNEL_IMAGE_TYPE_UNKNOWN;
+        if (c->entry_token_type < 0)
+                c->entry_token_type = BOOT_ENTRY_TOKEN_AUTO;
 
         r = context_open_root(c);
         if (r < 0)
@@ -733,13 +819,40 @@ static int context_init(Context *c) {
         return 0;
 }
 
+static int context_from_cmdline(Context *c, Action action) {
+        int r;
+
+        assert(c);
+
+        c->action = action;
+
+        c->entry_type = arg_boot_entry_type;
+
+        r = free_and_strdup_warn(&c->entry_token, arg_entry_token);
+        if (r < 0)
+                return r;
+
+        c->entry_token_type = arg_entry_token_type;
+
+        return context_setup(c);
+}
+
 static int context_inspect_kernel(Context *c) {
+        int r;
+
         assert(c);
 
         if (!c->kernel)
                 return 0;
 
-        return inspect_kernel(c->rfd, c->kernel, &c->kernel_image_type, NULL, NULL, NULL);
+        r = inspect_kernel(
+                        c->rfd,
+                        c->kernel,
+                        &c->kernel_image_type);
+        if (r < 0)
+                return log_error_errno(r, "Failed to inspect kernel image '%s': %m", c->kernel);
+
+        return 0;
 }
 
 static int context_ensure_layout(Context *c) {
@@ -766,9 +879,18 @@ static int context_ensure_layout(Context *c) {
         if (!srel_path)
                 return log_oom();
 
-        _cleanup_free_ char *srel = NULL;
-        r = read_one_line_file_at(c->rfd, srel_path, &srel);
-        if (r >= 0) {
+        _cleanup_fclose_ FILE *f = NULL;
+        r = chase_and_fopenat_unlocked(c->rfd, c->rfd, srel_path, CHASE_MUST_BE_REGULAR, "re", /* ret_path= */ NULL, &f);
+        if (r < 0) {
+                if (r != -ENOENT)
+                        return log_error_errno(r, "Failed to open '%s': %m", srel_path);
+        } else {
+                _cleanup_free_ char *srel = NULL;
+
+                r = read_line(f, LONG_LINE_MAX, &srel);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read %s: %m", srel_path);
+
                 if (streq(srel, "type1"))
                         /* The loader/entries.srel file clearly indicates that the installed boot loader
                          * implements the proper standard upstream boot loader spec for Type #1 entries.
@@ -782,17 +904,17 @@ static int context_ensure_layout(Context *c) {
 
                 log_debug("%s with '%s' found, using layout=%s.", srel_path, srel, layout_to_string(c->layout));
                 return 0;
-        } else if (r != -ENOENT)
-                return log_error_errno(r, "Failed to read %s: %m", srel_path);
+        }
 
         _cleanup_free_ char *entry_token_path = path_join(c->boot_root, c->entry_token);
         if (!entry_token_path)
                 return log_oom();
 
-        r = is_dir_at(c->rfd, entry_token_path, /* follow = */ false);
-        if (r < 0 && r != -ENOENT)
-                return log_error_errno(r, "Failed to check if '%s' is a directory: %m", entry_token_path);
-        if (r > 0) {
+        r = chaseat(c->rfd, c->rfd, entry_token_path, CHASE_MUST_BE_DIRECTORY, /* ret_path= */ NULL, /* ret_fd= */ NULL);
+        if (r < 0) {
+                if (!IN_SET(r, -ENOENT, -ENOTDIR))
+                        return log_error_errno(r, "Failed to check if '%s' exists and is a directory: %m", entry_token_path);
+        } else {
                 /* If the metadata in $BOOT_ROOT doesn't tell us anything, then check if the entry token
                  * directory already exists. If so, let's assume it's the standard boot loader spec, too. */
                 c->layout = LAYOUT_BLS;
@@ -810,7 +932,6 @@ static int context_ensure_layout(Context *c) {
 }
 
 static int context_set_up_staging_area(Context *c) {
-        static const char *template = "/tmp/kernel-install.staging.XXXXXX";
         int r;
 
         assert(c);
@@ -818,12 +939,19 @@ static int context_set_up_staging_area(Context *c) {
         if (c->staging_area)
                 return 0;
 
-        if (c->action == ACTION_INSPECT) {
+        const char *d;
+        r = var_tmp_dir(&d);
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine temporary directory location: %m");
+
+        _cleanup_free_ char *template = path_join(d, "kernel-install.staging.XXXXXX");
+        if (!template)
+                return log_oom();
+
+        if (c->action == ACTION_INSPECT)
                 /* This is only used for display. The directory will not be created. */
-                c->staging_area = strdup(template);
-                if (!c->staging_area)
-                        return log_oom();
-        } else {
+                c->staging_area = TAKE_PTR(template);
+        else {
                 r = mkdtemp_malloc(template, &c->staging_area);
                 if (r < 0)
                         return log_error_errno(r, "Failed to create staging area: %m");
@@ -874,7 +1002,7 @@ static int context_make_entry_dir(Context *c) {
                 return 0;
 
         log_debug("mkdir -p %s", c->entry_dir);
-        fd = chase_and_openat(c->rfd, c->entry_dir, CHASE_AT_RESOLVE_IN_ROOT | CHASE_MKDIR_0755,
+        fd = chase_and_openat(c->rfd, c->rfd, c->entry_dir, CHASE_MKDIR_0755,
                               O_CLOEXEC | O_CREAT | O_DIRECTORY | O_PATH, NULL);
         if (fd < 0)
                 return log_error_errno(fd, "Failed to make directory '%s': %m", c->entry_dir);
@@ -898,7 +1026,7 @@ static int context_remove_entry_dir(Context *c) {
                 return 0;
 
         log_debug("rm -rf %s", c->entry_dir);
-        fd = chase_and_openat(c->rfd, c->entry_dir, CHASE_AT_RESOLVE_IN_ROOT, O_CLOEXEC | O_DIRECTORY, &p);
+        fd = chase_and_openat(c->rfd, c->rfd, c->entry_dir, /* chase_flags= */ 0, O_CLOEXEC | O_DIRECTORY, &p);
         if (fd < 0) {
                 if (IN_SET(fd, -ENOTDIR, -ENOENT))
                         return 0;
@@ -963,7 +1091,7 @@ static int context_build_arguments(Context *c) {
                 if (r < 0)
                         return log_oom();
 
-                r = strv_extend_strv(&a, c->initrds, /* filter_duplicates = */ false);
+                r = strv_extend_strv(&a, c->initrds, /* filter_duplicates= */ false);
                 if (r < 0)
                         return log_oom();
 
@@ -989,6 +1117,10 @@ static int context_build_environment(Context *c) {
         if (c->envp)
                 return 0;
 
+        r = context_resolve_entry_name(c);
+        if (r < 0)
+                return r;
+
         r = strv_env_assign_many(&e,
                                  "LC_COLLATE",                      SYSTEMD_DEFAULT_LOCALE,
                                  "KERNEL_INSTALL_VERBOSE",          one_zero(arg_verbose),
@@ -1000,7 +1132,8 @@ static int context_build_environment(Context *c) {
                                  "KERNEL_INSTALL_INITRD_GENERATOR", strempty(c->initrd_generator),
                                  "KERNEL_INSTALL_UKI_GENERATOR",    strempty(c->uki_generator),
                                  "KERNEL_INSTALL_BOOT_ENTRY_TYPE",  boot_entry_type_to_string(c->entry_type),
-                                 "KERNEL_INSTALL_STAGING_AREA",     c->staging_area);
+                                 "KERNEL_INSTALL_STAGING_AREA",     c->staging_area,
+                                 "KERNEL_INSTALL_ENTRY_NAME",       c->entry_name);
         if (r < 0)
                 return log_error_errno(r, "Failed to build environment variables for plugins: %m");
 
@@ -1050,10 +1183,10 @@ static int context_execute(Context *c) {
                 return r;
 
         if (DEBUG_LOGGING) {
-                _cleanup_free_ char *x = strv_join_full(c->plugins, "", "\n  ", /* escape_separator = */ false);
+                _cleanup_free_ char *x = strv_join_full(c->plugins, "", "\n  ");
                 log_debug("Using plugins: %s", strna(x));
 
-                _cleanup_free_ char *y = strv_join_full(c->envp, "", "\n  ", /* escape_separator = */ false);
+                _cleanup_free_ char *y = strv_join_full(c->envp, "", "\n  ");
                 log_debug("Plugin environment: %s", strna(y));
 
                 _cleanup_free_ char *z = strv_join(strv_skip(c->argv, 1), " ");
@@ -1061,12 +1194,12 @@ static int context_execute(Context *c) {
         }
 
         ret = execute_strv(
-                        /* name = */ NULL,
+                        "plugins",
                         c->plugins,
-                        /* root = */ NULL,
+                        /* root= */ NULL,
                         USEC_INFINITY,
-                        /* callbacks = */ NULL,
-                        /* callback_args = */ NULL,
+                        /* callbacks= */ NULL,
+                        /* callback_args= */ NULL,
                         c->argv,
                         c->envp,
                         EXEC_DIR_SKIP_REMAINING);
@@ -1083,6 +1216,27 @@ static bool bypass(void) {
         return should_bypass("KERNEL_INSTALL");
 }
 
+static int kernel_from_version(const char *version, char **ret_kernel) {
+        _cleanup_free_ char *vmlinuz = NULL;
+        int r;
+
+        assert(version);
+        assert(ret_kernel);
+
+        vmlinuz = path_join("/usr/lib/modules/", version, "/vmlinuz");
+        if (!vmlinuz)
+                return log_oom();
+
+        r = access_nofollow(vmlinuz, F_OK);
+        if (r == -ENOENT)
+                return log_error_errno(r, "Kernel image not installed to '%s', specify kernel kernel image path explicitly.", vmlinuz);
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine if kernel image is installed to '%s': %m", vmlinuz);
+
+        *ret_kernel = TAKE_PTR(vmlinuz);
+        return 0;
+}
+
 static int do_add(
                 Context *c,
                 const char *version,
@@ -1092,8 +1246,21 @@ static int do_add(
         int r;
 
         assert(c);
-        assert(version);
-        assert(kernel);
+
+        struct utsname un;
+        if (!version) {
+                assert_se(uname(&un) >= 0);
+                version = un.release;
+        }
+
+        _cleanup_free_ char *vmlinuz = NULL;
+        if (!kernel) {
+                r = kernel_from_version(version, &vmlinuz);
+                if (r < 0)
+                        return r;
+
+                kernel = vmlinuz;
+        }
 
         r = context_set_version(c, version);
         if (r < 0)
@@ -1114,32 +1281,11 @@ static int do_add(
         return context_execute(c);
 }
 
-static int kernel_from_version(const char *version, char **ret_kernel) {
-        _cleanup_free_ char *vmlinuz = NULL;
-        int r;
-
-        assert(version);
-
-        vmlinuz = path_join("/usr/lib/modules/", version, "/vmlinuz");
-        if (!vmlinuz)
-                return log_oom();
-
-        r = access_nofollow(vmlinuz, F_OK);
-        if (r == -ENOENT)
-                return log_error_errno(r, "Kernel image not installed to '%s', requiring manual kernel image path specification.", vmlinuz);
-        if (r < 0)
-                return log_error_errno(r, "Failed to determine if kernel image is installed to '%s': %m", vmlinuz);
-
-        *ret_kernel = TAKE_PTR(vmlinuz);
-        return 0;
-}
-
-static int verb_add(int argc, char *argv[], void *userdata) {
-        Context *c = ASSERT_PTR(userdata);
-        _cleanup_free_ char *vmlinuz = NULL;
+VERB(verb_add, "add", "[[[KERNEL-VERSION] KERNEL-IMAGE] [INITRD ...]]\0", 1, VERB_ANY, 0,
+     "Add a kernel and initrd images to the boot partition");
+static int verb_add(int argc, char *argv[], uintptr_t _data, void *userdata) {
         const char *version, *kernel;
         char **initrds;
-        struct utsname un;
         int r;
 
         assert(argv);
@@ -1150,7 +1296,10 @@ static int verb_add(int argc, char *argv[], void *userdata) {
         if (bypass())
                 return 0;
 
-        c->action = ACTION_ADD;
+        _cleanup_(context_done) Context c = CONTEXT_NULL;
+        r = context_from_cmdline(&c, ACTION_ADD);
+        if (r < 0)
+                return r;
 
         /* We use the same order of arguments that "inspect" introduced, i.e. if only on argument is
          * specified we take it as the kernel path, not the version, i.e. it's the first argument that is
@@ -1160,24 +1309,12 @@ static int verb_add(int argc, char *argv[], void *userdata) {
                 (argc > 1 ? empty_or_dash_to_null(argv[1]) : NULL);
         initrds = strv_skip(argv, 3);
 
-        if (!version) {
-                assert_se(uname(&un) >= 0);
-                version = un.release;
-        }
-
-        if (!kernel) {
-                r = kernel_from_version(version, &vmlinuz);
-                if (r < 0)
-                        return r;
-
-                kernel = vmlinuz;
-        }
-
-        return do_add(c, version, kernel, initrds);
+        return do_add(&c, version, kernel, initrds);
 }
 
-static int verb_add_all(int argc, char *argv[], void *userdata) {
-        Context *c = ASSERT_PTR(userdata);
+VERB_NOARG(verb_add_all, "add-all",
+           "Add all kernels found in /usr/lib/modules/");
+static int verb_add_all(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_close_ int fd = -EBADF;
         size_t n = 0;
         int ret = 0, r;
@@ -1190,28 +1327,21 @@ static int verb_add_all(int argc, char *argv[], void *userdata) {
         if (bypass())
                 return 0;
 
-        c->action = ACTION_ADD;
+        _cleanup_(context_done) Context c = CONTEXT_NULL;
+        r = context_from_cmdline(&c, ACTION_ADD);
+        if (r < 0)
+                return r;
 
-        fd = chase_and_openat(c->rfd, "/usr/lib/modules", CHASE_AT_RESOLVE_IN_ROOT, O_DIRECTORY|O_RDONLY|O_CLOEXEC, NULL);
+        fd = chase_and_openat(c.rfd, c.rfd, "/usr/lib/modules", /* chase_flags= */ 0, O_DIRECTORY|O_RDONLY|O_CLOEXEC, NULL);
         if (fd < 0)
                 return log_error_errno(fd, "Failed to open %s/usr/lib/modules/: %m", strempty(arg_root));
 
         _cleanup_free_ DirectoryEntries *de = NULL;
-        r = readdir_all(fd, RECURSE_DIR_SORT|RECURSE_DIR_IGNORE_DOT, &de);
+        r = readdir_all(fd, RECURSE_DIR_SORT|RECURSE_DIR_IGNORE_DOT|RECURSE_DIR_MUST_BE_DIRECTORY, &de);
         if (r < 0)
                 return log_error_errno(r, "Failed to numerate /usr/lib/modules/ contents: %m");
 
         FOREACH_ARRAY(d, de->entries, de->n_entries) {
-                r = dirent_ensure_type(fd, *d);
-                if (r < 0) {
-                        if (r != -ENOENT) /* don't log if just gone by now */
-                                log_debug_errno(r, "Failed to check if '%s/usr/lib/modules/%s' is a directory, ignoring: %m", strempty(arg_root), (*d)->d_name);
-                        continue;
-                }
-
-                if ((*d)->d_type != DT_DIR)
-                        continue;
-
                 _cleanup_free_ char *fn = path_join((*d)->d_name, "vmlinuz");
                 if (!fn)
                         return log_oom();
@@ -1226,7 +1356,7 @@ static int verb_add_all(int argc, char *argv[], void *userdata) {
 
                 _cleanup_(context_done) Context copy = CONTEXT_NULL;
 
-                r = context_copy(c, &copy);
+                r = context_copy(&c, &copy);
                 if (r < 0)
                         return log_error_errno(r, "Failed to copy execution context: %m");
 
@@ -1254,18 +1384,19 @@ static int verb_add_all(int argc, char *argv[], void *userdata) {
         return ret;
 }
 
-static int run_as_installkernel(int argc, char *argv[], Context *c) {
+static int run_as_installkernel(char **args) {
         /* kernel's install.sh invokes us as
          *   /sbin/installkernel <version> <vmlinuz> <map> <installation-dir>
          * We ignore the last two arguments. */
-        if (optind + 2 > argc)
+        if (strv_length(args) < 2)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "'installkernel' command requires at least two arguments.");
 
-        return verb_add(3, STRV_MAKE("add", argv[optind], argv[optind+1]), c);
+        return verb_add(3, STRV_MAKE("add", args[0], args[1]), /* data= */ 0, /* userdata= */ NULL);
 }
 
-static int verb_remove(int argc, char *argv[], void *userdata) {
-        Context *c = ASSERT_PTR(userdata);
+VERB(verb_remove, "remove", "KERNEL-VERSION\0", 2, VERB_ANY, 0,
+     "Remove a kernel from the boot partition");
+static int verb_remove(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
         assert(argc >= 2);
@@ -1281,25 +1412,29 @@ static int verb_remove(int argc, char *argv[], void *userdata) {
         if (bypass())
                 return 0;
 
-        c->action = ACTION_REMOVE;
+        _cleanup_(context_done) Context c = CONTEXT_NULL;
+        r = context_from_cmdline(&c, ACTION_REMOVE);
+        if (r < 0)
+                return r;
 
         /* Note, we do not automatically derive the kernel version to remove from uname() here (unlike we do
          * it for the "add" verb), since we don't want to make it too easy to uninstall your running
          * kernel, as a safety precaution */
 
-        r = context_set_version(c, argv[1]);
+        r = context_set_version(&c, argv[1]);
         if (r < 0)
                 return r;
 
-        r = context_prepare_execution(c);
+        r = context_prepare_execution(&c);
         if (r < 0)
                 return r;
 
-        return context_execute(c);
+        return context_execute(&c);
 }
 
-static int verb_inspect(int argc, char *argv[], void *userdata) {
-        Context *c = ASSERT_PTR(userdata);
+VERB(verb_inspect, "inspect", "[[[KERNEL-VERSION] KERNEL-IMAGE] [INITRD ...]]\0", 1, VERB_ANY, VERB_DEFAULT,
+     "Print details about the installation");
+static int verb_inspect(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(table_unrefp) Table *t = NULL;
         _cleanup_free_ char *vmlinuz = NULL;
         const char *version, *kernel;
@@ -1307,7 +1442,10 @@ static int verb_inspect(int argc, char *argv[], void *userdata) {
         struct utsname un;
         int r;
 
-        c->action = ACTION_INSPECT;
+        _cleanup_(context_done) Context c = CONTEXT_NULL;
+        r = context_from_cmdline(&c, ACTION_INSPECT);
+        if (r < 0)
+                return r;
 
         /* When only a single parameter is specified 'inspect' it's the kernel image path, and not the kernel
          * version. i.e. it's the first argument that is optional, not the 2nd. That's a bit unfortunate, but
@@ -1332,19 +1470,19 @@ static int verb_inspect(int argc, char *argv[], void *userdata) {
                 kernel = vmlinuz;
         }
 
-        r = context_set_version(c, version);
+        r = context_set_version(&c, version);
         if (r < 0)
                 return r;
 
-        r = context_set_kernel(c, kernel);
+        r = context_set_kernel(&c, kernel);
         if (r < 0)
                 return r;
 
-        r = context_set_initrds(c, initrds);
+        r = context_set_initrds(&c, initrds);
         if (r < 0)
                 return r;
 
-        r = context_prepare_execution(c);
+        r = context_prepare_execution(&c);
         if (r < 0)
                 return r;
 
@@ -1354,40 +1492,44 @@ static int verb_inspect(int argc, char *argv[], void *userdata) {
 
         r = table_add_many(t,
                            TABLE_FIELD, "Machine ID",
-                           TABLE_ID128, c->machine_id,
+                           TABLE_ID128, c.machine_id,
                            TABLE_FIELD, "Kernel Image Type",
-                           TABLE_STRING, kernel_image_type_to_string(c->kernel_image_type),
+                           TABLE_STRING, kernel_image_type_to_string(c.kernel_image_type),
                            TABLE_FIELD, "Layout",
-                           TABLE_STRING, context_get_layout(c),
+                           TABLE_STRING, context_get_layout(&c),
                            TABLE_FIELD, "Boot Root",
-                           TABLE_STRING, c->boot_root,
+                           TABLE_STRING, c.boot_root,
                            TABLE_FIELD, "Entry Token Type",
-                           TABLE_STRING, boot_entry_token_type_to_string(c->entry_token_type),
+                           TABLE_STRING, boot_entry_token_type_to_string(c.entry_token_type),
                            TABLE_FIELD, "Entry Token",
-                           TABLE_STRING, c->entry_token,
+                           TABLE_STRING, c.entry_token,
+                           TABLE_FIELD, "Entry Name Format",
+                           TABLE_STRING, c.entry_name_format ?: DEFAULT_ENTRY_NAME_FORMAT,
+                           TABLE_FIELD, "Entry Name",
+                           TABLE_STRING, c.entry_name,
                            TABLE_FIELD, "Entry Directory",
-                           TABLE_STRING, c->entry_dir,
+                           TABLE_STRING, c.entry_dir,
                            TABLE_FIELD, "Kernel Version",
-                           TABLE_STRING, c->version,
+                           TABLE_VERSION, c.version,
                            TABLE_FIELD, "Kernel",
-                           TABLE_STRING, c->kernel,
+                           TABLE_STRING, c.kernel,
                            TABLE_FIELD, "Initrds",
-                           TABLE_STRV, c->initrds,
+                           TABLE_STRV, c.initrds,
                            TABLE_FIELD, "Initrd Generator",
-                           TABLE_STRING, c->initrd_generator,
+                           TABLE_STRING, c.initrd_generator,
                            TABLE_FIELD, "UKI Generator",
-                           TABLE_STRING, c->uki_generator,
+                           TABLE_STRING, c.uki_generator,
                            TABLE_FIELD, "Plugins",
-                           TABLE_STRV, c->plugins,
+                           TABLE_STRV, c.plugins,
                            TABLE_FIELD, "Plugin Environment",
-                           TABLE_STRV, c->envp);
+                           TABLE_STRV, c.envp);
         if (r < 0)
                 return table_log_add_error(r);
 
         if (!sd_json_format_enabled(arg_json_format_flags)) {
                 r = table_add_many(t,
                                    TABLE_FIELD, "Plugin Arguments",
-                                   TABLE_STRV, strv_skip(c->argv, 1));
+                                   TABLE_STRV, strv_skip(c.argv, 1));
                 if (r < 0)
                         return table_log_add_error(r);
         }
@@ -1409,17 +1551,23 @@ static int verb_inspect(int argc, char *argv[], void *userdata) {
         return table_print_with_pager(t, arg_json_format_flags, arg_pager_flags, /* show_header= */ false);
 }
 
-static int verb_list(int argc, char *argv[], void *userdata) {
-        Context *c = ASSERT_PTR(userdata);
+VERB_NOARG(verb_list, "list",
+           "List installed kernels");
+static int verb_list(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_close_ int fd = -EBADF;
         int r;
 
-        fd = chase_and_openat(c->rfd, "/usr/lib/modules", CHASE_AT_RESOLVE_IN_ROOT, O_DIRECTORY|O_RDONLY|O_CLOEXEC, NULL);
+        _cleanup_(context_done) Context c = CONTEXT_NULL;
+        r = context_from_cmdline(&c, ACTION_INSPECT);
+        if (r < 0)
+                return r;
+
+        fd = chase_and_openat(c.rfd, c.rfd, "/usr/lib/modules", /* chase_flags= */ 0, O_DIRECTORY|O_RDONLY|O_CLOEXEC, NULL);
         if (fd < 0)
                 return log_error_errno(fd, "Failed to open %s/usr/lib/modules/: %m", strempty(arg_root));
 
         _cleanup_free_ DirectoryEntries *de = NULL;
-        r = readdir_all(fd, RECURSE_DIR_SORT|RECURSE_DIR_IGNORE_DOT, &de);
+        r = readdir_all(fd, RECURSE_DIR_SORT|RECURSE_DIR_IGNORE_DOT|RECURSE_DIR_MUST_BE_DIRECTORY, &de);
         if (r < 0)
                 return log_error_errno(r, "Failed to numerate /usr/lib/modules/ contents: %m");
 
@@ -1430,21 +1578,12 @@ static int verb_list(int argc, char *argv[], void *userdata) {
 
         table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
         table_set_align_percent(table, table_get_cell(table, 0, 1), 100);
+        (void) table_set_sort(table, (size_t) 0);
 
         FOREACH_ARRAY(d, de->entries, de->n_entries) {
                 _cleanup_free_ char *j = path_join("/usr/lib/modules/", (*d)->d_name);
                 if (!j)
                         return log_oom();
-
-                r = dirent_ensure_type(fd, *d);
-                if (r < 0) {
-                        if (r != -ENOENT) /* don't log if just gone by now */
-                                log_debug_errno(r, "Failed to check if '%s/%s' is a directory, ignoring: %m", strempty(arg_root), j);
-                        continue;
-                }
-
-                if ((*d)->d_type != DT_DIR)
-                        continue;
 
                 _cleanup_free_ char *fn = path_join((*d)->d_name, "vmlinuz");
                 if (!fn)
@@ -1460,7 +1599,7 @@ static int verb_list(int argc, char *argv[], void *userdata) {
                         exists = true;
 
                 r = table_add_many(table,
-                                   TABLE_STRING, (*d)->d_name,
+                                   TABLE_VERSION, (*d)->d_name,
                                    TABLE_BOOLEAN_CHECKMARK, exists,
                                    TABLE_SET_COLOR, ansi_highlight_green_red(exists),
                                    TABLE_PATH, j);
@@ -1471,130 +1610,51 @@ static int verb_list(int argc, char *argv[], void *userdata) {
         return table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, arg_legend);
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
+VERB_COMMON_HELP_AUTO_PROGRAM("kernel-install");
 
-        r = terminal_urlify_man("kernel-install", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s [OPTIONS...] COMMAND ...\n\n"
-               "%5$sAdd and remove kernel and initrd images to and from the boot partition.%6$s\n"
-               "\n%3$sUsage:%4$s\n"
-               "  kernel-install [OPTIONS...] add [[[KERNEL-VERSION] KERNEL-IMAGE] [INITRD ...]]\n"
-               "  kernel-install [OPTIONS...] add-all\n"
-               "  kernel-install [OPTIONS...] remove KERNEL-VERSION\n"
-               "  kernel-install [OPTIONS...] inspect [[[KERNEL-VERSION] KERNEL-IMAGE]\n"
-               "                                      [INITRD ...]]\n"
-               "  kernel-install [OPTIONS...] list\n"
-               "\n%3$sOptions:%4$s\n"
-               "  -h --help                    Show this help\n"
-               "     --version                 Show package version\n"
-               "  -v --verbose                 Increase verbosity\n"
-               "     --esp-path=PATH           Path to the EFI System Partition (ESP)\n"
-               "     --boot-path=PATH          Path to the $BOOT partition\n"
-               "     --make-entry-directory=yes|no|auto\n"
-               "                               Create $BOOT/ENTRY-TOKEN/ directory\n"
-               "     --entry-type=type1|type2|all\n"
-               "                               Operate only on the specified bootloader\n"
-               "                               entry type\n"
-               "     --entry-token=machine-id|os-id|os-image-id|auto|literal:…\n"
-               "                               Entry token to be used for this installation\n"
-               "     --no-pager                Do not pipe inspect output into a pager\n"
-               "     --json=pretty|short|off   Generate JSON output\n"
-               "     --no-legend               Do not show the headers and footers\n"
-               "     --root=PATH               Operate on an alternate filesystem root\n"
-               "     --image=PATH              Operate on disk image as filesystem root\n"
-               "     --image-policy=POLICY     Specify disk image dissection policy\n"
-               "\n"
-               "This program may also be invoked as 'installkernel':\n"
-               "  installkernel  [OPTIONS...] VERSION VMLINUZ [MAP] [INSTALLATION-DIR]\n"
-               "(The optional arguments are passed by kernel build system, but ignored.)\n"
-               "\n"
-               "See the %2$s for details.\n",
-               program_invocation_short_name,
-               link,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal());
-
-        return 0;
-}
-
-static int parse_argv(int argc, char *argv[], Context *c) {
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_NO_LEGEND,
-                ARG_ESP_PATH,
-                ARG_BOOT_PATH,
-                ARG_MAKE_ENTRY_DIRECTORY,
-                ARG_ENTRY_TOKEN,
-                ARG_NO_PAGER,
-                ARG_JSON,
-                ARG_ROOT,
-                ARG_IMAGE,
-                ARG_IMAGE_POLICY,
-                ARG_BOOT_ENTRY_TYPE,
-        };
-        static const struct option options[] = {
-                { "help",                 no_argument,       NULL, 'h'                      },
-                { "version",              no_argument,       NULL, ARG_VERSION              },
-                { "verbose",              no_argument,       NULL, 'v'                      },
-                { "esp-path",             required_argument, NULL, ARG_ESP_PATH             },
-                { "boot-path",            required_argument, NULL, ARG_BOOT_PATH            },
-                { "make-entry-directory", required_argument, NULL, ARG_MAKE_ENTRY_DIRECTORY },
-                { "entry-token",          required_argument, NULL, ARG_ENTRY_TOKEN          },
-                { "no-pager",             no_argument,       NULL, ARG_NO_PAGER             },
-                { "json",                 required_argument, NULL, ARG_JSON                 },
-                { "root",                 required_argument, NULL, ARG_ROOT                 },
-                { "image",                required_argument, NULL, ARG_IMAGE                },
-                { "image-policy",         required_argument, NULL, ARG_IMAGE_POLICY         },
-                { "no-legend",            no_argument,       NULL, ARG_NO_LEGEND            },
-                { "entry-type",           required_argument, NULL, ARG_BOOT_ENTRY_TYPE      },
-                {}
-        };
-        int t, r;
-
+static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         assert(argc >= 0);
         assert(argv);
-        assert(c);
+        assert(remaining_args);
 
-        while ((t = getopt_long(argc, argv, "hv", options, NULL)) >= 0)
-                switch (t) {
-                case 'h':
-                        return help();
+        OptionParser opts = { argc, argv };
+        int r;
 
-                case ARG_VERSION:
+        FOREACH_OPTION_OR_RETURN(c, &opts)
+                switch (c) {
+
+                OPTION_COMMON_HELP:
+                        return command_print_help_name("kernel-install");
+
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_NO_LEGEND:
+                OPTION_COMMON_NO_LEGEND:
                         arg_legend = false;
                         break;
 
-                case 'v':
+                OPTION('v', "verbose", NULL, "Increase verbosity"):
                         log_set_max_level(LOG_DEBUG);
                         arg_verbose = true;
                         break;
 
-                case ARG_ESP_PATH:
-                        r = parse_path_argument(optarg, /* suppress_root = */ false, &arg_esp_path);
+                OPTION_LONG("esp-path", "PATH", "Path to the EFI System Partition (ESP)"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_esp_path);
                         if (r < 0)
-                                return log_oom();
+                                return r;
                         break;
 
-                case ARG_BOOT_PATH:
-                        r = parse_path_argument(optarg, /* suppress_root = */ false, &arg_xbootldr_path);
+                OPTION_LONG("boot-path", "PATH", "Path to the $BOOT partition"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_xbootldr_path);
                         if (r < 0)
-                                return log_oom();
+                                return r;
                         break;
 
-                case ARG_MAKE_ENTRY_DIRECTORY:
-                        if (streq(optarg, "auto"))
+                OPTION_COMMON_MAKE_ENTRY_DIRECTORY:
+                        if (streq(opts.arg, "auto"))
                                 arg_make_entry_directory = -1;
                         else {
-                                r = parse_boolean_argument("--make-entry-directory=", optarg, NULL);
+                                r = parse_boolean_argument("--make-entry-directory=", opts.arg, NULL);
                                 if (r < 0)
                                         return r;
 
@@ -1602,86 +1662,94 @@ static int parse_argv(int argc, char *argv[], Context *c) {
                         }
                         break;
 
-                case ARG_ENTRY_TOKEN:
-                        r = parse_boot_entry_token_type(optarg, &c->entry_token_type, &c->entry_token);
+                OPTION_COMMON_ENTRY_TOKEN:
+                        r = parse_boot_entry_token_type(opts.arg, &arg_entry_token_type, &arg_entry_token);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_NO_PAGER:
+                OPTION_LONG("entry-type", "TYPE",
+                            "Operate only on the specified bootloader entry type (type1, type2, all)"): {
+                        if (isempty(opts.arg) || streq(opts.arg, "all")) {
+                                arg_boot_entry_type = _BOOT_ENTRY_TYPE_INVALID;
+                                break;
+                        }
+
+                        BootEntryType e = boot_entry_type_from_string(opts.arg);
+                        if (e < 0)
+                                return log_error_errno(e, "Invalid entry type: %s", opts.arg);
+                        arg_boot_entry_type = e;
+                        break;
+                }
+
+                OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
-                case ARG_JSON:
-                        r = parse_json_argument(optarg, &arg_json_format_flags);
+                OPTION_COMMON_JSON:
+                        r = parse_json_argument(opts.arg, &arg_json_format_flags);
+                        if (r <= 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("root", "PATH", "Operate on an alternate filesystem root"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_root);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_ROOT:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_root);
+                OPTION_LONG("image", "PATH", "Operate on disk image as filesystem root"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_image);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_IMAGE:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_image);
+                OPTION_LONG("image-policy", "POLICY", "Specify disk image dissection policy"):
+                        r = parse_image_policy_argument(opts.arg, &arg_image_policy);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_IMAGE_POLICY:
-                        r = parse_image_policy_argument(optarg, &arg_image_policy);
-                        if (r < 0)
-                                return r;
-                        break;
-
-                case ARG_BOOT_ENTRY_TYPE:
-                        r = context_set_entry_type(c, optarg);
-                        if (r < 0)
-                                return r;
-                        break;
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(arg_json_format_flags);
                 }
 
         if (arg_image && arg_root)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Please specify either --root= or --image=, the combination of both is not supported.");
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Please specify either --root= or --image=, the combination of both is not supported.");
 
+        *remaining_args = option_parser_get_args(&opts);
         return 1;
 }
 
+/* Definition for the compat interface to populate introspection data.
+ * Keep below the VERB definitions for the main command. */
+COMMAND(
+        "installkernel\0",
+        "Add and remove kernel and initrd images to and from the boot partition.",
+        .argspec = "VERSION VMLINUZ [MAP] [INSTALLATION-DIR]\0",
+        .footer = "This is a compat interface intended only to be called from kernel Makefiles.",
+        .man_pages = "kernel-install(8)\0",
+        .pager_flags = &arg_pager_flags,
+);
+
 static int run(int argc, char* argv[]) {
-        static const Verb verbs[] = {
-                { "add",         1,        VERB_ANY, 0,            verb_add            },
-                { "add-all",     1,        1,        0,            verb_add_all        },
-                { "remove",      2,        VERB_ANY, 0,            verb_remove         },
-                { "inspect",     1,        VERB_ANY, VERB_DEFAULT, verb_inspect        },
-                { "list",        1,        1,        0,            verb_list           },
-                {}
-        };
-        _cleanup_(context_done) Context c = {
-                .rfd = AT_FDCWD,
-                .action = _ACTION_INVALID,
-                .kernel_image_type = KERNEL_IMAGE_TYPE_UNKNOWN,
-                .layout = _LAYOUT_INVALID,
-                .entry_type = _BOOT_ENTRY_TYPE_INVALID,
-                .entry_token_type = BOOT_ENTRY_TOKEN_AUTO,
-        };
-        _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
-        _cleanup_(umount_and_freep) char *mounted_dir = NULL;
         int r;
+
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
 
         log_setup();
 
-        r = parse_argv(argc, argv, &c);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
+        _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
+        _cleanup_(umount_and_freep) char *mounted_dir = NULL;
         if (arg_image) {
                 assert(!arg_root);
 
@@ -1704,14 +1772,10 @@ static int run(int argc, char* argv[]) {
                         return log_oom();
         }
 
-        r = context_init(&c);
-        if (r < 0)
-                return r;
-
         if (invoked_as(argv, "installkernel"))
-                return run_as_installkernel(argc, argv, &c);
+                return run_as_installkernel(args);
 
-        return dispatch_verb(argc, argv, verbs, &c);
+        return dispatch_verb(args, /* userdata= */ NULL);
 }
 
 DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);

@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include "sd-bus.h"
+#include "sd-json.h"
 
 #include "blockdev-util.h"
 #include "btrfs-util.h"
@@ -47,9 +48,6 @@
 #include "user-record-sign.h"
 #include "user-record-util.h"
 #include "user-util.h"
-
-/* Retry to deactivate home directories again and again every 15s until it works */
-#define RETRY_DEACTIVATE_USEC (15U * USEC_PER_SEC)
 
 #define HOME_USERS_MAX 500
 #define PENDING_OPERATIONS_MAX 100
@@ -513,7 +511,7 @@ static void home_start_retry_deactivate(Home *h) {
                         h->manager->event,
                         &h->retry_deactivate_event_source,
                         CLOCK_MONOTONIC,
-                        RETRY_DEACTIVATE_USEC,
+                        HOME_RETRY_DEACTIVATE_USEC,
                         1*USEC_PER_MINUTE,
                         home_on_retry_deactivate,
                         h);
@@ -554,11 +552,13 @@ static void home_set_state(Home *h, HomeState state) {
 
 static int home_parse_worker_stdout(int _fd, UserRecord **ret) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
-        _cleanup_close_ int fd = _fd; /* take possession, even on failure */
+        _cleanup_close_ int fd = ASSERT_FD(TAKE_FD(_fd)); /* take possession, even on failure */
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
         _cleanup_fclose_ FILE *f = NULL;
         struct stat st;
         int r;
+
+        assert(ret);
 
         if (fstat(fd, &st) < 0)
                 return log_error_errno(errno, "Failed to stat stdout fd: %m");
@@ -570,26 +570,24 @@ static int home_parse_worker_stdout(int _fd, UserRecord **ret) {
                 return 0;
         }
 
-        if (lseek(fd, SEEK_SET, 0) < 0)
-                return log_error_errno(errno, "Failed to seek to beginning of memfd: %m");
-
         f = take_fdopen(&fd, "r");
         if (!f)
                 return log_error_errno(errno, "Failed to reopen memfd: %m");
 
         if (DEBUG_LOGGING) {
-                _cleanup_free_ char *text = NULL;
+                if (fseek(f, 0, SEEK_SET) < 0)
+                        return log_error_errno(errno, "Failed to seek to beginning of memfd: %m");
 
+                _cleanup_free_ char *text = NULL;
                 r = read_full_stream(f, &text, NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read from client: %m");
 
                 log_debug("Got from worker: %s", text);
-                rewind(f);
         }
 
         unsigned line = 0, column = 0;
-        r = sd_json_parse_file(f, "stdout", SD_JSON_PARSE_SENSITIVE, &v, &line, &column);
+        r = sd_json_parse_file(f, "stdout", SD_JSON_PARSE_MUST_BE_OBJECT|SD_JSON_PARSE_SENSITIVE|SD_JSON_PARSE_SEEK0, &v, &line, &column);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse identity at %u:%u: %m", line, column);
 
@@ -740,7 +738,7 @@ static void home_fixate_finish(Home *h, int ret, UserRecord *hr) {
         secret = TAKE_PTR(h->secret); /* Take possession */
 
         if (ret < 0) {
-                (void) home_count_bad_authentication(h, ret, /* save= */ false);
+                home_count_bad_authentication(h, ret, /* save= */ false);
 
                 (void) convert_worker_errno(h, ret, &error);
                 r = log_error_errno(ret, "Fixation failed: %m");
@@ -831,7 +829,7 @@ static void home_activate_finish(Home *h, int ret, UserRecord *hr) {
         assert(IN_SET(h->state, HOME_ACTIVATING, HOME_ACTIVATING_FOR_ACQUIRE));
 
         if (ret < 0) {
-                (void) home_count_bad_authentication(h, ret, /* save= */ true);
+                home_count_bad_authentication(h, ret, /* save= */ true);
 
                 (void) convert_worker_errno(h, ret, &error);
                 r = log_full_errno(error_is_bad_password(ret) ? LOG_NOTICE : LOG_ERR,
@@ -994,7 +992,7 @@ static void home_change_finish(Home *h, int ret, UserRecord *hr) {
         flags = h->current_operation ? h->current_operation->call_flags : 0;
 
         if (ret < 0) {
-                (void) home_count_bad_authentication(h, ret, /* save= */ true);
+                home_count_bad_authentication(h, ret, /* save= */ true);
 
                 (void) convert_worker_errno(h, ret, &error);
                 r = log_full_errno(error_is_bad_password(ret) ? LOG_NOTICE : LOG_ERR,
@@ -1003,6 +1001,60 @@ static void home_change_finish(Home *h, int ret, UserRecord *hr) {
         }
 
         if (hr) {
+                _cleanup_(user_record_unrefp) UserRecord *signed_hr = NULL;
+                bool signed_locally = false;
+                int allowed;
+
+                allowed = user_record_self_changes_allowed(h->record, hr);
+                if (allowed < 0) {
+                        r = log_error_errno(allowed, "Failed to determine whether worker returned permitted changes: %m");
+                        goto finish;
+                }
+
+                if (!allowed) {
+                        r = home_verify_user_record(h, hr, &signed_locally, &error);
+                        if (r < 0)
+                                goto finish;
+                } else {
+                        int is_signed = manager_verify_user_record(h->manager, hr);
+
+                        switch (is_signed) {
+
+                        case USER_RECORD_SIGNED_EXCLUSIVE:
+                                signed_locally = true;
+                                break;
+
+                        case USER_RECORD_SIGNED:
+                        case USER_RECORD_FOREIGN:
+                                break;
+
+                        case USER_RECORD_UNSIGNED:
+                                if (h->signed_locally <= 0) {
+                                        r = sd_bus_error_setf(&error, BUS_ERROR_HOME_RECORD_SIGNED,
+                                                              "Home %s is signed and cannot be modified locally.", h->user_name);
+                                        goto finish;
+                                }
+
+                                r = manager_sign_user_record(h->manager, hr, &signed_hr, &error);
+                                if (r < 0)
+                                        goto finish;
+
+                                hr = signed_hr;
+                                signed_locally = true;
+                                break;
+
+                        case -ENOKEY:
+                                r = home_verify_user_record(h, hr, &signed_locally, &error);
+                                assert(r < 0);
+                                goto finish;
+
+                        default:
+                                assert(is_signed < 0);
+                                r = log_error_errno(is_signed, "Failed to verify worker returned record: %m");
+                                goto finish;
+                        }
+                }
+
                 if (!FLAGS_SET(flags, SD_HOMED_UPDATE_OFFLINE)) {
                         r = user_record_good_authentication(h->record);
                         if (r < 0)
@@ -1010,8 +1062,11 @@ static void home_change_finish(Home *h, int ret, UserRecord *hr) {
                 }
 
                 r = home_set_record(h, hr);
-                if (r >= 0)
+                if (r >= 0) {
+                        h->signed_locally = signed_locally;
+
                         r = home_save_record(h);
+                }
                 if (r < 0) {
                         if (FLAGS_SET(flags, SD_HOMED_UPDATE_OFFLINE)) {
                                 log_error_errno(r, "Failed to update home record and write it to disk: %m");
@@ -1069,7 +1124,7 @@ static void home_unlocking_finish(Home *h, int ret, UserRecord *hr) {
         assert(IN_SET(h->state, HOME_UNLOCKING, HOME_UNLOCKING_FOR_ACQUIRE));
 
         if (ret < 0) {
-                (void) home_count_bad_authentication(h, ret, /* save= */ true);
+                home_count_bad_authentication(h, ret, /* save= */ true);
 
                 (void) convert_worker_errno(h, ret, &error);
                 r = log_full_errno(error_is_bad_password(ret) ? LOG_NOTICE : LOG_ERR,
@@ -1092,9 +1147,8 @@ static void home_unlocking_finish(Home *h, int ret, UserRecord *hr) {
 
         log_debug("Unlocking operation of %s completed.", h->user_name);
 
-        h->current_operation = operation_result_unref(h->current_operation, r, &error);
+        h->current_operation = operation_result_unref(h->current_operation, 0, NULL);
         home_set_state(h, _HOME_STATE_INVALID);
-        return;
 }
 
 static void home_authenticating_finish(Home *h, int ret, UserRecord *hr) {
@@ -1105,7 +1159,7 @@ static void home_authenticating_finish(Home *h, int ret, UserRecord *hr) {
         assert(IN_SET(h->state, HOME_AUTHENTICATING, HOME_AUTHENTICATING_WHILE_ACTIVE, HOME_AUTHENTICATING_FOR_ACQUIRE));
 
         if (ret < 0) {
-                (void) home_count_bad_authentication(h, ret, /* save= */ true);
+                home_count_bad_authentication(h, ret, /* save= */ true);
 
                 (void) convert_worker_errno(h, ret, &error);
                 r = log_full_errno(error_is_bad_password(ret) ? LOG_NOTICE : LOG_ERR,
@@ -1114,10 +1168,21 @@ static void home_authenticating_finish(Home *h, int ret, UserRecord *hr) {
         }
 
         if (hr) {
+                bool signed_locally = false, signed_locally_needs_update = false;
+
+                r = home_verify_user_record(h, hr, &signed_locally, /* ret_error= */ NULL);
+                if (r < 0)
+                        hr = h->record;
+                else
+                        signed_locally_needs_update = true;
+
                 r = home_set_record(h, hr);
                 if (r < 0)
                         log_warning_errno(r, "Failed to update home record, ignoring: %m");
                 else {
+                        if (signed_locally_needs_update)
+                                h->signed_locally = signed_locally;
+
                         r = user_record_good_authentication(h->record);
                         if (r < 0)
                                 log_warning_errno(r, "Failed to increase good authentication counter, ignoring: %m");
@@ -1327,7 +1392,7 @@ static int home_start_work(
         if (r == 0) {
                 /* Child */
 
-                if (setenv("NOTIFY_SOCKET", h->manager->notify_socket_path, /* overwrite = */ true) < 0) {
+                if (setenv("NOTIFY_SOCKET", h->manager->notify_socket_path, /* overwrite= */ true) < 0) {
                         log_error_errno(errno, "Failed to set $NOTIFY_SOCKET: %m");
                         _exit(EXIT_FAILURE);
                 }
@@ -2011,7 +2076,7 @@ int home_passwd(Home *h,
                  * data. This is useful as a way to propagate updated user records into the LUKS backends
                  * properly. */
 
-                r = user_record_make_hashed_password(c, new_secret->password, /* extend = */ false);
+                r = user_record_make_hashed_password(c, new_secret->password, /* extend= */ false);
                 if (r < 0)
                         return r;
 
@@ -2189,7 +2254,7 @@ void home_process_notify(Home *h, char **l, int fd) {
                         return (void) log_debug_errno(r, "Failed to parse SYSTEMD_LUKS_LOCK_FD value: %m");
                 if (r > 0) {
                         if (taken_fd < 0)
-                                return (void) log_debug("Got notify message with SYSTEMD_LUKS_LOCK_FD=1 but no fd passed, ignoring: %m");
+                                return (void) log_debug("Got notify message with SYSTEMD_LUKS_LOCK_FD=1 but no fd passed, ignoring.");
 
                         close_and_replace(h->luks_lock_fd, taken_fd);
 
@@ -2199,7 +2264,7 @@ void home_process_notify(Home *h, char **l, int fd) {
                         home_maybe_close_luks_lock_fd(h, _HOME_STATE_INVALID);
                 } else {
                         if (taken_fd >= 0)
-                                return (void) log_debug("Got notify message with SYSTEMD_LUKS_LOCK_FD=0 but fd passed, ignoring: %m");
+                                return (void) log_debug("Got notify message with SYSTEMD_LUKS_LOCK_FD=0 but fd passed, ignoring.");
 
                         h->luks_lock_fd = safe_close(h->luks_lock_fd);
                 }
@@ -2233,9 +2298,10 @@ int home_killall(Home *h) {
         assert(h->uid > 0); /* We never should be UID 0 */
 
         /* Let's kill everything matching the specified UID */
-        r = safe_fork("(sd-killer)",
-                      FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGKILL|FORK_WAIT|FORK_LOG|FORK_REOPEN_LOG,
-                      NULL);
+        r = pidref_safe_fork(
+                        "(sd-killer)",
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGKILL|FORK_WAIT|FORK_LOG|FORK_REOPEN_LOG,
+                        /* ret= */ NULL);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -2687,9 +2753,9 @@ int home_augment_status(
                 disk_ceiling = USER_DISK_SIZE_MAX;
 
         r = sd_json_buildo(&status,
-                           SD_JSON_BUILD_PAIR("state", SD_JSON_BUILD_STRING(home_state_to_string(state))),
+                           SD_JSON_BUILD_PAIR_STRING("state", home_state_to_string(state)),
                            SD_JSON_BUILD_PAIR("service", JSON_BUILD_CONST_STRING("io.systemd.Home")),
-                           SD_JSON_BUILD_PAIR("useFallback", SD_JSON_BUILD_BOOLEAN(!HOME_STATE_IS_ACTIVE(state))),
+                           SD_JSON_BUILD_PAIR_BOOLEAN("useFallback", !HOME_STATE_IS_ACTIVE(state)),
                            SD_JSON_BUILD_PAIR("fallbackShell", JSON_BUILD_CONST_STRING(BINDIR "/systemd-home-fallback-shell")),
                            SD_JSON_BUILD_PAIR("fallbackHomeDirectory", JSON_BUILD_CONST_STRING("/")),
                            SD_JSON_BUILD_PAIR_CONDITION(disk_size != UINT64_MAX, "diskSize", SD_JSON_BUILD_UNSIGNED(disk_size)),
@@ -3213,8 +3279,9 @@ static int home_get_image_path_seat(Home *h, char **ret) {
         if (stat(ip, &st) < 0)
                 return -errno;
 
-        if (!S_ISBLK(st.st_mode))
-                return -ENOTBLK;
+        r = stat_verify_block(&st);
+        if (r < 0)
+                return r;
 
         r = sd_device_new_from_stat_rdev(&d, &st);
         if (r < 0)
@@ -3299,11 +3366,14 @@ int home_wait_for_worker(Home *h) {
 
         log_info("Worker process for home %s is still running while exiting. Waiting for it to finish.", h->user_name);
 
-        r = wait_for_terminate_with_timeout(h->worker_pid.pid, 30 * USEC_PER_SEC);
+        siginfo_t si;
+        r = pidref_wait_for_terminate_full(&h->worker_pid, 30 * USEC_PER_SEC, &si);
         if (r == -ETIMEDOUT)
                 log_warning_errno(r, "Waiting for worker process for home %s timed out. Ignoring.", h->user_name);
         else if (r < 0)
-                log_warning_errno(r, "Failed to wait for worker process for home %s. Ignoring.", h->user_name);
+                log_warning_errno(r, "Failed to wait for worker process for home %s, ignoring: %m", h->user_name);
+        else if (si.si_code != CLD_EXITED || si.si_status != 0)
+                log_warning("Worker process for home %s failed with non-zero exit status. Ignoring.", h->user_name);
 
         (void) hashmap_remove_value(h->manager->homes_by_worker_pid, &h->worker_pid, h);
         pidref_done(&h->worker_pid);

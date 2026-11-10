@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
-# ruff: noqa: E501 UP015
+# ruff: noqa: UP015
 
 import os
 import re
 import sys
+from pathlib import Path
 from typing import IO
 
 
@@ -61,6 +62,23 @@ def process_header_file(file: IO[str]) -> str:
             text += f'        {{ "{m[1]}", {m[1]} }},\n'
             continue
 
+        # Functions declared by ref/unref macros
+        m = re.search(r'_SD_DECLARE_TRIVIAL_REF_UNREF_FUNC\((\w+)\)', line)
+        if m:
+            text += f'        {{ "{m[1]}_ref", {m[1]}_ref }},\n'
+            text += f'        {{ "{m[1]}_unref", {m[1]}_unref }},\n'
+            continue
+
+        m = re.search(r'_SD_DECLARE_TRIVIAL_REF_FUNC\((\w+)\)', line)
+        if m:
+            text += f'        {{ "{m[1]}_ref", {m[1]}_ref }},\n'
+            continue
+
+        m = re.search(r'_SD_DECLARE_TRIVIAL_UNREF_FUNC\((\w+)\)', line)
+        if m:
+            text += f'        {{ "{m[1]}_unref", {m[1]}_unref }},\n'
+            continue
+
     return text
 
 
@@ -102,52 +120,55 @@ def process_source_file(file: IO[str]) -> None:
             continue
 
 
-print("""/* SPDX-License-Identifier: LGPL-2.1-or-later */
+print('''/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-""")
+''')
 
 for header in sys.argv[3:]:
     with open(header, 'r') as f:
         if process_header_file(f):
             print('#include "{}"'.format(header.split('/')[-1]))
 
-print("""
+print('''
 /* We want to check deprecated symbols too, without complaining */
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-""")
+''')
 
-print("""
+print('''
 struct symbol {
         const char *name;
         const void *symbol;
 };
-static struct symbol symbols_from_sym[] = {""")
+static struct symbol symbols_from_sym[] = {''')
 
 with open(sys.argv[1], 'r') as f:
     process_sym_file(f)
 
-print("""        {}
-}, symbols_from_header[] = {""")
+print('''        {}
+}, symbols_from_header[] = {''')
 
 for header in sys.argv[3:]:
     with open(header, 'r') as f:
         print(process_header_file(f), end='')
 
-print("""        {}
-}, symbols_from_source[] = {""")
+print('''        {}
+}, symbols_from_source[] = {''')
 
 for dirpath, _, filenames in sorted(os.walk(sys.argv[2])):
     for filename in sorted(filenames):
         if not filename.endswith('.c') and not filename.endswith('.h'):
             continue
-        with open(os.path.join(dirpath, filename), 'r') as f:
+        p = Path(dirpath) / filename
+        if p.is_symlink():
+            continue
+        with p.open('rt') as f:
             process_source_file(f)
 
-print("""        {}
+print('''        {}
 };
 
 static int sort_callback(const void *a, const void *b) {
@@ -218,4 +239,4 @@ int main(void) {
         }
 
         return n_error == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
-}""")
+}''')

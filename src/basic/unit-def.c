@@ -1,7 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <stdio.h>
-
 #include "alloc-util.h"
 #include "bus-label.h"
 #include "glyph-util.h"
@@ -25,6 +23,8 @@ char* unit_dbus_path_from_name(const char *name) {
 int unit_name_from_dbus_path(const char *path, char **name) {
         const char *e;
         char *n;
+
+        assert(name);
 
         e = startswith(path, "/org/freedesktop/systemd1/unit/");
         if (!e)
@@ -70,6 +70,14 @@ const char* unit_dbus_interface_from_name(const char *name) {
                 return NULL;
 
         return unit_dbus_interface_from_type(t);
+}
+
+const char* unit_type_to_capitalized_string(UnitType t) {
+        const char *di = unit_dbus_interface_from_type(t);
+        if (!di)
+                return NULL;
+
+        return ASSERT_PTR(startswith(di, "org.freedesktop.systemd1."));
 }
 
 static const char* const unit_type_table[_UNIT_TYPE_MAX] = {
@@ -144,9 +152,21 @@ FreezerState freezer_state_finish(FreezerState state) {
         return freezer_state_finish_table[state];
 }
 
+FreezerState freezer_state_objective(FreezerState state) {
+        FreezerState objective;
+
+        objective = freezer_state_finish(state);
+        if (objective == FREEZER_FROZEN_BY_PARENT)
+                objective = FREEZER_FROZEN;
+
+        return objective;
+}
+
 static const char* const unit_marker_table[_UNIT_MARKER_MAX] = {
         [UNIT_MARKER_NEEDS_RELOAD]  = "needs-reload",
         [UNIT_MARKER_NEEDS_RESTART] = "needs-restart",
+        [UNIT_MARKER_NEEDS_STOP]    = "needs-stop",
+        [UNIT_MARKER_NEEDS_START]   = "needs-start",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(unit_marker, UnitMarker);
@@ -213,11 +233,14 @@ static const char* const service_state_table[_SERVICE_STATE_MAX] = {
         [SERVICE_START]                      = "start",
         [SERVICE_START_POST]                 = "start-post",
         [SERVICE_RUNNING]                    = "running",
+        [SERVICE_RUNNING_REVALIDATING]       = "running-revalidating",
         [SERVICE_EXITED]                     = "exited",
+        [SERVICE_REFRESH_EXTENSIONS]         = "refresh-extensions",
+        [SERVICE_REFRESH_CREDENTIALS]        = "refresh-credentials",
         [SERVICE_RELOAD]                     = "reload",
         [SERVICE_RELOAD_SIGNAL]              = "reload-signal",
         [SERVICE_RELOAD_NOTIFY]              = "reload-notify",
-        [SERVICE_REFRESH_EXTENSIONS]         = "refresh-extensions",
+        [SERVICE_RELOAD_POST]                = "reload-post",
         [SERVICE_STOP]                       = "stop",
         [SERVICE_STOP_WATCHDOG]              = "stop-watchdog",
         [SERVICE_STOP_SIGTERM]               = "stop-sigterm",
@@ -371,6 +394,17 @@ static const char* const exec_directory_type_table[_EXEC_DIRECTORY_TYPE_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP(exec_directory_type, ExecDirectoryType);
+
+/* D-Bus properties carrying the symlink destinations and flags for each directory type. */
+static const char* const exec_directory_type_symlink_table[_EXEC_DIRECTORY_TYPE_MAX] = {
+        [EXEC_DIRECTORY_RUNTIME]       = "RuntimeDirectorySymlink",
+        [EXEC_DIRECTORY_STATE]         = "StateDirectorySymlink",
+        [EXEC_DIRECTORY_CACHE]         = "CacheDirectorySymlink",
+        [EXEC_DIRECTORY_LOGS]          = "LogsDirectorySymlink",
+        [EXEC_DIRECTORY_CONFIGURATION] = "ConfigurationDirectorySymlink",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(exec_directory_type_symlink, ExecDirectoryType);
 
 Glyph unit_active_state_to_glyph(UnitActiveState state) {
         static const Glyph map[_UNIT_ACTIVE_STATE_MAX] = {

@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
+#include "crypto-util.h"
 #include "json-util.h"
 #include "log.h"
-#include "openssl-util.h"
 #include "user-record-sign.h"
 #include "user-record.h"
 
@@ -58,8 +58,8 @@ int user_record_sign(UserRecord *ur, EVP_PKEY *private_key, UserRecord **ret) {
                         &v,
                         "signature",
                         SD_JSON_BUILD_ARRAY(
-                                        SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR("data", SD_JSON_BUILD_BASE64(signature, signature_size)),
-                                                             SD_JSON_BUILD_PAIR("key", SD_JSON_BUILD_STRING(key)))));
+                                        SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_BASE64("data", signature, signature_size),
+                                                             SD_JSON_BUILD_PAIR_STRING("key", key))));
         if (r < 0)
                 return r;
 
@@ -118,14 +118,19 @@ int user_record_verify(UserRecord *ur, EVP_PKEY *public_key) {
                 if (r < 0)
                         return r;
 
-                md_ctx = EVP_MD_CTX_new();
+                md_ctx = sym_EVP_MD_CTX_new();
                 if (!md_ctx)
                         return -ENOMEM;
 
-                if (EVP_DigestVerifyInit(md_ctx, NULL, NULL, NULL, public_key) <= 0)
-                        return -EIO;
+                if (sym_EVP_DigestVerifyInit(md_ctx, NULL, NULL, NULL, public_key) <= 0)
+                        return log_openssl_errors(LOG_DEBUG, "Failed to initialize signature verification");
 
-                if (EVP_DigestVerify(md_ctx, signature, signature_size, (uint8_t*) text, strlen(text)) <= 0) {
+                if (sym_EVP_DigestVerify(md_ctx, signature, signature_size, (uint8_t*) text, strlen(text)) <= 0) {
+                        /* A bad signature is an expected outcome here (counted as n_bad), but it may leave
+                         * entries in the thread-local OpenSSL error queue. Clear them so a later iteration's
+                         * failure — or an unrelated caller on this thread — translates its own error rather
+                         * than this stale one. */
+                        sym_ERR_clear_error();
                         n_bad++;
                         continue;
                 }

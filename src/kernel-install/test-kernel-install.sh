@@ -11,7 +11,8 @@ loaderentry_install="${2:?}"
 uki_copy_install="${3:?}"
 ukify="${4:-}"
 ukify_install="${5:-}"
-boot_stub="${6:-}"
+test_ukify_install="${6:-}"
+boot_stub="${7:-}"
 if [[ -d "${PROJECT_BUILD_ROOT:-}" ]]; then
     bootctl="${PROJECT_BUILD_ROOT}/bootctl"
 else
@@ -29,7 +30,12 @@ mkdir -p "$D/sources"
 echo 'buzy image' >"$D/sources/linux"
 echo 'the initrd' >"$D/sources/initrd"
 echo 'the-token' >"$D/sources/entry-token"
-echo 'opt1 opt2' >"$D/sources/cmdline"
+
+cat >"$D/sources/cmdline" <<EOF
+opt1
+# commented line
+opt2
+EOF
 
 cat >"$D/sources/install.conf" <<EOF
 layout=bls
@@ -136,8 +142,38 @@ grep -qE '^initrd .*/the-token/1.1.1/initrd' "$entry"
 grep -qE 'image' "$BOOT_ROOT/the-token/1.1.1/linux"
 grep -qE 'initrd' "$BOOT_ROOT/the-token/1.1.1/initrd"
 
+# Tries and devicetree files without trailing newline are accepted (issue #39881)
+rm "$entry"
+printf '%s' '56' >"$D/sources/tries"
+printf '%s' 'subdir/whatever.dtb' >"$D/sources/devicetree"
+"$kernel_install" -v add 1.1.1 "$D/sources/linux" "$D/sources/initrd"
+test -f "$entry"
+grep -qE '^devicetree .*/the-token/1.1.1/whatever.dtb' "$entry"
+
+# Empty tries files and empty or newline-only devicetree files are refused before the previous entry,
+# kernel image and devicetree blob are touched
+check_refused() {
+    ( ! "$kernel_install" -v add 1.1.1 "$D/sources/linux-new" "$D/sources/initrd" 2>"$D/err" )
+    grep -qF "$1" "$D/err"
+    cmp "$D/entry.orig" "$entry"
+    cmp "$D/sources/linux" "$BOOT_ROOT/the-token/1.1.1/linux"
+    cmp "$D/sources/subdir/whatever.dtb" "$BOOT_ROOT/the-token/1.1.1/whatever.dtb"
+}
+echo 'new image' >"$D/sources/linux-new"
+cp "$entry" "$D/entry.orig"
+: >"$D/sources/tries"
+check_refused "$D/sources/tries does not contain an integer."
+echo '56' >"$D/sources/tries"
+for dt in '' $'\n'; do
+    printf '%s' "$dt" >"$D/sources/devicetree"
+    check_refused "Error: '$D/sources/devicetree' is empty or cannot be read."
+done
+echo 'subdir/whatever.dtb' >"$D/sources/devicetree"
+
 # Install UKI
 if [ -f "$ukify" ]; then
+    "$test_ukify_install" "$ukify_install"
+
     mkdir "$D/sources/install.conf.d"
     cat >>"$D/sources/install.conf.d/override.conf" <<EOF
 layout=uki
@@ -149,17 +185,17 @@ EOF
     test -f "$uki"
 
     if [ -x "$bootctl" ]; then
-        "$bootctl" kernel-inspect "$uki" | grep -qE 'Kernel Type: +uki$'
-        "$bootctl" kernel-inspect "$uki" | grep -qE 'Version: +1\.1\.3$'
-        "$bootctl" kernel-inspect "$uki" | grep -qE 'Cmdline: +opt1 opt2$'
+        "$bootctl" kernel-inspect "$uki" | grep -E 'Kernel Type: +uki$' >/dev/null
+        "$bootctl" kernel-inspect "$uki" | grep -E 'Version: +1\.1\.3$' >/dev/null
+        "$bootctl" kernel-inspect "$uki" | grep -E 'Cmdline: +opt1 opt2$' >/dev/null
     fi
 
-    "$ukify" inspect "$uki" | grep -qE '^.sbat'
-    "$ukify" inspect "$uki" | grep -qE '^.cmdline'
-    "$ukify" inspect "$uki" | grep -qE '^.uname'
-    "$ukify" inspect "$uki" | grep -qE '^.initrd'
-    "$ukify" inspect "$uki" | grep -qE '^.linux'
-    "$ukify" inspect "$uki" | grep -qE '^.dtb'
+    "$ukify" inspect "$uki" | grep -E '^.sbat' >/dev/null
+    "$ukify" inspect "$uki" | grep -E '^.cmdline' >/dev/null
+    "$ukify" inspect "$uki" | grep -E '^.uname' >/dev/null
+    "$ukify" inspect "$uki" | grep -E '^.initrd' >/dev/null
+    "$ukify" inspect "$uki" | grep -E '^.linux' >/dev/null
+    "$ukify" inspect "$uki" | grep -E '^.dtb' >/dev/null
 
     rm "$D/sources/install.conf.d/override.conf"
 fi
@@ -287,11 +323,104 @@ test -d "$BOOT_ROOT/hoge"
 rmdir "$BOOT_ROOT/hoge"
 
 ###########################################
+# tests for entry_name_format=
+###########################################
+
+# Test inspect with custom entry_name_format
+cat >>"$D/sources/install.conf" <<EOF
+entry_name_format=%e_%v
+EOF
+
+output="$("$kernel_install" -v --json=pretty inspect 1.1.1 "$D/sources/linux")"
+echo "$output" | grep -E '"EntryNameFormat" : "%e_%v"' >/dev/null
+echo "$output" | grep -E '"EntryName" : "the-token_1.1.1"' >/dev/null
+
+# Test type#1 BLS entry with custom entry_name_format
+rm -f "$D/sources/tries"
+cat >"$D/sources/install.conf" <<EOF
+layout=bls
+initrd_generator=none
+entry_name_format=%e_%v
+EOF
+
+KERNEL_INSTALL_PLUGINS="'${loaderentry_install}' '${uki_copy_install}'" \
+    "$kernel_install" -v add 1.1.4 "$D/sources/linux" "$D/sources/initrd"
+entry="$BOOT_ROOT/loader/entries/the-token_1.1.4.conf"
+test -f "$entry"
+grep -qE '^version +1.1.4' "$entry"
+KERNEL_INSTALL_PLUGINS="'${loaderentry_install}' '${uki_copy_install}'" \
+    "$kernel_install" -v remove 1.1.4
+test ! -e "$entry"
+rm -rf "$BOOT_ROOT/the-token"
+
+# Test UKI with custom entry_name_format
+if [ -f "$ukify" ]; then
+    cat >"$D/sources/install.conf" <<EOF
+layout=uki
+uki_generator=ukify
+initrd_generator=none
+entry_name_format=%e_%v
+EOF
+    rm -f "$D/sources/tries"
+
+    KERNEL_INSTALL_PLUGINS="'${ukify_install}' '${loaderentry_install}' '${uki_copy_install}'" \
+        "$kernel_install" -v add 1.1.5 "$D/sources/linux" "$D/sources/initrd"
+    uki="${BOOT_ROOT}/EFI/Linux/the-token_1.1.5.efi"
+    test -f "$uki"
+    KERNEL_INSTALL_PLUGINS="'${ukify_install}' '${loaderentry_install}' '${uki_copy_install}'" \
+        "$kernel_install" -v remove 1.1.5
+    test ! -e "$uki"
+
+    # Test boot counting with custom entry_name_format
+    echo '56' >"$D/sources/tries"
+    KERNEL_INSTALL_PLUGINS="'${ukify_install}' '${loaderentry_install}' '${uki_copy_install}'" \
+        "$kernel_install" -v add 1.1.5 "$D/sources/linux" "$D/sources/initrd"
+    uki="${BOOT_ROOT}/EFI/Linux/the-token_1.1.5+56.efi"
+    test -f "$uki"
+    KERNEL_INSTALL_PLUGINS="'${ukify_install}' '${loaderentry_install}' '${uki_copy_install}'" \
+        "$kernel_install" -v remove 1.1.5
+    test ! -e "$uki"
+
+    rm -f "$D/sources/tries"
+fi
+
+# Test add-all with custom entry_name_format (exercises context_copy)
+KVER="$(uname -r)"
+if test -f "/usr/lib/modules/$KVER/vmlinuz"; then
+    rm -rf "$BOOT_ROOT"
+    mkdir -p "$BOOT_ROOT"
+    cat >"$D/sources/install.conf" <<EOF
+layout=bls
+initrd_generator=none
+entry_name_format=%e_%v
+EOF
+
+    KERNEL_INSTALL_PLUGINS="'${loaderentry_install}' '${uki_copy_install}'" \
+        "$kernel_install" -v add-all
+    entry="$BOOT_ROOT/loader/entries/the-token_${KVER}.conf"
+    test -f "$entry"
+    grep -qE "^version +${KVER}" "$entry"
+    KERNEL_INSTALL_PLUGINS="'${loaderentry_install}' '${uki_copy_install}'" \
+        "$kernel_install" -v remove "$KVER"
+    test ! -e "$entry"
+    rm -rf "$BOOT_ROOT/the-token"
+fi
+
+# Restore install.conf and plugins
+cat >"$D/sources/install.conf" <<EOF
+initrd_generator=none
+# those are overridden by envvars
+BOOT_ROOT="$D/badboot"
+MACHINE_ID=badbadbadbadbadbad6abadbadbadbad
+EOF
+export KERNEL_INSTALL_PLUGINS="$D/00-skip.install"
+
+###########################################
 # tests for --json=
 ###########################################
 output="$("$kernel_install" -v --json=pretty inspect 1.1.1 "$D/sources/linux")"
 
-diff -u <(echo "$output") - <<EOF
+diff -u <(echo "$output") - >&2 <<EOF
 {
 	"MachineID" : "3e0484f3634a418b8e6a39e8828b03e3",
 	"KernelImageType" : "unknown",
@@ -299,6 +428,8 @@ diff -u <(echo "$output") - <<EOF
 	"BootRoot" : "$BOOT_ROOT",
 	"EntryTokenType" : "literal",
 	"EntryToken" : "the-token",
+	"EntryNameFormat" : "%e-%v",
+	"EntryName" : "the-token-1.1.1",
 	"EntryDirectory" : "$BOOT_ROOT/the-token/1.1.1",
 	"KernelVersion" : "1.1.1",
 	"Kernel" : "$D/sources/linux",
@@ -309,7 +440,7 @@ diff -u <(echo "$output") - <<EOF
 		"$D/00-skip.install"
 	],
 	"PluginEnvironment" : [
-		"LC_COLLATE=C.UTF-8",
+		"LC_COLLATE=$SYSTEMD_DEFAULT_LOCALE",
 		"KERNEL_INSTALL_VERBOSE=1",
 		"KERNEL_INSTALL_IMAGE_TYPE=unknown",
 		"KERNEL_INSTALL_MACHINE_ID=3e0484f3634a418b8e6a39e8828b03e3",
@@ -318,7 +449,8 @@ diff -u <(echo "$output") - <<EOF
 		"KERNEL_INSTALL_LAYOUT=other",
 		"KERNEL_INSTALL_INITRD_GENERATOR=none",
 		"KERNEL_INSTALL_UKI_GENERATOR=",
-		"KERNEL_INSTALL_STAGING_AREA=/tmp/kernel-install.staging.XXXXXX"
+		"KERNEL_INSTALL_STAGING_AREA=${TMPDIR:-/var/tmp}/kernel-install.staging.XXXXXX",
+		"KERNEL_INSTALL_ENTRY_NAME=the-token-1.1.1"
 	]
 }
 EOF
@@ -347,3 +479,29 @@ KERNEL_INSTALL_PLUGINS="$D/10-plugin-fail" "$kernel_install" -v add 1.1.1 "$D/so
 ret=$?
 set -e
 test "$ret" -eq "42"
+
+###########################################
+# tests for tries file handling in 90-uki-copy.install
+###########################################
+uki_copy_add() {
+    KERNEL_INSTALL_CONF_ROOT="$D/uki-conf" \
+    KERNEL_INSTALL_LAYOUT=uki \
+    KERNEL_INSTALL_VERBOSE=1 \
+    KERNEL_INSTALL_ENTRY_TOKEN=the-token \
+    KERNEL_INSTALL_BOOT_ROOT="$D/uki-boot" \
+    KERNEL_INSTALL_STAGING_AREA="$D/uki-staging" \
+        "$uki_copy_install" add 2.0.0 "$D/uki-boot/the-token/2.0.0" "$D/sources/fake.efi"
+}
+mkdir "$D/uki-conf"
+echo 'fake UKI' >"$D/sources/fake.efi"
+
+# A tries file without trailing newline is accepted
+printf '%s' '3' >"$D/uki-conf/tries"
+uki_copy_add
+cmp "$D/sources/fake.efi" "$D/uki-boot/EFI/Linux/the-token-2.0.0+3.efi"
+
+# An empty tries file is refused before the previous UKI is removed
+: >"$D/uki-conf/tries"
+( ! uki_copy_add 2>"$D/err" )
+grep -qF "$D/uki-conf/tries does not contain an integer." "$D/err"
+test -f "$D/uki-boot/EFI/Linux/the-token-2.0.0+3.efi"

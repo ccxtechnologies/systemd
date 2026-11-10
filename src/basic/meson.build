@@ -10,7 +10,7 @@ basic_sources = files(
         'arphrd-util.c',
         'assert-util.c',
         'audit-util.c',
-        'btrfs.c',
+        'btrfs-util.c',
         'build.c',
         'build-path.c',
         'bus-label.c',
@@ -23,6 +23,7 @@ basic_sources = files(
         'compress.c',
         'conf-files.c',
         'confidential-virt.c',
+        'device-nodes.c',
         'devnum-util.c',
         'dirent-util.c',
         'dlfcn-util.c',
@@ -30,16 +31,17 @@ basic_sources = files(
         'env-file.c',
         'env-util.c',
         'errno-list.c',
+        'errno-util.c',
         'escape.c',
         'ether-addr-util.c',
         'extract-word.c',
         'fd-util.c',
+        'fiber-ops.c',
         'fileio.c',
         'filesystems.c',
         'format-ifname.c',
         'format-util.c',
         'fs-util.c',
-        'gcrypt-util.c',
         'glob-util.c',
         'glyph-util.c',
         'gunicode.c',
@@ -55,13 +57,14 @@ basic_sources = files(
         'iovec-util.c',
         'iovec-wrapper.c',
         'keyring-util.c',
-        'label.c',
+        'label-util.c',
         'limits-util.c',
         'locale-util.c',
         'lock-util.c',
         'log.c',
         'log-context.c',
         'login-util.c',
+        'math-util.c',
         'memfd-util.c',
         'memory-util.c',
         'mempool.c',
@@ -97,6 +100,7 @@ basic_sources = files(
         'sort-util.c',
         'stat-util.c',
         'static-destruct.c',
+        'stdio-util.c',
         'strbuf.c',
         'string-table.c',
         'string-util.c',
@@ -122,11 +126,13 @@ sources += basic_sources
 
 generated_gperf_headers = []
 foreach item : [
-        # name,        source,             prefix,    headers
-        ['af',         af_sources,         '',        ['<sys/socket.h>'],       ],
-        ['arphrd',     arphrd_sources,     'ARPHRD_', ['<linux/if_arp.h>'],     ],
-        ['capability', capability_sources, '',        ['<linux/capability.h>'], ],
-        ['errno',      [],                 '',        ['<errno.h>'],            ],
+        # name,             source,             prefix,    headers
+        ['af',              af_sources,         '',        ['<sys/socket.h>'],       ],
+        ['arphrd',          arphrd_sources,     'ARPHRD_', ['<linux/if_arp.h>'],     ],
+        ['capability',      capability_sources, '',        ['<linux/capability.h>'], ],
+        ['errno',           [],                 '',        ['<errno.h>'],            ],
+        ['statx-mask',      statx_sources                                            ],
+        ['statx-attribute', statx_sources                                            ],
 ]
 
         generate_list = files('generate-@0@-list.sh'.format(item[0]))
@@ -136,31 +142,35 @@ foreach item : [
                 command : [env, 'bash', generate_list, cpp, system_include_args],
                 capture : true)
 
-        gperf_file = custom_target(
-                input : list_txt,
-                output : '@0@-from-name.gperf'.format(item[0]),
-                command : [generate_gperfs, item[0], item[2], '@INPUT@'] + item[3],
-                capture : true)
-
-        target1 = custom_target(
-                input : gperf_file,
-                output : '@0@-from-name.inc'.format(item[0]),
-                command : [gperf,
-                           '-L', 'ANSI-C', '-t', '--ignore-case',
-                           '-N', 'lookup_@0@'.format(item[0]),
-                           '-H', 'hash_@0@_name'.format(item[0]),
-                           '-p', '-C',
-                           '@INPUT@'],
-                capture : true)
-
         awkscript = '@0@-to-name.awk'.format(item[0])
-        target2 = custom_target(
+        target = custom_target(
                 input : [awkscript, list_txt],
                 output : '@0@-to-name.inc'.format(item[0]),
                 command : [awk, '-f', '@INPUT0@', '@INPUT1@'],
                 capture : true)
 
-        generated_gperf_headers += [target1, target2]
+        generated_gperf_headers += [target]
+
+        if item.length() > 2
+                gperf_file = custom_target(
+                        input : list_txt,
+                        output : '@0@-from-name.gperf'.format(item[0]),
+                        command : [generate_gperfs, item[0], item[2], '@INPUT@'] + item[3],
+                        capture : true)
+
+                target = custom_target(
+                        input : gperf_file,
+                        output : '@0@-from-name.inc'.format(item[0]),
+                        command : [gperf,
+                                '-L', 'ANSI-C', '-t', '--ignore-case',
+                                '-N', 'lookup_@0@'.format(item[0]),
+                                '-H', 'hash_@0@_name'.format(item[0]),
+                                '-p', '-C',
+                                '@INPUT@'],
+                        capture : true)
+
+                generated_gperf_headers += [target]
+        endif
 endforeach
 
 generated_sources += generated_gperf_headers
@@ -193,8 +203,7 @@ basic_sources += [filesystem_sets_c, filesystems_gperf_h]
 
 test('kernel-filesystem-magics',
      filesystem_sets_py,
-     args : ['check'],
-     env : ['CPP=@0@'.format(cpp)])
+     args : ['check', cpp, system_include_args])
 
 libbasic_static = static_library(
         'basic',
@@ -202,15 +211,11 @@ libbasic_static = static_library(
         fundamental_sources,
         include_directories : basic_includes,
         implicit_include_directories : false,
-        dependencies : [libcap,
-                        libdl,
-                        libgcrypt_cflags,
+        dependencies : [libbzip2_cflags,
                         liblz4_cflags,
-                        libm,
-                        librt,
                         libxz_cflags,
+                        libz_cflags,
                         libzstd_cflags,
-                        threads,
                         userspace],
         c_args : ['-fvisibility=default'],
         build_by_default : false)

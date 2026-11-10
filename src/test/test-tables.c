@@ -12,6 +12,7 @@
 #include "device-private.h"
 #include "discover-image.h"
 #include "execute.h"
+#include "firstboot-util.h"
 #include "gpt.h"
 #include "import-util.h"
 #include "install.h"
@@ -29,13 +30,12 @@
 #include "service.h"
 #include "show-status.h"
 #include "socket.h"
-#include "socket-util.h"
+#include "socket-label.h"
 #include "swap.h"
 #include "test-tables.h"
 #include "tests.h"
 #include "timer.h"
 #include "unit.h"
-#include "unit-name.h"
 #include "virt.h"
 
 int main(int argc, char **argv) {
@@ -58,11 +58,13 @@ int main(int argc, char **argv) {
         test_table(DnssecMode, dnssec_mode, DNSSEC_MODE);
         test_table(EmergencyAction, emergency_action, EMERGENCY_ACTION);
         test_table(ExecDirectoryType, exec_directory_type, EXEC_DIRECTORY_TYPE);
+        test_table(ExecDirectoryType, exec_directory_type_symlink, EXEC_DIRECTORY_TYPE);
         test_table(ExecInput, exec_input, EXEC_INPUT);
         test_table(ExecKeyringMode, exec_keyring_mode, EXEC_KEYRING_MODE);
         test_table(ExecOutput, exec_output, EXEC_OUTPUT);
         test_table(ExecPreserveMode, exec_preserve_mode, EXEC_PRESERVE_MODE);
         test_table(ExecUtmpMode, exec_utmp_mode, EXEC_UTMP_MODE);
+        test_table(FirstBootMode, firstboot_mode, FIRSTBOOT_MODE);
         test_table(ImageType, image_type, IMAGE_TYPE);
         test_table(ImportVerify, import_verify, IMPORT_VERIFY);
         test_table(JobMode, job_mode, JOB_MODE);

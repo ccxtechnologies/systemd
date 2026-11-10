@@ -12,13 +12,36 @@
 #include "lldp-rx-internal.h"
 #include "network-util.h"
 #include "networkd-dhcp-server.h"
+#include "networkd-json.h"
 #include "networkd-link.h"
+#include "networkd-link-varlink.h"
 #include "networkd-manager.h"
 #include "networkd-manager-varlink.h"
 #include "stat-util.h"
+#include "string-util.h"
 #include "varlink-io.systemd.Network.h"
+#include "varlink-io.systemd.Network.Link.h"
 #include "varlink-io.systemd.service.h"
 #include "varlink-util.h"
+
+static int vl_method_describe(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        Manager *m = ASSERT_PTR(userdata);
+        int r;
+
+        assert(parameters);
+        assert(link);
+
+        r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, /* userdata= */ NULL);
+        if (r != 0)
+                return r;
+
+        r = manager_build_json(m, &v);
+        if (r < 0)
+                return log_error_errno(r, "Failed to format JSON data: %m");
+
+        return sd_varlink_reply(link, v);
+}
 
 static int vl_method_get_states(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         Manager *m = ASSERT_PTR(userdata);
@@ -26,17 +49,17 @@ static int vl_method_get_states(sd_varlink *link, sd_json_variant *parameters, s
 
         assert(link);
 
-        r = sd_varlink_dispatch(link, parameters, /* dispatch_table = */ NULL, /* userdata = */ NULL);
+        r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, /* userdata= */ NULL);
         if (r != 0)
                 return r;
 
         return sd_varlink_replybo(
                         link,
-                        SD_JSON_BUILD_PAIR_STRING("AddressState", link_address_state_to_string(m->address_state)),
-                        SD_JSON_BUILD_PAIR_STRING("IPv4AddressState", link_address_state_to_string(m->ipv4_address_state)),
-                        SD_JSON_BUILD_PAIR_STRING("IPv6AddressState", link_address_state_to_string(m->ipv6_address_state)),
+                        JSON_BUILD_PAIR_ENUM("AddressState", link_address_state_to_string(m->address_state)),
+                        JSON_BUILD_PAIR_ENUM("IPv4AddressState", link_address_state_to_string(m->ipv4_address_state)),
+                        JSON_BUILD_PAIR_ENUM("IPv6AddressState", link_address_state_to_string(m->ipv6_address_state)),
                         SD_JSON_BUILD_PAIR_STRING("CarrierState", link_carrier_state_to_string(m->carrier_state)),
-                        SD_JSON_BUILD_PAIR_CONDITION(m->online_state >= 0, "OnlineState", SD_JSON_BUILD_STRING(link_online_state_to_string(m->online_state))),
+                        SD_JSON_BUILD_PAIR_CONDITION(m->online_state >= 0, "OnlineState", JSON_BUILD_STRING_UNDERSCORIFY(link_online_state_to_string(m->online_state))),
                         SD_JSON_BUILD_PAIR_STRING("OperationalState", link_operstate_to_string(m->operational_state)));
 }
 
@@ -47,7 +70,7 @@ static int vl_method_get_namespace_id(sd_varlink *link, sd_json_variant *paramet
 
         assert(link);
 
-        r = sd_varlink_dispatch(link, parameters, /* dispatch_table = */ NULL, /* userdata = */ NULL);
+        r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, /* userdata= */ NULL);
         if (r != 0)
                 return r;
 
@@ -72,51 +95,6 @@ static int vl_method_get_namespace_id(sd_varlink *link, sd_json_variant *paramet
                                SD_JSON_BUILD_PAIR_CONDITION(nsid != UINT32_MAX, "NamespaceNSID", SD_JSON_BUILD_UNSIGNED(nsid)));
 }
 
-typedef struct InterfaceInfo {
-        int ifindex;
-        const char *ifname;
-} InterfaceInfo;
-
-static int dispatch_interface(sd_varlink *vlink, sd_json_variant *parameters, Manager *manager, Link **ret) {
-        static const sd_json_dispatch_field dispatch_table[] = {
-                { "InterfaceIndex", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex,         offsetof(InterfaceInfo, ifindex), SD_JSON_RELAX },
-                { "InterfaceName",  SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string, offsetof(InterfaceInfo, ifname),  0             },
-                {}
-        };
-
-        InterfaceInfo info = {};
-        Link *link = NULL;
-        int r;
-
-        assert(vlink);
-        assert(manager);
-
-        r = sd_varlink_dispatch(vlink, parameters, dispatch_table, &info);
-        if (r != 0)
-                return r;
-
-        if (info.ifindex < 0)
-                return sd_varlink_error_invalid_parameter(vlink, JSON_VARIANT_STRING_CONST("InterfaceIndex"));
-        if (info.ifindex > 0 && link_get_by_index(manager, info.ifindex, &link) < 0)
-                return sd_varlink_error_invalid_parameter(vlink, JSON_VARIANT_STRING_CONST("InterfaceIndex"));
-        if (info.ifname) {
-                Link *link_by_name;
-
-                if (link_get_by_name(manager, info.ifname, &link_by_name) < 0)
-                        return sd_varlink_error_invalid_parameter(vlink, JSON_VARIANT_STRING_CONST("InterfaceName"));
-
-                if (link && link_by_name != link)
-                        /* If both arguments are specified, then these must be consistent. */
-                        return sd_varlink_error_invalid_parameter(vlink, JSON_VARIANT_STRING_CONST("InterfaceName"));
-
-                link = link_by_name;
-        }
-
-        /* If neither InterfaceIndex nor InterfaceName specified, this function returns NULL. */
-        *ret = link;
-        return 0;
-}
-
 static int link_append_lldp_neighbors(Link *link, sd_json_variant *v, sd_json_variant **array) {
         assert(link);
         assert(array);
@@ -138,7 +116,7 @@ static int vl_method_get_lldp_neighbors(sd_varlink *vlink, sd_json_variant *para
         assert(vlink);
         assert(manager);
 
-        r = dispatch_interface(vlink, parameters, manager, &link);
+        r = dispatch_link(vlink, parameters, manager, /* flags= */ 0, &link);
         if (r != 0)
                 return r;
 
@@ -259,9 +237,58 @@ static int vl_method_set_persistent_storage(sd_varlink *vlink, sd_json_variant *
         return sd_varlink_reply(vlink, NULL);
 }
 
-int manager_connect_varlink(Manager *m, int fd) {
+static int vl_method_reload(sd_varlink *vlink, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "reconfigureLinks", SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate, 0, SD_JSON_NULLABLE },
+                VARLINK_DISPATCH_POLKIT_FIELD,
+                {}
+        };
+
+        Manager *m = ASSERT_PTR(userdata);
+        int r;
+
+        assert(vlink);
+
+        if (m->reloading > 0)
+                return sd_varlink_error(vlink, "io.systemd.Network.AlreadyReloading", NULL);
+
+        const char *method;
+        r = sd_varlink_get_current_method(vlink, &method);
+        if (r < 0)
+                return r;
+
+        bool is_network_reload = streq(method, "io.systemd.Network.Reload");
+        int reconfigure_links = -1; /* tristate: -1 = unset (defaults to true) */
+        r = sd_varlink_dispatch(
+                        vlink,
+                        parameters,
+                        is_network_reload ? dispatch_table : dispatch_table_polkit_only,
+                        &reconfigure_links);
+        if (r != 0)
+                return r;
+
+        r = varlink_verify_polkit_async(
+                        vlink,
+                        m->bus,
+                        "org.freedesktop.network1.reload",
+                        /* details= */ NULL,
+                        &m->polkit_registry);
+        if (r <= 0)
+                return r;
+
+        r = manager_reload(m, /* message= */ NULL, vlink, /* reconfigure_links= */ reconfigure_links != 0);
+        if (r < 0)
+                return log_error_errno(r, "Failed to reload: %m");
+
+        if (m->reloading > 0)
+                return 0; /* Reply will be sent asynchronously. */
+
+        return sd_varlink_reply(vlink, NULL);
+}
+
+int manager_varlink_init(Manager *m, int fd) {
         _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
-        _unused_ _cleanup_close_ int fd_close = fd;
+        _unused_ _cleanup_close_ int fd_close = fd; /* take possession */
         int r;
 
         assert(m);
@@ -282,18 +309,29 @@ int manager_connect_varlink(Manager *m, int fd) {
         r = sd_varlink_server_add_interface_many(
                         s,
                         &vl_interface_io_systemd_Network,
+                        &vl_interface_io_systemd_Network_Link,
                         &vl_interface_io_systemd_service);
         if (r < 0)
                 return log_error_errno(r, "Failed to add Network interface to varlink server: %m");
 
         r = sd_varlink_server_bind_method_many(
                         s,
+                        "io.systemd.Network.Describe",             vl_method_describe,
                         "io.systemd.Network.GetStates",            vl_method_get_states,
                         "io.systemd.Network.GetNamespaceId",       vl_method_get_namespace_id,
                         "io.systemd.Network.GetLLDPNeighbors",     vl_method_get_lldp_neighbors,
+                        "io.systemd.Network.Reload",               vl_method_reload,
                         "io.systemd.Network.SetPersistentStorage", vl_method_set_persistent_storage,
+                        "io.systemd.Network.Link.Describe",        vl_method_link_describe,
+                        "io.systemd.Network.Link.Up",              vl_method_link_up,
+                        "io.systemd.Network.Link.Down",            vl_method_link_down,
+                        "io.systemd.Network.Link.Renew",           vl_method_link_renew,
+                        "io.systemd.Network.Link.ForceRenew",      vl_method_link_force_renew,
+                        "io.systemd.Network.Link.Reconfigure",     vl_method_link_reconfigure,
                         "io.systemd.service.Ping",                 varlink_method_ping,
+                        "io.systemd.service.Reload",               vl_method_reload,
                         "io.systemd.service.SetLogLevel",          varlink_method_set_log_level,
+                        "io.systemd.service.GetLogLevel",          varlink_method_get_log_level,
                         "io.systemd.service.GetEnvironment",       varlink_method_get_environment);
         if (r < 0)
                 return log_error_errno(r, "Failed to register varlink methods: %m");
@@ -303,7 +341,7 @@ int manager_connect_varlink(Manager *m, int fd) {
         else
                 r = sd_varlink_server_listen_fd(s, fd);
         if (r < 0)
-                return log_error_errno(r, "Failed to bind to varlink socket: %m");
+                return log_error_errno(r, "Failed to bind to varlink socket '/run/systemd/netif/io.systemd.Network': %m");
 
         TAKE_FD(fd_close);
 
@@ -313,10 +351,4 @@ int manager_connect_varlink(Manager *m, int fd) {
 
         m->varlink_server = TAKE_PTR(s);
         return 0;
-}
-
-void manager_varlink_done(Manager *m) {
-        assert(m);
-
-        m->varlink_server = sd_varlink_server_unref(m->varlink_server);
 }

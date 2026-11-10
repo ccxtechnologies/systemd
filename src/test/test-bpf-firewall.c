@@ -9,7 +9,6 @@
 #include "in-addr-prefix-util.h"
 #include "load-fragment.h"
 #include "manager.h"
-#include "memory-util.h"
 #include "path-util.h"
 #include "rm-rf.h"
 #include "service.h"
@@ -52,7 +51,7 @@ int main(int argc, char *argv[]) {
 
         r = enter_cgroup_subroot(NULL);
         if (r == -ENOMEDIUM)
-                return log_tests_skipped("cgroupfs not available");
+                return log_tests_skipped("cgroupfs v2 is not mounted");
 
         r = find_executable("ping", NULL);
         if (r < 0)
@@ -76,7 +75,7 @@ int main(int argc, char *argv[]) {
         /* The simple tests succeeded. Now let's try full unit-based use-case. */
 
         ASSERT_OK(manager_new(RUNTIME_SCOPE_USER, MANAGER_TEST_RUN_BASIC, &m));
-        ASSERT_OK(manager_startup(m, NULL, NULL, NULL));
+        ASSERT_OK(manager_startup(m, NULL, NULL, NULL, NULL));
 
         ASSERT_NOT_NULL(u = unit_new(m, sizeof(Service)));
         ASSERT_EQ(unit_add_name(u, "foo.service"), 0);
@@ -129,6 +128,8 @@ int main(int argc, char *argv[]) {
         SERVICE(u)->type = SERVICE_ONESHOT;
         u->load_state = UNIT_LOADED;
 
+        CGroupRuntime *crt = ASSERT_PTR(unit_setup_cgroup_runtime(u));
+
         unit_dump(u, stdout, NULL);
 
         r = bpf_firewall_compile(u);
@@ -136,7 +137,6 @@ int main(int argc, char *argv[]) {
                 return log_tests_skipped("Kernel doesn't support the necessary bpf bits (masked out via seccomp?)");
         ASSERT_OK(r);
 
-        CGroupRuntime *crt = ASSERT_PTR(unit_get_cgroup_runtime(u));
         ASSERT_NOT_NULL(crt->ip_bpf_ingress);
         ASSERT_NOT_NULL(crt->ip_bpf_egress);
 

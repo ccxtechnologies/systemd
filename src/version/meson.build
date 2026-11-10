@@ -7,10 +7,11 @@ version_h = custom_target('version',
         output : 'version.h',
         capture : true,
         command : [
-                meson.project_source_root() / 'tools/vcs-tag.sh',
+                vcs_tag_sh,
                 '@INPUT@',
                 get_option('mode'),
                 vcs_tag ? '1' : '0',
         ])
 version_include = include_directories('.')
 userspace_sources += [version_h]
+generated_sources += [version_h]

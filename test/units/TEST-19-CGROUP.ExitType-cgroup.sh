@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
 set -eux
 
 # Test ExitType=cgroup
@@ -8,10 +9,8 @@ set -eux
 
 if [[ "$(get_cgroup_hierarchy)" != unified ]]; then
     echo "Skipping $0 as we're not running with the unified cgroup hierarchy"
-    exit 0
+    exit 77
 fi
-
-systemd-analyze log-level debug
 
 # Multiple level process tree, parent process stays up
 cat >/tmp/test19-exit-cgroup.sh <<EOF
@@ -98,6 +97,3 @@ systemd-run --wait \
             --property="Type=notify" \
             --property="ExitType=cgroup" \
             /tmp/test19-exit-cgroup-parentless.sh 'systemctl kill --signal 9 six'
-
-
-systemd-analyze log-level info

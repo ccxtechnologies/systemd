@@ -4,11 +4,13 @@ set -e
 
 # Exclude following paths from the Coccinelle transformations
 EXCLUDED_PATHS=(
-    "src/boot/efi/*"
-    "src/basic/include/linux/*"
+    "src/boot/*"
+    "src/include/uapi/*"
     # Symlinked to test-bus-vtable-cc.cc, which causes issues with the IN_SET macro
     "src/libsystemd/sd-bus/test-bus-vtable.c"
     "src/libsystemd/sd-journal/lookup3.c"
+    # Our BPF programs don't have access to systemd stuff
+    "src/network/bpf/*"
     # Ignore man examples, as they redefine some macros we use internally, which makes Coccinelle complain
     # and ignore code that tries to use the redefined stuff
     "man/*"
@@ -32,6 +34,11 @@ case "$1" in
         shift
         ;;
 esac
+
+if ! command -v spatch >/dev/null; then
+    echo 'Please install spatch (package "coccinelle")'
+    exit 1
+fi
 
 if ! parallel -h >/dev/null; then
     echo 'Please install GNU parallel (package "parallel")'

@@ -4,22 +4,24 @@
 #include "sd-varlink.h"
 
 #include "alloc-util.h"
+#include "dns-answer.h"
 #include "dns-domain.h"
+#include "dns-packet.h"
+#include "dns-question.h"
+#include "dns-rr.h"
 #include "dns-type.h"
 #include "event-util.h"
 #include "glyph-util.h"
 #include "log.h"
-#include "resolved-dns-answer.h"
-#include "resolved-dns-packet.h"
 #include "resolved-dns-query.h"
-#include "resolved-dns-question.h"
-#include "resolved-dns-rr.h"
 #include "resolved-dns-scope.h"
 #include "resolved-dns-search-domain.h"
 #include "resolved-dns-synthesize.h"
 #include "resolved-dns-transaction.h"
 #include "resolved-etc-hosts.h"
+#include "resolved-hook.h"
 #include "resolved-manager.h"
+#include "resolved-static-records.h"
 #include "resolved-timeouts.h"
 #include "set.h"
 #include "string-util.h"
@@ -147,7 +149,7 @@ static int dns_query_candidate_next_search_domain(DnsQueryCandidate *c) {
         dns_search_domain_unref(c->search_domain);
         c->search_domain = dns_search_domain_ref(next);
 
-        return 0;
+        return 1;
 }
 
 static int dns_query_candidate_add_transaction(
@@ -524,6 +526,8 @@ DnsQuery *dns_query_free(DnsQuery *q) {
 
         dns_service_browser_unref(q->service_browser_request);
 
+        hook_query_free(q->hook_query);
+
         if (q->manager) {
                 LIST_REMOVE(queries, q->manager->dns_queries, q);
                 q->manager->n_dns_queries--;
@@ -577,7 +581,7 @@ static int manager_validate_and_mangle_question(Manager *manager, DnsQuestion **
 
         RefuseRecordTypeResult result = test_refuse_record_types(manager->refuse_record_types, *question);
         if (result == REFUSE_BAD)
-                return -ENOANO; /* All bad, refuse.*/
+                return -ENOANO; /* All bad, refuse. */
         if (result == REFUSE_GOOD) {
                 *ret_allocated = NULL;
                 return 0; /* All good. Not necessary to filter. */
@@ -907,24 +911,44 @@ static int dns_query_try_etc_hosts(DnsQuery *q) {
         return 1;
 }
 
-int dns_query_go(DnsQuery *q) {
-        DnsScopeMatch found = DNS_SCOPE_NO;
-        DnsScope *first = NULL;
+static int dns_query_try_static_records(DnsQuery *q) {
         int r;
 
         assert(q);
 
-        if (q->state != DNS_TRANSACTION_NULL)
+        if (FLAGS_SET(q->flags, SD_RESOLVED_NO_SYNTHESIZE))
                 return 0;
 
-        r = dns_query_try_etc_hosts(q);
-        if (r < 0)
+        _cleanup_(dns_answer_unrefp) DnsAnswer *answer = NULL;
+        r = manager_static_records_lookup(
+                        q->manager,
+                        q->question_bypass ? q->question_bypass->question : q->question_utf8,
+                        &answer);
+        if (r <= 0)
                 return r;
-        if (r > 0) {
-                dns_query_complete(q, DNS_TRANSACTION_SUCCESS);
-                return 1;
-        }
 
+        dns_query_reset_answer(q);
+
+        q->answer = TAKE_PTR(answer);
+        q->answer_rcode = DNS_RCODE_SUCCESS;
+        q->answer_protocol = dns_synthesize_protocol(q->flags);
+        q->answer_family = dns_synthesize_family(q->flags);
+        q->answer_query_flags = SD_RESOLVED_AUTHENTICATED|SD_RESOLVED_CONFIDENTIAL|SD_RESOLVED_SYNTHETIC;
+
+        return 1;
+}
+
+static int dns_query_go_scopes(DnsQuery *q) {
+        int r;
+
+        assert(q);
+        assert(!q->hook_query);
+        assert(q->state == DNS_TRANSACTION_NULL);
+
+        /* Start the lookup via the scopes */
+
+        DnsScopeMatch found = DNS_SCOPE_NO;
+        DnsScope *first = NULL;
         LIST_FOREACH(scopes, s, q->manager->dns_scopes) {
                 DnsScopeMatch match;
 
@@ -997,6 +1021,80 @@ int dns_query_go(DnsQuery *q) {
 fail:
         dns_query_stop(q);
         return r;
+}
+
+static void on_hook_complete(HookQuery *hq, int rcode, DnsAnswer *answer, void *userdata) {
+        DnsQuery *q = ASSERT_PTR(userdata);
+        int r;
+
+        assert(hq);
+        assert(q->hook_query == hq);
+        assert(q->state == DNS_TRANSACTION_NULL);
+
+        q->hook_query = hook_query_free(q->hook_query);
+        TAKE_PTR(hq);
+
+        if (rcode < 0) {
+                log_debug("Hook yielded no results, proceeding.");
+                r = dns_query_go_scopes(q);
+                if (r < 0) {
+                        dns_query_reset_answer(q);
+                        q->answer_errno = r;
+                        dns_query_complete(q, DNS_TRANSACTION_ERRNO);
+                }
+
+                return;
+        }
+
+        dns_query_reset_answer(q);
+
+        q->answer = dns_answer_ref(answer);
+        q->answer_rcode = rcode;
+        q->answer_protocol = dns_synthesize_protocol(q->flags);
+        q->answer_family = dns_synthesize_family(q->flags);
+        q->answer_query_flags = SD_RESOLVED_FROM_HOOK;
+        dns_query_complete(q, rcode == DNS_RCODE_SUCCESS ? DNS_TRANSACTION_SUCCESS : DNS_TRANSACTION_RCODE_FAILURE);
+}
+
+int dns_query_go(DnsQuery *q) {
+        int r;
+
+        assert(q);
+
+        /* Already ongoing? Then suppress */
+        if (q->hook_query ||
+            q->state != DNS_TRANSACTION_NULL)
+                return 0;
+
+        r = dns_query_try_static_records(q);
+        if (r < 0)
+                return r;
+        if (r > 0) {
+                dns_query_complete(q, DNS_TRANSACTION_SUCCESS);
+                return 1;
+        }
+
+        r = dns_query_try_etc_hosts(q);
+        if (r < 0)
+                return r;
+        if (r > 0) {
+                dns_query_complete(q, DNS_TRANSACTION_SUCCESS);
+                return 1;
+        }
+
+        r = manager_hook_query(
+                        q->manager,
+                        q->question_bypass ? q->question_bypass->question : q->question_idna,
+                        q->question_bypass ? q->question_bypass->question : q->question_utf8,
+                        on_hook_complete,
+                        q,
+                        &q->hook_query);
+        if (r < 0)
+                return r;
+        if (r > 0) /* hook calls are pending */
+                return 0;
+
+        return dns_query_go_scopes(q);
 }
 
 static void dns_query_accept(DnsQuery *q, DnsQueryCandidate *c) {
@@ -1137,6 +1235,9 @@ void dns_query_ready(DnsQuery *q) {
          * after calling this function, unless the block_ready
          * counter was explicitly bumped before doing so. */
 
+        if (q->hook_query)
+                return;
+
         if (q->block_ready > 0)
                 return;
 
@@ -1237,6 +1338,11 @@ static int dns_query_cname_redirect(DnsQuery *q, const DnsResourceRecord *cname)
 
         if (r == 0 && k == 0) /* No actual cname happened? */
                 return -ELOOP;
+
+        if (r == 0)
+                nq_idna = dns_question_ref(q->question_idna);
+        if (k == 0)
+                nq_utf8 = dns_question_ref(q->question_utf8);
 
         if (q->answer_protocol == DNS_PROTOCOL_DNS)
                 /* Don't permit CNAME redirects from unicast DNS to LLMNR or MulticastDNS, so that global resources

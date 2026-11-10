@@ -6,6 +6,9 @@
 #include "networkd-address.h"
 #include "networkd-manager.h"
 #include "networkd-network.h"
+#include "networkd-route.h"
+#include "networkd-route-nexthop.h"
+#include "ordered-set.h"
 #include "set.h"
 #include "strv.h"
 #include "tests.h"
@@ -186,7 +189,7 @@ static void test_config_parse_address_one(const char *rvalue, int family, unsign
         _cleanup_(manager_freep) Manager *manager = NULL;
         _cleanup_(network_unrefp) Network *network = NULL;
 
-        assert_se(manager_new(&manager, /* test_mode = */ true) >= 0);
+        assert_se(manager_new(&manager, /* test_mode= */ true) >= 0);
         assert_se(network = new0(Network, 1));
         network->n_ref = 1;
         network->manager = manager;
@@ -261,6 +264,232 @@ TEST(config_parse_match_strv) {
                                        "KEY=val",
                                        "KEY2=val with space",
                                        "KEY3=val with \\quotation\\")));
+}
+
+static int parse_mpr(const char *rvalue, OrderedSet **nexthops) {
+        return config_parse_multipath_route(
+                        "network", "filename", 1, "section", 1, "MultiPathRoute", 0, rvalue, nexthops, NULL);
+}
+
+static void test_config_parse_multipath_route_one(const char *rvalue, int expected_ret, size_t expected_size) {
+        _cleanup_ordered_set_free_ OrderedSet *nexthops = NULL;
+
+        ASSERT_OK_EQ(parse_mpr(rvalue, &nexthops), expected_ret);
+        ASSERT_EQ(ordered_set_size(nexthops), expected_size);
+}
+
+static void test_config_parse_multipath_route_verify(
+                const char *rvalue,
+                int expected_family,
+                const char *expected_gw,
+                const char *expected_ifname,
+                int expected_ifindex,
+                uint32_t expected_weight) {
+
+        _cleanup_ordered_set_free_ OrderedSet *nexthops = NULL;
+        RouteNextHop *nh;
+
+        ASSERT_OK_EQ(parse_mpr(rvalue, &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 1u);
+
+        ASSERT_NOT_NULL(nh = ordered_set_first(nexthops));
+        ASSERT_EQ(nh->family, expected_family);
+
+        if (expected_gw) {
+                union in_addr_union gw;
+                ASSERT_OK(in_addr_from_string(expected_family, expected_gw, &gw));
+                ASSERT_EQ(memcmp(&nh->gw, &gw, FAMILY_ADDRESS_SIZE(expected_family)), 0);
+        } else
+                ASSERT_FALSE(in_addr_is_set(nh->family, &nh->gw));
+
+        ASSERT_STREQ(nh->ifname, expected_ifname);
+
+        ASSERT_EQ(nh->ifindex, expected_ifindex);
+        ASSERT_EQ(nh->weight, expected_weight);
+}
+
+TEST(route_nexthops_compare) {
+        _cleanup_ordered_set_free_ OrderedSet *a_nexthops = NULL, *b_nexthops = NULL;
+        Route a = { .family = AF_INET }, b = { .family = AF_INET };
+        _cleanup_set_free_ Set *routes = NULL;
+
+        ASSERT_OK_EQ(parse_mpr("10.0.0.1@1 10", &a_nexthops), 1);
+        ASSERT_OK_EQ(parse_mpr("10.0.0.2@2 20", &a_nexthops), 1);
+        ASSERT_OK_EQ(parse_mpr("10.0.0.1@1 10", &b_nexthops), 1);
+        ASSERT_OK_EQ(parse_mpr("10.0.0.2@2 20", &b_nexthops), 1);
+
+        a.nexthops = a_nexthops;
+        b.nexthops = b_nexthops;
+        ASSERT_EQ(route_nexthops_compare_func(&a, &b), 0);
+
+        b_nexthops = ordered_set_free(b_nexthops);
+        ASSERT_OK_EQ(parse_mpr("10.0.0.1@1 10", &b_nexthops), 1);
+        ASSERT_OK_EQ(parse_mpr("10.0.0.3@2 20", &b_nexthops), 1);
+        b.nexthops = b_nexthops;
+        ASSERT_NE(route_nexthops_compare_func(&a, &b), 0);
+
+        b_nexthops = ordered_set_free(b_nexthops);
+        ASSERT_OK_EQ(parse_mpr("10.0.0.1@1 10", &b_nexthops), 1);
+        ASSERT_OK_EQ(parse_mpr("10.0.0.2@2 30", &b_nexthops), 1);
+        b.nexthops = b_nexthops;
+        ASSERT_NE(route_nexthops_compare_func(&a, &b), 0);
+
+        b_nexthops = ordered_set_free(b_nexthops);
+        ASSERT_OK_EQ(parse_mpr("10.0.0.2@2 20", &b_nexthops), 1);
+        ASSERT_OK_EQ(parse_mpr("10.0.0.1@1 10", &b_nexthops), 1);
+        b.nexthops = b_nexthops;
+        ASSERT_EQ(route_nexthops_compare_func(&a, &b), 0);
+
+        ASSERT_NOT_NULL(routes = set_new(&route_hash_ops));
+        ASSERT_OK_POSITIVE(set_put(routes, &a));
+        ASSERT_PTR_EQ(set_get(routes, &b), &a);
+        ASSERT_OK_ZERO(set_put(routes, &b));
+
+        ASSERT_OK_EQ(parse_mpr("10.0.0.3@3 30", &b_nexthops), 1);
+        ASSERT_NE(route_nexthops_compare_func(&a, &b), 0);
+}
+
+TEST(config_parse_multipath_route) {
+        _cleanup_ordered_set_free_ OrderedSet *nexthops = NULL;
+
+        /* Device only routes */
+        test_config_parse_multipath_route_verify("@wg0", AF_UNSPEC, NULL, "wg0", 0, 0);
+        test_config_parse_multipath_route_verify("@wg0 10", AF_UNSPEC, NULL, "wg0", 0, 9);
+        test_config_parse_multipath_route_verify("@eth0 255", AF_UNSPEC, NULL, "eth0", 0, 254);
+        test_config_parse_multipath_route_verify("@1 15", AF_UNSPEC, NULL, NULL, 1, 14);
+
+        /* Gateway with device */
+        test_config_parse_multipath_route_verify("10.0.0.1@eth0", AF_INET, "10.0.0.1", "eth0", 0, 0);
+        test_config_parse_multipath_route_verify("10.0.0.1@eth0 20", AF_INET, "10.0.0.1", "eth0", 0, 19);
+        test_config_parse_multipath_route_verify("2001:db8::1@wg0 15", AF_INET6, "2001:db8::1", "wg0", 0, 14);
+
+        /* Gateway without device */
+        test_config_parse_multipath_route_verify("192.168.1.1", AF_INET, "192.168.1.1", NULL, 0, 0);
+        test_config_parse_multipath_route_verify("192.168.1.1 100", AF_INET, "192.168.1.1", NULL, 0, 99);
+        test_config_parse_multipath_route_verify("fe80::1", AF_INET6, "fe80::1", NULL, 0, 0);
+
+        /* Interface index instead of name */
+        test_config_parse_multipath_route_verify("10.0.0.1@5", AF_INET, "10.0.0.1", NULL, 5, 0);
+        test_config_parse_multipath_route_verify("@10", AF_UNSPEC, NULL, NULL, 10, 0);
+        test_config_parse_multipath_route_verify("@10 50", AF_UNSPEC, NULL, NULL, 10, 49);
+
+        /* Empty value clears nexthops */
+        ASSERT_OK_EQ(parse_mpr("@wg0 15", &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 1u);
+        ASSERT_OK_EQ(parse_mpr("", &nexthops), 1);
+        ASSERT_NULL(nexthops);
+
+        /* Make sure device-only/AF_UNSPEC routes do not collapse into a single entry. */
+
+        /* Different interfaces, same weight */
+        ASSERT_OK_EQ(parse_mpr("@wg0 15", &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 1u);
+        ASSERT_OK_EQ(parse_mpr("@wg1 15", &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 2u);
+        /* Same interface, different weights */
+        ASSERT_OK_EQ(parse_mpr("@eth0 10", &nexthops), 1);
+        ASSERT_OK_EQ(parse_mpr("@eth0 20", &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 4u);
+        /* Interface name vs interface index */
+        ASSERT_OK_EQ(parse_mpr("@5 15", &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 5u);
+        /* Mixing device-only and gateway routes */
+        ASSERT_OK_EQ(parse_mpr("10.0.0.1@eth0 20", &nexthops), 1);
+        ASSERT_OK_EQ(parse_mpr("192.168.1.1 30", &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 7u);
+        /* Large interface index */
+        ASSERT_OK_EQ(parse_mpr("@999999 10", &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 8u);
+        /* IPv4 and IPv6 mixing */
+        ASSERT_OK_EQ(parse_mpr("2001:db8::1@eth0 20", &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 9u);
+        /* Default weight handling */
+        ASSERT_OK_EQ(parse_mpr("@wg2", &nexthops), 1);
+        ASSERT_OK_EQ(parse_mpr("@wg3", &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 11u);
+
+        nexthops = ordered_set_free(nexthops);
+
+        /* Insertion order does not affect deduplication */
+        _cleanup_ordered_set_free_ OrderedSet *nexthops2 = NULL;
+        ASSERT_OK_EQ(parse_mpr("@wg0 10", &nexthops), 1);
+        ASSERT_OK_EQ(parse_mpr("@wg1 20", &nexthops), 1);
+        ASSERT_OK_EQ(parse_mpr("@wg1 20", &nexthops2), 1);
+        ASSERT_OK_EQ(parse_mpr("@wg0 10", &nexthops2), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 2u);
+        ASSERT_EQ(ordered_set_size(nexthops2), 2u);
+
+        nexthops = ordered_set_free(nexthops);
+
+        /* Duplicate routes should be detected and rejected with a warning. */
+
+        /* Exact duplicates are rejected */
+        ASSERT_OK_EQ(parse_mpr("@wg0 15", &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 1u);
+        ASSERT_OK_EQ(parse_mpr("@wg0 15", &nexthops), 0);
+        ASSERT_EQ(ordered_set_size(nexthops), 1u);
+
+        nexthops = ordered_set_free(nexthops);
+
+        /* Default weight vs explicit weight=1 are treated as identical */
+        ASSERT_OK_EQ(parse_mpr("@eth0", &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 1u);
+        ASSERT_OK_EQ(parse_mpr("@eth0 1", &nexthops), 0);
+        ASSERT_EQ(ordered_set_size(nexthops), 1u);
+
+        nexthops = ordered_set_free(nexthops);
+
+        /* Weight=1 then default weight (reverse order), still detected as duplicate */
+        ASSERT_OK_EQ(parse_mpr("@wg0 1", &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 1u);
+        ASSERT_OK_EQ(parse_mpr("@wg0", &nexthops), 0);
+        ASSERT_EQ(ordered_set_size(nexthops), 1u);
+
+        nexthops = ordered_set_free(nexthops);
+
+        /* Device-only vs gateway with device are semantically distinct, both accepted */
+        ASSERT_OK_EQ(parse_mpr("@eth0 10", &nexthops), 1);
+        ASSERT_OK_EQ(parse_mpr("10.0.0.1@eth0 10", &nexthops), 1);
+        ASSERT_EQ(ordered_set_size(nexthops), 2u);
+
+        /* Invalid input should be rejected */
+
+        /* Invalid gateway addresses */
+        test_config_parse_multipath_route_one("999.999.999.999", 0, 0);
+        test_config_parse_multipath_route_one("not-an-ip", 0, 0);
+        test_config_parse_multipath_route_one("10", 0, 0);
+
+        /* Invalid weights */
+        test_config_parse_multipath_route_one("@wg0 0", 0, 0);   /* Weight 0 */
+        test_config_parse_multipath_route_one("@wg0 257", 0, 0); /* Weight > 256 */
+        test_config_parse_multipath_route_one("@wg0 -1", 0, 0);  /* Negative */
+        test_config_parse_multipath_route_one("@wg0 abc", 0, 0); /* Non-numeric */
+}
+
+TEST(config_parse_stacked_netdev) {
+        _cleanup_hashmap_free_ Hashmap *netdevs = NULL;
+        ASSERT_OK(config_parse_stacked_netdev("network", "filename", 1, "section", 1, "VLAN", NETDEV_KIND_VLAN, "foo bar baz invalid:name", &netdevs, NULL));
+        ASSERT_OK(config_parse_stacked_netdev("network", "filename", 1, "section", 1, "VXLAN", NETDEV_KIND_VXLAN, "aaa 321 foo bbb", &netdevs, NULL));
+
+        static const struct {
+                const char *name;
+                NetDevKind kind;
+        } expected[] = {
+                { "foo", NETDEV_KIND_VLAN },
+                { "bar", NETDEV_KIND_VLAN },
+                { "baz", NETDEV_KIND_VLAN },
+                { "aaa", NETDEV_KIND_VXLAN },
+                { "bbb", NETDEV_KIND_VXLAN },
+        };
+
+        ASSERT_EQ(hashmap_size(netdevs), ELEMENTSOF(expected));
+        FOREACH_ELEMENT(i, expected) {
+                void *p = ASSERT_NOT_NULL(hashmap_get(netdevs, i->name));
+                ASSERT_EQ(PTR_TO_INT(p), i->kind);
+        }
+
+        ASSERT_OK(config_parse_stacked_netdev("network", "filename", 1, "section", 1, "VXLAN", NETDEV_KIND_VXLAN, "", &netdevs, NULL));
+        ASSERT_NULL(netdevs);
 }
 
 DEFINE_TEST_MAIN(LOG_INFO);

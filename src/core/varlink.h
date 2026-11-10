@@ -4,6 +4,7 @@
 #include "core-forward.h"
 
 int manager_setup_varlink_server(Manager *m);
+int manager_setup_varlink_metrics_server(Manager *m);
 
 int manager_varlink_init(Manager *m);
 void manager_varlink_done(Manager *m);
@@ -12,3 +13,5 @@ void manager_varlink_done(Manager *m);
  * - The value of ManagedOOM*= properties change
  * - A unit with ManagedOOM*= properties changes unit active state */
 int manager_varlink_send_managed_oom_update(Unit *u);
+
+void manager_varlink_send_pending_reload_message(Manager *m);

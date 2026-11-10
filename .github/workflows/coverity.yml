@@ -22,9 +22,18 @@ jobs:
       COVERITY_SCAN_NOTIFICATION_EMAIL: "${{ secrets.COVERITY_SCAN_NOTIFICATION_EMAIL }}"
     steps:
       - name: Repository checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       # Reuse the setup phase of the unit test script to avoid code duplication
       - name: Install build dependencies
-        run: sudo -E .github/workflows/unit-tests.sh SETUP
+        run: |
+          sudo -E .github/workflows/unit-tests.sh SETUP
+          # TODO: drop after we switch to ubuntu 26.04
+          bpftool_binary=$(find /usr/lib/linux-tools/ /usr/lib/linux-tools-* -name 'bpftool' -perm /u=x 2>/dev/null | sort -r | head -n1)
+          if [ -n "$bpftool_binary" ]; then
+            sudo rm -f /usr/{bin,sbin}/bpftool
+            sudo ln -s "$bpftool_binary" /usr/bin/
+          fi
       - name: Build & upload the results
         run: tools/coverity.sh

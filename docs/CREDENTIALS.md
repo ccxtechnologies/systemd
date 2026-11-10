@@ -52,9 +52,9 @@ purpose. Specifically, the following features are provided:
 
 7. Credentials may be acquired from a hosting VM hypervisor (SMBIOS OEM strings
    or qemu `fw_cfg`), a hosting container manager, the kernel command line,
-   from the initrd, or from the UEFI environment via the EFI System Partition
-   (via `systemd-stub`). Such system credentials may then be propagated into
-   individual services as needed.
+   from the initrd, from the UEFI environment via the EFI System Partition
+   (via `systemd-stub`), or from a cloud Instance Metadata Service (IMDS). Such
+   system credentials may then be propagated into individual services as needed.
 
 8. Credentials are an effective way to pass parameters into services that run
    with `RootImage=` or `RootDirectory=` and thus cannot read these resources
@@ -67,7 +67,7 @@ purpose. Specifically, the following features are provided:
 
 ## Configuring per-Service Credentials
 
-Within unit files, there are the following settings to configure service 
+Within unit files, there are the following settings to configure service
 credentials.
 
 1. `LoadCredential=` may be used to load a credential from disk, from an
@@ -96,7 +96,7 @@ for inclusion in a filename) in the unit file, under which the invoked service
 code can then retrieve it. Each name should only be specified once.
 
 For details about these settings [see the man
-page](https://www.freedesktop.org/software/systemd/man/systemd.exec.html#Credentials).
+page](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#Credentials).
 
 It is a good idea to also enable mount namespacing for services that process
 credentials configured this way. If so, the runtime credential directory of the
@@ -159,7 +159,7 @@ activation, so that service code only receives plaintext credentials.
 
 ## Programming Interface from Generator Code
 
-[Generators](https://www.freedesktop.org/software/systemd/man/systemd.generator.html)
+[Generators](https://www.freedesktop.org/software/systemd/man/latest/systemd.generator.html)
 may generate native unit files from external configuration or system
 parameters, such as system credentials. Note that they run outside of service
 context, and hence will not receive encrypted credentials in plaintext
@@ -169,8 +169,8 @@ be placed as they are in a directory referenced by the
 plaintext form will be placed in `$CREDENTIALS_DIRECTORY`. Use a command such
 as `systemd-creds --system cat …` to access both forms of credentials, and
 decrypt them if needed (see
-[systemd-creds(1)](https://www.freedesktop.org/software/systemd/man/systemd-creds.html)
-for details.
+[systemd-creds(1)](https://www.freedesktop.org/software/systemd/man/latest/systemd-creds.html)
+for details).
 
 Note that generators typically run very early during boot (similar to initrd
 code), earlier than the `/var/` file system is necessarily mounted (which is
@@ -184,7 +184,7 @@ For further details about encrypted credentials, see below.
 ## Tools
 
 The
-[`systemd-creds`](https://www.freedesktop.org/software/systemd/man/systemd-creds.html)
+[`systemd-creds`](https://www.freedesktop.org/software/systemd/man/latest/systemd-creds.html)
 tool is provided to work with system and service credentials. It may be used to
 access and enumerate system and service credentials, or to encrypt/decrypt credentials
 (for details about the latter, see below).
@@ -274,6 +274,33 @@ SetCredentialEncrypted=foobar: \
 …
 ```
 
+### Null-Key Encryption and the Boot Policy
+
+In some situations a credential must be provisioned to a machine that does not
+yet (or does not at all) possess a key to encrypt against, for example before
+first boot completes, or on systems without a TPM2 device. For these cases
+`systemd-creds encrypt --with-key=null` produces a credential wrapped in the
+normal `systemd-creds` envelope, but encrypted with a fixed zero-length key.
+Such a credential travels through the same path as any other encrypted
+credential (e.g. it may be dropped into the ESP under `/loader/credentials/` or
+`*.efi.extra.d/`), but it offers neither confidentiality nor authenticity.
+Because of that, accepting it is risky on a system that could do better, and
+whether it is accepted at boot is controlled by the `systemd.credentials_boot_policy=`
+kernel command line option:
+
+| Mode      | A null-key credential is accepted when…           |
+|-----------|---------------------------------------------------|
+| `strict`  | never                                             |
+| `tofu`    | this is the first boot, or no TPM2 is available   |
+| `relaxed` | SecureBoot is off, or no TPM2 is available        |
+| `off`     | always                                            |
+
+The default is `relaxed`. This policy only governs the
+default acceptance decision; credentials encrypted against a host key or TPM2
+device are always accepted. See
+[systemd(1)](https://www.freedesktop.org/software/systemd/man/latest/systemd.html)
+for details.
+
 ## Inheritance from Container Managers, Hypervisors, Kernel Command Line, or the UEFI Boot Environment
 
 Sometimes it is useful to parameterize whole systems the same way as services,
@@ -286,7 +313,7 @@ services where they are ultimately consumed.
 1. A container manager may set the `$CREDENTIALS_DIRECTORY` environment
    variable for systemd running as PID 1 in the container, the same way as
    systemd would set it for a service it invokes.
-   [`systemd-nspawn(1)`](https://www.freedesktop.org/software/systemd/man/systemd-nspawn.html#Credentials)'s
+   [`systemd-nspawn(1)`](https://www.freedesktop.org/software/systemd/man/latest/systemd-nspawn.html#Credentials)'s
    `--set-credential=` and `--load-credential=` switches implement this, in
    order to pass arbitrary credentials from host to container payload. Also see
    the [Container Interface](/CONTAINER_INTERFACE) documentation.
@@ -311,7 +338,7 @@ services where they are ultimately consumed.
 
 4. Credentials may also be passed from the UEFI environment to userspace, if
    the
-   [`systemd-stub`](https://www.freedesktop.org/software/systemd/man/systemd-stub.html)
+   [`systemd-stub`](https://www.freedesktop.org/software/systemd/man/latest/systemd-stub.html)
    UEFI kernel stub is used.
    This allows placing encrypted credentials in the EFI System Partition, which are then picked up by `systemd-stub` and passed to the kernel and ultimately userspace where systemd receives them.
    This is useful to implement secure parameterization of vendor-built and signed
@@ -366,11 +393,76 @@ Or propagated to services further down:
 systemd-run -p ImportCredential=mycred -P --wait systemd-creds cat mycred
 ```
 
+## Acquisition from Cloud Instance Metadata Services (IMDS)
+
+Most public cloud environments provide an "Instance Metadata Service" (IMDS),
+i.e. a node-local network endpoint from which a virtual machine may acquire
+information about itself and the parameters it was invoked with, including data
+suitable for use as `systemd` credentials. `systemd` can automatically acquire
+such data from the IMDS and import it into the system's credential store, where
+it is then available to services via `ImportCredential=` and friends, the same
+way as credentials acquired through any of the mechanisms described above.
+
+This functionality is implemented by
+[`systemd-imdsd@.service`](https://www.freedesktop.org/software/systemd/man/latest/systemd-imdsd@.service.html),
+which provides a local Varlink IPC interface to the IMDS endpoint, and the
+[`systemd-imds`](https://www.freedesktop.org/software/systemd/man/latest/systemd-imds.html)
+client tool. On recognized clouds these are pulled into the boot transaction
+automatically by
+[`systemd-imds-generator`](https://www.freedesktop.org/software/systemd/man/latest/systemd-imds-generator.html),
+which detects the cloud environment via the SMBIOS/DMI hardware database
+(`hwdb.d/40-imds.hwdb`).
+
+At boot the `systemd-imds-import.service` runs `systemd-imds --import`, which
+acquires data from the IMDS endpoint and writes the relevant fields as
+credentials into `/run/credstore/` (and `/run/credstore.encrypted/` for
+encrypted credentials). Because these directories are part of the credential
+search path (see "Relevant Paths" below), credentials imported this way are
+automatically picked up by `ImportCredential=` in consuming units. Specifically,
+the following is imported:
+
+1. The instance's "userdata" field, if it is a JSON object containing a
+   `systemd.credentials` array. Each array entry carries a `name` field plus
+   one of `text` (a literal string), `data` (Base64-encoded binary data), or
+   `encrypted` (a Base64-encoded encrypted credential, as produced by
+   `systemd-creds encrypt`). This is the primary mechanism for passing
+   arbitrary credentials into a cloud instance. Note: if a traditional IMDS
+   client (such as `cloud-init`) is used the "userdata" field might be used for
+   that, and `systemd-imds-import.service` will gracefully ignore the data. Or
+   in other words: this functionality is not available if `cloud-init` is used.
+
+2. The instance's SSH public key, imported into the `ssh.authorized_keys.root`
+   credential (used to provision SSH access for the `root` user).
+
+3. The instance's hostname, imported into the `firstboot.hostname` credential
+   (consumed by `systemd-firstboot.service`).
+
+The acquired userdata is measured into the TPM2 (PCR 12) before it is imported,
+so that the cloud-provided parameterization may be subjected to attestation.
+
+An example `systemd.credentials` userdata payload (passed as the instance's user
+data via the cloud's provisioning interface) looks like this:
+
+```json
+{
+        "systemd.credentials": [
+                {
+                        "name": "mycred",
+                        "text": "supersecret"
+                },
+                {
+                        "name": "mybinarycred",
+                        "data": "YmFyCg=="
+                }
+        ]
+}
+```
+
 ## Well-Known Credentials
 
 Various services shipped with `systemd` consume credentials for tweaking behaviour:
 
-* [`systemd(1)`](https://www.freedesktop.org/software/systemd/man/systemd.html)
+* [`systemd(1)`](https://www.freedesktop.org/software/systemd/man/latest/systemd.html)
   (I.E.: PID1, the system manager) will look for the credential `vmm.notify_socket`
   and will use it to send a `READY=1` datagram when the system has finished
   booting.
@@ -380,24 +472,24 @@ Various services shipped with `systemd` consume credentials for tweaking behavio
   The credential payload should be in the form: `vsock:<CID>:<PORT>`.
   Also note that this requires support for VSOCK to be built in both the guest and the host kernels, and the kernel modules to be loaded.
 
-* [`systemd-sysusers(8)`](https://www.freedesktop.org/software/systemd/man/systemd-sysusers.html)
+* [`systemd-sysusers(8)`](https://www.freedesktop.org/software/systemd/man/latest/systemd-sysusers.html)
   will look for the credentials `passwd.hashed-password.<username>`,
   `passwd.plaintext-password.<username>` and `passwd.shell.<username>` to
   configure the password (either in UNIX hashed form, or plaintext) or shell of
   system users created.
   Replace `<username>` with the system user of your choice, for example, `root`.
 
-* [`systemd-firstboot(1)`](https://www.freedesktop.org/software/systemd/man/systemd-firstboot.html)
+* [`systemd-firstboot(1)`](https://www.freedesktop.org/software/systemd/man/latest/systemd-firstboot.html)
   will look for the credentials `firstboot.locale`, `firstboot.locale-messages`,
   `firstboot.keymap`, `firstboot.timezone`, that configure locale, keymap or
   timezone settings in case the data is not yet set in `/etc/`.
 
-* [`tmpfiles.d(5)`](https://www.freedesktop.org/software/systemd/man/tmpfiles.d.html)
+* [`tmpfiles.d(5)`](https://www.freedesktop.org/software/systemd/man/latest/tmpfiles.d.html)
   will look for the credentials `tmpfiles.extra` with arbitrary tmpfiles.d lines.
   Can be encoded in base64 to allow easily passing it on the command line.
 
 * Further well-known credentials are documented in
-  [`systemd.system-credentials(7)`](https://www.freedesktop.org/software/systemd/man/systemd.system-credentials.html).
+  [`systemd.system-credentials(7)`](https://www.freedesktop.org/software/systemd/man/latest/systemd.system-credentials.html).
 
 In future more services are likely to gain support for consuming credentials.
 
@@ -411,7 +503,7 @@ systemd-nspawn -i test.raw  \
 ```
 
 This boots the specified disk image as `systemd-nspawn` container, and passes
-the root password `mysecret`and default locale `C.UTF-8` to use to it. This
+the root password `mysecret` and the default locale `C.UTF-8` to it. This
 data is then propagated by default to `systemd-sysusers.service` and
 `systemd-firstboot.service`, where it is applied. (Note that these services
 will only do so if these settings in `/etc/` are so far unset, i.e. they only

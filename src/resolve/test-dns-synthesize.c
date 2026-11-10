@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "resolved-dns-answer.h"
-#include "resolved-dns-packet.h"
-#include "resolved-dns-question.h"
-#include "resolved-dns-rr.h"
+#include "dns-answer.h"
+#include "dns-packet.h"
+#include "dns-question.h"
+#include "dns-rr.h"
 #include "resolved-dns-synthesize.h"
 #include "resolved-manager.h"
 #include "tests.h"
@@ -300,6 +300,27 @@ TEST(dns_synthesize_answer_address_local_dns_proxy) {
         rr->ptr.name = strdup("_localdnsproxy");
         ASSERT_NOT_NULL(rr->ptr.name);
         ASSERT_TRUE(dns_answer_contains(answer, rr));
+}
+
+TEST(dns_synthesize_answer_onion) {
+        Manager manager = {};
+        int type;
+
+        FOREACH_ARGUMENT(type, DNS_TYPE_A, DNS_TYPE_TXT) {
+                _cleanup_(dns_question_unrefp) DnsQuestion *question = NULL;
+                _cleanup_(dns_resource_key_unrefp) DnsResourceKey *key = NULL;
+                _cleanup_(dns_answer_unrefp) DnsAnswer *answer = NULL;
+
+                question = dns_question_new(1);
+                ASSERT_NOT_NULL(question);
+
+                key = dns_resource_key_new(DNS_CLASS_IN, type, "mysecret.onion");
+                ASSERT_NOT_NULL(key);
+                ASSERT_OK(dns_question_add(question, key, 0));
+
+                ASSERT_ERROR(dns_synthesize_answer(&manager, question, 0, &answer), ENXIO);
+                ASSERT_NULL(answer);
+        }
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

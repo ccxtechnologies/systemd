@@ -2,8 +2,7 @@
 
 #pragma once
 
-#include <curl/curl.h>
-
+#include "curl-util.h"
 #include "forward.h"
 #include "journal-compression-util.h"
 

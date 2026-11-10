@@ -3,6 +3,8 @@
 
 #include "forward.h"
 
+#include "../fundamental/confidential-virt.h"   /* IWYU pragma: export */
+
 typedef enum ConfidentialVirtualization {
         CONFIDENTIAL_VIRTUALIZATION_NONE = 0,
 
@@ -20,5 +22,4 @@ typedef enum ConfidentialVirtualization {
 
 ConfidentialVirtualization detect_confidential_virtualization(void);
 
-const char* confidential_virtualization_to_string(ConfidentialVirtualization v) _const_;
-ConfidentialVirtualization confidential_virtualization_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(confidential_virtualization, ConfidentialVirtualization);

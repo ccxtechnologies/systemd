@@ -5,7 +5,7 @@
 
 #include "alloc-util.h"
 #include "conf-parser-forward.h"
-#include "forward.h"
+#include "fd-util.h"
 #include "log.h"
 
 /* An abstract parser for simple, line based, shallow configuration files consisting of variable assignments only. */
@@ -66,21 +66,48 @@ int config_parse(
                 void *userdata,
                 struct stat *ret_stat);     /* possibly NULL */
 
-int config_parse_many(
+int config_parse_many_full(
                 const char* const* conf_files,  /* possibly empty */
                 const char* const* conf_file_dirs,
                 const char *dropin_dirname,
                 const char *root,
+                int root_fd,
                 const char *sections,         /* nulstr */
                 ConfigItemLookup lookup,
                 const void *table,
                 ConfigParseFlags flags,
                 void *userdata,
                 Hashmap **ret_stats_by_path,  /* possibly NULL */
-                char ***ret_drop_in_files);   /* possibly NULL */
+                char ***ret_dropin_files);   /* possibly NULL */
+
+static inline int config_parse_many(
+                const char* const* conf_files,  /* possibly empty */
+                const char* const* conf_file_dirs,
+                const char *dropin_dirname,
+                const char *sections,         /* nulstr */
+                ConfigItemLookup lookup,
+                const void *table,
+                ConfigParseFlags flags,
+                void *userdata) {
+
+        return config_parse_many_full(
+                        conf_files,
+                        conf_file_dirs,
+                        dropin_dirname,
+                        /* root= */ NULL,
+                        /* root_fd= */ XAT_FDROOT,
+                        sections,
+                        lookup,
+                        table,
+                        flags,
+                        userdata,
+                        /* ret_stats_by_path= */ NULL,
+                        /* ret_drop_in_files= */ NULL);
+}
 
 int config_parse_standard_file_with_dropins_full(
                 const char *root,
+                int root_fd,
                 const char *main_file,        /* A path like "systemd/frobnicator.conf" */
                 const char *sections,
                 ConfigItemLookup lookup,
@@ -99,6 +126,7 @@ static inline int config_parse_standard_file_with_dropins(
                 void *userdata) {
         return config_parse_standard_file_with_dropins_full(
                         /* root= */ NULL,
+                        /* root_fd= */ XAT_FDROOT,
                         main_file,
                         sections,
                         lookup,
@@ -112,7 +140,7 @@ static inline int config_parse_standard_file_with_dropins(
 int config_get_stats_by_path(
                 const char *suffix,
                 const char *root,
-                unsigned flags,
+                ConfFilesFlags flags,
                 const char* const* dirs,
                 bool check_dropins,
                 Hashmap **ret);
@@ -165,7 +193,7 @@ static inline bool section_is_invalid(ConfigSection *section) {
 #define log_section_full_errno_zerook(section, level, error, ...)       \
         ({                                                              \
                 const ConfigSection *_s = (section);                    \
-                log_syntax(/* unit = */ NULL,                           \
+                log_syntax(/* unit= */ NULL,                            \
                            level,                                       \
                            _s ? _s->filename : NULL,                    \
                            _s ? _s->line : 0,                           \
@@ -209,6 +237,7 @@ CONFIG_PARSER_PROTOTYPE(config_parse_int32);
 CONFIG_PARSER_PROTOTYPE(config_parse_uint64);
 CONFIG_PARSER_PROTOTYPE(config_parse_double);
 CONFIG_PARSER_PROTOTYPE(config_parse_iec_size);
+CONFIG_PARSER_PROTOTYPE(config_parse_iec_size_long);
 CONFIG_PARSER_PROTOTYPE(config_parse_si_uint64);
 CONFIG_PARSER_PROTOTYPE(config_parse_iec_uint64);
 CONFIG_PARSER_PROTOTYPE(config_parse_iec_uint64_infinity);

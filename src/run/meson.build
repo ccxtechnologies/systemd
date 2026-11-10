@@ -4,7 +4,7 @@ executables += [
         executable_template + {
                 'name' : 'systemd-run',
                 'public' : true,
-                'sources' : files('run.c'),
+                'sources' : files('run.c', 'run-polkit.c'),
         },
 ]
 
@@ -18,3 +18,8 @@ custom_target(
         command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
         install : pamconfdir != 'no',
         install_dir : pamconfdir)
+
+if install_polkit
+        install_data('empower.rules',
+                     install_dir : polkitrulesdir)
+endif

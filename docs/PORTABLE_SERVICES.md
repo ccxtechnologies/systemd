@@ -8,7 +8,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 # Portable Services
 
 systemd (since version 239) supports a concept of "Portable Services".
-"Portable Services" are a delivery method for system services that uses
+"Portable Services" are a delivery method for services that uses
 two specific features of container management:
 
 1. Applications are bundled. I.e. multiple services, their binaries and all
@@ -17,7 +17,8 @@ two specific features of container management:
 2. Stricter default security policies, i.e. sand-boxing of applications.
 
 The primary tool for interacting with Portable Services is `portablectl`,
-and they are managed by the `systemd-portabled` service.
+and they are managed by the `systemd-portabled` service. `systemd-portabled` can
+run as a system or a user service.
 
 Portable services don't bring anything inherently new to the table.
 All they do is put together known concepts to cover a specific set of use-cases in a
@@ -29,7 +30,7 @@ A portable service is ultimately just an OS tree, either inside of a directory,
 or inside a raw disk image containing a Linux file system.
 This tree is called the "image". It can be "attached" or "detached" from the system.
 When "attached", specific systemd units from the image are made available on the
-host system, then behaving pretty much exactly like locally installed system services.
+host system, then behaving pretty much exactly like locally installed services.
 When "detached", these units are removed again from the host, leaving
 no artifacts around (except maybe messages they might have logged).
 
@@ -56,12 +57,12 @@ systemd-nspawn/LXC-type OS containers, for Docker/rkt-like micro service
 containers, and even certain 'lightweight' VM runtimes.
 
 "Portable services" do not provide a fully isolated environment to the payload, like containers mostly intend to.
-Instead, they are more like regular system services, can be controlled with the same tools, are exposed the same way in all infrastructure, and so on.
+Instead, they are more like regular services, can be controlled with the same tools, are exposed the same way in all infrastructure, and so on.
 The main difference is that they use a different root directory than the rest of the system.
 Hence, the intent is not to run code in a different, isolated environment from the host — like most containers would — but to run it in the same environment, but with stricter access controls on what the service can see and do.
 
 One point of differentiation: since programs running as "portable services" are
-pretty much regular system services, they won't run as PID 1 (like they would
+pretty much regular services, they won't run as PID 1 (like they would
 under Docker), but as normal processes.
 
 A corollary of that is that they aren't supposed to manage anything in their own environment (such as the network) as the execution environment is mostly shared with the rest of the system.
@@ -70,10 +71,6 @@ The primary focus use-case of "portable services" is to extend the host system
 with encapsulated extensions, but provide almost full integration with the rest
 of the system, though possibly restricted by security knobs.
 This focus includes system extensions otherwise sometimes called "super-privileged containers".
-
-Note that portable services are only available for system services, not for
-user services (i.e. the functionality cannot be used for the stuff
-[`bubblewrap`](https://github.com/containers/bubblewrap)/[`flatpak`](https://flatpak.org/) is focusing on).
 
 ## Mode of Operation
 
@@ -131,7 +128,7 @@ And that's already it.
 
 Note that the images need to stay around (and in the same location) as long as the
 portable service is attached.
-If an image is moved, the `RootImage=` line written to the unit drop-in would point to an non-existent path, and break access to the image.
+If an image is moved, the `RootImage=` line written to the unit drop-in would point to a non-existent path, and break access to the image.
 
 The `portablectl detach` command executes the reverse operation:
 it looks for the drop-ins and the unit files associated with the image, and removes them.
@@ -162,7 +159,7 @@ Specifically, the following requirements are made for an image that can be attac
    an image with a partition table understood by the Linux kernel with only a
    single partition defined, or alternatively, a GPT partition table with a set
    of properly marked partitions following the
-   [Discoverable Partitions Specification](https://uapi-group.org/specifications/specs/discoverable_partitions_specification).
+   [UAPI.2 Discoverable Partitions Specification](https://uapi-group.org/specifications/specs/discoverable_partitions_specification).
 
 3. The image must at least contain one matching unit file, with the right name
    prefix and suffix (see above).
@@ -239,7 +236,7 @@ image.
 As mentioned, `mkosi -b` takes care of all of that for you, but any other image generator should work too.
 
 The
-[os-release(5)](https://www.freedesktop.org/software/systemd/man/os-release.html)
+[os-release(5)](https://www.freedesktop.org/software/systemd/man/latest/os-release.html)
 file may optionally be extended with a `PORTABLE_PREFIXES=` field listing all
 supported portable service prefixes for the image (see above).
 This is useful for informational purposes (as it allows recognizing portable service images
@@ -249,6 +246,14 @@ This is particularly relevant if the images are cryptographically authenticated 
 validated against the (authenticated) image contents.
 If the field is not specified the image will work fine, but is not necessarily recognizable as
 portable service image, and any set of units included in the image may be attached, there are no restrictions enforced.
+
+The [os-release(5)](https://www.freedesktop.org/software/systemd/man/latest/os-release.html) may
+optionally be extended with a `PORTABLE_SCOPE=` field listing the scope in which the portable
+service may be used. This field may be set to either `system`, in which case the portable service
+can only be attached to the system instance of `systemd-portabled`, `user` in which case the portable
+can only be attached to a user instance of `systemd-portabled`, or `any` in which case it can be
+attached to either the system instance or user instances of `systemd-portabled`. If not specified, the
+`system` scope is implied.
 
 ## Extension Images
 
@@ -287,7 +292,7 @@ On top of the requirements listed in the previous section, the following must al
 
 Note that the code in portable service images is run exactly like regular services.
 Hence there's no new execution environment to consider.
-And, unlike Docker would do it, as these are regular system services they aren't run as PID
+And, unlike Docker would do it, as these are regular services they aren't run as PID
 1 either, but with regular PID values.
 
 ## Access to host resources
@@ -327,7 +332,7 @@ services copied onto the host.
 
 ## Logging
 
-Several fields are autotmatically added to log messages generated by a portable
+Several fields are automatically added to log messages generated by a portable
 service (or about a portable service, e.g.: start/stop logs from systemd).
 The `PORTABLE=` field will refer to the name of the portable image where the unit
 was loaded from. In case extensions are used, additionally there will be a `PORTABLE_ROOT=` field, referring to the name of the image used as the base layer (i.e.: `RootImage=` or `RootDirectory=`), and one `PORTABLE_EXTENSION=` field for
@@ -361,7 +366,7 @@ PORTABLE_EXTENSION_NAME_AND_VERSION=app_1
 
 ## Links
 
-[`portablectl(1)`](https://www.freedesktop.org/software/systemd/man/portablectl.html)<br>
-[`systemd-portabled.service(8)`](https://www.freedesktop.org/software/systemd/man/systemd-portabled.service.html)<br>
+[`portablectl(1)`](https://www.freedesktop.org/software/systemd/man/latest/portablectl.html)<br>
+[`systemd-portabled.service(8)`](https://www.freedesktop.org/software/systemd/man/latest/systemd-portabled.service.html)<br>
 [Walkthrough for Portable Services](https://0pointer.net/blog/walkthrough-for-portable-services.html)<br>
 [Repo with examples](https://github.com/systemd/portable-walkthrough)

@@ -6,7 +6,6 @@ set -eux
 # shellcheck source=test/units/util.sh
 . "$(dirname "$0")"/util.sh
 
-systemctl log-level debug
 export SYSTEMD_LOG_LEVEL=debug
 
 # Sanity checks
@@ -19,7 +18,8 @@ systemd-analyze time || :
 systemd-analyze critical-chain || :
 # blame
 systemd-analyze blame
-systemd-run --wait --user --pipe -M testuser@.host systemd-analyze blame
+systemd-analyze blame --json=pretty
+systemd-run --wait --user --pipe -M testuser@.host systemd-analyze blame --no-pager
 (! systemd-analyze blame --global)
 # plot
 systemd-analyze plot >/dev/null || :
@@ -80,8 +80,12 @@ systemd-analyze dump "*.socket" "*.service" aaaaaaa ... >/dev/null
 systemd-analyze dump systemd-journald.service >/dev/null
 (! systemd-analyze dump "")
 (! systemd-analyze dump --global systemd-journald.service)
-# malloc
-systemd-analyze malloc >/dev/null
+# malloc (supported only when built with glibc)
+if built_with_musl; then
+    (! systemd-analyze malloc)
+else
+    systemd-analyze malloc >/dev/null
+fi
 (! systemd-analyze malloc --global)
 # unit-files
 systemd-analyze unit-files >/dev/null
@@ -417,7 +421,7 @@ systemd-analyze security --offline=true /tmp/testfile.service
 (! systemd-analyze security --threshold=90 --offline=true /tmp/testfile.service)
 
 # Ensure we print the list of ACLs, see https://github.com/systemd/systemd/issues/23185
-systemd-analyze security --offline=true /tmp/testfile.service | grep -q -F "/dev/sda"
+systemd-analyze security --offline=true /tmp/testfile.service | grep -F "/dev/sda" >/dev/null
 
 # Make sure that running generators under systemd-analyze verify works.
 # Note: sd-analyze spawns generators in a sandbox which makes gcov unhapy, so temporarily override
@@ -486,6 +490,19 @@ EOF
 systemd-analyze verify /tmp/multi-exec-start.service
 echo 'ExecStart=command-should-not-exist' >>/tmp/multi-exec-start.service
 (! systemd-analyze verify /tmp/multi-exec-start.service)
+
+# test that a missing man binary is reported as such, and that --man=no skips the check.
+cat <<EOF >/tmp/man-documentation.service
+[Unit]
+Documentation=man:systemd(1)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/true
+EOF
+(! env PATH=/nonexistent "$(command -v systemd-analyze)" verify /tmp/man-documentation.service 2>/tmp/man-documentation.log)
+grep "man may not be installed" /tmp/man-documentation.log >/dev/null
+env PATH=/nonexistent "$(command -v systemd-analyze)" verify --man=no /tmp/man-documentation.service
 
 # Prevent regression from #20233 where systemd-analyze will return nonzero exit codes on warnings
 
@@ -1006,8 +1023,31 @@ systemd-analyze security --threshold=25 --offline=true \
 
 rm /tmp/img/usr/lib/systemd/system/testfile.service
 
-if systemd-analyze --version | grep -q -F "+ELFUTILS"; then
-    systemd-analyze inspect-elf --json=short /lib/systemd/systemd | grep -q -F '"elfType":"executable"'
+if systemd-analyze --version | grep -F "+ELFUTILS" >/dev/null; then
+    systemd-analyze inspect-elf /lib/systemd/systemd
+    systemd-analyze inspect-elf --json=short /lib/systemd/systemd | grep -F '"elfType":"executable"' >/dev/null
+
+    # For some unknown reason the .note.dlopen sections are removed when building with sanitizers, so only
+    # run this test if we're not running under sanitizers.
+    # Also the linker removes them on CentOS 9 as binutils < 2.36 does not support the SHF_GNU_RETAIN flag
+    if [[ ! -v ASAN_OPTIONS ]] && ( . /etc/os-release; [[ ! "$ID $ID_LIKE" =~ centos|rhel ]] || systemd-analyze compare-versions "$VERSION_ID" ge 10 ); then
+        shared="$(ldd /lib/systemd/systemd | grep shared | cut -d' ' -f3)"
+        systemd-analyze dlopen-metadata "$shared"
+        systemd-analyze dlopen-metadata --json=short "$shared"
+
+        dlopen_json="$(systemd-analyze dlopen-metadata --json=short "$shared")"
+        assert_eq "$(echo "$dlopen_json" | jq 'type')" '"array"'
+        assert_ge "$(echo "$dlopen_json" | jq 'length')" 1
+        # Every entry must have the four fields with the expected types and a valid priority.
+        assert_eq "$(echo "$dlopen_json" | jq 'all(
+            (.feature | type == "string") and
+            (.description | type == "string") and
+            (.priority | IN("required", "recommended", "suggested")) and
+            (.soname | type == "array" and length > 0 and all(type == "string"))
+        )')" 'true'
+        # libmount is unconditionally pulled into libsystemd-shared, so its note must be present and correct.
+        assert_eq "$(echo "$dlopen_json" | jq 'any(.feature == "mount" and (.soname | index("libmount.so.1") != null))')" 'true'
+    fi
 fi
 
 systemd-analyze --threshold=90 security systemd-journald.service
@@ -1071,13 +1111,13 @@ check deny no "$name"
 
 # Let's also test the "image-policy" verb
 
-systemd-analyze image-policy '*' 2>&1 | grep -q -F "Long form: =verity+signed+encrypted+unprotected+unused+absent"
-systemd-analyze image-policy '-' 2>&1 | grep -q -F "Long form: =unused+absent"
-systemd-analyze image-policy 'home=encrypted:usr=verity' 2>&1 | grep -q -F "Long form: usr=verity:home=encrypted:=unused+absent"
-systemd-analyze image-policy 'home=encrypted:usr=verity' 2>&1 | grep -q -e '^home \+encrypted \+'
-systemd-analyze image-policy 'home=encrypted:usr=verity' 2>&1 | grep -q -e '^usr \+verity \+'
-systemd-analyze image-policy 'home=encrypted:usr=verity' 2>&1 | grep -q -e '^root \+ignore \+'
-systemd-analyze image-policy 'home=encrypted:usr=verity' 2>&1 | grep -q -e '^usr-verity \+unprotected \+'
+systemd-analyze image-policy '*' 2>&1 | grep -F "Long form: =verity+signed+encrypted+encryptedwithintegrity+unprotected+unused+absent" >/dev/null
+systemd-analyze image-policy '-' 2>&1 | grep -F "Long form: =unused+absent" >/dev/null
+systemd-analyze image-policy 'home=encrypted:usr=verity' 2>&1 | grep -F "Long form: usr=verity:home=encrypted:=unused+absent" >/dev/null
+systemd-analyze image-policy 'home=encrypted:usr=verity' 2>&1 | grep -e '^home \+encrypted \+' >/dev/null
+systemd-analyze image-policy 'home=encrypted:usr=verity' 2>&1 | grep -e '^usr \+verity \+' >/dev/null
+systemd-analyze image-policy 'home=encrypted:usr=verity' 2>&1 | grep -e '^root \+ignore \+' >/dev/null
+systemd-analyze image-policy 'home=encrypted:usr=verity' 2>&1 | grep -e '^usr-verity \+unprotected \+' >/dev/null
 
 (! systemd-analyze image-policy 'doedel')
 
@@ -1085,6 +1125,11 @@ systemd-analyze image-policy 'home=encrypted:usr=verity' 2>&1 | grep -q -e '^usr
 systemd-analyze pcrs
 systemd-analyze pcrs --json=pretty
 systemd-analyze pcrs 14 7 0 ima
+if systemd-analyze has-tpm2 -q ; then
+    systemd-analyze nvpcrs
+    systemd-analyze nvpcrs --json=pretty
+    systemd-analyze nvpcrs hardware cryptsetup
+fi
 
 systemd-analyze architectures
 systemd-analyze architectures --json=pretty
@@ -1108,6 +1153,8 @@ systemd-analyze security --instance=tmp systemd-growfs@.service
 systemd-analyze has-tpm2 ||:
 if systemd-analyze has-tpm2 -q ; then
     echo "have tpm2"
+    systemd-analyze identify-tpm2
+    systemd-analyze identify-tpm2 --json=pretty
 else
     echo "have no tpm2"
 fi
@@ -1133,7 +1180,7 @@ Description=Test unit for systemd-analyze unit-shell
 [Service]
 Type=notify
 NotifyAccess=all
-ExecStart=/bin/sh -c "echo 'Hello from test unit' >/tmp/testfile; systemd-notify --ready; sleep infinity"
+ExecStart=bash -c "echo 'Hello from test unit' >/tmp/testfile; systemd-notify --ready; sleep infinity"
 PrivateTmp=disconnected
 EOF
 # Start the service
@@ -1146,7 +1193,5 @@ MAIN_PID=$(systemctl show -p MainPID --value "$UNIT_NAME")
 # Test systemd-analyze unit-shell with a command (cat /tmp/testfile)
 OUTPUT=$(systemd-analyze unit-shell "$UNIT_NAME" cat /tmp/testfile)
 assert_in "Hello from test unit" "$OUTPUT"
-
-systemd-analyze log-level info
 
 touch /testok

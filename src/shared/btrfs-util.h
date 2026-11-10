@@ -3,8 +3,9 @@
 
 #include "sd-id128.h"
 
-#include "btrfs.h"      /* IWYU pragma: export */
 #include "forward.h"
+
+#include "../basic/btrfs-util.h"      /* IWYU pragma: export */
 
 typedef struct BtrfsSubvolInfo {
         uint64_t subvol_id;
@@ -49,12 +50,15 @@ static inline int btrfs_is_subvol(const char *path) {
         return btrfs_is_subvol_at(AT_FDCWD, path);
 }
 
-int btrfs_get_block_device_at(int dir_fd, const char *path, dev_t *ret);
+int btrfs_get_block_device_at_full(int dir_fd, const char *path, uint64_t *ret_devid, char **ret_path, dev_t *ret);
+static inline int btrfs_get_block_device_at(int dir_fd, const char *path, dev_t *ret) {
+        return btrfs_get_block_device_at_full(dir_fd, path, NULL, NULL, ret);
+}
 static inline int btrfs_get_block_device(const char *path, dev_t *ret) {
         return btrfs_get_block_device_at(AT_FDCWD, path, ret);
 }
 static inline int btrfs_get_block_device_fd(int fd, dev_t *ret) {
-        return btrfs_get_block_device_at(fd, "", ret);
+        return btrfs_get_block_device_at(fd, NULL, ret);
 }
 
 int btrfs_defrag_fd(int fd);
@@ -91,17 +95,17 @@ int btrfs_subvol_get_id(int fd, const char *subvolume, uint64_t *ret);
 int btrfs_subvol_get_id_fd(int fd, uint64_t *ret);
 int btrfs_subvol_get_parent(int fd, uint64_t subvol_id, uint64_t *ret);
 
-int btrfs_subvol_get_info_fd(int fd, uint64_t subvol_id, BtrfsSubvolInfo *info);
+int btrfs_subvol_get_info_fd(int fd, uint64_t subvol_id, BtrfsSubvolInfo *ret);
 
 int btrfs_subvol_find_subtree_qgroup(int fd, uint64_t subvol_id, uint64_t *ret);
 
-int btrfs_subvol_get_subtree_quota(const char *path, uint64_t subvol_id, BtrfsQuotaInfo *quota);
-int btrfs_subvol_get_subtree_quota_fd(int fd, uint64_t subvol_id, BtrfsQuotaInfo *quota);
+int btrfs_subvol_get_subtree_quota(const char *path, uint64_t subvol_id, BtrfsQuotaInfo *ret);
+int btrfs_subvol_get_subtree_quota_fd(int fd, uint64_t subvol_id, BtrfsQuotaInfo *ret);
 
 int btrfs_subvol_set_subtree_quota_limit(const char *path, uint64_t subvol_id, uint64_t referenced_max);
 int btrfs_subvol_set_subtree_quota_limit_fd(int fd, uint64_t subvol_id, uint64_t referenced_max);
 
-int btrfs_subvol_auto_qgroup_fd(int fd, uint64_t subvol_id, bool new_qgroup);
+int btrfs_subvol_auto_qgroup_fd(int fd, uint64_t subvol_id, bool insert_intermediary_qgroup);
 int btrfs_subvol_auto_qgroup(const char *path, uint64_t subvol_id, bool create_intermediary_qgroup);
 
 int btrfs_subvol_make_default(const char *path);
@@ -123,8 +127,8 @@ int btrfs_qgroup_unassign(int fd, uint64_t child, uint64_t parent);
 
 int btrfs_qgroup_find_parents(int fd, uint64_t qgroupid, uint64_t **ret);
 
-int btrfs_qgroup_get_quota_fd(int fd, uint64_t qgroupid, BtrfsQuotaInfo *quota);
-int btrfs_qgroup_get_quota(const char *path, uint64_t qgroupid, BtrfsQuotaInfo *quota);
+int btrfs_qgroup_get_quota_fd(int fd, uint64_t qgroupid, BtrfsQuotaInfo *ret);
+int btrfs_qgroup_get_quota(const char *path, uint64_t qgroupid, BtrfsQuotaInfo *ret);
 
 int btrfs_log_dev_root(int level, int ret, const char *p);
 
@@ -133,3 +137,6 @@ bool btrfs_might_be_subvol(const struct stat *st) _pure_;
 int btrfs_forget_device(const char *path);
 
 int btrfs_get_file_physical_offset_fd(int fd, uint64_t *ret);
+
+int btrfs_replace(int fdmntpnt, uint64_t device_id, const char *target);
+int btrfs_resize_max(int fdmntpnt, uint64_t devid);

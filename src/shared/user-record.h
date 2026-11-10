@@ -1,11 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include <time.h>
+
 #include "sd-id128.h"
 
 #include "bitfield.h"
-#include "rlimit-util.h"
 #include "forward.h"
+#include "pkcs11-padding.h"
+#include "rlimit-util.h"
 
 typedef enum UserDisposition {
         USER_INTRINSIC,   /* root and nobody */
@@ -187,6 +190,10 @@ typedef struct Pkcs11EncryptedKey {
         /* Where to find the private key to decrypt the encrypted passphrase above */
         char *uri;
 
+        /* Which RSA padding scheme was used to wrap the encrypted passphrase. Defaults to PKCS#1 v1.5 for
+         * legacy records that omit the field; new enrollments use RSA-OAEP with SHA-256 or SHA-1. */
+        Pkcs11RsaPadding padding;
+
         /* What to test the decrypted passphrase against to allow access (classic UNIX password hash).  Note
          * that the decrypted passphrase is also used for unlocking LUKS and fscrypt, and if the account is
          * backed by LUKS or fscrypt the hashed password is only an additional layer of authentication, not
@@ -266,6 +273,7 @@ typedef struct UserRecord {
         char *password_hint;
         char *icon_name;
         char *location;
+        struct tm birth_date;
 
         char *blob_directory;
         Hashmap *blob_manifest;
@@ -418,8 +426,7 @@ typedef struct UserRecord {
 } UserRecord;
 
 UserRecord* user_record_new(void);
-UserRecord* user_record_ref(UserRecord *h);
-UserRecord* user_record_unref(UserRecord *h);
+DECLARE_TRIVIAL_REF_UNREF_FUNC(UserRecord, user_record);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(UserRecord*, user_record_unref);
 
@@ -469,7 +476,7 @@ uint32_t user_record_dev_shm_limit_scale(UserRecord *h);
 const char **user_record_self_modifiable_fields(UserRecord *h);
 const char **user_record_self_modifiable_blobs(UserRecord *h);
 const char **user_record_self_modifiable_privileged(UserRecord *h);
-int user_record_self_changes_allowed(UserRecord *current, UserRecord *new);
+int user_record_self_changes_allowed(UserRecord *current, UserRecord *incoming);
 
 int user_record_build_image_path(UserStorage storage, const char *user_name_and_realm, char **ret);
 
@@ -513,6 +520,7 @@ typedef struct UserDBMatch {
                 uid_t uid_max;
                 gid_t gid_max;
         };
+        sd_id128_t uuid;
 } UserDBMatch;
 
 #define USER_DISPOSITION_MASK_ALL ((UINT64_C(1) << _USER_DISPOSITION_MAX) - UINT64_C(1))
@@ -522,6 +530,7 @@ typedef struct UserDBMatch {
                 .disposition_mask = USER_DISPOSITION_MASK_ALL,  \
                 .uid_min = 0,                                   \
                 .uid_max = UID_INVALID-1,                       \
+                .uuid = SD_ID128_NULL,                          \
        }
 
 /* Maybe useful when we want to resolve root and system user/group but want to refuse nobody user/group. */
@@ -537,6 +546,7 @@ bool userdb_match_is_set(const UserDBMatch *match) _pure_;
 
 void userdb_match_done(UserDBMatch *match);
 
+bool record_name_matches_alias_realm(const char *name, char * const *aliases, const char *realm);
 bool user_name_fuzzy_match(const char *names[], size_t n_names, char **matches);
 bool user_record_match(UserRecord *u, const UserDBMatch *match);
 
@@ -544,11 +554,8 @@ bool user_record_matches_user_name(const UserRecord *u, const char *username);
 
 int json_dispatch_dispositions_mask(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 
-const char* user_storage_to_string(UserStorage t) _const_;
-UserStorage user_storage_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(user_storage, UserStorage);
 
-const char* user_disposition_to_string(UserDisposition t) _const_;
-UserDisposition user_disposition_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(user_disposition, UserDisposition);
 
-const char* auto_resize_mode_to_string(AutoResizeMode m) _const_;
-AutoResizeMode auto_resize_mode_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(auto_resize_mode, AutoResizeMode);

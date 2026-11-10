@@ -40,8 +40,7 @@ static inline void clear_log_syntax_callback(dummy_t *dummy) {
           set_log_syntax_callback(/* cb= */ NULL, /* userdata= */ NULL);
 }
 
-const char* log_target_to_string(LogTarget target) _const_;
-LogTarget log_target_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(log_target, LogTarget);
 void log_set_target(LogTarget target);
 void log_set_target_and_open(LogTarget target);
 int log_set_target_from_string(const char *e);
@@ -192,15 +191,21 @@ int log_dump_internal(
 
 #if BUILD_MODE_DEVELOPER && !defined(TEST_CODE)
 #  define ASSERT_NON_ZERO(x) assert((x) != 0)
+#  define ASSERT_UNDERFLOW(x) assert((x) >= INT_MIN)
 #else
 #  define ASSERT_NON_ZERO(x)
+#  define ASSERT_UNDERFLOW(x)
 #endif
 
+/* We often call log macros with ssize_t instead of int, so check for underflows,
+ * as ssize_t is not guaranteed to be the same as int, and we usually do
+ * 'return log_errno...' from functions that return 'int' */
 #define log_full_errno(level, error, ...)                               \
         ({                                                              \
-                int _error = (error);                                   \
+                int64_t _error = (error);                               \
+                ASSERT_UNDERFLOW(_error);                               \
                 ASSERT_NON_ZERO(_error);                                \
-                log_full_errno_zerook(level, _error, __VA_ARGS__);      \
+                log_full_errno_zerook(level, (int)_error, __VA_ARGS__); \
         })
 
 #define log_full(level, fmt, ...)                                      \
@@ -268,6 +273,15 @@ int log_emergency_level(void);
         log_struct_iovec_internal(level, error, PROJECT_FILE, __LINE__, __func__, iovec, n_iovec)
 #define log_struct_iovec(level, iovec, n_iovec) log_struct_iovec_errno(level, 0, iovec, n_iovec)
 
+/* Like log_struct(), but with log_once() semantics */
+#define log_struct_once(level, ...)                                     \
+        ({                                                              \
+                if (ONCE)                                               \
+                        log_struct(level, __VA_ARGS__);                 \
+                else if (LOG_PRI(level) != LOG_DEBUG)                   \
+                        log_struct(LOG_DEBUG, __VA_ARGS__);             \
+        })
+
 /* This modifies the buffer passed! */
 #define log_dump(level, buffer)                                         \
         log_dump_internal(level, 0, PROJECT_FILE, __LINE__, __func__, buffer)
@@ -281,18 +295,21 @@ bool log_on_console(void) _pure_;
 
 /* Helper to wrap the main message in structured logging. The macro doesn't do much,
  * except to provide visual grouping of the format string and its arguments. */
-#if LOG_MESSAGE_VERIFICATION || defined(__COVERITY__)
+#ifdef __COVERITY__
+/* Coverity does not like the concatenation of multiple formats and arguments. Let's replace each format
+ * string with a dummy string. The validity of the formats is hopefully checked by other CIs. */
+#  define LOG_ITEM(fmt, ...)    "dummy", NULL, ##__VA_ARGS__
+#elif LOG_MESSAGE_VERIFICATION
 /* Do a fake formatting of the message string to let the scanner verify the arguments against the format
  * message. The variable will never be set to true, but we don't tell the compiler that :) */
 extern bool _log_message_dummy;
 #  define LOG_ITEM(fmt, ...) "%.0d" fmt, (_log_message_dummy && printf(fmt, ##__VA_ARGS__)), ##__VA_ARGS__
-#  define LOG_MESSAGE(fmt, ...) LOG_ITEM("MESSAGE=" fmt, ##__VA_ARGS__)
 #else
 #  define LOG_ITEM(fmt, ...) fmt, ##__VA_ARGS__
-#  define LOG_MESSAGE(fmt, ...) "MESSAGE=" fmt, ##__VA_ARGS__
 #endif
 
-#define LOG_MESSAGE_ID(id) LOG_ITEM("MESSAGE_ID=" id)
+#define LOG_MESSAGE(fmt, ...) LOG_ITEM("MESSAGE=" fmt, ##__VA_ARGS__)
+#define LOG_MESSAGE_ID(id)    LOG_ITEM("MESSAGE_ID=" id)
 
 void log_received_signal(int level, const struct signalfd_siginfo *si);
 
@@ -365,13 +382,15 @@ int log_syntax_parse_error_internal(
         log_syntax_parse_error_internal(unit, config_file, config_line, error, critical, PROJECT_FILE, __LINE__, __func__, lvalue, rvalue)
 
 #define log_syntax_parse_error(unit, config_file, config_line, error, lvalue, rvalue) \
-        log_syntax_parse_error_full(unit, config_file, config_line, error, /* critical = */ false, lvalue, rvalue)
+        log_syntax_parse_error_full(unit, config_file, config_line, error, /* critical= */ false, lvalue, rvalue)
 
 #define DEBUG_LOGGING _unlikely_(log_get_max_level() >= LOG_DEBUG)
 
 void log_setup(void);
 
 const char* _log_set_prefix(const char *prefix, bool force);
+
+void log_prefix_swap(const char **prefix);
 static inline const char* _log_unset_prefixp(const char **p) {
         assert(p);
         _log_set_prefix(*p, true);

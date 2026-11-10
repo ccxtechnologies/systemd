@@ -1,11 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
-#include <linux/prctl.h>
 #include <poll.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
-#include <sys/prctl.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -19,11 +18,13 @@
 #include "cgroup-setup.h"
 #include "coredump-util.h"
 #include "cpu-set-util.h"
+#include "creds-util.h"
 #include "dissect-image.h"
 #include "dynamic-user.h"
 #include "env-file.h"
 #include "env-util.h"
 #include "escape.h"
+#include "exec-credential.h"
 #include "execute.h"
 #include "execute-serialize.h"
 #include "fd-util.h"
@@ -56,6 +57,7 @@
 #include "serialize.h"
 #include "set.h"
 #include "sort-util.h"
+#include "specifier.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
@@ -114,7 +116,7 @@ int exec_context_apply_tty_size(
         if (rows == UINT_MAX && cols == UINT_MAX &&
             exec_context_shall_ansi_seq_reset(context) &&
             isatty_safe(input_fd)) {
-                r = terminal_get_size_by_dsr(input_fd, output_fd, &rows, &cols);
+                r = terminal_get_size(input_fd, output_fd, &rows, &cols, /* try_dsr= */ true, /* try_csi18= */ false);
                 if (r < 0)
                         log_debug_errno(r, "Failed to get terminal size by DSR, ignoring: %m");
         }
@@ -257,14 +259,14 @@ bool exec_needs_pid_namespace(const ExecContext *context, const ExecParameters *
         return context->private_pids != PRIVATE_PIDS_NO && namespace_type_supported(NAMESPACE_PID);
 }
 
-bool exec_needs_mount_namespace(
-                const ExecContext *context,
-                const ExecParameters *params,
-                const ExecRuntime *runtime) {
-
+bool exec_needs_mount_namespace(const ExecContext *context, const ExecParameters *params) {
         assert(context);
 
-        if (context->root_image)
+        if (context->root_image ||
+            context->root_mstack)
+                return true;
+
+        if (context->root_directory_as_fd)
                 return true;
 
         if (!strv_isempty(context->read_write_paths) ||
@@ -292,13 +294,8 @@ bool exec_needs_mount_namespace(
         if (!IN_SET(context->mount_propagation_flag, 0, MS_SHARED))
                 return true;
 
-        if (context->private_tmp == PRIVATE_TMP_DISCONNECTED)
-                return true;
-
-        if (context->private_tmp == PRIVATE_TMP_CONNECTED && runtime && runtime->shared && (runtime->shared->tmp_dir || runtime->shared->var_tmp_dir))
-                return true;
-
         if (context->private_devices ||
+            context->private_tmp != PRIVATE_TMP_NO || /* no need to check for private_var_tmp here, private_tmp is never demoted to "no" */
             context->private_mounts > 0 ||
             (context->private_mounts < 0 && exec_needs_network_namespace(context)) ||
             context->protect_system != PROTECT_SYSTEM_NO ||
@@ -354,7 +351,7 @@ const char* exec_get_private_notify_socket_path(const ExecContext *context, cons
         if (!needs_sandboxing)
                 return NULL;
 
-        if (!context->root_directory && !context->root_image)
+        if (!exec_context_with_rootfs(context))
                 return NULL;
 
         if (!exec_context_get_effective_mount_apivfs(context))
@@ -366,13 +363,17 @@ const char* exec_get_private_notify_socket_path(const ExecContext *context, cons
         return "/run/host/notify";
 }
 
-int exec_log_level_max(const ExecContext *context, const ExecParameters *params) {
-        assert(context);
+int exec_log_level_max_with_exec_params(const ExecContext *context, const ExecParameters *params) {
         assert(params);
 
         if (params->debug_invocation)
                 return LOG_DEBUG;
 
+        return exec_log_level_max(context);
+}
+
+int exec_log_level_max(const ExecContext *context) {
+        assert(context);
         return context->log_level_max < 0 ? log_get_max_level() : context->log_level_max;
 }
 
@@ -459,7 +460,7 @@ static void log_command_line(Unit *unit, const char *msg, const char *executable
                         LOG_UNIT_INVOCATION_ID(unit));
 }
 
-static int exec_context_load_environment(const Unit *unit, const ExecContext *c, char ***l);
+static int exec_context_load_environment(const Unit *unit, const ExecContext *c, char ***ret);
 
 int exec_spawn(
                 Unit *unit,
@@ -478,12 +479,11 @@ int exec_spawn(
         assert(unit);
         assert(unit->manager);
         assert(unit->manager->executor_fd >= 0);
-        assert(unit->manager->executor_path);
         assert(command);
         assert(context);
         assert(params);
-        assert(!params->fds || FLAGS_SET(params->flags, EXEC_PASS_FDS));
-        assert(params->fds || (params->n_socket_fds + params->n_storage_fds + params->n_extra_fds == 0));
+        assert(params->fds || (params->n_socket_fds + params->n_stashed_fds == 0 && !params->fd_names));
+        assert(params->n_stashed_fds == 0 || FLAGS_SET(params->flags, EXEC_PASS_FDS));
         assert(!params->files_env); /* We fill this field, ensure it comes NULL-initialized to us */
         assert(ret);
 
@@ -579,7 +579,7 @@ int exec_spawn(
         /* The executor binary is pinned, to avoid compatibility problems during upgrades. */
         r = posix_spawn_wrapper(
                         FORMAT_PROC_FD_PATH(unit->manager->executor_fd),
-                        STRV_MAKE(unit->manager->executor_path,
+                        STRV_MAKE("systemd-executor",
                                   "--deserialize", serialization_fd_number,
                                   "--log-level", max_log_levels,
                                   "--log-target", log_target_to_string(manager_get_executor_log_target(unit->manager))),
@@ -629,7 +629,7 @@ void exec_context_init(ExecContext *c) {
                 .timer_slack_nsec = NSEC_INFINITY,
                 .personality = PERSONALITY_INVALID,
                 .timeout_clean_usec = USEC_INFINITY,
-                .capability_bounding_set = CAP_MASK_UNSET,
+                .capability_bounding_set = CAP_MASK_ALL,
                 .restrict_namespaces = NAMESPACE_FLAGS_INITIAL,
                 .delegate_namespaces = NAMESPACE_FLAGS_INITIAL,
                 .log_level_max = -1,
@@ -673,15 +673,12 @@ void exec_context_done(ExecContext *c) {
         c->root_directory = mfree(c->root_directory);
         c->root_image = mfree(c->root_image);
         c->root_image_options = mount_options_free_all(c->root_image_options);
-        c->root_hash = mfree(c->root_hash);
-        c->root_hash_size = 0;
+        iovec_done(&c->root_hash);
         c->root_hash_path = mfree(c->root_hash_path);
-        c->root_hash_sig = mfree(c->root_hash_sig);
-        c->root_hash_sig_size = 0;
+        iovec_done(&c->root_hash_sig);
         c->root_hash_sig_path = mfree(c->root_hash_sig_path);
         c->root_verity = mfree(c->root_verity);
-        c->extension_images = mount_image_free_many(c->extension_images, &c->n_extension_images);
-        c->extension_directories = strv_free(c->extension_directories);
+        c->root_mstack = mfree(c->root_mstack);
         c->tty_path = mfree(c->tty_path);
         c->syslog_identifier = mfree(c->syslog_identifier);
         c->user = mfree(c->user);
@@ -701,10 +698,16 @@ void exec_context_done(ExecContext *c) {
         bind_mount_free_many(c->bind_mounts, c->n_bind_mounts);
         c->bind_mounts = NULL;
         c->n_bind_mounts = 0;
+        mount_image_free_array(c->mount_images, c->n_mount_images);
+        c->mount_images = NULL;
+        c->n_mount_images = 0;
+        mount_image_free_array(c->extension_images, c->n_extension_images);
+        c->extension_images = NULL;
+        c->n_extension_images = 0;
+        c->extension_directories = strv_free(c->extension_directories);
         temporary_filesystem_free_many(c->temporary_filesystems, c->n_temporary_filesystems);
         c->temporary_filesystems = NULL;
         c->n_temporary_filesystems = 0;
-        c->mount_images = mount_image_free_many(c->mount_images, &c->n_mount_images);
 
         cpu_set_done(&c->cpu_set);
         numa_policy_reset(&c->numa_policy);
@@ -735,6 +738,7 @@ void exec_context_done(ExecContext *c) {
         c->stdin_data = mfree(c->stdin_data);
         c->stdin_data_size = 0;
 
+        c->user_namespace_path = mfree(c->user_namespace_path);
         c->network_namespace_path = mfree(c->network_namespace_path);
         c->ipc_namespace_path = mfree(c->ipc_namespace_path);
 
@@ -749,6 +753,88 @@ void exec_context_done(ExecContext *c) {
         c->extension_image_policy = image_policy_free(c->extension_image_policy);
 
         c->private_hostname = mfree(c->private_hostname);
+}
+
+int exec_context_apply_environment(
+                Unit *u,
+                ExecContext *c,
+                char **env,
+                UnitWriteFlags flags) {
+
+        assert(u);
+        assert(c);
+
+        if (strv_length(env) > ENVIRONMENT_ASSIGNMENTS_MAX)
+                return -E2BIG;
+        if (!strv_env_is_valid(env))
+                return -EINVAL;
+
+        if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                if (strv_isempty(env)) {
+                        c->environment = strv_free(c->environment);
+                        unit_write_setting(u, flags, "Environment", "Environment=");
+                } else {
+                        _cleanup_free_ char *joined = unit_concat_strv(env, UNIT_ESCAPE_SPECIFIERS|UNIT_ESCAPE_C);
+                        if (!joined)
+                                return -ENOMEM;
+
+                        char **e = strv_env_merge(c->environment, env);
+                        if (!e)
+                                return -ENOMEM;
+
+                        strv_free_and_replace(c->environment, e);
+                        unit_write_settingf(u, flags, "Environment", "Environment=%s", joined);
+                }
+        }
+
+        return 0;
+}
+
+int exec_context_apply_set_credential(
+                Unit *u,
+                ExecContext *c,
+                const char *id,
+                const void *data,
+                size_t size,
+                bool encrypted,
+                UnitWriteFlags flags,
+                const char **reterr_message) {
+
+        int r;
+
+        assert(u);
+        assert(c);
+        assert(id);
+        assert(data || size == 0);
+
+        if (!credential_name_valid(id)) {
+                if (reterr_message)
+                        *reterr_message = "Credential ID is invalid";
+                return -EINVAL;
+        }
+
+        if (UNIT_WRITE_FLAGS_NOOP(flags))
+                return 0;
+
+        _cleanup_free_ void *copy = memdup(data, size);
+        if (!copy)
+                return -ENOMEM;
+
+        _cleanup_free_ char *escaped_id = specifier_escape(id);
+        if (!escaped_id)
+                return -ENOMEM;
+
+        _cleanup_free_ char *escaped_value = cescape_length(data, size);
+        if (!escaped_value)
+                return -ENOMEM;
+
+        r = exec_context_put_set_credential(c, id, TAKE_PTR(copy), size, encrypted);
+        if (r < 0)
+                return r;
+
+        const char *name = encrypted ? "SetCredentialEncrypted" : "SetCredential";
+        unit_write_settingf(u, flags, name, "%s=%s:%s", name, escaped_id, escaped_value);
+        return 0;
 }
 
 int exec_context_destroy_runtime_directory(const ExecContext *c, const char *runtime_prefix) {
@@ -913,7 +999,7 @@ static int exec_context_load_environment(const Unit *unit, const ExecContext *c,
                 }
 
                 /* Filename supports globbing, take all matching files */
-                r = safe_glob(fn, /* flags = */ 0, &paths);
+                r = safe_glob(fn, /* flags= */ 0, &paths);
                 if (r < 0) {
                         if (ignore)
                                 continue;
@@ -1044,7 +1130,6 @@ void exec_params_dump(const ExecParameters *p, FILE* f, const char *prefix) {
                 "%sRuntimeScope: %s\n"
                 "%sExecFlags: %u\n"
                 "%sSELinuxContextNetwork: %s\n"
-                "%sCgroupSupportedMask: %u\n"
                 "%sCgroupPath: %s\n"
                 "%sCrededentialsDirectory: %s\n"
                 "%sEncryptedCredentialsDirectory: %s\n"
@@ -1057,7 +1142,6 @@ void exec_params_dump(const ExecParameters *p, FILE* f, const char *prefix) {
                 prefix, runtime_scope_to_string(p->runtime_scope),
                 prefix, p->flags,
                 prefix, yes_no(p->selinux_context_net),
-                prefix, p->cgroup_supported,
                 prefix, p->cgroup_path,
                 prefix, strempty(p->received_credentials_directory),
                 prefix, strempty(p->received_encrypted_credentials_directory),
@@ -1114,6 +1198,7 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 "%sProtectHostname: %s%s%s\n"
                 "%sProtectProc: %s\n"
                 "%sProcSubset: %s\n"
+                "%sMemoryTHP: %s\n"
                 "%sPrivateBPF: %s\n",
                 prefix, c->umask,
                 prefix, empty_to_root(c->working_directory),
@@ -1142,6 +1227,7 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 prefix, protect_hostname_to_string(c->protect_hostname), c->private_hostname ? ":" : "", strempty(c->private_hostname),
                 prefix, protect_proc_to_string(c->protect_proc),
                 prefix, proc_subset_to_string(c->proc_subset),
+                prefix, exec_memory_thp_to_string(c->memory_thp),
                 prefix, private_bpf_to_string(c->private_bpf));
 
         if (c->private_bpf == PRIVATE_BPF_YES) {
@@ -1164,18 +1250,15 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 fprintf(f, "%sRootImage: %s\n", prefix, c->root_image);
 
         if (c->root_image_options) {
-                fprintf(f, "%sRootImageOptions:", prefix);
-                LIST_FOREACH(mount_options, o, c->root_image_options)
-                        if (!isempty(o->options))
-                                fprintf(f, " %s:%s",
-                                        partition_designator_to_string(o->partition_designator),
-                                        o->options);
-                fprintf(f, "\n");
+                _cleanup_free_ char *opts_str = NULL;
+
+                if (mount_options_to_string(c->root_image_options, &opts_str) >= 0 && !isempty(opts_str))
+                        fprintf(f, "%sRootImageOptions: %s\n", prefix, opts_str);
         }
 
-        if (c->root_hash) {
+        if (iovec_is_set(&c->root_hash)) {
                 _cleanup_free_ char *encoded = NULL;
-                encoded = hexmem(c->root_hash, c->root_hash_size);
+                encoded = hexmem(c->root_hash.iov_base, c->root_hash.iov_len);
                 if (encoded)
                         fprintf(f, "%sRootHash: %s\n", prefix, encoded);
         }
@@ -1183,10 +1266,10 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
         if (c->root_hash_path)
                 fprintf(f, "%sRootHash: %s\n", prefix, c->root_hash_path);
 
-        if (c->root_hash_sig) {
+        if (iovec_is_set(&c->root_hash_sig)) {
                 _cleanup_free_ char *encoded = NULL;
                 ssize_t len;
-                len = base64mem(c->root_hash_sig, c->root_hash_sig_size, &encoded);
+                len = base64mem(c->root_hash_sig.iov_base, c->root_hash_sig.iov_len, &encoded);
                 if (len)
                         fprintf(f, "%sRootHashSignature: base64:%s\n", prefix, encoded);
         }
@@ -1196,6 +1279,9 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
 
         if (c->root_verity)
                 fprintf(f, "%sRootVerity: %s\n", prefix, c->root_verity);
+
+        if (c->root_mstack)
+                fprintf(f, "%sRootMStack: %s\n", prefix, c->root_mstack);
 
         STRV_FOREACH(e, c->environment)
                 fprintf(f, "%sEnvironment: %s\n", prefix, *e);
@@ -1489,27 +1575,29 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                         fputc('~', f);
 
 #if HAVE_SECCOMP
-                void *id, *val;
-                bool first = true;
-                HASHMAP_FOREACH_KEY(val, id, c->syscall_filter) {
-                        _cleanup_free_ char *name = NULL;
-                        const char *errno_name = NULL;
-                        int num = PTR_TO_INT(val);
+                if (dlopen_libseccomp(LOG_DEBUG) >= 0) {
+                        void *id, *val;
+                        bool first = true;
+                        HASHMAP_FOREACH_KEY(val, id, c->syscall_filter) {
+                                _cleanup_free_ char *name = NULL;
+                                const char *errno_name = NULL;
+                                int num = PTR_TO_INT(val);
 
-                        if (first)
-                                first = false;
-                        else
-                                fputc(' ', f);
-
-                        name = seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, PTR_TO_INT(id) - 1);
-                        fputs(strna(name), f);
-
-                        if (num >= 0) {
-                                errno_name = seccomp_errno_or_action_to_string(num);
-                                if (errno_name)
-                                        fprintf(f, ":%s", errno_name);
+                                if (first)
+                                        first = false;
                                 else
-                                        fprintf(f, ":%d", num);
+                                        fputc(' ', f);
+
+                                name = sym_seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, PTR_TO_INT(id) - 1);
+                                fputs(strna(name), f);
+
+                                if (num >= 0) {
+                                        errno_name = seccomp_errno_or_action_to_string(num);
+                                        if (errno_name)
+                                                fprintf(f, ":%s", errno_name);
+                                        else
+                                                fprintf(f, ":%d", num);
+                                }
                         }
                 }
 #endif
@@ -1547,6 +1635,11 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
         }
 #endif
 
+        if (c->user_namespace_path)
+                fprintf(f,
+                        "%sUserNamespacePath: %s\n",
+                        prefix, c->user_namespace_path);
+
         if (c->network_namespace_path)
                 fprintf(f,
                         "%sNetworkNamespacePath: %s\n",
@@ -1570,10 +1663,12 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                         mount->ignore_enoent ? "-": "",
                         mount->source,
                         mount->destination);
-                LIST_FOREACH(mount_options, o, mount->mount_options)
-                        fprintf(f, ":%s:%s",
-                                partition_designator_to_string(o->partition_designator),
-                                strempty(o->options));
+                if (mount->mount_options) {
+                        _cleanup_free_ char *opts = NULL;
+
+                        if (mount_options_to_string(mount->mount_options, &opts) >= 0 && !isempty(opts))
+                                fprintf(f, " %s", opts);
+                }
                 fprintf(f, "\n");
         }
 
@@ -1581,10 +1676,12 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 fprintf(f, "%sExtensionImages: %s%s", prefix,
                         mount->ignore_enoent ? "-": "",
                         mount->source);
-                LIST_FOREACH(mount_options, o, mount->mount_options)
-                        fprintf(f, ":%s:%s",
-                                partition_designator_to_string(o->partition_designator),
-                                strempty(o->options));
+                if (mount->mount_options) {
+                        _cleanup_free_ char *opts = NULL;
+
+                        if (mount_options_to_string(mount->mount_options, &opts) >= 0 && !isempty(opts))
+                                fprintf(f, " %s", opts);
+                }
                 fprintf(f, "\n");
         }
 
@@ -1875,9 +1972,11 @@ uint64_t exec_context_get_timer_slack_nsec(const ExecContext *c) {
         if (c->timer_slack_nsec != NSEC_INFINITY)
                 return c->timer_slack_nsec;
 
-        r = prctl(PR_GET_TIMERSLACK);
-        if (r < 0)
+        r = prctl_safe(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+        if (r < 0) {
                 log_debug_errno(r, "Failed to get timer slack, ignoring: %m");
+                return 0;
+        }
 
         return (uint64_t) MAX(r, 0);
 }
@@ -1897,6 +1996,9 @@ char** exec_context_get_syscall_filter(const ExecContext *c) {
         assert(c);
 
 #if HAVE_SECCOMP
+        if (dlopen_libseccomp(LOG_DEBUG) < 0)
+                return strv_new(NULL);
+
         void *id, *val;
         HASHMAP_FOREACH_KEY(val, id, c->syscall_filter) {
                 _cleanup_free_ char *name = NULL;
@@ -1908,20 +2010,18 @@ char** exec_context_get_syscall_filter(const ExecContext *c) {
                         /* syscall with num >= 0 in allow-list is denied. */
                         continue;
 
-                name = seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, PTR_TO_INT(id) - 1);
+                name = sym_seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, PTR_TO_INT(id) - 1);
                 if (!name)
                         continue;
 
                 if (num >= 0) {
                         e = seccomp_errno_or_action_to_string(num);
-                        if (e) {
+                        if (e)
                                 s = strjoin(name, ":", e);
-                                if (!s)
-                                        return NULL;
-                        } else {
-                                if (asprintf(&s, "%s:%d", name, num) < 0)
-                                        return NULL;
-                        }
+                        else
+                                s = asprintf_safe("%s:%d", name, num);
+                        if (!s)
+                                return NULL;
                 } else
                         s = TAKE_PTR(name);
 
@@ -1965,11 +2065,14 @@ char** exec_context_get_syscall_log(const ExecContext *c) {
         assert(c);
 
 #if HAVE_SECCOMP
+        if (dlopen_libseccomp(LOG_DEBUG) < 0)
+                return strv_new(NULL);
+
         void *id, *val;
         HASHMAP_FOREACH_KEY(val, id, c->syscall_log) {
                 char *name = NULL;
 
-                name = seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, PTR_TO_INT(id) - 1);
+                name = sym_seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, PTR_TO_INT(id) - 1);
                 if (!name)
                         continue;
 
@@ -2035,9 +2138,19 @@ bool exec_context_restrict_filesystems_set(const ExecContext *c) {
 bool exec_context_with_rootfs(const ExecContext *c) {
         assert(c);
 
-        /* Checks if RootDirectory= or RootImage= are used */
+        /* Checks if RootDirectory=, RootImage=, RootMStack= or RootDirectoryFileDescriptor= are used */
 
-        return !empty_or_root(c->root_directory) || c->root_image;
+        return !empty_or_root(c->root_directory) || c->root_image || c->root_directory_as_fd || c->root_mstack;
+}
+
+bool exec_context_with_rootfs_strict(const ExecContext *c) {
+        assert(c);
+
+        /* just like exec_context_with_rootfs(), but doesn't suppress a root directory of "/", i.e. returns
+         * true in more cases: when a root directory is explicitly configured, even if it's our usual
+         * root. */
+
+        return c->root_directory || c->root_image || c->root_directory_as_fd || c->root_mstack;
 }
 
 int exec_context_has_vpicked_extensions(const ExecContext *context) {
@@ -2244,7 +2357,7 @@ int exec_command_append(ExecCommand *c, const char *path, ...) {
         if (!l)
                 return -ENOMEM;
 
-        r = strv_extend_strv_consume(&c->argv, l, /* filter_duplicates = */ false);
+        r = strv_extend_strv_consume(&c->argv, l, /* filter_duplicates= */ false);
         if (r < 0)
                 return r;
 
@@ -2273,6 +2386,7 @@ void exec_shared_runtime_done(ExecSharedRuntime *rt) {
         rt->id = mfree(rt->id);
         rt->tmp_dir = mfree(rt->tmp_dir);
         rt->var_tmp_dir = mfree(rt->var_tmp_dir);
+        safe_close_pair(rt->userns_storage_socket);
         safe_close_pair(rt->netns_storage_socket);
         safe_close_pair(rt->ipcns_storage_socket);
 }
@@ -2320,6 +2434,7 @@ static int exec_shared_runtime_allocate(ExecSharedRuntime **ret, const char *id)
 
         *n = (ExecSharedRuntime) {
                 .id = TAKE_PTR(id_copy),
+                .userns_storage_socket = EBADF_PAIR,
                 .netns_storage_socket = EBADF_PAIR,
                 .ipcns_storage_socket = EBADF_PAIR,
         };
@@ -2333,6 +2448,7 @@ static int exec_shared_runtime_add(
                 const char *id,
                 char **tmp_dir,
                 char **var_tmp_dir,
+                int userns_storage_socket[2],
                 int netns_storage_socket[2],
                 int ipcns_storage_socket[2],
                 ExecSharedRuntime **ret) {
@@ -2342,6 +2458,8 @@ static int exec_shared_runtime_add(
 
         assert(m);
         assert(id);
+        assert(tmp_dir);
+        assert(var_tmp_dir);
 
         /* tmp_dir, var_tmp_dir, {net,ipc}ns_storage_socket fds are donated on success */
 
@@ -2353,9 +2471,13 @@ static int exec_shared_runtime_add(
         if (r < 0)
                 return r;
 
-        assert(!!rt->tmp_dir == !!rt->var_tmp_dir); /* We require both to be set together */
         rt->tmp_dir = TAKE_PTR(*tmp_dir);
         rt->var_tmp_dir = TAKE_PTR(*var_tmp_dir);
+
+        if (userns_storage_socket) {
+                rt->userns_storage_socket[0] = TAKE_FD(userns_storage_socket[0]);
+                rt->userns_storage_socket[1] = TAKE_FD(userns_storage_socket[1]);
+        }
 
         if (netns_storage_socket) {
                 rt->netns_storage_socket[0] = TAKE_FD(netns_storage_socket[0]);
@@ -2383,27 +2505,41 @@ static int exec_shared_runtime_make(
                 ExecSharedRuntime **ret) {
 
         _cleanup_(namespace_cleanup_tmpdirp) char *tmp_dir = NULL, *var_tmp_dir = NULL;
-        _cleanup_close_pair_ int netns_storage_socket[2] = EBADF_PAIR, ipcns_storage_socket[2] = EBADF_PAIR;
+        _cleanup_close_pair_ int userns_storage_socket[2] = EBADF_PAIR, netns_storage_socket[2] = EBADF_PAIR, ipcns_storage_socket[2] = EBADF_PAIR;
         int r;
 
         assert(m);
         assert(c);
         assert(id);
+        assert(ret);
 
         /* It is not necessary to create ExecSharedRuntime object. */
-        if (!exec_needs_network_namespace(c) && !exec_needs_ipc_namespace(c) && c->private_tmp != PRIVATE_TMP_CONNECTED) {
+        if (!c->user_namespace_path && !exec_needs_network_namespace(c) && !exec_needs_ipc_namespace(c) &&
+            c->private_tmp != PRIVATE_TMP_CONNECTED && c->private_var_tmp != PRIVATE_TMP_CONNECTED) {
                 *ret = NULL;
                 return 0;
         }
 
         if (c->private_tmp == PRIVATE_TMP_CONNECTED &&
-            !(prefixed_path_strv_contains(c->inaccessible_paths, "/tmp") &&
-              (prefixed_path_strv_contains(c->inaccessible_paths, "/var/tmp") ||
-               prefixed_path_strv_contains(c->inaccessible_paths, "/var")))) {
-                r = setup_tmp_dirs(id, &tmp_dir, &var_tmp_dir);
+            !prefixed_path_strv_contains(c->inaccessible_paths, "/tmp")) {
+
+                r = setup_tmp_dir_one(id, "/tmp", &tmp_dir);
                 if (r < 0)
                         return r;
         }
+
+        if (c->private_var_tmp == PRIVATE_TMP_CONNECTED &&
+            !prefixed_path_strv_contains(c->inaccessible_paths, "/var/tmp") &&
+            !prefixed_path_strv_contains(c->inaccessible_paths, "/var")) {
+
+                r = setup_tmp_dir_one(id, "/var/tmp", &var_tmp_dir);
+                if (r < 0)
+                        return r;
+        }
+
+        if (c->user_namespace_path)
+                if (socketpair(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, 0, userns_storage_socket) < 0)
+                        return -errno;
 
         if (exec_needs_network_namespace(c))
                 if (socketpair(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, 0, netns_storage_socket) < 0)
@@ -2413,7 +2549,7 @@ static int exec_shared_runtime_make(
                 if (socketpair(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, 0, ipcns_storage_socket) < 0)
                         return -errno;
 
-        r = exec_shared_runtime_add(m, id, &tmp_dir, &var_tmp_dir, netns_storage_socket, ipcns_storage_socket, ret);
+        r = exec_shared_runtime_add(m, id, &tmp_dir, &var_tmp_dir, userns_storage_socket, netns_storage_socket, ipcns_storage_socket, ret);
         if (r < 0)
                 return r;
 
@@ -2470,6 +2606,26 @@ int exec_shared_runtime_serialize(const Manager *m, FILE *f, FDSet *fds) {
 
                 if (rt->var_tmp_dir)
                         fprintf(f, " var-tmp-dir=%s", rt->var_tmp_dir);
+
+                if (rt->userns_storage_socket[0] >= 0) {
+                        int copy;
+
+                        copy = fdset_put_dup(fds, rt->userns_storage_socket[0]);
+                        if (copy < 0)
+                                return copy;
+
+                        fprintf(f, " userns-socket-0=%i", copy);
+                }
+
+                if (rt->userns_storage_socket[1] >= 0) {
+                        int copy;
+
+                        copy = fdset_put_dup(fds, rt->userns_storage_socket[1]);
+                        if (copy < 0)
+                                return copy;
+
+                        fprintf(f, " userns-socket-1=%i", copy);
+                }
 
                 if (rt->netns_storage_socket[0] >= 0) {
                         int copy;
@@ -2595,7 +2751,8 @@ int exec_shared_runtime_deserialize_compat(Unit *u, const char *key, const char 
 int exec_shared_runtime_deserialize_one(Manager *m, const char *value, FDSet *fds) {
         _cleanup_free_ char *tmp_dir = NULL, *var_tmp_dir = NULL;
         char *id = NULL;
-        int r, netns_fdpair[] = {-1, -1}, ipcns_fdpair[] = {-1, -1};
+        _cleanup_close_pair_ int userns_fdpair[] = EBADF_PAIR, netns_fdpair[] = EBADF_PAIR, ipcns_fdpair[] = EBADF_PAIR;
+        int r;
         const char *p, *v = ASSERT_PTR(value);
         size_t n;
 
@@ -2625,6 +2782,36 @@ int exec_shared_runtime_deserialize_one(Manager *m, const char *value, FDSet *fd
                 var_tmp_dir = strndup(v, n);
                 if (!var_tmp_dir)
                         return log_oom();
+                if (v[n] != ' ')
+                        goto finalize;
+                p = v + n + 1;
+        }
+
+        v = startswith(p, "userns-socket-0=");
+        if (v) {
+                char *buf;
+
+                n = strcspn(v, " ");
+                buf = strndupa_safe(v, n);
+
+                userns_fdpair[0] = deserialize_fd(fds, buf);
+                if (userns_fdpair[0] < 0)
+                        return userns_fdpair[0];
+                if (v[n] != ' ')
+                        goto finalize;
+                p = v + n + 1;
+        }
+
+        v = startswith(p, "userns-socket-1=");
+        if (v) {
+                char *buf;
+
+                n = strcspn(v, " ");
+                buf = strndupa_safe(v, n);
+
+                userns_fdpair[1] = deserialize_fd(fds, buf);
+                if (userns_fdpair[1] < 0)
+                        return userns_fdpair[1];
                 if (v[n] != ' ')
                         goto finalize;
                 p = v + n + 1;
@@ -2688,7 +2875,7 @@ int exec_shared_runtime_deserialize_one(Manager *m, const char *value, FDSet *fd
         }
 
 finalize:
-        r = exec_shared_runtime_add(m, id, &tmp_dir, &var_tmp_dir, netns_fdpair, ipcns_fdpair, NULL);
+        r = exec_shared_runtime_add(m, id, &tmp_dir, &var_tmp_dir, userns_fdpair, netns_fdpair, ipcns_fdpair, NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to add exec-runtime: %m");
         return 0;
@@ -2799,6 +2986,7 @@ void exec_params_shallow_clear(ExecParameters *p) {
         p->fd_names = strv_free(p->fd_names);
         p->files_env = strv_free(p->files_env);
         p->fds = mfree(p->fds);
+        p->root_directory_fd = safe_close(p->root_directory_fd);
         p->exec_fd = safe_close(p->exec_fd);
         p->user_lookup_fd = -EBADF;
         p->bpf_restrict_fs_map_fd = -EBADF;
@@ -2816,7 +3004,7 @@ void exec_params_deep_clear(ExecParameters *p) {
          * to be fully cleaned up to make sanitizers and analyzers happy, as opposed as the shallow clean
          * function above. */
 
-        close_many_unset(p->fds, p->n_socket_fds + p->n_storage_fds + p->n_extra_fds);
+        close_many_unset(p->fds, p->n_socket_fds + p->n_stashed_fds);
 
         p->cgroup_path = mfree(p->cgroup_path);
 
@@ -2997,23 +3185,13 @@ static const char* const exec_utmp_mode_table[_EXEC_UTMP_MODE_MAX] = {
 DEFINE_STRING_TABLE_LOOKUP(exec_utmp_mode, ExecUtmpMode);
 
 static const char* const exec_preserve_mode_table[_EXEC_PRESERVE_MODE_MAX] = {
-        [EXEC_PRESERVE_NO]      = "no",
-        [EXEC_PRESERVE_YES]     = "yes",
-        [EXEC_PRESERVE_RESTART] = "restart",
+        [EXEC_PRESERVE_NO]         = "no",
+        [EXEC_PRESERVE_YES]        = "yes",
+        [EXEC_PRESERVE_RESTART]    = "restart",
+        [EXEC_PRESERVE_ON_SUCCESS] = "on-success",
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(exec_preserve_mode, ExecPreserveMode, EXEC_PRESERVE_YES);
-
-/* This table maps ExecDirectoryType to the symlink setting it is configured with in the unit */
-static const char* const exec_directory_type_symlink_table[_EXEC_DIRECTORY_TYPE_MAX] = {
-        [EXEC_DIRECTORY_RUNTIME]       = "RuntimeDirectorySymlink",
-        [EXEC_DIRECTORY_STATE]         = "StateDirectorySymlink",
-        [EXEC_DIRECTORY_CACHE]         = "CacheDirectorySymlink",
-        [EXEC_DIRECTORY_LOGS]          = "LogsDirectorySymlink",
-        [EXEC_DIRECTORY_CONFIGURATION] = "ConfigurationDirectorySymlink",
-};
-
-DEFINE_STRING_TABLE_LOOKUP(exec_directory_type_symlink, ExecDirectoryType);
 
 static const char* const exec_directory_type_mode_table[_EXEC_DIRECTORY_TYPE_MAX] = {
         [EXEC_DIRECTORY_RUNTIME]       = "RuntimeDirectoryMode",
@@ -3045,3 +3223,12 @@ static const char* const exec_keyring_mode_table[_EXEC_KEYRING_MODE_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP(exec_keyring_mode, ExecKeyringMode);
+
+static const char* const exec_memory_thp_table[_EXEC_MEMORY_THP_MAX] = {
+        [EXEC_MEMORY_THP_INHERIT] = "inherit",
+        [EXEC_MEMORY_THP_DISABLE] = "disable",
+        [EXEC_MEMORY_THP_MADVISE] = "madvise",
+        [EXEC_MEMORY_THP_SYSTEM]  = "system",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(exec_memory_thp, ExecMemoryTHP);

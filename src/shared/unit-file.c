@@ -291,17 +291,15 @@ int unit_file_resolve_symlink(
                                          dir, dir ? "/" : "", filename);
 
         if (!dir) {
-                r = path_extract_directory(filename, &_dir);
-                if (r < 0)
-                        return r;
-                dir = _dir;
-
-                r = path_extract_filename(filename, &_filename);
+                r = path_split_prefix_filename(filename, &_dir, &_filename);
                 if (r < 0)
                         return r;
                 if (r == O_DIRECTORY)
                         return log_warning_errno(SYNTHETIC_ERRNO(EISDIR),
                                                  "Unexpected path to a directory \"%s\", refusing.", filename);
+
+                /* We validate that the path is absolute above, hence dir must be extractable. */
+                dir = ASSERT_PTR(_dir);
                 filename = _filename;
         }
 
@@ -385,6 +383,11 @@ int unit_file_build_name_map(
         _cleanup_strv_free_ char **expanded_search_path = NULL;
         uint64_t timestamp_hash;
         int r;
+
+        assert(lp);
+        POINTER_MAY_BE_NULL(cache_timestamp_hash);
+        assert(unit_ids_map);
+        assert(unit_names_map);
 
         /* Before doing anything, check if the timestamp hash that was passed is still valid.
          * If yes, do nothing. */
@@ -499,7 +502,7 @@ int unit_file_build_name_map(
                                                 continue;
                                         }
 
-                                        r = is_dir(target, /* follow = */ true);
+                                        r = is_dir(target, /* follow= */ true);
                                         if (r <= 0)
                                                 continue;
 
@@ -637,6 +640,9 @@ int unit_file_remove_from_name_map(
 
         int r;
 
+        assert(lp);
+        assert(unit_ids_map);
+        assert(unit_names_map);
         assert(path);
 
         /* This assumes the specified path is already removed, and drops the relevant entries from the maps. */
@@ -657,7 +663,8 @@ int unit_file_remove_from_name_map(
         _unused_ _cleanup_free_ char *key = NULL;
         free(hashmap_remove2(*unit_ids_map, name, (void**) &key));
         string_strv_hashmap_remove(*unit_names_map, name, name);
-        free(set_remove(*path_cache, path));
+        if (path_cache)
+                free(set_remove(*path_cache, path));
 
         return 0;
 }
@@ -753,6 +760,8 @@ int unit_file_find_fragment(
         _cleanup_free_ char *template = NULL, *instance = NULL;
         _cleanup_set_free_ Set *names = NULL;
         int r;
+
+        assert(ret_fragment_path);
 
         /* Finds a fragment path, and returns the set of names:
          * if we have …/foo.service and …/foo-alias.service→foo.service,

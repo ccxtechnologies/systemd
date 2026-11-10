@@ -39,12 +39,12 @@
 
     <itemizedlist>
       <listitem><para>Boot entries defined with <ulink
-      url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader Specification</ulink> Type #1
+      url="https://uapi-group.org/specifications/specs/boot_loader_specification">UAPI.1 Boot Loader Specification</ulink> Type #1
       description files located in <filename>/loader/entries/</filename> on the ESP and the Extended Boot
       Loader Partition. These usually describe Linux kernel images with associated initrd images, but
       alternatively may also describe other arbitrary EFI executables.</para></listitem>
 
-      <listitem><para>Unified kernel images, <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot
+      <listitem><para>Unified kernel images, <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">UAPI.1 Boot
       Loader Specification</ulink> Type #2, which are executable EFI binaries in
       <filename>/EFI/Linux/</filename> on the ESP and the Extended Boot Loader Partition.</para></listitem>
 
@@ -57,7 +57,7 @@
       <listitem><para>A <literal>Reboot Into Firmware Interface</literal> option, if supported by the UEFI
       firmware.</para></listitem>
 
-      <listitem><para>Secure Boot variables enrollment if the UEFI firmware is in setup-mode and files are provided
+      <listitem><para>Secure Boot variable enrollment if the UEFI firmware is in setup mode and files are provided
       on the ESP.</para></listitem>
     </itemizedlist>
 
@@ -97,7 +97,7 @@
       entropy pool initialization, providing a full entropy pool during early boot.</para></listitem>
 
       <listitem><para>The boot manager allows for Secure Boot variables to be enrolled if the UEFI firmware is
-      in setup-mode. Additionally, variables can be automatically enrolled if configured.</para></listitem>
+      in setup mode. Additionally, variables can be automatically enrolled if configured.</para></listitem>
     </itemizedlist>
 
     <para><citerefentry><refentrytitle>bootctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>
@@ -147,11 +147,20 @@
 
       <varlistentry>
         <term><keycap>d</keycap></term>
-        <listitem><para>Make selected entry the default</para>
+        <listitem><para>Make selected entry the preferred boot entry</para>
 
         <para>An EFI variable is set to allow this setting to persist.</para>
 
-        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
+        <xi:include href="version-info.xml" xpointer="v260"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><keycap>D</keycap></term>
+        <listitem><para>Make selected entry the default boot entry</para>
+
+        <para>An EFI variable is set to allow this setting to persist.</para>
+
+        <xi:include href="version-info.xml" xpointer="v260"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -373,27 +382,91 @@
     <citerefentry><refentrytitle>loader.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para>
 
     <para>Boot entry description files following the <ulink
-    url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader Specification</ulink> are read from
+    url="https://uapi-group.org/specifications/specs/boot_loader_specification">UAPI.1 Boot Loader Specification</ulink> are read from
     <filename>/loader/entries/</filename> on the ESP and the Extended Boot Loader partition.</para>
 
     <para>Unified kernel boot entries following the <ulink
-    url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader Specification</ulink> are read from
+    url="https://uapi-group.org/specifications/specs/boot_loader_specification">UAPI.1 Boot Loader Specification</ulink> are read from
     <filename>/EFI/Linux/</filename> on the ESP and the Extended Boot Loader partition.</para>
 
     <para>Optionally, a random seed for early boot entropy pool provisioning is stored in
-    <filename>/loader/random-seed</filename> in the ESP.</para>
+    <filename>/loader/random-seed</filename> in the ESP. If the read-only file attribute is set on this
+    file, it is neither updated nor used: a seed that cannot be updated would be identical on every boot,
+    and hence must not be credited. The file attribute may thus be used to explicitly turn off random seed
+    handling, for example in OS images that are replicated to multiple systems.</para>
 
-    <para>During initialization, <command>sd-boot</command> automatically loads all driver files placed in
-    the <filename>/EFI/systemd/drivers/</filename> directory of the ESP. The files placed there must have an
-    extension of the EFI architecture ID followed by <filename>.efi</filename> (e.g. for x86-64 this means a
-    suffix of <filename>x64.efi</filename>). This may be used to automatically load file system drivers and
-    similar, to extend the native firmware support.</para>
+    <para>During initialization, <command>systemd-boot</command> automatically loads all driver files placed
+    in the <filename>/EFI/systemd/drivers/</filename> directory of the ESP. The files placed there must have
+    an extension of the EFI architecture ID followed by <filename>.efi</filename> (e.g. for x86-64 this means
+    a suffix of <filename>x64.efi</filename>). This may be used e.g. to add support for hardware not
+    supported natively by the firmware.</para>
 
     <para>Enrollment of Secure Boot variables can be performed manually or automatically if files are available
     under <filename>/loader/keys/<replaceable>NAME</replaceable>/{db,dbx,KEK,PK}.auth</filename>, <replaceable>NAME</replaceable>
     being the display name for the set of variables in the menu. If one of the sets is named <filename>auto</filename>
-    then it might be enrolled automatically depending on whether <literal>secure-boot-enroll</literal> is set
-    to force or not.</para>
+    then it might be enrolled automatically depending on the execution environment and the value of the <literal>secure-boot-enroll</literal> option.
+    See
+    <citerefentry><refentrytitle>loader.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>Companion Files</title>
+
+    <para>For Type #1 boot loader entries (as defined in the <ulink
+    url="https://uapi-group.org/specifications/specs/boot_loader_specification">UAPI.1 Boot Loader
+    Specification</ulink>) <command>systemd-boot</command> will collect additional companion resources
+    declared via the <literal>extra</literal> key in the entry, dynamically generate
+    <command>cpio</command> initrd archives from them, and register those archives via the Linux initrd EFI
+    protocol so that they are passed to the kernel together with the entry's own initrd. This is supported
+    for entries referencing a Unified Kernel Image (UKI) via the <literal>uki</literal> or
+    <literal>uki-url</literal> keys. Each <literal>extra</literal> key references a single regular file
+    (relative to the root of the file system containing the entry snippet) and the key may be specified
+    multiple times. Companion resources are recognized by file name suffix:</para>
+
+    <itemizedlist>
+      <listitem><para>Files with the <filename>.cred</filename> suffix are packed into a
+      <command>cpio</command> archive placed in the <filename>/.extra/credentials/</filename> directory of
+      the initrd file hierarchy. This is intended to convey auxiliary, encrypted, authenticated credentials
+      for use with <varname>LoadCredentialEncrypted=</varname>. See
+      <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry> and
+      <citerefentry><refentrytitle>systemd-creds</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
+      details on encrypted credentials. The generated <command>cpio</command> archive is measured into TPM
+      PCR 12 (if a TPM is present).</para></listitem>
+
+      <listitem><para>Files with the <filename>.sysext.raw</filename> suffix are packed into a
+      <command>cpio</command> archive placed in the <filename>/.extra/sysext/</filename> directory of the
+      initrd file hierarchy. This is intended to pass additional entry-specific system extension images to
+      the initrd. See
+      <citerefentry><refentrytitle>systemd-sysext</refentrytitle><manvolnum>8</manvolnum></citerefentry> for
+      details on system extension images. The generated <command>cpio</command> archive is measured into TPM
+      PCR 13 (if a TPM is present).</para></listitem>
+
+      <listitem><para>Files with the <filename>.confext.raw</filename> suffix are packed into a
+      <command>cpio</command> archive placed in the <filename>/.extra/confext/</filename> directory of the
+      initrd file hierarchy. This is intended to pass additional entry-specific configuration extension
+      images to the initrd. See
+      <citerefentry><refentrytitle>systemd-confext</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+      for details on configuration extension images. The generated <command>cpio</command> archive is
+      measured into TPM PCR 12 (if a TPM is present).</para></listitem>
+    </itemizedlist>
+
+    <para>When the booted kernel is a UKI, the <command>systemd-stub</command> UEFI stub embedded in it will
+    combine the companion resources injected here with any companion files it itself collects from the UKI's
+    <filename>.extra.d/</filename> drop-in directory and from <filename>/loader/credentials/</filename> and
+    <filename>/loader/extensions/</filename>, so that all sources are merged uniformly into
+    <filename>/.extra/</filename> in the initrd. See
+    <citerefentry><refentrytitle>systemd-stub</refentrytitle><manvolnum>7</manvolnum></citerefentry> for
+    details.</para>
+
+    <para>Example Type #1 entry making use of the <literal>extra</literal> key:</para>
+
+    <programlisting>title       My OS
+version     1.2.3
+machine-id  6a9857a393724b7a981ebb5b8495b9ea
+uki         /6a9857a393724b7a981ebb5b8495b9ea/1.2.3/img.efi
+extra       /6a9857a393724b7a981ebb5b8495b9ea/1.2.3/foo.cred
+extra       /6a9857a393724b7a981ebb5b8495b9ea/1.2.3/bar.sysext.raw
+extra       /6a9857a393724b7a981ebb5b8495b9ea/1.2.3/baz.confext.raw</programlisting>
   </refsect1>
 
   <refsect1>
@@ -471,6 +544,7 @@
       </varlistentry>
 
       <varlistentry>
+        <term><varname>LoaderEntryPreferred</varname></term>
         <term><varname>LoaderEntryDefault</varname></term>
         <term><varname>LoaderEntrySysFail</varname></term>
         <term><varname>LoaderEntryOneShot</varname></term>
@@ -478,6 +552,8 @@
         <listitem><para>The identifier of the default boot loader entry. Can be set in the OS and the boot
         loader. <varname>LoaderEntryOneShot</varname> sets the default entry for the next boot only, while
         <varname>LoaderEntryDefault</varname> sets it persistently for all future boots.
+        <varname>LoaderEntryPreferred</varname> is like <varname>LoaderEntryDefault</varname> but additionally
+        takes into account boot assessment and skips boot entries with a tries-left counter equal to zero.
         <citerefentry><refentrytitle>bootctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>'s
         <option>set-default</option> and <option>set-oneshot</option> commands make use of these variables.
         The boot loader modifies <varname>LoaderEntryDefault</varname> on request, when the
@@ -547,6 +623,19 @@
         to view this data.</para>
 
         <xi:include href="version-info.xml" xpointer="v258"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>LoaderPcrSMBIOS</varname></term>
+
+        <listitem><para>The PCR register index select SMBIOS structures are measured into — type 1
+        (system information, with the volatile "Wake-up Type" field zeroed out), type 2 (baseboard
+        information) and type 11 (OEM strings). Formatted as decimal ASCII string (e.g.
+        <literal>1</literal>). Set by the boot loader only if all of these structures were measured
+        successfully, and remains unset otherwise. (Note that <command>systemd-stub</command> performs the
+        same measurement when booted directly, bypassing the boot loader.)</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -640,6 +729,16 @@ uki-url http://example.com/somedir/fooos.efi</programlisting>
 
         <xi:include href="version-info.xml" xpointer="v258"/></listitem>
       </varlistentry>
+
+      <varlistentry>
+        <term><varname>io.systemd.boot.loglevel</varname></term>
+        <listitem><para>If set, the value of this string is used as log level. Valid values (from most to
+        least critical) are <literal>emerg</literal>, <literal>alert</literal>, <literal>crit</literal>,
+        <literal>err</literal>, <literal>warning</literal>, <literal>notice</literal>, <literal>info</literal>,
+        and <literal>debug</literal>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v259"/></listitem>
+      </varlistentry>
     </variablelist>
   </refsect1>
 
@@ -647,7 +746,7 @@ uki-url http://example.com/somedir/fooos.efi</programlisting>
     <title>Boot Counting</title>
 
     <para><command>systemd-boot</command> implements a simple boot counting mechanism on top of the <ulink
-    url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader Specification</ulink>, for automatic and unattended
+    url="https://uapi-group.org/specifications/specs/boot_loader_specification">UAPI.1 Boot Loader Specification</ulink>, for automatic and unattended
     fallback to older kernel versions/boot loader entries when a specific entry continuously fails. Any boot loader
     entry file and unified kernel image file that contains a <literal>+</literal> followed by one or two numbers (if
     two they need to be separated by a <literal>-</literal>), before the <filename>.conf</filename> or
@@ -701,18 +800,26 @@ uki-url http://example.com/somedir/fooos.efi</programlisting>
   <refsect1>
     <title>Using <command>systemd-boot</command> in virtual machines</title>
 
-    <para>When using qemu with OVMF (UEFI Firmware for virtual machines) the <option>-kernel</option> switch
-    works not only for linux kernels, but for any EFI binary, including sd-boot and unified linux
-    kernels. Example command line for loading <command>systemd-boot</command> on x64:</para>
+    <para>When using <ulink url="https://www.qemu.org/docs/master/">qemu</ulink> with
+    <ulink url="https://www.linux-kvm.org/downloads/lersek/ovmf-whitepaper-c770f8c.txt">OVMF</ulink>
+    (UEFI Firmware for virtual machines) the <option>-kernel</option> switch works not only for linux
+    kernels, but for any EFI binary, including <filename>systemd-boot</filename> and unified linux kernels
+    (UKIs). Example command line for loading <command>systemd-boot</command> on x64:</para>
 
     <para>
-      <command>qemu-system-x86_64 <replaceable>[ ... ]</replaceable>
-      -kernel /usr/lib/systemd/boot/efi/systemd-bootx64.efi</command>
+      <command>qemu-system-x86_64
+      -drive if=pflash,format=qcow2,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2
+      -kernel /usr/lib/systemd/boot/efi/systemd-bootx64.efi
+      -drive file=<replaceable>...</replaceable>
+      <replaceable>[ ... ]</replaceable>
+      </command>
     </para>
 
-    <para>systemd-boot will detect that it was started directly instead of being loaded from ESP and will
-    search for the ESP in that case, taking into account boot order information from the hypervisor (if
-    available).</para>
+    <para>(The path to the firmware file might need to be adjusted depending on the distribution.)
+    <filename>systemd-boot</filename> will detect that it was started directly instead of being loaded from
+    ESP and will search for the ESP in that case, taking into account boot order information from the
+    hypervisor (if available). Note that for this to yield a useful result, another <option>-drive</option>
+    argument needs to be used to attach an actual disk image with an ESP.</para>
   </refsect1>
 
   <refsect1>
@@ -724,7 +831,7 @@ uki-url http://example.com/somedir/fooos.efi</programlisting>
       <member><citerefentry><refentrytitle>systemd-boot-random-seed.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
       <member><citerefentry><refentrytitle>kernel-install</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
       <member><citerefentry><refentrytitle>systemd-stub</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
-      <member><ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader Specification</ulink></member>
+      <member><ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">UAPI.1 Boot Loader Specification</ulink></member>
       <member><ulink url="https://systemd.io/BOOT_LOADER_INTERFACE">Boot Loader Interface</ulink></member>
       <member><ulink url="https://systemd.io/TPM2_PCR_MEASUREMENTS">TPM2 PCR Measurements Made by systemd</ulink></member>
     </simplelist></para>

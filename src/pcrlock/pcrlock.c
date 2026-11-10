@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
-#include <openssl/evp.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "sd-device.h"
@@ -10,6 +9,7 @@
 #include "sd-varlink.h"
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "ask-password-api.h"
 #include "bitfield.h"
 #include "blockdev-util.h"
@@ -18,7 +18,10 @@
 #include "chase.h"
 #include "color-util.h"
 #include "conf-files.h"
+#include "copy.h"
 #include "creds-util.h"
+#include "crypto-util.h"
+#include "dlopen-note.h"
 #include "efi-api.h"
 #include "efivars.h"
 #include "env-util.h"
@@ -30,6 +33,7 @@
 #include "format-table.h"
 #include "format-util.h"
 #include "fs-util.h"
+#include "glyph-util.h"
 #include "gpt.h"
 #include "hexdecoct.h"
 #include "initrd-util.h"
@@ -37,7 +41,7 @@
 #include "label-util.h"
 #include "list.h"
 #include "main-func.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "ordered-set.h"
 #include "parse-argument.h"
 #include "parse-util.h"
@@ -45,7 +49,6 @@
 #include "pcrextend-util.h"
 #include "pcrlock-firmware.h"
 #include "pe-binary.h"
-#include "pretty-print.h"
 #include "proc-cmdline.h"
 #include "recovery-key.h"
 #include "sort-util.h"
@@ -53,12 +56,14 @@
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
+#include "tmpfile-util.h"
 #include "tpm2-pcr.h"
 #include "tpm2-util.h"
 #include "unaligned.h"
 #include "unit-name.h"
 #include "utf8.h"
 #include "varlink-io.systemd.PCRLock.h"
+#include "varlink-io.systemd.SysUpdate.Notify.h"
 #include "varlink-util.h"
 #include "verbs.h"
 
@@ -84,9 +89,12 @@ static RecoveryPinMode arg_recovery_pin = RECOVERY_PIN_HIDE;
 static char *arg_policy_path = NULL;
 static bool arg_force = false;
 static BootEntryTokenType arg_entry_token_type = BOOT_ENTRY_TOKEN_AUTO;
+static bool arg_strict = false;
 static char *arg_entry_token = NULL;
 static bool arg_varlink = false;
 static bool arg_quiet = false;
+/* abbreviate to 7 chars, just like git */
+static size_t arg_abbreviate_hash = 7;
 
 STATIC_DESTRUCTOR_REGISTER(arg_components, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_pcrlock_path, freep);
@@ -94,6 +102,13 @@ STATIC_DESTRUCTOR_REGISTER(arg_location_start, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_location_end, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_policy_path, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_entry_token, freep);
+
+COMMAND(
+        "systemd-pcrlock\0",
+        "Manage a TPM2 PCR lock.",
+        .man_pages = "systemd-pcrlock(8)\0",
+        .pager_flags = &arg_pager_flags,
+);
 
 #define PCRLOCK_SECUREBOOT_POLICY_PATH      "/var/lib/pcrlock.d/240-secureboot-policy.pcrlock.d/generated.pcrlock"
 #define PCRLOCK_FIRMWARE_CODE_EARLY_PATH    "/var/lib/pcrlock.d/250-firmware-code-early.pcrlock.d/generated.pcrlock"
@@ -107,6 +122,11 @@ STATIC_DESTRUCTOR_REGISTER(arg_entry_token, freep);
 #define PCRLOCK_MACHINE_ID_PATH             "/var/lib/pcrlock.d/820-machine-id.pcrlock"
 #define PCRLOCK_ROOT_FILE_SYSTEM_PATH       "/var/lib/pcrlock.d/830-root-file-system.pcrlock"
 #define PCRLOCK_FILE_SYSTEM_PATH_PREFIX     "/var/lib/pcrlock.d/840-file-system-"
+#define PCRLOCK_PE_INPUT_MAX                (2U * U64_GB)
+
+/* Maximum number of retries when PCR values keep changing while we submit the policy for, or unseal, the
+ * recovery PIN */
+#define PCRLOCK_RETRY_UNSEAL_MAX            16U
 
 /* The default set of PCRs to lock to */
 #define DEFAULT_PCR_MASK                                     \
@@ -118,7 +138,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_entry_token, freep);
          (UINT32_C(1) << TPM2_PCR_BOOT_LOADER_CONFIG) |      \
          (UINT32_C(1) << TPM2_PCR_SECURE_BOOT_POLICY) |      \
          (UINT32_C(1) << TPM2_PCR_KERNEL_BOOT) |             \
-         (UINT32_C(1) << TPM2_PCR_KERNEL_CONFIG) |           \
+         /* Note: we do not add PCR12/TPM2_PCR_KERNEL_CONFIG here, since our pcrlock policy ends up in there, and this would hence result in a conceptual loop */ \
          (UINT32_C(1) << TPM2_PCR_SYSEXTS) |                 \
          (UINT32_C(1) << TPM2_PCR_SHIM_POLICY) |             \
          (UINT32_C(1) << TPM2_PCR_SYSTEM_IDENTITY))
@@ -155,7 +175,9 @@ typedef enum EventPayloadValid {
 
 struct EventLogRecord {
         EventLog *event_log;
-        uint32_t pcr;
+
+        uint32_t pcr;      /* Either 'pcr' or 'nv_index' are set, but not both. Other one is UINT32_MAX. */
+        uint32_t nv_index;
 
         const char *source;
         char *description;
@@ -184,6 +206,8 @@ struct EventLogRecord {
 
 #define EVENT_LOG_RECORD_IS_FIRMWARE(record) ((record)->firmware_event_type != UINT32_MAX)
 #define EVENT_LOG_RECORD_IS_USERSPACE(record) ((record)->userspace_event_type >= 0)
+#define EVENT_LOG_RECORD_IS_PCR(record) ((record)->pcr != UINT32_MAX)
+#define EVENT_LOG_RECORD_IS_NV_INDEX(record) ((record)->nv_index != UINT32_MAX)
 
 struct EventLogRegisterBank {
         TPM2B_DIGEST observed;
@@ -240,6 +264,9 @@ struct EventLog {
 
         /* PCRs mask indicating all PCRs touched by unrecognized components */
         uint32_t missing_component_pcrs;
+
+        /* PCRs mask indicating component found for the pcr */
+        uint32_t has_component_pcrs;
 };
 
 static EventLogRecordBank *event_log_record_bank_free(EventLogRecordBank *bank) {
@@ -339,6 +366,8 @@ static EventLogRecord* event_log_record_new(EventLog *el) {
 
         *record = (EventLogRecord) {
                 .event_log = el,
+                .pcr = UINT32_MAX,
+                .nv_index = UINT32_MAX,
                 .firmware_event_type = UINT32_MAX,
                 .userspace_event_type = _TPM2_USERSPACE_EVENT_TYPE_INVALID,
                 .event_payload_valid = _EVENT_PAYLOAD_VALID_INVALID,
@@ -537,7 +566,7 @@ static int event_log_record_parse_variable_data(
         if (!p)
                 return log_oom_debug();
 
-        if (!string_is_safe(p))
+        if (!string_is_safe(p, STRING_ALLOW_GLOBS))
                 return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Unsafe EFI variable string in record.");
 
         *ret_variable_uuid = efi_guid_to_id128(vdata->variableName);
@@ -621,7 +650,7 @@ static int event_log_record_extract_firmware_description(EventLogRecord *rec) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to make C string from EFI action string: %m");
 
-                if (!string_is_safe(d)) {
+                if (!string_is_safe(d, STRING_ALLOW_GLOBS|STRING_ALLOW_EMPTY|STRING_ALLOW_BACKSLASHES)) {
                         log_warning("Unsafe EFI action string in record, ignoring.");
                         goto invalid;
                 }
@@ -738,6 +767,23 @@ static int event_log_record_extract_firmware_description(EventLogRecord *rec) {
                                 break;
                         }
 
+                        /* SMBIOS structures measured by sd-boot/sd-stub. The tagged event payload is just a
+                         * constant identifying string ("smbios:typeN"), hence don't show it. */
+                        case SMBIOS_TYPE1_EVENT_TAG_ID:
+                                if (!strextend_with_separator(&rec->description, ", ", "systemd: SMBIOS system information (type 1)"))
+                                        return log_oom();
+                                break;
+
+                        case SMBIOS_TYPE2_EVENT_TAG_ID:
+                                if (!strextend_with_separator(&rec->description, ", ", "systemd: SMBIOS baseboard information (type 2)"))
+                                        return log_oom();
+                                break;
+
+                        case SMBIOS_TYPE11_EVENT_TAG_ID:
+                                if (!strextend_with_separator(&rec->description, ", ", "systemd: SMBIOS OEM strings (type 11)"))
+                                        return log_oom();
+                                break;
+
                         default: {
                                 _cleanup_free_ char *s = NULL;
 
@@ -793,6 +839,16 @@ static int event_log_record_extract_firmware_description(EventLogRecord *rec) {
                         goto invalid;
                 }
 
+                /* device path could be empty. Don't mark that as invalid but leave as don't know.
+                 * Happens eg with shim https://github.com/rhboot/shim/issues/642 */
+                if (load->lengthOfDevicePath == 0) {
+                        rec->description = strdup("File: <unspecified>");
+                        if (!rec->description)
+                                return log_oom();
+
+                        return 1;
+                }
+
                 const packed_EFI_DEVICE_PATH *dp = (const packed_EFI_DEVICE_PATH*) load->devicePath;
                 size_t left = load->lengthOfDevicePath;
 
@@ -811,7 +867,9 @@ static int event_log_record_extract_firmware_description(EventLogRecord *rec) {
                                 goto invalid;
                         }
 
-                        if (left < offsetof(packed_EFI_DEVICE_PATH, path) || left < dp->length) {
+                        if (left < offsetof(packed_EFI_DEVICE_PATH, path) ||
+                            dp->length < offsetof(packed_EFI_DEVICE_PATH, path) ||
+                            left < dp->length) {
                                 log_warning("Device path element too short, ignoring.");
                                 goto invalid;
                         }
@@ -880,7 +938,40 @@ static int event_log_add_algorithms_from_record(EventLog *el, EventLogRecord *re
         return 0;
 }
 
-static int event_log_load_firmware(EventLog *el) {
+static int event_log_add_firmware_record(
+                EventLog *el,
+                const char *source,
+                uint32_t pcr,
+                uint32_t event_type,
+                const void *payload,
+                size_t payload_size,
+                EventLogRecord **ret) {
+
+        EventLogRecord *record = NULL;
+        int r;
+
+        assert(el);
+        assert(source);
+        assert(payload || payload_size == 0);
+        assert(ret);
+
+        r = event_log_add_record(el, &record);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add record to event log: %m");
+
+        record->pcr = pcr;
+        record->source = source;
+        record->firmware_event_type = event_type;
+        record->firmware_payload = memdup(payload, payload_size);
+        if (!record->firmware_payload)
+                return log_oom();
+        record->firmware_payload_size = payload_size;
+
+        *ret = record;
+        return 0;
+}
+
+static int event_log_load_firmware(EventLog *el, bool keep_no_action) {
         const TCG_EfiSpecIdEventAlgorithmSize *algorithms;
         size_t bufsize = 0, n_algorithms = 0, left = 0;
         _cleanup_free_ void *buf = NULL;
@@ -893,6 +984,10 @@ static int event_log_load_firmware(EventLog *el) {
         path = tpm2_firmware_log_path();
 
         r = read_full_file(path, (char**) &buf, &bufsize);
+        if (r == -ENOENT) {
+                log_notice_errno(r, "No '%s' file, assuming TPM without firmware support.", path);
+                return 0;
+        }
         if (r < 0)
                 return log_error_errno(r, "Failed to open TPM2 event log '%s': %m", path);
 
@@ -905,6 +1000,23 @@ static int event_log_load_firmware(EventLog *el) {
         r = validate_firmware_header(buf, bufsize, &algorithms, &n_algorithms, &event, &left);
         if (r < 0)
                 return r;
+
+        if (keep_no_action) {
+                /* The log header is an EV_NO_ACTION event (the Spec ID event), which carries the version
+                 * of the TCG PC Client Platform Firmware Profile Specification the log follows. Retain it if
+                 * requested. Note that unlike all other events it is in the legacy event format, and hence
+                 * comes with a single (all-zero) SHA1 digest. */
+                const TCG_PCClientPCREvent *h = buf;
+                EventLogRecord *record;
+
+                r = event_log_add_firmware_record(el, path, h->pcrIndex, h->eventType, h->event, h->eventDataSize, &record);
+                if (r < 0)
+                        return r;
+
+                r = event_log_record_add_bank(record, TPM2_ALG_SHA1, h->digest, sizeof(h->digest), /* ret= */ NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add bank to event log record: %m");
+        }
 
         for (const TCG_PCR_EVENT2 *next_event = NULL;; event = next_event) {
                 EventLogRecord *record = NULL;
@@ -935,25 +1047,25 @@ static int event_log_load_firmware(EventLog *el) {
                         el->startup_locality = ((const uint8_t*) payload)[sizeof("StartupLocality")];
                         el->startup_locality_found = true;
                         log_debug("Found StartupLocality event: %u", el->startup_locality);
-                        continue;
                 }
 
-                if (event->eventType == EV_NO_ACTION) { /* Ignore pseudo events, that don't result in a measurement */
+                /* Ignore pseudo events that don't result in a measurement, unless we are asked to keep
+                 * them. They carry information that may be useful to consumers of the event log (e.g.
+                 * verifiers of TPM2 reports), such as the StartupLocality event, which determines the
+                 * initial value of PCR 0. */
+                if (event->eventType == EV_NO_ACTION && !keep_no_action) {
                         log_debug("Skipping NO_ACTION event.");
                         continue;
                 }
 
-                r = event_log_add_record(el, &record);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to add record to event log: %m");
+                if (event->pcrIndex >= TPM2_PCRS_MAX) {
+                        log_debug("Skipping event on PCR %" PRIu32 " (out of range).", event->pcrIndex);
+                        continue;
+                }
 
-                record->pcr = event->pcrIndex;
-                record->source = path;
-                record->firmware_event_type = event->eventType;
-                record->firmware_payload = memdup(payload, payload_size);
-                if (!record->firmware_payload)
-                        return log_oom();
-                record->firmware_payload_size = payload_size;
+                r = event_log_add_firmware_record(el, path, event->pcrIndex, event->eventType, payload, payload_size, &record);
+                if (r < 0)
+                        return r;
 
                 const void *ha, *ha_next = NULL;
                 ha = (const uint8_t*) event + offsetof(TCG_PCR_EVENT2, digests.digests);
@@ -1003,9 +1115,6 @@ static int event_log_load_firmware(EventLog *el) {
 }
 
 static int event_log_record_parse_json(EventLogRecord *record, sd_json_variant *j) {
-        const char *rectype = NULL;
-        sd_json_variant *x, *k;
-        uint64_t u;
         int r;
 
         assert(record);
@@ -1014,23 +1123,44 @@ static int event_log_record_parse_json(EventLogRecord *record, sd_json_variant *
         if (!sd_json_variant_is_object(j))
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "record object is not an object.");
 
-        x = sd_json_variant_by_key(j, "pcr");
-        if (!x)
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'pcr' field missing from TPM measurement log file entry.");
-        if (!sd_json_variant_is_unsigned(x))
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'pcr' field is not an integer.");
+        sd_json_variant *jp = sd_json_variant_by_key(j, "pcr");
+        sd_json_variant *jn = sd_json_variant_by_key(j, "nv_index");
+        if (jp) {
+                uint64_t u;
+                if (jn)
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Both 'pcr' and 'nv_index' field found in TPM measurement log file entry.");
+                if (!sd_json_variant_is_unsigned(jp))
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'pcr' field is not an integer.");
 
-        u = sd_json_variant_unsigned(x);
-        if (u >= TPM2_PCRS_MAX)
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'pcr' field is out of range.");
-        record->pcr = sd_json_variant_unsigned(x);
+                u = sd_json_variant_unsigned(jp);
+                if (u >= TPM2_PCRS_MAX)
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'pcr' field is out of range.");
 
-        x = sd_json_variant_by_key(j, "digests");
+                record->pcr = u;
+                record->nv_index = UINT32_MAX;
+        } else {
+                uint64_t u;
+
+                if (!jn)
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Neither 'pcr' nor 'nv_index' field found in TPM measurement log file entry.");
+                if (!sd_json_variant_is_unsigned(jn))
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'nv_index' field is not an integer.");
+
+                u = sd_json_variant_unsigned(jn);
+                if (u >= UINT32_MAX)
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'nv_index' field is out of range.");
+
+                record->nv_index = u;
+                record->pcr = UINT32_MAX;
+        }
+
+        sd_json_variant *x = sd_json_variant_by_key(j, "digests");
         if (!x)
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'digests' field missing from TPM measurement log file entry.");
         if (!sd_json_variant_is_array(x))
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'digests' field is not an array.");
 
+        sd_json_variant *k;
         JSON_VARIANT_ARRAY_FOREACH(k, x) {
                 _cleanup_free_ void *hash = NULL;
                 size_t hash_size;
@@ -1067,6 +1197,7 @@ static int event_log_record_parse_json(EventLogRecord *record, sd_json_variant *
                         return log_error_errno(r, "Failed to add bank to event log record: %m");
         }
 
+        const char *rectype = NULL;
         x = sd_json_variant_by_key(j, "content_type");
         if (!x)
                 log_debug("'content_type' missing from TPM measurement log file entry, ignoring.");
@@ -1118,6 +1249,7 @@ static int event_log_load_userspace(EventLog *el) {
         _cleanup_free_ char *b = NULL;
         bool beginning = true;
         const char *path;
+        struct stat st;
         size_t bn = 0;
         int r;
 
@@ -1135,6 +1267,13 @@ static int event_log_load_userspace(EventLog *el) {
 
         if (flock(fileno(f), LOCK_SH) < 0)
                 return log_error_errno(errno, "Failed to lock userspace TPM measurement log file: %m");
+
+        /* The sticky bit marks the log as incomplete: a writer died between updating a PCR and appending
+         * the matching record. Load the log anyway, the affected PCRs will simply fail validation. */
+        if (fstat(fileno(f), &st) < 0)
+                log_warning_errno(errno, "Failed to stat userspace TPM measurement log file, cannot determine whether it is complete, ignoring: %m");
+        else if (FLAGS_SET(st.st_mode, S_ISVTX))
+                log_warning("Userspace TPM measurement log file is marked as incomplete, PCR validation may fail.");
 
         for (;;) {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
@@ -1213,12 +1352,12 @@ static EventLog *event_log_new(void) {
         return TAKE_PTR(el);
 }
 
-static int event_log_load(EventLog *el) {
+static int event_log_load(EventLog *el, bool keep_fw_no_action) {
         int r;
 
         assert(el);
 
-        r = event_log_load_firmware(el);
+        r = event_log_load_firmware(el, keep_fw_no_action);
         if (r < 0)
                 return r;
 
@@ -1312,7 +1451,7 @@ static int event_log_calculate_pcrs(EventLog *el) {
                 const char *a;
 
                 assert_se(a = tpm2_hash_alg_to_string(el->algorithms[i]));
-                assert_se(md = EVP_get_digestbyname(a));
+                assert_se(md = sym_EVP_get_digestbyname(a));
 
                 el->mds[i] = md;
         }
@@ -1320,10 +1459,14 @@ static int event_log_calculate_pcrs(EventLog *el) {
         for (uint32_t pcr = 0; pcr < TPM2_PCRS_MAX; pcr++)
                 for (size_t i = 0; i < el->n_algorithms; i++) {
                         EventLogRegisterBank *b = el->registers[pcr].banks + i;
-                        event_log_initial_pcr_state(el, pcr, EVP_MD_size(el->mds[i]), &b->calculated);
+                        event_log_initial_pcr_state(el, pcr, sym_EVP_MD_get_size(el->mds[i]), &b->calculated);
                 }
 
         FOREACH_ARRAY(rr, el->records, el->n_records) {
+
+                if (!EVENT_LOG_RECORD_IS_PCR(*rr))
+                        continue;
+
                 EventLogRegister *reg = el->registers + (*rr)->pcr;
 
                 for (size_t i = 0; i < el->n_algorithms; i++) {
@@ -1341,20 +1484,20 @@ static int event_log_calculate_pcrs(EventLog *el) {
 
                         reg_b = reg->banks + i;
 
-                        mc = EVP_MD_CTX_new();
+                        mc = sym_EVP_MD_CTX_new();
                         if (!mc)
                                 return log_oom();
 
-                        if (EVP_DigestInit_ex(mc, el->mds[i], NULL) != 1)
+                        if (sym_EVP_DigestInit_ex(mc, el->mds[i], NULL) != 1)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to initialize %s message digest context.", n);
 
-                        if (EVP_DigestUpdate(mc, reg_b->calculated.buffer, reg_b->calculated.size) != 1)
+                        if (sym_EVP_DigestUpdate(mc, reg_b->calculated.buffer, reg_b->calculated.size) != 1)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to run digest.");
 
-                        if (EVP_DigestUpdate(mc, rec_b->hash.buffer, rec_b->hash.size) != 1)
+                        if (sym_EVP_DigestUpdate(mc, rec_b->hash.buffer, rec_b->hash.size) != 1)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to run digest.");
 
-                        if (EVP_DigestFinal_ex(mc, reg_b->calculated.buffer, &sz) != 1)
+                        if (sym_EVP_DigestFinal_ex(mc, reg_b->calculated.buffer, &sz) != 1)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to finalize hash context.");
 
                         assert(sz == reg_b->calculated.size);
@@ -1443,7 +1586,7 @@ static int event_log_record_validate_hash_firmware(
                 strict = false;
         }
 
-        int mdsz = EVP_MD_size(md);
+        int mdsz = sym_EVP_MD_get_size(md);
         assert(mdsz > 0);
         assert((size_t) mdsz <= sizeof_field(TPM2B_DIGEST, buffer));
 
@@ -1453,13 +1596,13 @@ static int event_log_record_validate_hash_firmware(
 
         unsigned dsz = mdsz;
 
-        if (EVP_Digest(hdata, hsz, payload_hash.buffer, &dsz, md, NULL) != 1)
+        if (sym_EVP_Digest(hdata, hsz, payload_hash.buffer, &dsz, md, NULL) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to calculate event payload hash.");
         assert(dsz == (unsigned) mdsz);
 
         /* If this didn't match then let's try the alternative format here, if we have one, and check things then. */
         if (memcmp_nn(bank->hash.buffer, bank->hash.size, payload_hash.buffer, payload_hash.size) != 0 && hdata_alternative) {
-                if (EVP_Digest(hdata_alternative, hsz_alternative, payload_hash.buffer, &dsz, md, NULL) != 1)
+                if (sym_EVP_Digest(hdata_alternative, hsz_alternative, payload_hash.buffer, &dsz, md, NULL) != 1)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to calculate event payload hash.");
                 assert(dsz == (unsigned) mdsz);
         }
@@ -1503,7 +1646,7 @@ static int event_log_record_validate_hash_userspace(
         assert(sd_json_variant_is_string(js));
         s = sd_json_variant_string(js);
 
-        mdsz = EVP_MD_size(md);
+        mdsz = sym_EVP_MD_get_size(md);
         assert(mdsz > 0);
 
         payload_hash_size = mdsz;
@@ -1511,7 +1654,7 @@ static int event_log_record_validate_hash_userspace(
         if (!payload_hash)
                 return log_oom();
 
-        if (EVP_Digest(s, strlen(s), payload_hash, &payload_hash_size, md, NULL) != 1)
+        if (sym_EVP_Digest(s, strlen(s), payload_hash, &payload_hash_size, md, NULL) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to calculate event payload hash.");
 
         assert((int) payload_hash_size == mdsz);
@@ -1537,7 +1680,7 @@ static int event_log_validate_record_hashes(EventLog *el) {
                         const char *a;
 
                         assert_se(a = tpm2_hash_alg_to_string(bank->algorithm));
-                        assert_se(md = EVP_get_digestbyname(a));
+                        assert_se(md = sym_EVP_get_digestbyname(a));
 
                         r = event_log_record_validate_hash_firmware(*rr, bank, md);
                         if (r < 0)
@@ -1626,6 +1769,9 @@ static int event_log_record_equal(const EventLogRecord *a, const EventLogRecord 
         if (a->pcr != b->pcr)
                 return false;
 
+        if (a->nv_index != b->nv_index)
+                return false;
+
         x = event_log_record_find_bank(a, a->event_log->primary_algorithm);
         y = event_log_record_find_bank(b, b->event_log->primary_algorithm);
         if (!x || !y)
@@ -1681,7 +1827,7 @@ static int event_log_add_component_file(EventLog *el, EventLogComponent *compone
         }
 
         if (!sd_json_variant_is_object(j)) {
-                log_warning_errno(r, "Component file %s does not contain JSON object, ignoring.", path);
+                log_warning("Component file %s does not contain JSON object, ignoring.", path);
                 return 0;
         }
 
@@ -1704,7 +1850,7 @@ static int event_log_add_component_file(EventLog *el, EventLogComponent *compone
                 sd_json_variant *rj;
 
                 if (!sd_json_variant_is_array(records)) {
-                        log_warning_errno(r, "Component records field of file %s is not an array, ignoring.", path);
+                        log_warning("Component records field of file %s is not an array, ignoring.", path);
                         return 0;
                 }
 
@@ -1770,7 +1916,9 @@ static int event_log_add_component_dir(EventLog *el, const char *path, char **ba
                         return log_oom();
         }
 
-        r = conf_files_list_strv(&files, ".pcrlock", /* root= */ NULL, CONF_FILES_REGULAR, (const char*const*) search);
+        r = conf_files_list_strv(&files, ".pcrlock", /* root= */ NULL,
+                                 CONF_FILES_REGULAR|CONF_FILES_WARN,
+                                 (const char*const*) search);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate .pcrlock files for component '%s': %m", id);
 
@@ -1797,7 +1945,9 @@ static int event_log_load_components(EventLog *el) {
                           "/usr/local/lib/pcrlock.d",
                           "/usr/lib/pcrlock.d");
 
-        r = conf_files_list_strv(&files, NULL, NULL, CONF_FILES_REGULAR|CONF_FILES_DIRECTORY|CONF_FILES_FILTER_MASKED, (const char*const*) dirs);
+        r = conf_files_list_strv(&files, /* suffix= */ NULL, /* root= */ NULL,
+                                 CONF_FILES_REGULAR|CONF_FILES_DIRECTORY|CONF_FILES_FILTER_MASKED|CONF_FILES_WARN,
+                                 (const char*const*) dirs);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate .pcrlock files: %m");
 
@@ -1848,11 +1998,14 @@ static int event_log_validate_fully_recognized(EventLog *el) {
                 FOREACH_ARRAY(rr, el->records, el->n_records) {
                         EventLogRecord *rec = *rr;
 
+                        if (!EVENT_LOG_RECORD_IS_PCR(rec))
+                                continue;
+
                         if (rec->pcr != pcr)
                                 continue;
 
                         if (rec->n_mapped == 0) {
-                                log_notice("Event log record %zu (PCR %" PRIu32 ", \"%s\") not matching any component.",
+                                log_info("Event log record %zu (PCR %" PRIu32 ", \"%s\") not matching any component.",
                                            (size_t) (rr - el->records), rec->pcr, strna(rec->description));
                                 fully_recognized = false;
                                 break;
@@ -1899,7 +2052,7 @@ static int event_log_match_component_variant(
                 return r;
 
         if (assign) {
-                /* Take ownership (Note we allow multiple components and variants to take owneship of the same record!) */
+                /* Take ownership (Note we allow multiple components and variants to take ownership of the same record!) */
                 if (!GREEDY_REALLOC(el->records[i]->mapped, el->records[i]->n_mapped+1))
                         return log_oom();
 
@@ -1916,8 +2069,13 @@ static uint32_t event_log_component_variant_pcrs(EventLogComponentVariant *i) {
 
         /* returns mask of PCRs touched by this variant */
 
-        FOREACH_ARRAY(rr, i->records, i->n_records)
+        FOREACH_ARRAY(rr, i->records, i->n_records) {
+
+                if (!EVENT_LOG_RECORD_IS_PCR(*rr))
+                        continue;
+
                 mask |= UINT32_C(1) << (*rr)->pcr;
+        }
 
         return mask;
 }
@@ -1958,6 +2116,8 @@ static int event_log_map_components(EventLog *el) {
                                 continue;
                         }
 
+                        el->has_component_pcrs |= event_log_component_variant_pcrs(*ii);
+
                         r = event_log_match_component_variant(el, 0, i, 0, n_matching + n_empty == 0);
                         if (r < 0)
                                 return r;
@@ -1977,7 +2137,7 @@ static int event_log_map_components(EventLog *el) {
                         else if (arg_location_end && strcmp(c->id, arg_location_end) > 0) {
                                 log_info("Didn't find component '%s' in event log, but irrelevant for location window, ignoring.", c->id);
                         } else {
-                                log_notice("Couldn't find component '%s' in event log.", c->id);
+                                log_info("Couldn't find component '%s' in event log.", c->id);
                                 el->n_missing_components++;
                                 el->missing_component_pcrs |= event_log_component_pcrs(c);
 
@@ -1996,9 +2156,9 @@ static int event_log_map_components(EventLog *el) {
         }
 
         if (n_skipped > 0)
-                log_notice("Skipped %u components (%s).", n_skipped, skipped_ids);
+                log_info("Skipped %u components (%s).", n_skipped, skipped_ids);
         if (el->n_missing_components > 0)
-                log_notice("Unable to recognize %zu components in event log.", el->n_missing_components);
+                log_debug("Unable to recognize %zu components in event log.", el->n_missing_components);
 
         return event_log_validate_fully_recognized(el);
 }
@@ -2008,6 +2168,18 @@ static int event_log_map_components(EventLog *el) {
 static const char *ansi_true_color(uint8_t r, uint8_t g, uint8_t b, char ret[static ANSI_TRUE_COLOR_MAX]) {
         snprintf(ret, ANSI_TRUE_COLOR_MAX, "\x1B[38;2;%u;%u;%um", r, g, b);
         return ret;
+}
+
+/* red and green colors usually have good/bad meaning. So exclude color ranges that look too red- or
+ * greenish. See https://en.wikipedia.org/wiki/Hue */
+static double map_pcr_to_hue(uint32_t pcr) {
+        double exclude_red_range = 60.0;
+        double exclude_green_range = 60.0;
+        double h = (360.0 - exclude_red_range - exclude_green_range) / (TPM2_PCRS_MAX - 1) * pcr;
+        h += exclude_red_range / 2;
+        if (h > 120 - exclude_green_range / 2)
+                h += exclude_green_range;
+        return MIN(h, 360 - exclude_red_range / 2);
 }
 
 static char *color_for_pcr(EventLog *el, uint32_t pcr) {
@@ -2020,7 +2192,7 @@ static char *color_for_pcr(EventLog *el, uint32_t pcr) {
         if (el->registers[pcr].color)
                 return el->registers[pcr].color;
 
-        hsv_to_rgb(360.0 / (TPM2_PCRS_MAX - 1) * pcr, 100, 90, &r, &g, &b);
+        hsv_to_rgb(map_pcr_to_hue(pcr), 100, 90, &r, &g, &b);
         ansi_true_color(r, g, b, color);
 
         el->registers[pcr].color = strdup(color);
@@ -2086,7 +2258,7 @@ static int show_log_table(EventLog *el, sd_json_variant **ret_variant) {
         if (!table)
                 return log_oom();
 
-        (void) table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
+        table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
 
         r = table_add_many(table,
                            TABLE_HEADER, "pcr",
@@ -2123,11 +2295,23 @@ static int show_log_table(EventLog *el, sd_json_variant **ret_variant) {
         FOREACH_ARRAY(rr, el->records, el->n_records) {
                 EventLogRecord *record = *rr;
 
-                r = table_add_many(table,
-                                   TABLE_UINT32, record->pcr,
-                                   TABLE_STRING, glyph(GLYPH_FULL_BLOCK),
-                                   TABLE_SET_COLOR, color_for_pcr(el, record->pcr),
-                                   TABLE_STRING, tpm2_pcr_index_to_string(record->pcr));
+                if (EVENT_LOG_RECORD_IS_PCR(record) &&
+                    arg_pcr_mask != 0 && !FLAGS_SET(arg_pcr_mask, UINT32_C(1) << record->pcr))
+                        continue;
+
+                if (EVENT_LOG_RECORD_IS_PCR(record))
+                        r = table_add_many(table,
+                                           TABLE_UINT32, record->pcr,
+                                           TABLE_STRING, glyph(GLYPH_FULL_BLOCK),
+                                           TABLE_SET_COLOR, color_for_pcr(el, record->pcr),
+                                           TABLE_STRING, tpm2_pcr_index_to_string(record->pcr));
+                else if EVENT_LOG_RECORD_IS_NV_INDEX(record)
+                        r = table_add_many(table,
+                                           TABLE_UINT32_HEX_0x, record->nv_index,
+                                           TABLE_EMPTY,
+                                           TABLE_EMPTY);
+                else
+                        assert_not_reached();
                 if (r < 0)
                         return table_log_add_error(r);
 
@@ -2166,6 +2350,9 @@ static int show_log_table(EventLog *el, sd_json_variant **ret_variant) {
                                 if (!hex)
                                         return log_oom();
 
+                                if (!sd_json_format_enabled(arg_json_format_flags))
+                                        strshorten(hex, arg_abbreviate_hash);
+
                                 r = table_add_cell(table, NULL, TABLE_STRING, hex);
                         } else
                                 r = table_add_cell(table, NULL, TABLE_EMPTY, NULL);
@@ -2191,7 +2378,7 @@ static int show_log_table(EventLog *el, sd_json_variant **ret_variant) {
                 return 0;
         }
 
-        r = table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, /* show_header= */true);
+        r = table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, /* show_header= */ true);
         if (r < 0)
                 return r;
 
@@ -2224,7 +2411,7 @@ static int show_pcr_table(EventLog *el, sd_json_variant **ret_variant) {
         if (!table)
                 return log_oom();
 
-        (void) table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
+        table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
 
         r = table_add_many(table,
                            TABLE_HEADER, "pcr",
@@ -2261,20 +2448,32 @@ static int show_pcr_table(EventLog *el, sd_json_variant **ret_variant) {
         (void) table_set_json_field_name(table, 7, "noMissingComponents");
 
         for (uint32_t pcr = 0; pcr < TPM2_PCRS_MAX; pcr++) {
+                if (arg_pcr_mask != 0 && !FLAGS_SET(arg_pcr_mask, UINT32_C(1) << pcr))
+                        continue;
+
                 /* Check if the PCR hash value matches the event log data */
                 bool hash_match = event_log_pcr_checks_out(el, el->registers + pcr);
 
                 /* Whether all records in this PCR have a matching component */
                 bool fully_recognized = el->registers[pcr].fully_recognized;
 
+                bool seen = el->registers[pcr].n_measurements > 0;
+
                 /* Whether any unmatched components touch this PCR */
                 bool missing_components = BIT_SET(el->missing_component_pcrs, pcr);
+                bool has_components = BIT_SET(el->has_component_pcrs, pcr);
 
-                const char *emoji = glyph(
-                                !hash_match ? GLYPH_DEPRESSED_SMILEY :
-                                !fully_recognized ? GLYPH_UNHAPPY_SMILEY :
-                                missing_components ?  GLYPH_SLIGHTLY_HAPPY_SMILEY :
-                                GLYPH_HAPPY_SMILEY);
+                const char *emoji = "";
+                if (seen || has_components) {
+                        if (!hash_match)
+                                emoji = glyph(GLYPH_DEPRESSED_SMILEY);
+                        else if (!fully_recognized)
+                                emoji = glyph(GLYPH_UNHAPPY_SMILEY);
+                        else if (!missing_components)
+                                emoji = glyph(GLYPH_HAPPY_SMILEY);
+                        else
+                                emoji = glyph(GLYPH_SLIGHTLY_HAPPY_SMILEY);
+                }
 
                 r = table_add_many(table,
                                    TABLE_UINT32, pcr,
@@ -2292,13 +2491,19 @@ static int show_pcr_table(EventLog *el, sd_json_variant **ret_variant) {
                 if (r < 0)
                         return table_log_add_error(r);
 
-                r = table_add_many(table,
-                                   TABLE_BOOLEAN_CHECKMARK, hash_match,
-                                   TABLE_SET_COLOR, ansi_highlight_green_red(hash_match),
-                                   TABLE_BOOLEAN_CHECKMARK, fully_recognized,
-                                   TABLE_SET_COLOR, ansi_highlight_green_red(fully_recognized),
-                                   TABLE_BOOLEAN_CHECKMARK, !missing_components,
-                                   TABLE_SET_COLOR, ansi_highlight_green_red(!missing_components));
+                if (sd_json_format_enabled(arg_json_format_flags))
+                        r = table_add_many(table,
+                                           TABLE_BOOLEAN_CHECKMARK, hash_match,
+                                           TABLE_BOOLEAN_CHECKMARK, fully_recognized,
+                                           TABLE_BOOLEAN_CHECKMARK, !missing_components);
+                else
+                        r = table_add_many(table,
+                                           TABLE_STRING, seen ? glyph_check_mark(hash_match) : " ",
+                                           TABLE_SET_COLOR, ansi_highlight_green_red(hash_match),
+                                           TABLE_STRING, seen ? glyph_check_mark(fully_recognized) : " ",
+                                           TABLE_SET_COLOR, ansi_highlight_green_red(fully_recognized),
+                                           TABLE_STRING, has_components ? glyph_check_mark(!missing_components) : " ",
+                                           TABLE_SET_COLOR, ansi_highlight_green_red(!missing_components));
                 if (r < 0)
                         return table_log_add_error(r);
 
@@ -2313,6 +2518,9 @@ static int show_pcr_table(EventLog *el, sd_json_variant **ret_variant) {
                                 hex = hexmem(el->registers[pcr].banks[i].calculated.buffer, el->registers[pcr].banks[i].calculated.size);
                                 if (!hex)
                                         return log_oom();
+
+                                if (!sd_json_format_enabled(arg_json_format_flags))
+                                        strshorten(hex, arg_abbreviate_hash);
 
                                 r = table_add_many(table,
                                                    TABLE_STRING, hex,
@@ -2332,6 +2540,9 @@ static int show_pcr_table(EventLog *el, sd_json_variant **ret_variant) {
                         hex = hexmem(el->registers[pcr].banks[i].observed.buffer, el->registers[pcr].banks[i].observed.size);
                         if (!hex)
                                 return log_oom();
+
+                        if (!sd_json_format_enabled(arg_json_format_flags))
+                                strshorten(hex, arg_abbreviate_hash);
 
                         color = !hash_match ? ansi_highlight_red() :
                                 is_unset_pcr(el->registers[pcr].banks[i].observed.buffer, el->registers[pcr].banks[i].observed.size) ? ansi_grey() : NULL;
@@ -2360,7 +2571,7 @@ static int show_pcr_table(EventLog *el, sd_json_variant **ret_variant) {
                 printf("\n"
                        "%sLegend: H → PCR hash value matches event log%s\n"
                        "%s        R → All event log records for this PCR have a matching component%s\n"
-                       "%s        C → No components that couldn't be matched with log records affect this PCR%s\n",
+                       "%s        C → Component exists and found in event log%s\n",
                        ansi_grey(), ansi_normal(), /* less on small screens automatically resets the color after long lines, hence we set it anew for each line */
                        ansi_grey(), ansi_normal(),
                        ansi_grey(), ansi_normal());
@@ -2395,6 +2606,8 @@ static int event_log_load_and_process(EventLog **ret) {
         _cleanup_(event_log_freep) EventLog *el = NULL;
         int r;
 
+        assert(ret);
+
         el = event_log_new();
         if (!el)
                 return log_oom();
@@ -2403,7 +2616,7 @@ static int event_log_load_and_process(EventLog **ret) {
         if (r < 0)
                 return r;
 
-        r = event_log_load(el);
+        r = event_log_load(el, /* keep_fw_no_action= */ false);
         if (r < 0)
                 return r;
 
@@ -2437,7 +2650,9 @@ static int event_log_load_and_process(EventLog **ret) {
         return 0;
 }
 
-static int verb_show_log(int argc, char *argv[], void *userdata) {
+VERB_DEFAULT_NOARG(verb_show_log, "log",
+     "Show measurement log");
+static int verb_show_log(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *log_table = NULL, *pcr_table = NULL;
         _cleanup_(event_log_freep) EventLog *el = NULL;
         bool want_json = sd_json_format_enabled(arg_json_format_flags);
@@ -2538,7 +2753,8 @@ static int event_log_record_to_cel(EventLogRecord *record, uint64_t *recnum, sd_
 
         r = sd_json_buildo(
                         ret,
-                        SD_JSON_BUILD_PAIR_UNSIGNED("pcr", record->pcr),
+                        SD_JSON_BUILD_PAIR_CONDITION(EVENT_LOG_RECORD_IS_PCR(record), "pcr", SD_JSON_BUILD_UNSIGNED(record->pcr)),
+                        SD_JSON_BUILD_PAIR_CONDITION(EVENT_LOG_RECORD_IS_NV_INDEX(record), "nv_index", SD_JSON_BUILD_UNSIGNED(record->nv_index)),
                         SD_JSON_BUILD_PAIR_UNSIGNED("recnum", ++(*recnum)),
                         SD_JSON_BUILD_PAIR_VARIANT("digests", ja),
                         SD_JSON_BUILD_PAIR_CONDITION(!!ct, "content_type", SD_JSON_BUILD_STRING(ct)),
@@ -2549,7 +2765,9 @@ static int event_log_record_to_cel(EventLogRecord *record, uint64_t *recnum, sd_
         return 0;
 }
 
-static int verb_show_cel(int argc, char *argv[], void *userdata) {
+VERB_NOARG(verb_show_cel, "cel",
+           "Show measurement log in TCG CEL-JSON format");
+static int verb_show_cel(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL;
         _cleanup_(event_log_freep) EventLog *el = NULL;
         uint64_t recnum = 0;
@@ -2559,7 +2777,7 @@ static int verb_show_cel(int argc, char *argv[], void *userdata) {
         if (!el)
                 return log_oom();
 
-        r = event_log_load(el);
+        r = event_log_load(el, /* keep_fw_no_action= */ true);
         if (r < 0)
                 return r;
 
@@ -2584,15 +2802,11 @@ static int verb_show_cel(int argc, char *argv[], void *userdata) {
         return 0;
 }
 
-static int verb_list_components(int argc, char *argv[], void *userdata) {
+static int event_log_load_and_process_components(EventLog **ret) {
         _cleanup_(event_log_freep) EventLog *el = NULL;
-        _cleanup_(table_unrefp) Table *table = NULL;
-        enum {
-                BEFORE_LOCATION,
-                BETWEEN_LOCATION,
-                AFTER_LOCATION,
-        } loc = BEFORE_LOCATION;
         int r;
+
+        assert(ret);
 
         el = event_log_new();
         if (!el)
@@ -2610,11 +2824,34 @@ static int verb_list_components(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return r;
 
+        *ret = TAKE_PTR(el);
+        return 0;
+}
+
+VERB_NOARG(verb_list_components, "list-components",
+           "List defined .pcrlock components");
+static int verb_list_components(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(event_log_freep) EventLog *el = NULL;
+        _cleanup_(table_unrefp) Table *table = NULL;
+        enum {
+                BEFORE_LOCATION,
+                BETWEEN_LOCATION,
+                AFTER_LOCATION,
+        } loc = BEFORE_LOCATION;
+        int r;
+
+        r = event_log_load_and_process_components(&el);
+        if (r < 0)
+                return r;
+
         table = table_new("id", "variants");
         if (!table)
                 return log_oom();
 
         FOREACH_ARRAY(c, el->components, el->n_components) {
+
+                if (arg_pcr_mask != 0 && (arg_pcr_mask & event_log_component_pcrs(*c)) == 0)
+                        continue;
 
                 if (!sd_json_format_enabled(arg_json_format_flags)) {
                         _cleanup_free_ char *marker = NULL;
@@ -2718,8 +2955,8 @@ static int make_pcrlock_record(
                 const char *a;
 
                 assert_se(a = tpm2_hash_alg_to_string(*pa));
-                assert_se(md = EVP_get_digestbyname(a));
-                hash_ssize = EVP_MD_size(md);
+                assert_se(md = sym_EVP_get_digestbyname(a));
+                hash_ssize = sym_EVP_MD_get_size(md);
                 assert(hash_ssize > 0);
                 hash_usize = hash_ssize;
 
@@ -2727,20 +2964,20 @@ static int make_pcrlock_record(
                 if (!hash)
                         return log_oom();
 
-                if (EVP_Digest(data, data_size, hash, &hash_usize, md, NULL) != 1)
+                if (sym_EVP_Digest(data, data_size, hash, &hash_usize, md, NULL) != 1)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to hash data with algorithm '%s'.", a);
 
                 r = sd_json_variant_append_arraybo(
                                 &digests,
-                                SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(a)),
+                                SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
                                 SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(hash, hash_usize)));
                 if (r < 0)
                         return log_error_errno(r, "Failed to build JSON digest object: %m");
         }
 
         r = sd_json_buildo(ret_record,
-                           SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(pcr)),
-                           SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(digests)));
+                           SD_JSON_BUILD_PAIR_UNSIGNED("pcr", pcr),
+                           SD_JSON_BUILD_PAIR_VARIANT("digests", digests));
         if (r < 0)
                 return log_error_errno(r, "Failed to build record object: %m");
 
@@ -2751,7 +2988,7 @@ static void evp_md_ctx_free_all(EVP_MD_CTX *(*md)[TPM2_N_HASH_ALGORITHMS]) {
         assert(md);
         FOREACH_ARRAY(alg, *md, TPM2_N_HASH_ALGORITHMS)
                 if (*alg)
-                        EVP_MD_CTX_free(*alg);
+                        sym_EVP_MD_CTX_free(*alg);
 }
 
 static int make_pcrlock_record_from_stream(
@@ -2771,13 +3008,13 @@ static int make_pcrlock_record_from_stream(
                 const EVP_MD *md;
 
                 assert_se(a = tpm2_hash_alg_to_string(tpm2_hash_algorithms[i]));
-                assert_se(md = EVP_get_digestbyname(a));
+                assert_se(md = sym_EVP_get_digestbyname(a));
 
-                mdctx[i] = EVP_MD_CTX_new();
+                mdctx[i] = sym_EVP_MD_CTX_new();
                 if (!mdctx[i])
                         return log_oom();
 
-                if (EVP_DigestInit_ex(mdctx[i], md, NULL) != 1)
+                if (sym_EVP_DigestInit_ex(mdctx[i], md, NULL) != 1)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
                                                "Failed to initialize message digest for %s.", a);
         }
@@ -2793,7 +3030,7 @@ static int make_pcrlock_record_from_stream(
                         break;
 
                 for (size_t i = 0; i < TPM2_N_HASH_ALGORITHMS; i++)
-                        if (EVP_DigestUpdate(mdctx[i], buffer, n) != 1)
+                        if (sym_EVP_DigestUpdate(mdctx[i], buffer, n) != 1)
                                 return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Unable to hash data.");
         }
 
@@ -2803,18 +3040,18 @@ static int make_pcrlock_record_from_stream(
                 unsigned hash_usize;
 
                 assert_se(a = tpm2_hash_alg_to_string(tpm2_hash_algorithms[i]));
-                hash_ssize = EVP_MD_CTX_size(mdctx[i]);
+                hash_ssize = sym_EVP_MD_CTX_get_size(mdctx[i]);
                 assert(hash_ssize > 0 && hash_ssize <= EVP_MAX_MD_SIZE);
                 hash_usize = hash_ssize;
                 unsigned char hash[hash_usize];
 
-                if (EVP_DigestFinal_ex(mdctx[i], hash, &hash_usize) != 1)
+                if (sym_EVP_DigestFinal_ex(mdctx[i], hash, &hash_usize) != 1)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
                                                "Failed to finalize hash context for algorithn '%s'.", a);
 
                 r = sd_json_variant_append_arraybo(
                                 &digests,
-                                SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(a)),
+                                SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
                                 SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(hash, hash_usize)));
                 if (r < 0)
                         return log_error_errno(r, "Failed to build JSON digest object: %m");
@@ -2828,8 +3065,8 @@ static int make_pcrlock_record_from_stream(
 
                 r = sd_json_buildo(
                                 &record,
-                                SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(i)),
-                                SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(digests)));
+                                SD_JSON_BUILD_PAIR_UNSIGNED("pcr", i),
+                                SD_JSON_BUILD_PAIR_VARIANT("digests", digests));
                 if (r < 0)
                         return log_error_errno(r, "Failed to build record object: %m");
 
@@ -2861,7 +3098,7 @@ static int write_pcrlock(sd_json_variant *array, const char *default_pcrlock_pat
 
         r = sd_json_buildo(
                         &v,
-                        SD_JSON_BUILD_PAIR("records", SD_JSON_BUILD_VARIANT(array)));
+                        SD_JSON_BUILD_PAIR_VARIANT("records", array));
         if (r < 0)
                 return log_error_errno(r, "Failed to build JSON object: %m");
 
@@ -2879,7 +3116,7 @@ static int write_pcrlock(sd_json_variant *array, const char *default_pcrlock_pat
                 return log_error_errno(r, "Failed to output JSON object: %m");
 
         if (p)
-                log_info("%s written.", p);
+                log_debug("%s written.", p);
 
         return 0;
 }
@@ -2904,988 +3141,9 @@ static int unlink_pcrlock(const char *default_pcrlock_path) {
         return 0;
 }
 
-static int verb_lock_raw(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *records = NULL;
-        _cleanup_fclose_ FILE *f = NULL;
-        int r;
-
-        if (arg_pcr_mask == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No PCR specified, refusing.");
-
-        if (argc >= 2) {
-                f = fopen(argv[1], "re");
-                if (!f)
-                        return log_error_errno(errno, "Failed to open '%s': %m", argv[1]);
-        }
-
-        r = make_pcrlock_record_from_stream(arg_pcr_mask, f ?: stdin, &records);
-        if (r < 0)
-                return r;
-
-        return write_pcrlock(records, NULL);
-}
-
-static int verb_unlock_simple(int argc, char *argv[], void *userdata) {
-        return unlink_pcrlock(NULL);
-}
-
-static int verb_lock_secureboot_policy(int argc, char *argv[], void *userdata) {
-        static const struct {
-                sd_id128_t id;
-                const char *name;
-                int synthesize_empty; /* 0 → fail, > 0 → synthesize empty db, < 0 → skip */
-        } variables[] = {
-                { EFI_VENDOR_GLOBAL,   "SecureBoot", 0 },
-                { EFI_VENDOR_GLOBAL,   "PK",         1 },
-                { EFI_VENDOR_GLOBAL,   "KEK",        1 },
-                { EFI_VENDOR_DATABASE, "db",         1 },
-                { EFI_VENDOR_DATABASE, "dbx",        1 },
-                { EFI_VENDOR_DATABASE, "dbt",       -1 },
-                { EFI_VENDOR_DATABASE, "dbr",       -1 },
-        };
-
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL;
-        int r;
-
-        /* Generates expected records from the current SecureBoot state, as readable in the EFI variables
-         * right now. */
-
-        FOREACH_ELEMENT(vv, variables) {
-                _cleanup_(sd_json_variant_unrefp) sd_json_variant *record = NULL;
-
-                _cleanup_free_ char *name = NULL;
-                if (asprintf(&name, "%s-" SD_ID128_UUID_FORMAT_STR, vv->name, SD_ID128_FORMAT_VAL(vv->id)) < 0)
-                        return log_oom();
-
-                _cleanup_free_ void *data = NULL;
-                size_t data_size;
-                r = efi_get_variable(name, NULL, &data, &data_size);
-                if (r < 0) {
-                        if (r != -ENOENT || vv->synthesize_empty == 0)
-                                return log_error_errno(r, "Failed to read EFI variable '%s': %m", name);
-                        if (vv->synthesize_empty < 0)
-                                continue;
-
-                        /* If the main database variables are not set we don't consider this an error, but
-                         * measure an empty database instead. */
-                        log_debug("EFI variable %s is not set, synthesizing empty variable for measurement.", name);
-                        data_size = 0;
-                }
-
-                _cleanup_free_ char16_t* name16 = utf8_to_utf16(vv->name, SIZE_MAX);
-                if (!name16)
-                        return log_oom();
-                size_t name16_bytes = char16_strlen(name16) * 2;
-
-                size_t vdata_size = offsetof(UEFI_VARIABLE_DATA, unicodeName) + name16_bytes + data_size;
-                _cleanup_free_ UEFI_VARIABLE_DATA *vdata = malloc(vdata_size);
-                if (!vdata)
-                        return log_oom();
-
-                *vdata = (UEFI_VARIABLE_DATA) {
-                        .unicodeNameLength = name16_bytes / 2,
-                        .variableDataLength = data_size,
-                };
-
-                efi_id128_to_guid(vv->id, vdata->variableName);
-                memcpy(mempcpy(vdata->unicodeName, name16, name16_bytes), data, data_size);
-
-                r = make_pcrlock_record(TPM2_PCR_SECURE_BOOT_POLICY /* =7 */, vdata, vdata_size, &record);
-                if (r < 0)
-                        return r;
-
-                r = sd_json_variant_append_array(&array, record);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to append to JSON array: %m");
-        }
-
-        return write_pcrlock(array, PCRLOCK_SECUREBOOT_POLICY_PATH);
-}
-
-static int verb_unlock_secureboot_policy(int argc, char *argv[], void *userdata) {
-        return unlink_pcrlock(PCRLOCK_SECUREBOOT_POLICY_PATH);
-}
-
-static int event_log_record_is_secureboot_variable(EventLogRecord *rec, sd_id128_t uuid, const char *name) {
-        _cleanup_free_ char *found_name = NULL;
-        sd_id128_t found_uuid;
-        int r;
-
-        assert(rec);
-        assert(name);
-
-        if (!EVENT_LOG_RECORD_IS_FIRMWARE(rec))
-                return false;
-
-        if (rec->pcr != TPM2_PCR_SECURE_BOOT_POLICY)
-                return false;
-
-        if (rec->event_payload_valid != EVENT_PAYLOAD_VALID_YES)
-                return false;
-
-        if (rec->firmware_event_type != EV_EFI_VARIABLE_DRIVER_CONFIG)
-                return false;
-
-        r = event_log_record_parse_variable_data(rec, &found_uuid, &found_name);
-        if (r == -EBADMSG)
-                return false;
-        if (r < 0)
-                return r;
-
-        if (!sd_id128_equal(found_uuid, uuid))
-                return false;
-
-        return streq(found_name, name);
-}
-
-static bool event_log_record_is_secureboot_authority(EventLogRecord *rec) {
-        assert(rec);
-
-        if (!EVENT_LOG_RECORD_IS_FIRMWARE(rec))
-                return false;
-
-        if (rec->pcr != TPM2_PCR_SECURE_BOOT_POLICY)
-                return false;
-
-        if (rec->event_payload_valid != EVENT_PAYLOAD_VALID_YES)
-                return false;
-
-        return rec->firmware_event_type == EV_EFI_VARIABLE_AUTHORITY;
-}
-
-static int event_log_ensure_secureboot_consistency(EventLog *el) {
-        static const struct {
-                sd_id128_t id;
-                const char *name;
-                bool required;
-        } table[] = {
-                { EFI_VENDOR_GLOBAL,   "SecureBoot", true  },
-                { EFI_VENDOR_GLOBAL,   "PK",         true  },
-                { EFI_VENDOR_GLOBAL,   "KEK",        true  },
-                { EFI_VENDOR_DATABASE, "db",         true  },
-                { EFI_VENDOR_DATABASE, "dbx",        true  },
-                { EFI_VENDOR_DATABASE, "dbt",        false },
-                { EFI_VENDOR_DATABASE, "dbr",        false },
-                // FIXME: ensure we also find the separator here
-        };
-
-        EventLogRecord *records[ELEMENTSOF(table)] = {};
-        EventLogRecord *first_authority = NULL;
-
-        assert(el);
-
-        /* Ensures that the PCR 7 records are complete and in order. Before we lock down PCR 7 we want to
-         * ensure its state is actually consistent. */
-
-        FOREACH_ARRAY(rr, el->records, el->n_records) {
-                EventLogRecord *rec = *rr;
-                size_t found = SIZE_MAX;
-
-                if (event_log_record_is_secureboot_authority(rec)) {
-                        if (first_authority)
-                                continue;
-
-                        first_authority = rec;
-                        // FIXME: also check that each authority record's data is also listed in 'db'
-                        continue;
-                }
-
-                for (size_t i = 0; i < ELEMENTSOF(table); i++)
-                        if (event_log_record_is_secureboot_variable(rec, table[i].id, table[i].name)) {
-                                found = i;
-                                break;
-                        }
-                if (found == SIZE_MAX)
-                        continue;
-
-                /* Require the authority records always come *after* database measurements */
-                if (first_authority)
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "SecureBoot authority before variable, refusing.");
-
-                /* Check for duplicates */
-                if (records[found])
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Duplicate '%s' record, refusing.", rec->description);
-
-                /* Check for order */
-                for (size_t j = found + 1; j < ELEMENTSOF(table); j++)
-                        if (records[j])
-                                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'%s' record before '%s' record, refusing.", records[j]->description, rec->description);
-
-                records[found] = rec;
-        }
-
-        /* Check for existence */
-        for (size_t i = 0; i < ELEMENTSOF(table); i++)
-                if (table[i].required && !records[i])
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Required record '%s' not found, refusing.", table[i].name);
-
-        /* At this point we know that all required variables have been measured, in the right order. */
-        return 0;
-}
-
-static int verb_lock_secureboot_authority(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL;
-        _cleanup_(event_log_freep) EventLog *el = NULL;
-        int r;
-
-        /* Lock down the EV_EFI_VARIABLE_AUTHORITY records from the existing log. Note that there's not too
-         * much value in locking this down too much, since it stores only the result of the primary database
-         * checks, and that's what we should bind policy to. Moreover it's hard to predict, since extension
-         * card firmware validation will result in additional records here. */
-
-        if (!is_efi_secure_boot()) {
-                log_info("SecureBoot disabled, not generating authority .pcrlock file.");
-                return unlink_pcrlock(PCRLOCK_SECUREBOOT_AUTHORITY_PATH);
-        }
-
-        el = event_log_new();
-        if (!el)
-                return log_oom();
-
-        r = event_log_add_algorithms_from_environment(el);
-        if (r < 0)
-                return r;
-
-        r = event_log_load(el);
-        if (r < 0)
-                return r;
-
-        r = event_log_read_pcrs(el);
-        if (r < 0)
-                return r;
-
-        r = event_log_calculate_pcrs(el);
-        if (r < 0)
-                return r;
-
-        /* Before we base anything on the event log records, let's check that the event log state checks
-         * out. */
-
-        r = event_log_pcr_mask_checks_out(el, UINT32_C(1) << TPM2_PCR_SECURE_BOOT_POLICY);
-        if (r < 0)
-                return r;
-
-        r = event_log_validate_record_hashes(el);
-        if (r < 0)
-                return r;
-
-        r = event_log_ensure_secureboot_consistency(el);
-        if (r < 0)
-                return r;
-
-        FOREACH_ARRAY(rr, el->records, el->n_records) {
-                _cleanup_(sd_json_variant_unrefp) sd_json_variant *digests = NULL;
-                EventLogRecord *rec = *rr;
-
-                if (!event_log_record_is_secureboot_authority(rec))
-                        continue;
-
-                log_debug("Locking down authority '%s'.", strna(rec->description));
-
-                LIST_FOREACH(banks, bank, rec->banks) {
-                        r = sd_json_variant_append_arraybo(
-                                        &digests,
-                                        SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(tpm2_hash_alg_to_string(bank->algorithm))),
-                                        SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(bank->hash.buffer, bank->hash.size)));
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to build digests array: %m");
-                }
-
-                r = sd_json_variant_append_arraybo(
-                                &array,
-                                SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(rec->pcr)),
-                                SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(digests)));
-                if (r < 0)
-                        return log_error_errno(r, "Failed to build record array: %m");
-        }
-
-        return write_pcrlock(array, PCRLOCK_SECUREBOOT_AUTHORITY_PATH);
-}
-
-static int verb_unlock_secureboot_authority(int argc, char *argv[], void *userdata) {
-        return unlink_pcrlock(PCRLOCK_SECUREBOOT_AUTHORITY_PATH);
-}
-
-static int verb_lock_gpt(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL, *record = NULL;
-        _cleanup_(sd_device_unrefp) sd_device *d = NULL;
-        uint8_t h[2 * 4096]; /* space for at least two 4K sectors. GPT header should definitely be in here */
-        uint64_t start, n_members, member_size;
-        _cleanup_close_ int fd = -EBADF;
-        const GptHeader *p;
-        size_t found = 0;
-        ssize_t n;
-        int r;
-
-        r = block_device_new_from_path(
-                        argc >= 2 ? argv[1] : "/",
-                        BLOCK_DEVICE_LOOKUP_WHOLE_DISK|BLOCK_DEVICE_LOOKUP_BACKING|BLOCK_DEVICE_LOOKUP_ORIGINATING,
-                        &d);
-        if (r < 0)
-                return log_error_errno(r, "Failed to determine root block device: %m");
-
-        fd = sd_device_open(d, O_CLOEXEC|O_RDONLY|O_NOCTTY);
-        if (fd < 0)
-                return log_error_errno(fd, "Failed to open root block device: %m");
-
-        n = pread(fd, &h, sizeof(h), 0);
-        if (n < 0)
-                return log_error_errno(errno, "Failed to read GPT header of block device: %m");
-        if ((size_t) n != sizeof(h))
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Short read trying to read GPT header.");
-
-        /* Try a couple of sector sizes */
-        for (size_t sz = 512; sz <= 4096; sz <<= 1) {
-                assert(sizeof(h) >= sz * 2);
-                p = (const GptHeader*) (h + sz); /* 2nd sector */
-
-                if (!gpt_header_has_signature(p))
-                        continue;
-
-                if (found != 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(ENOTUNIQ),
-                                               "Disk has partition table for multiple sector sizes, refusing.");
-
-                found = sz;
-        }
-
-        if (found == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
-                                       "Disk does not have GPT partition table, refusing.");
-
-        p = (const GptHeader*) (h + found);
-
-        if (le32toh(p->header_size) > found)
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
-                                       "GPT header size over long (%" PRIu32 "), refusing.", le32toh(p->header_size));
-
-        start = le64toh(p->partition_entry_lba);
-        if (start > UINT64_MAX / found)
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
-                                       "Partition table start offset overflow, refusing.");
-
-        member_size = le32toh(p->size_of_partition_entry);
-        if (member_size < sizeof(GptPartitionEntry))
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
-                                       "Partition entry size too short, refusing.");
-
-        n_members = le32toh(p->number_of_partition_entries);
-        uint64_t member_bufsz = n_members * member_size;
-        if (member_bufsz > 1U*1024U*1024U)
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
-                                       "Partition table size too large, refusing.");
-
-        member_bufsz = ROUND_UP(member_bufsz, found);
-
-        _cleanup_free_ void *members = malloc(member_bufsz);
-        if (!members)
-                return log_oom();
-
-        n = pread(fd, members, member_bufsz, start * found);
-        if (n < 0)
-                return log_error_errno(errno, "Failed to read GPT partition table entries: %m");
-        if ((size_t) n != member_bufsz)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Short read while reading GPT partition table entries.");
-
-        size_t vdata_size = le32toh(p->header_size) + sizeof(le64_t) + member_size * n_members;
-        _cleanup_free_ void *vdata = malloc0(vdata_size);
-        if (!vdata)
-                return log_oom();
-
-        void *n_measured_entries = mempcpy(vdata, p, sizeof(GptHeader)); /* n_measured_entries is a 64bit value */
-
-        void *qq = (uint8_t*) n_measured_entries + sizeof(le64_t);
-
-        for (uint64_t i = 0; i < n_members; i++) {
-                const GptPartitionEntry *entry = (const GptPartitionEntry*) ((const uint8_t*) members + (member_size * i));
-
-                if (memeqzero(entry->partition_type_guid, sizeof(entry->partition_type_guid)))
-                        continue;
-
-                qq = mempcpy(qq, entry, member_size);
-                unaligned_write_le64(n_measured_entries, unaligned_read_le64(n_measured_entries) + 1);
-        }
-
-        vdata_size = (uint8_t*) qq - (uint8_t*) vdata;
-
-        r = make_pcrlock_record(TPM2_PCR_BOOT_LOADER_CONFIG /* =5 */, vdata, vdata_size, &record);
-        if (r < 0)
-                return r;
-
-        r = sd_json_variant_new_array(&array, &record, 1);
-        if (r < 0)
-                return log_error_errno(r, "Failed to append to JSON array: %m");
-
-        return write_pcrlock(array, PCRLOCK_GPT_PATH);
-}
-
-static int verb_unlock_gpt(int argc, char *argv[], void *userdata) {
-        return unlink_pcrlock(PCRLOCK_GPT_PATH);
-}
-
-static bool event_log_record_is_separator(const EventLogRecord *rec) {
-        assert(rec);
-
-        /* Recognizes EV_SEPARATOR events */
-
-        if (!EVENT_LOG_RECORD_IS_FIRMWARE(rec))
-                return false;
-
-        if (rec->firmware_event_type != EV_SEPARATOR)
-                return false;
-
-        return rec->event_payload_valid == EVENT_PAYLOAD_VALID_YES; /* Insist the record is consistent */
-}
-
-static int event_log_record_is_action_calling_efi_app(const EventLogRecord *rec) {
-        _cleanup_free_ char *d = NULL;
-        int r;
-
-        assert(rec);
-
-        /* Recognizes the special EV_EFI_ACTION that is issues when the firmware passes control to the boot loader. */
-
-        if (!EVENT_LOG_RECORD_IS_FIRMWARE(rec))
-                return false;
-
-        if (rec->pcr != TPM2_PCR_BOOT_LOADER_CODE)
-                return false;
-
-        if (rec->firmware_event_type != EV_EFI_ACTION)
-                return false;
-
-        if (rec->event_payload_valid != EVENT_PAYLOAD_VALID_YES) /* Insist the record is consistent */
-                return false;
-
-        r = make_cstring(rec->firmware_payload, rec->firmware_payload_size, MAKE_CSTRING_ALLOW_TRAILING_NUL, &d);
-        if (r < 0)
-                return r;
-
-        return streq(d, "Calling EFI Application from Boot Option");
-}
-
-static void enable_json_sse(void) {
-        /* We shall write this to a single output stream? We have to output two files, hence try to be smart
-         * and enable JSON SSE */
-
-        if (!arg_pcrlock_path && arg_pcrlock_auto)
-                return;
-
-        if (FLAGS_SET(arg_json_format_flags, SD_JSON_FORMAT_SSE))
-                return;
-
-        log_notice("Enabling JSON_SEQ mode, since writing two .pcrlock files to single output.");
-        arg_json_format_flags |= SD_JSON_FORMAT_SSE;
-}
-
-static int verb_lock_firmware(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array_early = NULL, *array_late = NULL;
-        _cleanup_(event_log_freep) EventLog *el = NULL;
-        uint32_t always_mask, separator_mask, separator_seen_mask = 0, action_seen_mask = 0;
-        const char *default_pcrlock_early_path, *default_pcrlock_late_path;
-        int r;
-
-        enable_json_sse();
-
-        /* The PCRs we intend to cover. Note that we measure firmware, external *and* boot loader code/config
-         * here – but the latter only until the "separator" events are seen, which tell us where transition
-         * into OS boot loader happens. This reflects the fact that on some systems the firmware already
-         * measures some firmware-supplied apps into PCR 4. (e.g. Thinkpad X1 Gen9) */
-        if (endswith(argv[0], "firmware-code")) {
-                always_mask = (UINT32_C(1) << TPM2_PCR_PLATFORM_CODE) |      /* → 0 */
-                        (UINT32_C(1) << TPM2_PCR_EXTERNAL_CODE);             /* → 2 */
-
-                separator_mask = UINT32_C(1) << TPM2_PCR_BOOT_LOADER_CODE;   /* → 4 */
-
-                default_pcrlock_early_path = PCRLOCK_FIRMWARE_CODE_EARLY_PATH;
-                default_pcrlock_late_path = PCRLOCK_FIRMWARE_CODE_LATE_PATH;
-        } else {
-                assert(endswith(argv[0], "firmware-config"));
-                always_mask = (UINT32_C(1) << TPM2_PCR_PLATFORM_CONFIG) |    /* → 1 */
-                        (UINT32_C(1) << TPM2_PCR_EXTERNAL_CONFIG);           /* → 3 */
-
-                separator_mask = UINT32_C(1) << TPM2_PCR_BOOT_LOADER_CONFIG; /* → 5 */
-
-                default_pcrlock_early_path = PCRLOCK_FIRMWARE_CONFIG_EARLY_PATH;
-                default_pcrlock_late_path = PCRLOCK_FIRMWARE_CONFIG_LATE_PATH;
-        }
-
-        el = event_log_new();
-        if (!el)
-                return log_oom();
-
-        r = event_log_add_algorithms_from_environment(el);
-        if (r < 0)
-                return r;
-
-        r = event_log_load(el);
-        if (r < 0)
-                return r;
-
-        r = event_log_read_pcrs(el);
-        if (r < 0)
-                return r;
-
-        r = event_log_calculate_pcrs(el);
-        if (r < 0)
-                return r;
-
-        r = event_log_validate_record_hashes(el);
-        if (r < 0)
-                return r;
-
-        /* Before we base anything on the event log records for any of the selected PCRs, let's check that
-         * the event log state checks out for them. */
-
-        r = event_log_pcr_mask_checks_out(el, always_mask|separator_mask);
-        if (r < 0)
-                return r;
-
-        // FIXME: before doing this, validate ahead-of-time that EV_SEPARATOR records exist for all entries,
-        //        and exactly once
-
-        FOREACH_ARRAY(rr, el->records, el->n_records) {
-                _cleanup_(sd_json_variant_unrefp) sd_json_variant *digests = NULL;
-                EventLogRecord *rec = *rr;
-                uint32_t bit = UINT32_C(1) << rec->pcr;
-
-                if (!EVENT_LOG_RECORD_IS_FIRMWARE(rec))
-                        continue;
-
-                if (!FLAGS_SET(always_mask, bit) &&
-                    !(FLAGS_SET(separator_mask, bit) && !FLAGS_SET(separator_seen_mask|action_seen_mask, bit)))
-                        continue;
-
-                /* If we hit the separator record, we stop processing the PCRs listed in `separator_mask` */
-                if (event_log_record_is_separator(rec)) {
-                        separator_seen_mask |= bit;
-                        continue;
-                }
-
-                /* If we hit the special "Calling EFI Application from Boot Option" action we treat this the
-                 * same as a separator here, as that's where firmware passes control to boot loader. Note
-                 * that some EFI implementations forget to generate one of them. */
-                r = event_log_record_is_action_calling_efi_app(rec);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to check if event is 'Calling EFI Application from Boot Option' action: %m");
-                if (r > 0) {
-                        action_seen_mask |= bit;
-                        continue;
-                }
-
-                LIST_FOREACH(banks, bank, rec->banks) {
-                        r = sd_json_variant_append_arraybo(
-                                        &digests,
-                                        SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(tpm2_hash_alg_to_string(bank->algorithm))),
-                                        SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(bank->hash.buffer, bank->hash.size)));
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to build digests array: %m");
-                }
-
-                r = sd_json_variant_append_arraybo(
-                                FLAGS_SET(separator_seen_mask, bit) ? &array_late : &array_early,
-                                SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(rec->pcr)),
-                                SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(digests)));
-                if (r < 0)
-                        return log_error_errno(r, "Failed to build record array: %m");
-        }
-
-        r = write_pcrlock(array_early, default_pcrlock_early_path);
-        if (r < 0)
-                return r;
-
-        return write_pcrlock(array_late, default_pcrlock_late_path);
-}
-
-static int verb_unlock_firmware(int argc, char *argv[], void *userdata) {
-        const char *default_pcrlock_early_path, *default_pcrlock_late_path;
-        int r;
-
-        if (endswith(argv[0], "firmware-code")) {
-                default_pcrlock_early_path = PCRLOCK_FIRMWARE_CODE_EARLY_PATH;
-                default_pcrlock_late_path = PCRLOCK_FIRMWARE_CODE_LATE_PATH;
-        } else {
-                default_pcrlock_early_path = PCRLOCK_FIRMWARE_CONFIG_EARLY_PATH;
-                default_pcrlock_late_path = PCRLOCK_FIRMWARE_CONFIG_LATE_PATH;
-        }
-
-        r = unlink_pcrlock(default_pcrlock_early_path);
-        if (r < 0)
-                return r;
-
-        if (arg_pcrlock_path) /* if the path is specified don't delete the same thing twice */
-                return 0;
-
-        r = unlink_pcrlock(default_pcrlock_late_path);
-        if (r < 0)
-                return r;
-
-        return 0;
-}
-
-static int verb_lock_machine_id(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *record = NULL, *array = NULL;
-        _cleanup_free_ char *word = NULL;
-        int r;
-
-        r = pcrextend_machine_id_word(&word);
-        if (r < 0)
-                return r;
-
-        r = make_pcrlock_record(TPM2_PCR_SYSTEM_IDENTITY /* = 15 */, word, SIZE_MAX, &record);
-        if (r < 0)
-                return r;
-
-        r = sd_json_variant_new_array(&array, &record, 1);
-        if (r < 0)
-                return log_error_errno(r, "Failed to create record array: %m");
-
-        return write_pcrlock(array, PCRLOCK_MACHINE_ID_PATH);
-}
-
-static int verb_unlock_machine_id(int argc, char *argv[], void *userdata) {
-        return unlink_pcrlock(PCRLOCK_MACHINE_ID_PATH);
-}
-
-static int pcrlock_file_system_path(const char *normalized_path, char **ret) {
-        _cleanup_free_ char *s = NULL;
-
-        assert(normalized_path);
-
-        if (path_equal(normalized_path, "/"))
-                s = strdup(PCRLOCK_ROOT_FILE_SYSTEM_PATH);
-        else {
-                /* We reuse the escaping we use for turning paths into unit names */
-                _cleanup_free_ char *escaped = NULL;
-
-                assert(normalized_path[0] == '/');
-                assert(normalized_path[1] != '/');
-
-                escaped = unit_name_escape(normalized_path + 1);
-                if (!escaped)
-                        return log_oom();
-
-                s = strjoin(PCRLOCK_FILE_SYSTEM_PATH_PREFIX, escaped, ".pcrlock");
-        }
-        if (!s)
-                return log_oom();
-
-        *ret = TAKE_PTR(s);
-        return 0;
-}
-
-static int verb_lock_file_system(int argc, char *argv[], void *userdata) {
-        const char* paths[3] = {};
-        int r;
-
-        if (argc > 1)
-                paths[0] = argv[1];
-        else {
-                dev_t a, b;
-                paths[0] = "/";
-
-                r = get_block_device("/", &a);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to get device of root file system: %m");
-
-                r = get_block_device("/var", &b);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to get device of /var/ file system: %m");
-
-                /* if backing device is distinct, then measure /var/ too */
-                if (a != b)
-                        paths[1] = "/var";
-
-                enable_json_sse();
-        }
-
-        STRV_FOREACH(p, paths) {
-                _cleanup_free_ char *word = NULL, *normalized_path = NULL, *pcrlock_file = NULL;
-                _cleanup_(sd_json_variant_unrefp) sd_json_variant *record = NULL, *array = NULL;
-
-                r = pcrextend_file_system_word(*p, &word, &normalized_path);
-                if (r < 0)
-                        return r;
-
-                r = pcrlock_file_system_path(normalized_path, &pcrlock_file);
-                if (r < 0)
-                        return r;
-
-                r = make_pcrlock_record(TPM2_PCR_SYSTEM_IDENTITY /* = 15 */, word, SIZE_MAX, &record);
-                if (r < 0)
-                        return r;
-
-                r = sd_json_variant_new_array(&array, &record, 1);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to create record array: %m");
-
-                r = write_pcrlock(array, pcrlock_file);
-                if (r < 0)
-                        return r;
-        }
-
-        return 0;
-}
-
-static int verb_unlock_file_system(int argc, char *argv[], void *userdata) {
-        const char* paths[3] = {};
-        int r;
-
-        if (argc > 1)
-                paths[0] = argv[1];
-        else {
-                paths[0] = "/";
-                paths[1] = "/var";
-        }
-
-        STRV_FOREACH(p, paths) {
-                _cleanup_free_ char *normalized_path = NULL, *pcrlock_file = NULL;
-
-                r = chase(*p, NULL, 0, &normalized_path, NULL);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to normal path '%s': %m", argv[1]);
-
-                r = pcrlock_file_system_path(normalized_path, &pcrlock_file);
-                if (r < 0)
-                        return r;
-
-                r = unlink_pcrlock(pcrlock_file);
-                if (r < 0)
-                        return r;
-        }
-
-        return 0;
-}
-
-static int verb_lock_pe(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL;
-        _cleanup_close_ int fd = -EBADF;
-        int r;
-
-        // FIXME: Maybe also generate a matching EV_EFI_VARIABLE_AUTHORITY records here for each signature that
-        //        covers this PE plus its hash, as alternatives under the same component name
-
-        if (argc >= 2) {
-                fd = open(argv[1], O_RDONLY|O_CLOEXEC);
-                if (fd < 0)
-                        return log_error_errno(errno, "Failed to open '%s': %m", argv[1]);
-        }
-
-        if (arg_pcr_mask == 0)
-                arg_pcr_mask = UINT32_C(1) << TPM2_PCR_BOOT_LOADER_CODE;
-
-        for (uint32_t i = 0; i < TPM2_PCRS_MAX; i++) {
-                _cleanup_(sd_json_variant_unrefp) sd_json_variant *digests = NULL;
-
-                if (!BIT_SET(arg_pcr_mask, i))
-                        continue;
-
-                FOREACH_ARRAY(pa, tpm2_hash_algorithms, TPM2_N_HASH_ALGORITHMS) {
-                        _cleanup_free_ void *hash = NULL;
-                        size_t hash_size;
-                        const EVP_MD *md;
-                        const char *a;
-
-                        assert_se(a = tpm2_hash_alg_to_string(*pa));
-                        assert_se(md = EVP_get_digestbyname(a));
-
-                        r = pe_hash(fd < 0 ? STDIN_FILENO : fd, md, &hash, &hash_size);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to hash PE binary: %m");
-
-                        r = sd_json_variant_append_arraybo(
-                                        &digests,
-                                        SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(a)),
-                                        SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(hash, hash_size)));
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to build JSON digest object: %m");
-                }
-
-                r = sd_json_variant_append_arraybo(
-                                &array,
-                                SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(i)),
-                                SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(digests)));
-                if (r < 0)
-                        return log_error_errno(r, "Failed to append record object: %m");
-        }
-
-        return write_pcrlock(array, NULL);
-}
-
-typedef void* SectionHashArray[_UNIFIED_SECTION_MAX * TPM2_N_HASH_ALGORITHMS];
-
-static void section_hashes_array_done(SectionHashArray *array) {
-        assert(array);
-
-        for (size_t i = 0; i < _UNIFIED_SECTION_MAX * TPM2_N_HASH_ALGORITHMS; i++)
-                free((*array)[i]);
-}
-
-static int verb_lock_uki(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL, *pe_digests = NULL;
-        _cleanup_(section_hashes_array_done) SectionHashArray section_hashes = {};
-        size_t hash_sizes[TPM2_N_HASH_ALGORITHMS];
-        _cleanup_close_ int fd = -EBADF;
-        int r;
-
-        if (arg_pcr_mask != 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "PCR not configurable for UKI lock down.");
-
-        if (argc >= 2) {
-                fd = open(argv[1], O_RDONLY|O_CLOEXEC);
-                if (fd < 0)
-                        return log_error_errno(errno, "Failed to open '%s': %m", argv[1]);
-        }
-
-        for (size_t i = 0; i < TPM2_N_HASH_ALGORITHMS; i++) {
-                _cleanup_free_ void *peh = NULL;
-                const EVP_MD *md;
-                const char *a;
-
-                assert_se(a = tpm2_hash_alg_to_string(tpm2_hash_algorithms[i]));
-                assert_se(md = EVP_get_digestbyname(a));
-
-                r = pe_hash(fd < 0 ? STDIN_FILENO : fd, md, &peh, hash_sizes + i);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to hash PE binary: %m");
-
-                r = sd_json_variant_append_arraybo(
-                                &pe_digests,
-                                SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(a)),
-                                SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(peh, hash_sizes[i])));
-                if (r < 0)
-                        return log_error_errno(r, "Failed to build JSON digest object: %m");
-
-                r = uki_hash(fd < 0 ? STDIN_FILENO : fd, md, section_hashes + (i * _UNIFIED_SECTION_MAX), hash_sizes + i);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to UKI hash PE binary: %m");
-        }
-
-        r = sd_json_variant_append_arraybo(
-                        &array,
-                        SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(TPM2_PCR_BOOT_LOADER_CODE)),
-                        SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(pe_digests)));
-        if (r < 0)
-                return log_error_errno(r, "Failed to append record object: %m");
-
-        for (UnifiedSection section = 0; section < _UNIFIED_SECTION_MAX; section++) {
-                _cleanup_(sd_json_variant_unrefp) sd_json_variant *section_digests = NULL, *record = NULL;
-
-                if (!unified_section_measure(section))
-                        continue;
-
-                for (size_t i = 0; i < TPM2_N_HASH_ALGORITHMS; i++) {
-                        const char *a;
-                        void *hash;
-
-                        hash = section_hashes[i * _UNIFIED_SECTION_MAX + section];
-                        if (!hash)
-                                continue;
-
-                        assert_se(a = tpm2_hash_alg_to_string(tpm2_hash_algorithms[i]));
-
-                        r = sd_json_variant_append_arraybo(
-                                        &section_digests,
-                                        SD_JSON_BUILD_PAIR("hashAlg", SD_JSON_BUILD_STRING(a)),
-                                        SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(hash, hash_sizes[i])));
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to build JSON digest object: %m");
-                }
-
-                if (!section_digests)
-                        continue;
-
-                /* So we have digests for this section, hence generate a record for the section name first. */
-                r = make_pcrlock_record(TPM2_PCR_KERNEL_BOOT /* =11 */, unified_sections[section], strlen(unified_sections[section]) + 1, &record);
-                if (r < 0)
-                        return r;
-
-                r = sd_json_variant_append_array(&array, record);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to append JSON record array: %m");
-
-                /* And then append a record for the section contents digests as well */
-                r = sd_json_variant_append_arraybo(
-                                &array,
-                                SD_JSON_BUILD_PAIR("pcr", SD_JSON_BUILD_UNSIGNED(TPM2_PCR_KERNEL_BOOT /* =11 */)),
-                                SD_JSON_BUILD_PAIR("digests", SD_JSON_BUILD_VARIANT(section_digests)));
-                if (r < 0)
-                        return log_error_errno(r, "Failed to append record object: %m");
-        }
-
-        return write_pcrlock(array, NULL);
-}
-
-static int verb_lock_kernel_cmdline(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *record = NULL, *array = NULL;
-        _cleanup_free_ char *cmdline = NULL;
-        int r;
-
-        if (argc > 1) {
-                if (empty_or_dash(argv[1]))
-                        r = read_full_stream(stdin, &cmdline, NULL);
-                else
-                        r = read_full_file(argv[1], &cmdline, NULL);
-        } else
-                r = proc_cmdline(&cmdline);
-        if (r < 0)
-                return log_error_errno(r, "Failed to read cmdline: %m");
-
-        delete_trailing_chars(cmdline, "\n");
-
-        _cleanup_free_ char16_t *u = NULL;
-        u = utf8_to_utf16(cmdline, SIZE_MAX);
-        if (!u)
-                return log_oom();
-
-        r = make_pcrlock_record(TPM2_PCR_KERNEL_INITRD /* = 9 */, u, char16_strlen(u)*2+2, &record);
-        if (r < 0)
-                return r;
-
-        r = sd_json_variant_new_array(&array, &record, 1);
-        if (r < 0)
-                return log_error_errno(r, "Failed to create record array: %m");
-
-        r = write_pcrlock(array, PCRLOCK_KERNEL_CMDLINE_PATH);
-        if (r < 0)
-                return r;
-
-        return 0;
-}
-
-static int verb_unlock_kernel_cmdline(int argc, char *argv[], void *userdata) {
-        return unlink_pcrlock(PCRLOCK_KERNEL_CMDLINE_PATH);
-}
-
-static int verb_lock_kernel_initrd(int argc, char *argv[], void *userdata) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *records = NULL;
-        _cleanup_fclose_ FILE *f = NULL;
-        uint32_t pcr_mask = UINT32_C(1) << TPM2_PCR_KERNEL_INITRD;
-        int r;
-
-        if (argc >= 2) {
-                f = fopen(argv[1], "re");
-                if (!f)
-                        return log_error_errno(errno, "Failed to open '%s': %m", argv[1]);
-        }
-
-        r = make_pcrlock_record_from_stream(pcr_mask, f ?: stdin, &records);
-        if (r < 0)
-                return r;
-
-        r = write_pcrlock(records, PCRLOCK_KERNEL_INITRD_PATH);
-        if (r < 0)
-                return r;
-
-        return 0;
-}
-
-static int verb_unlock_kernel_initrd(int argc, char *argv[], void *userdata) {
-        return unlink_pcrlock(PCRLOCK_KERNEL_INITRD_PATH);
-}
-
 static int event_log_reduce_to_safe_pcrs(EventLog *el, uint32_t *pcrs) {
         _cleanup_free_ char *dropped = NULL, *kept = NULL;
+        bool dropped_relevant_pcr = false;
 
         assert(el);
         assert(pcrs);
@@ -3920,7 +3178,7 @@ static int event_log_reduce_to_safe_pcrs(EventLog *el, uint32_t *pcrs) {
                         goto drop;
                 }
 
-                log_info("PCR %" PRIu32 " (%s) matches event log and fully consists of recognized measurements. Including in set of PCRs.", pcr, strna(tpm2_pcr_index_to_string(pcr)));
+                log_debug("PCR %" PRIu32 " (%s) matches event log and fully consists of recognized measurements. Including in set of PCRs.", pcr, strna(tpm2_pcr_index_to_string(pcr)));
 
                 if (strextendf_with_separator(&kept, ", ", "%" PRIu32 " (%s)", pcr, tpm2_pcr_index_to_string(pcr)) < 0)
                         return log_oom();
@@ -3928,6 +3186,9 @@ static int event_log_reduce_to_safe_pcrs(EventLog *el, uint32_t *pcrs) {
                 continue;
 
         drop:
+                if (arg_strict)
+                        dropped_relevant_pcr = true;
+
                 *pcrs &= ~(UINT32_C(1) << pcr);
 
                 if (strextendf_with_separator(&dropped, ", ", "%" PRIu32 " (%s)", pcr, tpm2_pcr_index_to_string(pcr)) < 0)
@@ -3935,7 +3196,7 @@ static int event_log_reduce_to_safe_pcrs(EventLog *el, uint32_t *pcrs) {
         }
 
         if (dropped)
-                log_notice("PCRs dropped from protection mask: %s", dropped);
+                log_full(dropped_relevant_pcr ? LOG_ERR : LOG_NOTICE, "PCRs dropped from protection mask: %s", dropped);
         else
                 log_debug("No PCRs dropped from protection mask.");
 
@@ -3944,15 +3205,14 @@ static int event_log_reduce_to_safe_pcrs(EventLog *el, uint32_t *pcrs) {
         else
                 log_notice("No PCRs kept in protection mask.");
 
-        return 0;
+        return dropped_relevant_pcr ? -ENOEXEC : 0;
 }
 
 static int pcr_prediction_add_result(
                 Tpm2PCRPrediction *context,
                 Tpm2PCRPredictionResult *result,
                 uint32_t pcr,
-                const char *path,
-                size_t offset) {
+                const char *path) {
 
         _cleanup_free_ Tpm2PCRPredictionResult *copy = NULL;
         int r;
@@ -3983,26 +3243,22 @@ static const EVP_MD* evp_from_tpm2_alg(uint16_t alg) {
         if (!name)
                 return NULL;
 
-        return EVP_get_digestbyname(name);
+        return sym_EVP_get_digestbyname(name);
 }
 
 static int event_log_component_variant_calculate(
-                Tpm2PCRPrediction *context,
                 Tpm2PCRPredictionResult *result,
-                EventLogComponent *component,
                 EventLogComponentVariant *variant,
-                uint32_t pcr,
-                const char *path) {
+                uint32_t pcr) {
 
-        int r;
-
-        assert(context);
         assert(result);
-        assert(component);
         assert(variant);
 
         FOREACH_ARRAY(rr, variant->records, variant->n_records) {
                 EventLogRecord *rec = *rr;
+
+                if (!EVENT_LOG_RECORD_IS_PCR(rec))
+                        continue;
 
                 if (rec->pcr != pcr)
                         continue;
@@ -4021,13 +3277,13 @@ static int event_log_component_variant_calculate(
                                 continue;
                         }
 
-                        md_ctx = EVP_MD_CTX_new();
+                        md_ctx = sym_EVP_MD_CTX_new();
                         if (!md_ctx)
                                 return log_oom();
 
                         const EVP_MD *md = ASSERT_PTR(evp_from_tpm2_alg(tpm2_hash_algorithms[i]));
 
-                        int sz = EVP_MD_size(md);
+                        int sz = sym_EVP_MD_get_size(md);
                         assert(sz > 0);
                         assert((size_t) sz <= sizeof_field(TPM2B_DIGEST, buffer));
 
@@ -4036,27 +3292,20 @@ static int event_log_component_variant_calculate(
                         assert(result->hash[i].size == (size_t) sz);
                         assert(b->hash.size == (size_t) sz);
 
-                        if (EVP_DigestInit_ex(md_ctx, md, NULL) != 1)
+                        if (sym_EVP_DigestInit_ex(md_ctx, md, NULL) != 1)
                                 return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to initialize message digest.");
 
-                        if (EVP_DigestUpdate(md_ctx, result->hash[i].buffer, sz) != 1)
+                        if (sym_EVP_DigestUpdate(md_ctx, result->hash[i].buffer, sz) != 1)
                                 return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to hash bank value.");
 
-                        if (EVP_DigestUpdate(md_ctx, b->hash.buffer, sz) != 1)
+                        if (sym_EVP_DigestUpdate(md_ctx, b->hash.buffer, sz) != 1)
                                 return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to hash data value.");
 
                         unsigned l = (unsigned) sz;
-                        if (EVP_DigestFinal_ex(md_ctx, result->hash[i].buffer, &l) != 1)
+                        if (sym_EVP_DigestFinal_ex(md_ctx, result->hash[i].buffer, &l) != 1)
                                 return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to finalize message digest.");
 
                         assert(l == (unsigned) sz);
-                }
-
-                /* This is a valid result once we hit the start location */
-                if (arg_location_start && strcmp(component->id, arg_location_start) >= 0) {
-                        r = pcr_prediction_add_result(context, result, pcr, path, rr - variant->records);
-                        if (r < 0)
-                                return r;
                 }
         }
 
@@ -4081,7 +3330,7 @@ static int event_log_predict_pcrs(
         /* Check if we reached the end of the components, generate a result, and backtrack */
         if (component_index >= el->n_components ||
             (arg_location_end && strcmp(el->components[component_index]->id, arg_location_end) > 0)) {
-                r = pcr_prediction_add_result(context, parent_result, pcr, path, /* offset= */ 0);
+                r = pcr_prediction_add_result(context, parent_result, pcr, path);
                 if (r < 0)
                         return r;
 
@@ -4089,6 +3338,13 @@ static int event_log_predict_pcrs(
         }
 
         component = ASSERT_PTR(el->components[component_index]);
+
+        /* Check if we are just about to process a component after start, if so record a result and continue. */
+        if (arg_location_start && strcmp(component->id, arg_location_start) > 0) {
+                r = pcr_prediction_add_result(context, parent_result, pcr, path);
+                if (r < 0)
+                        return r;
+        }
 
         FOREACH_ARRAY(ii, component->variants, component->n_variants) {
                 _cleanup_free_ Tpm2PCRPredictionResult *result = NULL;
@@ -4113,12 +3369,9 @@ static int event_log_predict_pcrs(
                         return log_oom();
 
                 r = event_log_component_variant_calculate(
-                                context,
                                 result,
-                                component,
                                 variant,
-                                pcr,
-                                subpath);
+                                pcr);
                 if (r < 0)
                         return r;
 
@@ -4272,7 +3525,9 @@ static int tpm2_pcr_prediction_run(
         return 0;
 }
 
-static int verb_predict(int argc, char *argv[], void *userdata) {
+VERB_NOARG(verb_predict, "predict",
+           "Predict PCR values");
+static int verb_predict(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(tpm2_pcr_prediction_done) Tpm2PCRPrediction context = {
                 arg_pcr_mask != 0 ? arg_pcr_mask : DEFAULT_PCR_MASK,
         };
@@ -4339,7 +3594,7 @@ static int determine_boot_policy_file(char **ret_path, char **ret_credential_nam
                         /* root= */ NULL,
                         /* conf_root= */ NULL,
                         machine_id,
-                        /* machine_id_is_random = */ false,
+                        /* machine_id_is_random= */ false,
                         &arg_entry_token_type,
                         &arg_entry_token);
         if (r < 0)
@@ -4471,7 +3726,7 @@ static int make_policy(bool force, RecoveryPinMode recovery_pin_mode) {
         if (r < 0)
                 return r;
 
-        log_info("Predicted future PCRs in %s.", FORMAT_TIMESPAN(usec_sub_unsigned(now(CLOCK_MONOTONIC), predict_start_usec), 1));
+        log_debug("Predicted future PCRs in %s.", FORMAT_TIMESPAN(usec_sub_unsigned(now(CLOCK_MONOTONIC), predict_start_usec), 1));
 
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *new_prediction_json = NULL;
         r = tpm2_pcr_prediction_to_json(&new_prediction, el->primary_algorithm, &new_prediction_json);
@@ -4643,6 +3898,16 @@ static int make_policy(bool force, RecoveryPinMode recovery_pin_mode) {
                                         policy_session,
                                         &old_policy.prediction,
                                         old_policy.algorithm);
+                        if (r == -EUCLEAN) {
+                                if (attempt >= PCRLOCK_RETRY_UNSEAL_MAX)
+                                        return log_error_errno(r,
+                                                               "PCR values kept changing while submitting the policy, giving up after %u attempts. "
+                                                               "Something on this system extends a PCR continuously.",
+                                                               attempt + 1);
+
+                                log_debug("Trying again (attempt %u), as PCR values changed while submitting the policy.", attempt + 1);
+                                continue;
+                        }
                         if (r < 0)
                                 return r;
 
@@ -4662,12 +3927,12 @@ static int make_policy(bool force, RecoveryPinMode recovery_pin_mode) {
                                         policy_session,
                                         encryption_session,
                                         &secret);
-                        if (r < 0 && (r != -ESTALE || attempt >= 16))
+                        if (r < 0 && (r != -ESTALE || attempt >= PCRLOCK_RETRY_UNSEAL_MAX))
                                 return log_error_errno(r, "Failed to unseal PIN: %m");
                         if (r == 0)
                                 break;
 
-                        log_debug("Trying again (attempt %u), as PCR values changed during unlock attempt.", attempt+1);
+                        log_debug("Trying again (attempt %u), as PCR values changed during unlock attempt.", attempt + 1);
                 }
 
                 if (secret.iov_len > sizeof_field(TPM2B_AUTH, buffer))
@@ -4851,7 +4116,9 @@ static int make_policy(bool force, RecoveryPinMode recovery_pin_mode) {
         return 1; /* installed new policy */
 }
 
-static int verb_make_policy(int argc, char *argv[], void *userdata) {
+VERB_NOARG(verb_make_policy, "make-policy",
+           "Predict PCR values and generate TPM2 policy from it");
+static int verb_make_policy(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
         r = make_policy(arg_force, arg_recovery_pin);
@@ -4900,7 +4167,7 @@ static int undefine_policy_nv_index(
         if (r < 0)
                 return r;
 
-        r = tpm2_undefine_policy_nv_index(
+        r = tpm2_undefine_nv_index(
                         tc,
                         encryption_session,
                         nv_index,
@@ -4951,7 +4218,9 @@ static int remove_policy(void) {
         return ret;
 }
 
-static int verb_remove_policy(int argc, char *argv[], void *userdata) {
+VERB_NOARG(verb_remove_policy, "remove-policy",
+           "Remove TPM2 policy");
+static int verb_remove_policy(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return remove_policy();
 }
 
@@ -4985,7 +4254,9 @@ static int test_tpm2_support_pcrlock(Tpm2Support *ret) {
         return 0;
 }
 
-static int verb_is_supported(int argc, char *argv[], void *userdata) {
+VERB_NOARG(verb_is_supported, "is-supported",
+           "Tests if TPM2 supports necessary features");
+static int verb_is_supported(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
         Tpm2Support s;
@@ -5009,161 +4280,1167 @@ static int verb_is_supported(int argc, char *argv[], void *userdata) {
         return ~s & (TPM2_SUPPORT_API|TPM2_SUPPORT_API_PCRLOCK);
 }
 
-static int help(int argc, char *argv[], void *userdata) {
-        _cleanup_free_ char *link = NULL;
+static int event_log_record_is_action_calling_efi_app(const EventLogRecord *rec) {
+        _cleanup_free_ char *d = NULL;
         int r;
 
-        r = terminal_urlify_man("systemd-pcrlock", "8", &link);
+        assert(rec);
+
+        /* Recognizes the special EV_EFI_ACTION that is issues when the firmware passes control to the boot loader. */
+
+        if (!EVENT_LOG_RECORD_IS_FIRMWARE(rec))
+                return false;
+
+        if (rec->pcr != TPM2_PCR_BOOT_LOADER_CODE)
+                return false;
+
+        if (rec->firmware_event_type != EV_EFI_ACTION)
+                return false;
+
+        if (rec->event_payload_valid != EVENT_PAYLOAD_VALID_YES) /* Insist the record is consistent */
+                return false;
+
+        r = make_cstring(rec->firmware_payload, rec->firmware_payload_size, MAKE_CSTRING_ALLOW_TRAILING_NUL, &d);
         if (r < 0)
+                return r;
+
+        return streq(d, "Calling EFI Application from Boot Option");
+}
+
+static void enable_json_sse(void) {
+        /* We shall write this to a single output stream? We have to output two files, hence try to be smart
+         * and enable JSON SSE */
+
+        if (!arg_pcrlock_path && arg_pcrlock_auto)
+                return;
+
+        if (FLAGS_SET(arg_json_format_flags, SD_JSON_FORMAT_SSE))
+                return;
+
+        log_notice("Enabling JSON_SEQ mode, since writing two .pcrlock files to single output.");
+        arg_json_format_flags |= SD_JSON_FORMAT_SSE;
+}
+
+static bool event_log_record_is_separator(const EventLogRecord *rec) {
+        assert(rec);
+
+        /* Recognizes EV_SEPARATOR events */
+
+        if (!EVENT_LOG_RECORD_IS_FIRMWARE(rec))
+                return false;
+
+        if (rec->firmware_event_type != EV_SEPARATOR)
+                return false;
+
+        return rec->event_payload_valid == EVENT_PAYLOAD_VALID_YES; /* Insist the record is consistent */
+}
+
+VERB_GROUP("Protections");
+
+static int lock_firmware(bool is_code) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array_early = NULL, *array_late = NULL;
+        _cleanup_(event_log_freep) EventLog *el = NULL;
+        uint32_t always_mask, separator_mask, separator_seen_mask = 0, action_seen_mask = 0;
+        const char *default_pcrlock_early_path, *default_pcrlock_late_path;
+        int r;
+
+        enable_json_sse();
+
+        /* The PCRs we intend to cover. Note that we measure firmware, external *and* boot loader code/config
+         * here – but the latter only until the "separator" events are seen, which tell us where transition
+         * into OS boot loader happens. This reflects the fact that on some systems the firmware already
+         * measures some firmware-supplied apps into PCR 4. (e.g. Thinkpad X1 Gen9) */
+        if (is_code) {
+                always_mask = (UINT32_C(1) << TPM2_PCR_PLATFORM_CODE) |      /* → 0 */
+                        (UINT32_C(1) << TPM2_PCR_EXTERNAL_CODE);             /* → 2 */
+
+                separator_mask = UINT32_C(1) << TPM2_PCR_BOOT_LOADER_CODE;   /* → 4 */
+
+                default_pcrlock_early_path = PCRLOCK_FIRMWARE_CODE_EARLY_PATH;
+                default_pcrlock_late_path = PCRLOCK_FIRMWARE_CODE_LATE_PATH;
+        } else {
+                always_mask = (UINT32_C(1) << TPM2_PCR_PLATFORM_CONFIG) |    /* → 1 */
+                        (UINT32_C(1) << TPM2_PCR_EXTERNAL_CONFIG);           /* → 3 */
+
+                separator_mask = UINT32_C(1) << TPM2_PCR_BOOT_LOADER_CONFIG; /* → 5 */
+
+                default_pcrlock_early_path = PCRLOCK_FIRMWARE_CONFIG_EARLY_PATH;
+                default_pcrlock_late_path = PCRLOCK_FIRMWARE_CONFIG_LATE_PATH;
+        }
+
+        el = event_log_new();
+        if (!el)
                 return log_oom();
 
-        printf("%1$s  [OPTIONS...] COMMAND ...\n"
-               "\n%5$sManage a TPM2 PCR lock.%6$s\n"
-               "\n%3$sCommands:%4$s\n"
-               "  log                         Show measurement log\n"
-               "  cel                         Show measurement log in TCG CEL-JSON format\n"
-               "  list-components             List defined .pcrlock components\n"
-               "  predict                     Predict PCR values\n"
-               "  make-policy                 Predict PCR values and generate TPM2 policy from it\n"
-               "  remove-policy               Remove TPM2 policy\n"
-               "  is-supported                Tests if TPM2 supports necessary features\n"
-               "\n%3$sProtections:%4$s\n"
-               "  lock-firmware-code          Generate a .pcrlock file from current firmware code\n"
-               "  unlock-firmware-code        Remove .pcrlock file for firmware code\n"
-               "  lock-firmware-config        Generate a .pcrlock file from current firmware configuration\n"
-               "  unlock-firmware-config      Remove .pcrlock file for firmware configuration\n"
-               "  lock-secureboot-policy      Generate a .pcrlock file from current SecureBoot policy\n"
-               "  unlock-secureboot-policy    Remove .pcrlock file for SecureBoot policy\n"
-               "  lock-secureboot-authority   Generate a .pcrlock file from current SecureBoot authority\n"
-               "  unlock-secureboot-authority Remove .pcrlock file for SecureBoot authority\n"
-               "  lock-gpt [DISK]             Generate a .pcrlock file from GPT header\n"
-               "  unlock-gpt                  Remove .pcrlock file for GPT header\n"
-               "  lock-pe [BINARY]            Generate a .pcrlock file from PE binary\n"
-               "  unlock-pe                   Remove .pcrlock file for PE binary\n"
-               "  lock-uki [UKI]              Generate a .pcrlock file from UKI PE binary\n"
-               "  unlock-uki                  Remove .pcrlock file for UKI PE binary\n"
-               "  lock-machine-id             Generate a .pcrlock file from current machine ID\n"
-               "  unlock-machine-id           Remove .pcrlock file for machine ID\n"
-               "  lock-file-system [PATH]     Generate a .pcrlock file from current root fs + /var/\n"
-               "  unlock-file-system [PATH]   Remove .pcrlock file for root fs + /var/\n"
-               "  lock-kernel-cmdline [FILE]  Generate a .pcrlock file from kernel command line\n"
-               "  unlock-kernel-cmdline       Remove .pcrlock file for kernel command line\n"
-               "  lock-kernel-initrd FILE     Generate a .pcrlock file from an initrd file\n"
-               "  unlock-kernel-initrd        Remove .pcrlock file for an initrd file\n"
-               "  lock-raw [FILE]             Generate a .pcrlock file from raw data\n"
-               "  unlock-raw                  Remove .pcrlock file for raw data\n"
-               "\n%3$sOptions:%4$s\n"
-               "  -h --help                   Show this help\n"
-               "     --version                Print version\n"
-               "     --no-pager               Do not pipe output into a pager\n"
-               "     --json=pretty|short|off  Generate JSON output\n"
-               "     --raw-description        Show raw firmware record data as description in table\n"
-               "     --pcr=NR                 Generate .pcrlock for specified PCR\n"
-               "     --nv-index=NUMBER        Use the specified NV index, instead of a random one\n"
-               "     --components=PATH        Directory to read .pcrlock files from\n"
-               "     --location=STRING[:STRING]\n"
-               "                              Do not process components beyond this component name\n"
-               "     --recovery-pin=MODE      Controls whether to show, hide, or ask for a recovery PIN\n"
-               "     --pcrlock=PATH           .pcrlock file to write expected PCR measurement to\n"
-               "     --policy=PATH            JSON file to write policy output to\n"
-               "     --force                  Write policy even if it matches existing policy\n"
-               "     --entry-token=machine-id|os-id|os-image-id|auto|literal:…\n"
-               "                              Boot entry token to use for this installation\n"
-               "  -q --quiet                  Suppress unnecessary output\n"
-               "\nSee the %2$s for details.\n",
-               program_invocation_short_name,
-               link,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal());
+        r = event_log_add_algorithms_from_environment(el);
+        if (r < 0)
+                return r;
+
+        r = event_log_load(el, /* keep_fw_no_action= */ false);
+        if (r < 0)
+                return r;
+
+        r = event_log_read_pcrs(el);
+        if (r < 0)
+                return r;
+
+        r = event_log_calculate_pcrs(el);
+        if (r < 0)
+                return r;
+
+        r = event_log_validate_record_hashes(el);
+        if (r < 0)
+                return r;
+
+        /* Before we base anything on the event log records for any of the selected PCRs, let's check that
+         * the event log state checks out for them. */
+
+        r = event_log_pcr_mask_checks_out(el, always_mask|separator_mask);
+        if (r < 0)
+                return r;
+
+        // FIXME: before doing this, validate ahead-of-time that EV_SEPARATOR records exist for all entries,
+        //        and exactly once
+
+        FOREACH_ARRAY(rr, el->records, el->n_records) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *digests = NULL;
+                EventLogRecord *rec = *rr;
+                uint32_t bit = UINT32_C(1) << rec->pcr;
+
+                if (!EVENT_LOG_RECORD_IS_FIRMWARE(rec))
+                        continue;
+
+                if (!FLAGS_SET(always_mask, bit) &&
+                    !(FLAGS_SET(separator_mask, bit) && !FLAGS_SET(separator_seen_mask|action_seen_mask, bit)))
+                        continue;
+
+                /* If we hit the separator record, we stop processing the PCRs listed in `separator_mask` */
+                if (event_log_record_is_separator(rec)) {
+                        separator_seen_mask |= bit;
+                        continue;
+                }
+
+                /* If we hit the special "Calling EFI Application from Boot Option" action we treat this the
+                 * same as a separator here, as that's where firmware passes control to boot loader. Note
+                 * that some EFI implementations forget to generate one of them. */
+                r = event_log_record_is_action_calling_efi_app(rec);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to check if event is 'Calling EFI Application from Boot Option' action: %m");
+                if (r > 0) {
+                        action_seen_mask |= bit;
+                        continue;
+                }
+
+                LIST_FOREACH(banks, bank, rec->banks) {
+                        r = sd_json_variant_append_arraybo(
+                                        &digests,
+                                        SD_JSON_BUILD_PAIR_STRING("hashAlg", tpm2_hash_alg_to_string(bank->algorithm)),
+                                        SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(bank->hash.buffer, bank->hash.size)));
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to build digests array: %m");
+                }
+
+                r = sd_json_variant_append_arraybo(
+                                FLAGS_SET(separator_seen_mask, bit) ? &array_late : &array_early,
+                                SD_JSON_BUILD_PAIR_UNSIGNED("pcr", rec->pcr),
+                                SD_JSON_BUILD_PAIR_VARIANT("digests", digests));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to build record array: %m");
+        }
+
+        r = write_pcrlock(array_early, default_pcrlock_early_path);
+        if (r < 0)
+                return r;
+
+        return write_pcrlock(array_late, default_pcrlock_late_path);
+}
+
+VERB(verb_lock_firmware, "lock-firmware-code", NULL, VERB_ANY, 2, 0,
+     "Generate a .pcrlock file from current firmware code");
+static int verb_lock_firmware(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return lock_firmware(endswith(argv[0], "firmware-code"));
+}
+
+static int unlock_firmware(bool is_code) {
+        const char *default_pcrlock_early_path, *default_pcrlock_late_path;
+        int r;
+
+        if (is_code) {
+                default_pcrlock_early_path = PCRLOCK_FIRMWARE_CODE_EARLY_PATH;
+                default_pcrlock_late_path = PCRLOCK_FIRMWARE_CODE_LATE_PATH;
+        } else {
+                default_pcrlock_early_path = PCRLOCK_FIRMWARE_CONFIG_EARLY_PATH;
+                default_pcrlock_late_path = PCRLOCK_FIRMWARE_CONFIG_LATE_PATH;
+        }
+
+        r = unlink_pcrlock(default_pcrlock_early_path);
+        if (r < 0)
+                return r;
+
+        if (arg_pcrlock_path) /* if the path is specified don't delete the same thing twice */
+                return 0;
+
+        r = unlink_pcrlock(default_pcrlock_late_path);
+        if (r < 0)
+                return r;
 
         return 0;
 }
 
-static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_NO_PAGER,
-                ARG_JSON,
-                ARG_RAW_DESCRIPTION,
-                ARG_PCR,
-                ARG_NV_INDEX,
-                ARG_COMPONENTS,
-                ARG_LOCATION,
-                ARG_RECOVERY_PIN,
-                ARG_PCRLOCK,
-                ARG_POLICY,
-                ARG_FORCE,
-                ARG_ENTRY_TOKEN,
+VERB_NOARG(verb_unlock_firmware, "unlock-firmware-code",
+           "Remove .pcrlock file for firmware code");
+static int verb_unlock_firmware(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return unlock_firmware(endswith(argv[0], "firmware-code"));
+}
+
+VERB(verb_lock_firmware, "lock-firmware-config", NULL, VERB_ANY, 2, 0,
+     "Generate a .pcrlock file from current firmware configuration");
+
+VERB_NOARG(verb_unlock_firmware, "unlock-firmware-config",
+           "Remove .pcrlock file for firmware configuration");
+
+static int lock_secureboot_policy(void) {
+        static const struct {
+                sd_id128_t id;
+                const char *name;
+                int synthesize_empty; /* 0 → fail, > 0 → synthesize empty db, < 0 → skip */
+        } variables[] = {
+                { EFI_VENDOR_GLOBAL,   "SecureBoot", 0 },
+                { EFI_VENDOR_GLOBAL,   "PK",         1 },
+                { EFI_VENDOR_GLOBAL,   "KEK",        1 },
+                { EFI_VENDOR_DATABASE, "db",         1 },
+                { EFI_VENDOR_DATABASE, "dbx",        1 },
+                { EFI_VENDOR_DATABASE, "dbt",       -1 },
+                { EFI_VENDOR_DATABASE, "dbr",       -1 },
         };
 
-        static const struct option options[] = {
-                { "help",            no_argument,       NULL, 'h'                 },
-                { "version",         no_argument,       NULL, ARG_VERSION         },
-                { "no-pager",        no_argument,       NULL, ARG_NO_PAGER        },
-                { "json",            required_argument, NULL, ARG_JSON            },
-                { "raw-description", no_argument,       NULL, ARG_RAW_DESCRIPTION },
-                { "pcr",             required_argument, NULL, ARG_PCR             },
-                { "nv-index",        required_argument, NULL, ARG_NV_INDEX        },
-                { "components",      required_argument, NULL, ARG_COMPONENTS      },
-                { "location",        required_argument, NULL, ARG_LOCATION        },
-                { "recovery-pin",    required_argument, NULL, ARG_RECOVERY_PIN    },
-                { "pcrlock",         required_argument, NULL, ARG_PCRLOCK         },
-                { "policy",          required_argument, NULL, ARG_POLICY          },
-                { "force",           no_argument,       NULL, ARG_FORCE           },
-                { "entry-token",     required_argument, NULL, ARG_ENTRY_TOKEN     },
-                { "quiet",           no_argument,       NULL, 'q'                 },
-                {}
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL;
+        int r;
+
+        /* Generates expected records from the current SecureBoot state, as readable in the EFI variables
+         * right now. */
+
+        FOREACH_ELEMENT(vv, variables) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *record = NULL;
+
+                _cleanup_free_ char *name = NULL;
+                if (asprintf(&name, "%s-" SD_ID128_UUID_FORMAT_STR, vv->name, SD_ID128_FORMAT_VAL(vv->id)) < 0)
+                        return log_oom();
+
+                _cleanup_free_ void *data = NULL;
+                size_t data_size;
+                r = efi_get_variable(name, NULL, &data, &data_size);
+                if (r < 0) {
+                        if (r != -ENOENT || vv->synthesize_empty == 0)
+                                return log_error_errno(r, "Failed to read EFI variable '%s': %m", name);
+                        if (vv->synthesize_empty < 0)
+                                continue;
+
+                        /* If the main database variables are not set we don't consider this an error, but
+                         * measure an empty database instead. */
+                        log_debug("EFI variable %s is not set, synthesizing empty variable for measurement.", name);
+                        data_size = 0;
+                }
+
+                _cleanup_free_ char16_t* name16 = utf8_to_utf16(vv->name, SIZE_MAX);
+                if (!name16)
+                        return log_oom();
+                size_t name16_bytes = char16_strlen(name16) * 2;
+
+                size_t vdata_size = offsetof(UEFI_VARIABLE_DATA, unicodeName) + name16_bytes + data_size;
+                _cleanup_free_ UEFI_VARIABLE_DATA *vdata = malloc(vdata_size);
+                if (!vdata)
+                        return log_oom();
+
+                *vdata = (UEFI_VARIABLE_DATA) {
+                        .unicodeNameLength = name16_bytes / 2,
+                        .variableDataLength = data_size,
+                };
+
+                efi_id128_to_guid(vv->id, vdata->variableName);
+                memcpy(mempcpy(vdata->unicodeName, name16, name16_bytes), data, data_size);
+
+                r = make_pcrlock_record(TPM2_PCR_SECURE_BOOT_POLICY /* =7 */, vdata, vdata_size, &record);
+                if (r < 0)
+                        return r;
+
+                r = sd_json_variant_append_array(&array, record);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to append to JSON array: %m");
+        }
+
+        return write_pcrlock(array, PCRLOCK_SECUREBOOT_POLICY_PATH);
+}
+
+VERB_NOARG(verb_lock_secureboot_policy, "lock-secureboot-policy",
+           "Generate a .pcrlock file from current SecureBoot policy");
+static int verb_lock_secureboot_policy(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return lock_secureboot_policy();
+}
+
+VERB_NOARG(verb_unlock_secureboot_policy, "unlock-secureboot-policy",
+           "Remove .pcrlock file for SecureBoot policy");
+static int verb_unlock_secureboot_policy(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return unlink_pcrlock(PCRLOCK_SECUREBOOT_POLICY_PATH);
+}
+
+static int event_log_record_is_secureboot_variable(EventLogRecord *rec, sd_id128_t uuid, const char *name) {
+        _cleanup_free_ char *found_name = NULL;
+        sd_id128_t found_uuid;
+        int r;
+
+        assert(rec);
+        assert(name);
+
+        if (!EVENT_LOG_RECORD_IS_FIRMWARE(rec))
+                return false;
+
+        if (rec->pcr != TPM2_PCR_SECURE_BOOT_POLICY)
+                return false;
+
+        if (rec->event_payload_valid != EVENT_PAYLOAD_VALID_YES)
+                return false;
+
+        if (rec->firmware_event_type != EV_EFI_VARIABLE_DRIVER_CONFIG)
+                return false;
+
+        r = event_log_record_parse_variable_data(rec, &found_uuid, &found_name);
+        if (r == -EBADMSG)
+                return false;
+        if (r < 0)
+                return r;
+
+        if (!sd_id128_equal(found_uuid, uuid))
+                return false;
+
+        return streq(found_name, name);
+}
+
+static bool event_log_record_is_secureboot_authority(EventLogRecord *rec) {
+        assert(rec);
+
+        if (!EVENT_LOG_RECORD_IS_FIRMWARE(rec))
+                return false;
+
+        if (rec->pcr != TPM2_PCR_SECURE_BOOT_POLICY)
+                return false;
+
+        if (rec->event_payload_valid != EVENT_PAYLOAD_VALID_YES)
+                return false;
+
+        return rec->firmware_event_type == EV_EFI_VARIABLE_AUTHORITY;
+}
+
+static int event_log_ensure_secureboot_consistency(EventLog *el) {
+        static const struct {
+                sd_id128_t id;
+                const char *name;
+                bool required;
+        } table[] = {
+                { EFI_VENDOR_GLOBAL,   "SecureBoot", true  },
+                { EFI_VENDOR_GLOBAL,   "PK",         true  },
+                { EFI_VENDOR_GLOBAL,   "KEK",        true  },
+                { EFI_VENDOR_DATABASE, "db",         true  },
+                { EFI_VENDOR_DATABASE, "dbx",        true  },
+                { EFI_VENDOR_DATABASE, "dbt",        false },
+                { EFI_VENDOR_DATABASE, "dbr",        false },
+                // FIXME: ensure we also find the separator here
         };
 
-        bool auto_location = true;
-        int c, r;
+        EventLogRecord *records[ELEMENTSOF(table)] = {};
+        EventLogRecord *first_authority = NULL;
 
+        assert(el);
+
+        /* Ensures that the PCR 7 records are complete and in order. Before we lock down PCR 7 we want to
+         * ensure its state is actually consistent. */
+
+        FOREACH_ARRAY(rr, el->records, el->n_records) {
+                EventLogRecord *rec = *rr;
+                size_t found = SIZE_MAX;
+
+                if (event_log_record_is_secureboot_authority(rec)) {
+                        if (first_authority)
+                                continue;
+
+                        first_authority = rec;
+                        // FIXME: also check that each authority record's data is also listed in 'db'
+                        continue;
+                }
+
+                for (size_t i = 0; i < ELEMENTSOF(table); i++)
+                        if (event_log_record_is_secureboot_variable(rec, table[i].id, table[i].name)) {
+                                found = i;
+                                break;
+                        }
+                if (found == SIZE_MAX)
+                        continue;
+
+                /* Require the authority records always come *after* database measurements */
+                if (first_authority)
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "SecureBoot authority before variable, refusing.");
+
+                /* Check for duplicates */
+                if (records[found])
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Duplicate '%s' record, refusing.", rec->description);
+
+                /* Check for order */
+                for (size_t j = found + 1; j < ELEMENTSOF(table); j++)
+                        if (records[j])
+                                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "'%s' record before '%s' record, refusing.", records[j]->description, rec->description);
+
+                records[found] = rec;
+        }
+
+        /* Check for existence */
+        for (size_t i = 0; i < ELEMENTSOF(table); i++)
+                if (table[i].required && !records[i])
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Required record '%s' not found, refusing.", table[i].name);
+
+        /* At this point we know that all required variables have been measured, in the right order. */
+        return 0;
+}
+
+static int lock_secureboot_authority(void) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL;
+        _cleanup_(event_log_freep) EventLog *el = NULL;
+        int r;
+
+        /* Lock down the EV_EFI_VARIABLE_AUTHORITY records from the existing log. Note that there's not too
+         * much value in locking this down too much, since it stores only the result of the primary database
+         * checks, and that's what we should bind policy to. Moreover it's hard to predict, since extension
+         * card firmware validation will result in additional records here. */
+
+        if (!is_efi_secure_boot()) {
+                log_info("SecureBoot disabled, not generating authority .pcrlock file.");
+                return unlink_pcrlock(PCRLOCK_SECUREBOOT_AUTHORITY_PATH);
+        }
+
+        el = event_log_new();
+        if (!el)
+                return log_oom();
+
+        r = event_log_add_algorithms_from_environment(el);
+        if (r < 0)
+                return r;
+
+        r = event_log_load(el, /* keep_fw_no_action= */ false);
+        if (r < 0)
+                return r;
+
+        r = event_log_read_pcrs(el);
+        if (r < 0)
+                return r;
+
+        r = event_log_calculate_pcrs(el);
+        if (r < 0)
+                return r;
+
+        /* Before we base anything on the event log records, let's check that the event log state checks
+         * out. */
+
+        r = event_log_pcr_mask_checks_out(el, UINT32_C(1) << TPM2_PCR_SECURE_BOOT_POLICY);
+        if (r < 0)
+                return r;
+
+        r = event_log_validate_record_hashes(el);
+        if (r < 0)
+                return r;
+
+        r = event_log_ensure_secureboot_consistency(el);
+        if (r < 0)
+                return r;
+
+        FOREACH_ARRAY(rr, el->records, el->n_records) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *digests = NULL;
+                EventLogRecord *rec = *rr;
+
+                if (!event_log_record_is_secureboot_authority(rec))
+                        continue;
+
+                log_debug("Locking down authority '%s'.", strna(rec->description));
+
+                LIST_FOREACH(banks, bank, rec->banks) {
+                        r = sd_json_variant_append_arraybo(
+                                        &digests,
+                                        SD_JSON_BUILD_PAIR_STRING("hashAlg", tpm2_hash_alg_to_string(bank->algorithm)),
+                                        SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(bank->hash.buffer, bank->hash.size)));
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to build digests array: %m");
+                }
+
+                r = sd_json_variant_append_arraybo(
+                                &array,
+                                SD_JSON_BUILD_PAIR_UNSIGNED("pcr", rec->pcr),
+                                SD_JSON_BUILD_PAIR_VARIANT("digests", digests));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to build record array: %m");
+        }
+
+        return write_pcrlock(array, PCRLOCK_SECUREBOOT_AUTHORITY_PATH);
+}
+
+VERB_NOARG(verb_lock_secureboot_authority, "lock-secureboot-authority",
+           "Generate a .pcrlock file from current SecureBoot authority");
+static int verb_lock_secureboot_authority(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return lock_secureboot_authority();
+}
+
+VERB_NOARG(verb_unlock_secureboot_authority, "unlock-secureboot-authority",
+           "Remove .pcrlock file for SecureBoot authority");
+static int verb_unlock_secureboot_authority(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return unlink_pcrlock(PCRLOCK_SECUREBOOT_AUTHORITY_PATH);
+}
+
+VERB(verb_lock_gpt, "lock-gpt", "[DISK]\0", VERB_ANY, 2, 0,
+     "Generate a .pcrlock file from GPT header");
+static int verb_lock_gpt(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL, *record = NULL;
+        _cleanup_(sd_device_unrefp) sd_device *d = NULL;
+        uint8_t h[2 * 4096]; /* space for at least two 4K sectors. GPT header should definitely be in here */
+        uint64_t start, n_members, member_size;
+        _cleanup_close_ int fd = -EBADF;
+        const GptHeader *p;
+        size_t found = 0;
+        ssize_t n;
+        int r;
+
+        r = block_device_new_from_path(
+                        argc >= 2 ? argv[1] : "/",
+                        BLOCK_DEVICE_LOOKUP_WHOLE_DISK|BLOCK_DEVICE_LOOKUP_BACKING|BLOCK_DEVICE_LOOKUP_ORIGINATING,
+                        &d);
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine root block device: %m");
+
+        fd = sd_device_open(d, O_CLOEXEC|O_RDONLY|O_NOCTTY);
+        if (fd < 0)
+                return log_error_errno(fd, "Failed to open root block device: %m");
+
+        n = pread(fd, &h, sizeof(h), 0);
+        if (n < 0)
+                return log_error_errno(errno, "Failed to read GPT header of block device: %m");
+        if ((size_t) n != sizeof(h))
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Short read trying to read GPT header.");
+
+        /* Try a couple of sector sizes */
+        for (size_t sz = 512; sz <= 4096; sz <<= 1) {
+                assert(sizeof(h) >= sz * 2);
+                p = (const GptHeader*) (h + sz); /* 2nd sector */
+
+                if (!gpt_header_has_signature(p))
+                        continue;
+
+                if (found != 0)
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOTUNIQ),
+                                               "Disk has partition table for multiple sector sizes, refusing.");
+
+                found = sz;
+        }
+
+        if (found == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "Disk does not have GPT partition table, refusing.");
+
+        p = (const GptHeader*) (h + found);
+
+        if (le32toh(p->header_size) > found)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "GPT header size over long (%" PRIu32 "), refusing.", le32toh(p->header_size));
+
+        start = le64toh(p->partition_entry_lba);
+        if (start > UINT64_MAX / found)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "Partition table start offset overflow, refusing.");
+
+        member_size = le32toh(p->size_of_partition_entry);
+        if (member_size < sizeof(GptPartitionEntry))
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "Partition entry size too short, refusing.");
+
+        n_members = le32toh(p->number_of_partition_entries);
+        uint64_t member_bufsz = n_members * member_size;
+        if (member_bufsz > 1U*1024U*1024U)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "Partition table size too large, refusing.");
+
+        member_bufsz = ROUND_UP(member_bufsz, found);
+
+        _cleanup_free_ void *members = malloc(member_bufsz);
+        if (!members)
+                return log_oom();
+
+        n = pread(fd, members, member_bufsz, start * found);
+        if (n < 0)
+                return log_error_errno(errno, "Failed to read GPT partition table entries: %m");
+        if ((size_t) n != member_bufsz)
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Short read while reading GPT partition table entries.");
+
+        size_t vdata_size = le32toh(p->header_size) + sizeof(le64_t) + member_size * n_members;
+        _cleanup_free_ void *vdata = malloc0(vdata_size);
+        if (!vdata)
+                return log_oom();
+
+        void *n_measured_entries = mempcpy(vdata, p, sizeof(GptHeader)); /* n_measured_entries is a 64bit value */
+
+        void *qq = (uint8_t*) n_measured_entries + sizeof(le64_t);
+
+        for (uint64_t i = 0; i < n_members; i++) {
+                const GptPartitionEntry *entry = (const GptPartitionEntry*) ((const uint8_t*) members + (member_size * i));
+
+                if (memeqzero(entry->partition_type_guid, sizeof(entry->partition_type_guid)))
+                        continue;
+
+                qq = mempcpy(qq, entry, member_size);
+                unaligned_write_le64(n_measured_entries, unaligned_read_le64(n_measured_entries) + 1);
+        }
+
+        vdata_size = (uint8_t*) qq - (uint8_t*) vdata;
+
+        r = make_pcrlock_record(TPM2_PCR_BOOT_LOADER_CONFIG /* =5 */, vdata, vdata_size, &record);
+        if (r < 0)
+                return r;
+
+        r = sd_json_variant_new_array(&array, &record, 1);
+        if (r < 0)
+                return log_error_errno(r, "Failed to append to JSON array: %m");
+
+        return write_pcrlock(array, PCRLOCK_GPT_PATH);
+}
+
+VERB_NOARG(verb_unlock_gpt, "unlock-gpt",
+           "Remove .pcrlock file for GPT header");
+static int verb_unlock_gpt(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return unlink_pcrlock(PCRLOCK_GPT_PATH);
+}
+
+static int pe_stdin_too_large(void) {
+        return log_error_errno(SYNTHETIC_ERRNO(EFBIG),
+                               "PE/UKI binary from stdin is larger than the maximum supported size of %s.",
+                               FORMAT_BYTES(PCRLOCK_PE_INPUT_MAX));
+}
+
+static int acquire_stdin_pe_fd(void) {
+        _cleanup_close_ int fd = -EBADF;
+        const char *td;
+        struct stat st;
+        int r;
+
+        if (fstat(STDIN_FILENO, &st) < 0)
+                return log_error_errno(errno, "Failed to stat stdin: %m");
+
+        if (S_ISREG(st.st_mode)) {
+                if ((uint64_t) st.st_size > PCRLOCK_PE_INPUT_MAX)
+                        return pe_stdin_too_large();
+
+                /* Regular stdin is already seekable. Keep it directly to avoid copying large redirected
+                 * PE/UKI files before hashing them. The size check above is a fast-path guard; a file that
+                 * grows concurrently is still hashed stream-wise with bounded memory use. */
+                fd = fcntl(STDIN_FILENO, F_DUPFD_CLOEXEC, 3);
+                if (fd < 0)
+                        return log_error_errno(errno, "Failed to duplicate stdin: %m");
+
+                return TAKE_FD(fd);
+        }
+
+        r = var_tmp_dir(&td);
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine temporary directory: %m");
+
+        fd = open_tmpfile_unlinkable(td, O_RDWR|O_CLOEXEC);
+        if (fd < 0)
+                return log_error_errno(fd, "Failed to create temporary file for PE binary: %m");
+
+        r = copy_bytes(STDIN_FILENO, fd, PCRLOCK_PE_INPUT_MAX + 1, /* copy_flags= */ 0);
+        if (r < 0)
+                return log_error_errno(r, "Failed to copy PE binary from stdin to temporary file: %m");
+        if (r > 0)
+                return pe_stdin_too_large();
+
+        return TAKE_FD(fd);
+}
+
+static int acquire_pe_fd(const char *path) {
+        if (path) {
+                int fd = open(path, O_RDONLY|O_CLOEXEC);
+                if (fd < 0)
+                        return log_error_errno(errno, "Failed to open '%s': %m", path);
+
+                return fd;
+        }
+
+        return acquire_stdin_pe_fd();
+}
+
+VERB(verb_lock_pe, "lock-pe", "[BINARY]\0", VERB_ANY, 2, 0,
+     "Generate a .pcrlock file from PE binary");
+static int verb_lock_pe(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        int r;
+
+        // FIXME: Maybe also generate a matching EV_EFI_VARIABLE_AUTHORITY records here for each signature that
+        //        covers this PE plus its hash, as alternatives under the same component name
+
+        fd = acquire_pe_fd(argc >= 2 ? argv[1] : NULL);
+        if (fd < 0)
+                return fd;
+
+        if (arg_pcr_mask == 0)
+                arg_pcr_mask = UINT32_C(1) << TPM2_PCR_BOOT_LOADER_CODE;
+
+        for (uint32_t i = 0; i < TPM2_PCRS_MAX; i++) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *digests = NULL;
+
+                if (!BIT_SET(arg_pcr_mask, i))
+                        continue;
+
+                FOREACH_ARRAY(pa, tpm2_hash_algorithms, TPM2_N_HASH_ALGORITHMS) {
+                        _cleanup_free_ void *hash = NULL;
+                        size_t hash_size;
+                        const EVP_MD *md;
+                        const char *a;
+
+                        assert_se(a = tpm2_hash_alg_to_string(*pa));
+                        assert_se(md = sym_EVP_get_digestbyname(a));
+
+                        r = pe_hash(fd, md, &hash, &hash_size);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to hash PE binary: %m");
+
+                        r = sd_json_variant_append_arraybo(
+                                        &digests,
+                                        SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
+                                        SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(hash, hash_size)));
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to build JSON digest object: %m");
+                }
+
+                r = sd_json_variant_append_arraybo(
+                                &array,
+                                SD_JSON_BUILD_PAIR_UNSIGNED("pcr", i),
+                                SD_JSON_BUILD_PAIR_VARIANT("digests", digests));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to append record object: %m");
+        }
+
+        return write_pcrlock(array, NULL);
+}
+
+VERB_NOARG(verb_unlock_simple, "unlock-pe",
+           "Remove .pcrlock file for PE binary");
+static int verb_unlock_simple(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return unlink_pcrlock(NULL);
+}
+
+typedef void* SectionHashArray[_UNIFIED_SECTION_MAX * TPM2_N_HASH_ALGORITHMS];
+
+static void section_hashes_array_done(SectionHashArray *array) {
+        assert(array);
+
+        for (size_t i = 0; i < _UNIFIED_SECTION_MAX * TPM2_N_HASH_ALGORITHMS; i++)
+                free((*array)[i]);
+}
+
+VERB(verb_lock_uki, "lock-uki", "[UKI]\0", VERB_ANY, 2, 0,
+     "Generate a .pcrlock file from UKI PE binary");
+static int verb_lock_uki(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *array = NULL, *pe_digests = NULL;
+        _cleanup_(section_hashes_array_done) SectionHashArray section_hashes = {};
+        size_t hash_sizes[TPM2_N_HASH_ALGORITHMS];
+        _cleanup_close_ int fd = -EBADF;
+        int r;
+
+        if (arg_pcr_mask != 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "PCR not configurable for UKI lock down.");
+
+        fd = acquire_pe_fd(argc >= 2 ? argv[1] : NULL);
+        if (fd < 0)
+                return fd;
+
+        for (size_t i = 0; i < TPM2_N_HASH_ALGORITHMS; i++) {
+                _cleanup_free_ void *peh = NULL;
+                const EVP_MD *md;
+                const char *a;
+
+                assert_se(a = tpm2_hash_alg_to_string(tpm2_hash_algorithms[i]));
+                assert_se(md = sym_EVP_get_digestbyname(a));
+
+                r = pe_hash(fd, md, &peh, hash_sizes + i);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to hash PE binary: %m");
+
+                r = sd_json_variant_append_arraybo(
+                                &pe_digests,
+                                SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
+                                SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(peh, hash_sizes[i])));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to build JSON digest object: %m");
+
+                r = uki_hash(fd, md, section_hashes + (i * _UNIFIED_SECTION_MAX), hash_sizes + i);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to UKI hash PE binary: %m");
+        }
+
+        r = sd_json_variant_append_arraybo(
+                        &array,
+                        SD_JSON_BUILD_PAIR_UNSIGNED("pcr", TPM2_PCR_BOOT_LOADER_CODE),
+                        SD_JSON_BUILD_PAIR_VARIANT("digests", pe_digests));
+        if (r < 0)
+                return log_error_errno(r, "Failed to append record object: %m");
+
+        for (UnifiedSection section = 0; section < _UNIFIED_SECTION_MAX; section++) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *section_digests = NULL, *record = NULL;
+
+                if (!unified_section_measure(section))
+                        continue;
+
+                for (size_t i = 0; i < TPM2_N_HASH_ALGORITHMS; i++) {
+                        const char *a;
+                        void *hash;
+
+                        hash = section_hashes[i * _UNIFIED_SECTION_MAX + section];
+                        if (!hash)
+                                continue;
+
+                        assert_se(a = tpm2_hash_alg_to_string(tpm2_hash_algorithms[i]));
+
+                        r = sd_json_variant_append_arraybo(
+                                        &section_digests,
+                                        SD_JSON_BUILD_PAIR_STRING("hashAlg", a),
+                                        SD_JSON_BUILD_PAIR("digest", SD_JSON_BUILD_HEX(hash, hash_sizes[i])));
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to build JSON digest object: %m");
+                }
+
+                if (!section_digests)
+                        continue;
+
+                /* So we have digests for this section, hence generate a record for the section name first. */
+                r = make_pcrlock_record(TPM2_PCR_KERNEL_BOOT /* =11 */, unified_sections[section], strlen(unified_sections[section]) + 1, &record);
+                if (r < 0)
+                        return r;
+
+                r = sd_json_variant_append_array(&array, record);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to append JSON record array: %m");
+
+                /* And then append a record for the section contents digests as well */
+                r = sd_json_variant_append_arraybo(
+                                &array,
+                                SD_JSON_BUILD_PAIR_UNSIGNED("pcr", TPM2_PCR_KERNEL_BOOT),
+                                SD_JSON_BUILD_PAIR_VARIANT("digests", section_digests));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to append record object: %m");
+        }
+
+        return write_pcrlock(array, NULL);
+}
+
+VERB_NOARG(verb_unlock_simple, "unlock-uki",
+           "Remove .pcrlock file for UKI PE binary");
+
+VERB_NOARG(verb_lock_machine_id, "lock-machine-id",
+           "Generate a .pcrlock file from current machine ID");
+static int verb_lock_machine_id(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *record = NULL, *array = NULL;
+        _cleanup_free_ char *word = NULL;
+        int r;
+
+        r = pcrextend_machine_id_word(&word);
+        if (r < 0)
+                return r;
+
+        r = make_pcrlock_record(TPM2_PCR_SYSTEM_IDENTITY /* = 15 */, word, SIZE_MAX, &record);
+        if (r < 0)
+                return r;
+
+        r = sd_json_variant_new_array(&array, &record, 1);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create record array: %m");
+
+        return write_pcrlock(array, PCRLOCK_MACHINE_ID_PATH);
+}
+
+VERB_NOARG(verb_unlock_machine_id, "unlock-machine-id",
+           "Remove .pcrlock file for machine ID");
+static int verb_unlock_machine_id(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return unlink_pcrlock(PCRLOCK_MACHINE_ID_PATH);
+}
+
+static int pcrlock_file_system_path(const char *normalized_path, char **ret) {
+        _cleanup_free_ char *s = NULL;
+
+        assert(normalized_path);
+        assert(ret);
+
+        if (path_equal(normalized_path, "/"))
+                s = strdup(PCRLOCK_ROOT_FILE_SYSTEM_PATH);
+        else {
+                /* We reuse the escaping we use for turning paths into unit names */
+                _cleanup_free_ char *escaped = NULL;
+
+                assert(normalized_path[0] == '/');
+                assert(normalized_path[1] != '/');
+
+                escaped = unit_name_escape(normalized_path + 1);
+                if (!escaped)
+                        return log_oom();
+
+                s = strjoin(PCRLOCK_FILE_SYSTEM_PATH_PREFIX, escaped, ".pcrlock");
+        }
+        if (!s)
+                return log_oom();
+
+        *ret = TAKE_PTR(s);
+        return 0;
+}
+
+VERB(verb_lock_file_system, "lock-file-system", "[PATH]\0", VERB_ANY, 2, 0,
+     "Generate a .pcrlock file from current root fs + /var/");
+static int verb_lock_file_system(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        const char* paths[3] = {};
+        int r;
+
+        if (argc > 1)
+                paths[0] = argv[1];
+        else {
+                dev_t a, b;
+                paths[0] = "/";
+
+                r = get_block_device("/", &a);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get device of root file system: %m");
+
+                r = get_block_device("/var", &b);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get device of /var/ file system: %m");
+
+                /* if backing device is distinct, then measure /var/ too */
+                if (a != b)
+                        paths[1] = "/var";
+
+                enable_json_sse();
+        }
+
+        STRV_FOREACH(p, paths) {
+                _cleanup_free_ char *word = NULL, *normalized_path = NULL, *pcrlock_file = NULL;
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *record = NULL, *array = NULL;
+
+                r = pcrextend_file_system_word(*p, &word, &normalized_path);
+                if (r < 0)
+                        return r;
+
+                r = pcrlock_file_system_path(normalized_path, &pcrlock_file);
+                if (r < 0)
+                        return r;
+
+                r = make_pcrlock_record(TPM2_PCR_SYSTEM_IDENTITY /* = 15 */, word, SIZE_MAX, &record);
+                if (r < 0)
+                        return r;
+
+                r = sd_json_variant_new_array(&array, &record, 1);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to create record array: %m");
+
+                r = write_pcrlock(array, pcrlock_file);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+VERB(verb_unlock_file_system, "unlock-file-system", "[PATH]\0", VERB_ANY, 2, 0,
+     "Remove .pcrlock file for root fs + /var/");
+static int verb_unlock_file_system(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        const char* paths[3] = {};
+        int r;
+
+        if (argc > 1)
+                paths[0] = argv[1];
+        else {
+                paths[0] = "/";
+                paths[1] = "/var";
+        }
+
+        STRV_FOREACH(p, paths) {
+                _cleanup_free_ char *normalized_path = NULL, *pcrlock_file = NULL;
+
+                r = chase(*p, NULL, 0, &normalized_path, NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to normal path '%s': %m", argv[1]);
+
+                r = pcrlock_file_system_path(normalized_path, &pcrlock_file);
+                if (r < 0)
+                        return r;
+
+                r = unlink_pcrlock(pcrlock_file);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+VERB(verb_lock_kernel_cmdline, "lock-kernel-cmdline", "[FILE]\0", VERB_ANY, 2, 0,
+     "Generate a .pcrlock file from kernel command line");
+static int verb_lock_kernel_cmdline(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *record = NULL, *array = NULL;
+        _cleanup_free_ char *cmdline = NULL;
+        int r;
+
+        if (argc > 1) {
+                if (empty_or_dash(argv[1]))
+                        r = read_full_stream(stdin, &cmdline, NULL);
+                else
+                        r = read_full_file(argv[1], &cmdline, NULL);
+        } else
+                r = proc_cmdline(&cmdline);
+        if (r < 0)
+                return log_error_errno(r, "Failed to read cmdline: %m");
+
+        delete_trailing_chars(cmdline, "\n");
+
+        _cleanup_free_ char16_t *u = NULL;
+        u = utf8_to_utf16(cmdline, SIZE_MAX);
+        if (!u)
+                return log_oom();
+
+        r = make_pcrlock_record(TPM2_PCR_KERNEL_INITRD /* = 9 */, u, char16_strlen(u)*2+2, &record);
+        if (r < 0)
+                return r;
+
+        r = sd_json_variant_new_array(&array, &record, 1);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create record array: %m");
+
+        r = write_pcrlock(array, PCRLOCK_KERNEL_CMDLINE_PATH);
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
+VERB_NOARG(verb_unlock_kernel_cmdline, "unlock-kernel-cmdline",
+           "Remove .pcrlock file for kernel command line");
+static int verb_unlock_kernel_cmdline(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return unlink_pcrlock(PCRLOCK_KERNEL_CMDLINE_PATH);
+}
+
+VERB(verb_lock_kernel_initrd, "lock-kernel-initrd", "FILE\0", VERB_ANY, 2, 0,
+     "Generate a .pcrlock file from an initrd file");
+static int verb_lock_kernel_initrd(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *records = NULL;
+        _cleanup_fclose_ FILE *f = NULL;
+        uint32_t pcr_mask = UINT32_C(1) << TPM2_PCR_KERNEL_INITRD;
+        int r;
+
+        if (argc >= 2) {
+                f = fopen(argv[1], "re");
+                if (!f)
+                        return log_error_errno(errno, "Failed to open '%s': %m", argv[1]);
+        }
+
+        r = make_pcrlock_record_from_stream(pcr_mask, f ?: stdin, &records);
+        if (r < 0)
+                return r;
+
+        r = write_pcrlock(records, PCRLOCK_KERNEL_INITRD_PATH);
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
+VERB_NOARG(verb_unlock_kernel_initrd, "unlock-kernel-initrd",
+           "Remove .pcrlock file for an initrd file");
+static int verb_unlock_kernel_initrd(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return unlink_pcrlock(PCRLOCK_KERNEL_INITRD_PATH);
+}
+
+VERB(verb_lock_raw, "lock-raw", "[FILE]\0", VERB_ANY, 2, 0,
+     "Generate a .pcrlock file from raw data");
+static int verb_lock_raw(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *records = NULL;
+        _cleanup_fclose_ FILE *f = NULL;
+        int r;
+
+        if (arg_pcr_mask == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No PCR specified, refusing.");
+
+        if (argc >= 2) {
+                f = fopen(argv[1], "re");
+                if (!f)
+                        return log_error_errno(errno, "Failed to open '%s': %m", argv[1]);
+        }
+
+        r = make_pcrlock_record_from_stream(arg_pcr_mask, f ?: stdin, &records);
+        if (r < 0)
+                return r;
+
+        return write_pcrlock(records, NULL);
+}
+
+VERB_NOARG(verb_unlock_simple, "unlock-raw",
+           "Remove .pcrlock file for raw data");
+
+VERB_COMMON_HELP_AUTO_HIDDEN();
+
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
         assert(argv);
+        assert(ret_args);
 
-        while ((c = getopt_long(argc, argv, "hq", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+        bool auto_location = true;
+        int r;
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        help(0, NULL, NULL);
-                        return 0;
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_NO_PAGER:
+                OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
-                case ARG_JSON:
-                        r = parse_json_argument(optarg, &arg_json_format_flags);
+                OPTION_COMMON_JSON:
+                        r = parse_json_argument(opts.arg, &arg_json_format_flags);
                         if (r <= 0)
                                 return r;
                         break;
 
-                case ARG_RAW_DESCRIPTION:
+                OPTION_LONG("full", NULL,
+                            "Print full hash in measurement log"):
+                        arg_abbreviate_hash = SIZE_MAX;
+                        break;
+
+                OPTION_LONG("raw-description", NULL,
+                            "Show raw firmware record data as description in table"):
                         arg_raw_description = true;
                         break;
 
-                case ARG_PCR: {
-                        r = tpm2_parse_pcr_argument_to_mask(optarg, &arg_pcr_mask);
+                OPTION_LONG("pcr", "NR",
+                            "Generate .pcrlock for specified PCR"):
+                        r = tpm2_parse_pcr_argument_to_mask(opts.arg, &arg_pcr_mask);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse PCR specification: %s", optarg);
-
+                                return log_error_errno(r, "Failed to parse PCR specification: %s", opts.arg);
                         break;
-                }
 
-                case ARG_NV_INDEX:
-                        if (isempty(optarg))
+                OPTION_LONG("nv-index", "NUMBER",
+                            "Use the specified NV index, instead of a random one"):
+                        if (isempty(opts.arg))
                                 arg_nv_index = 0;
                         else {
                                 uint32_t u;
 
-                                r = safe_atou32_full(optarg, 16, &u);
+                                r = safe_atou32_full(opts.arg, 16, &u);
                                 if (r < 0)
-                                        return log_error_errno(r, "Failed to parse --nv-index= argument: %s", optarg);
+                                        return log_error_errno(r, "Failed to parse --nv-index= argument: %s", opts.arg);
 
                                 if (u < TPM2_NV_INDEX_FIRST || u > TPM2_NV_INDEX_LAST)
                                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Argument for --nv-index= outside of valid range 0x%" PRIx32 "…0x%"  PRIx32 ": 0x%" PRIx32,
@@ -5173,10 +5450,11 @@ static int parse_argv(int argc, char *argv[]) {
                         }
                         break;
 
-                case ARG_COMPONENTS: {
+                OPTION_LONG("components", "PATH",
+                            "Directory to read .pcrlock files from"): {
                         _cleanup_free_ char *p = NULL;
 
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &p);
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &p);
                         if (r < 0)
                                 return r;
 
@@ -5187,21 +5465,22 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                case ARG_LOCATION: {
+                OPTION_LONG("location", "START[:END]",
+                            "Do not process components beyond this component name"): {
                         _cleanup_free_ char *start = NULL, *end = NULL;
                         const char *e;
 
                         auto_location = false;
 
-                        if (isempty(optarg)) {
+                        if (isempty(opts.arg)) {
                                 arg_location_start = mfree(arg_location_start);
                                 arg_location_end = mfree(arg_location_end);
                                 break;
                         }
 
-                        e = strchr(optarg, ':');
+                        e = strchr(opts.arg, ':');
                         if (e) {
-                                start = strndup(optarg, e - optarg);
+                                start = strndup(opts.arg, e - opts.arg);
                                 if (!start)
                                         return log_oom();
 
@@ -5209,11 +5488,11 @@ static int parse_argv(int argc, char *argv[]) {
                                 if (!end)
                                         return log_oom();
                         } else {
-                                start = strdup(optarg);
+                                start = strdup(opts.arg);
                                 if (!start)
                                         return log_oom();
 
-                                end = strdup(optarg);
+                                end = strdup(opts.arg);
                                 if (!end)
                                         return log_oom();
                         }
@@ -5228,17 +5507,19 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                case ARG_RECOVERY_PIN:
-                        arg_recovery_pin = recovery_pin_mode_from_string(optarg);
+                OPTION_LONG("recovery-pin", "MODE",
+                            "Controls whether to show, hide, or ask for a recovery PIN"):
+                        arg_recovery_pin = recovery_pin_mode_from_string(opts.arg);
                         if (arg_recovery_pin < 0)
-                                return log_error_errno(arg_recovery_pin, "Failed to parse --recovery-pin= mode: %s", optarg);
+                                return log_error_errno(arg_recovery_pin, "Failed to parse --recovery-pin= mode: %s", opts.arg);
                         break;
 
-                case ARG_PCRLOCK:
-                        if (empty_or_dash(optarg))
+                OPTION_LONG("pcrlock", "PATH",
+                            ".pcrlock file to write expected PCR measurement to"):
+                        if (empty_or_dash(opts.arg))
                                 arg_pcrlock_path = mfree(arg_pcrlock_path);
                         else {
-                                r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_pcrlock_path);
+                                r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_pcrlock_path);
                                 if (r < 0)
                                         return r;
                         }
@@ -5246,36 +5527,44 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_pcrlock_auto = false;
                         break;
 
-                case ARG_POLICY:
-                        if (empty_or_dash(optarg))
+                OPTION_LONG("policy", "PATH",
+                            "JSON file to write policy output to"):
+                        if (empty_or_dash(opts.arg))
                                 arg_policy_path = mfree(arg_policy_path);
                         else {
-                                r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_policy_path);
+                                r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_policy_path);
                                 if (r < 0)
                                         return r;
                         }
 
                         break;
 
-                case ARG_FORCE:
+                OPTION_LONG("force", NULL,
+                            "Write policy even if it matches existing policy"):
                         arg_force = true;
                         break;
 
-                case ARG_ENTRY_TOKEN:
-                        r = parse_boot_entry_token_type(optarg, &arg_entry_token_type, &arg_entry_token);
+                OPTION_LONG("entry-token", "TOKEN",
+                            "Boot entry token to use for this installation "
+                            "(machine-id, os-id, os-image-id, auto, literal:…)"):
+                        r = parse_boot_entry_token_type(opts.arg, &arg_entry_token_type, &arg_entry_token);
                         if (r < 0)
                                 return r;
                         break;
 
-                case 'q':
+                OPTION_LONG("strict", "BOOL",
+                            "Require all PCRs configured via --pcr= included in policy"):
+                        r = parse_boolean_argument("--strict", opts.arg, &arg_strict);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION('q', "quiet", NULL, "Suppress unnecessary output"):
                         arg_quiet = true;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(arg_json_format_flags);
                 }
 
         if (auto_location) {
@@ -5299,47 +5588,8 @@ static int parse_argv(int argc, char *argv[]) {
                 arg_pager_flags |= PAGER_DISABLE;
         }
 
+        *ret_args = option_parser_get_args(&opts);
         return 1;
-}
-
-static int pcrlock_main(int argc, char *argv[]) {
-        static const Verb verbs[] = {
-                { "help",                        VERB_ANY, VERB_ANY, 0,            help                             },
-                { "log",                         VERB_ANY, 1,        VERB_DEFAULT, verb_show_log                    },
-                { "cel",                         VERB_ANY, 1,        0,            verb_show_cel                    },
-                { "list-components",             VERB_ANY, 1,        0,            verb_list_components             },
-                { "predict",                     VERB_ANY, 1,        0,            verb_predict                     },
-                { "lock-firmware-code",          VERB_ANY, 2,        0,            verb_lock_firmware               },
-                { "unlock-firmware-code",        VERB_ANY, 1,        0,            verb_unlock_firmware             },
-                { "lock-firmware-config",        VERB_ANY, 2,        0,            verb_lock_firmware               },
-                { "unlock-firmware-config",      VERB_ANY, 1,        0,            verb_unlock_firmware             },
-                { "lock-secureboot-policy",      VERB_ANY, 1,        0,            verb_lock_secureboot_policy      },
-                { "unlock-secureboot-policy",    VERB_ANY, 1,        0,            verb_unlock_secureboot_policy    },
-                { "lock-secureboot-authority",   VERB_ANY, 1,        0,            verb_lock_secureboot_authority   },
-                { "unlock-secureboot-authority", VERB_ANY, 1,        0,            verb_unlock_secureboot_authority },
-                { "lock-gpt",                    VERB_ANY, 2,        0,            verb_lock_gpt                    },
-                { "unlock-gpt",                  VERB_ANY, 1,        0,            verb_unlock_gpt                  },
-                { "lock-pe",                     VERB_ANY, 2,        0,            verb_lock_pe                     },
-                { "unlock-pe",                   VERB_ANY, 1,        0,            verb_unlock_simple               },
-                { "lock-uki",                    VERB_ANY, 2,        0,            verb_lock_uki                    },
-                { "unlock-uki",                  VERB_ANY, 1,        0,            verb_unlock_simple               },
-                { "lock-machine-id",             VERB_ANY, 1,        0,            verb_lock_machine_id             },
-                { "unlock-machine-id",           VERB_ANY, 1,        0,            verb_unlock_machine_id           },
-                { "lock-file-system",            VERB_ANY, 2,        0,            verb_lock_file_system            },
-                { "unlock-file-system",          VERB_ANY, 2,        0,            verb_unlock_file_system          },
-                { "lock-kernel-cmdline",         VERB_ANY, 2,        0,            verb_lock_kernel_cmdline         },
-                { "unlock-kernel-cmdline",       VERB_ANY, 1,        0,            verb_unlock_kernel_cmdline       },
-                { "lock-kernel-initrd",          VERB_ANY, 2,        0,            verb_lock_kernel_initrd          },
-                { "unlock-kernel-initrd",        VERB_ANY, 1,        0,            verb_unlock_kernel_initrd        },
-                { "lock-raw",                    VERB_ANY, 2,        0,            verb_lock_raw                    },
-                { "unlock-raw",                  VERB_ANY, 1,        0,            verb_unlock_simple               },
-                { "make-policy",                 VERB_ANY, 1,        0,            verb_make_policy                 },
-                { "remove-policy",               VERB_ANY, 1,        0,            verb_remove_policy               },
-                { "is-supported",                VERB_ANY, 1,        0,            verb_is_supported                },
-                {}
-        };
-
-        return dispatch_verb(argc, argv, verbs, NULL);
 }
 
 static int vl_method_read_event_log(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -5348,8 +5598,9 @@ static int vl_method_read_event_log(sd_varlink *link, sd_json_variant *parameter
         int r;
 
         assert(link);
+        assert(FLAGS_SET(flags, SD_VARLINK_METHOD_MORE));
 
-        r = sd_varlink_dispatch(link, parameters, /* dispatch_table = */ NULL, /* userdata = */ NULL);
+        r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, /* userdata= */ NULL);
         if (r != 0)
                 return r;
 
@@ -5357,28 +5608,74 @@ static int vl_method_read_event_log(sd_varlink *link, sd_json_variant *parameter
         if (!el)
                 return log_oom();
 
-        r = event_log_load(el);
+        r = event_log_load(el, /* keep_fw_no_action= */ true);
         if (r < 0)
                 return r;
 
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *rec_cel = NULL;
+        r = sd_varlink_set_sentinel(link, NULL);
+        if (r < 0)
+                return r;
 
         FOREACH_ARRAY(rr, el->records, el->n_records) {
-
-                if (rec_cel) {
-                        r = sd_varlink_notifybo(link, SD_JSON_BUILD_PAIR_VARIANT("record", rec_cel));
-                        if (r < 0)
-                                return r;
-
-                        rec_cel = sd_json_variant_unref(rec_cel);
-                }
-
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *rec_cel = NULL;
                 r = event_log_record_to_cel(*rr, &recnum, &rec_cel);
+                if (r < 0)
+                        return r;
+
+                r = sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_VARIANT("record", rec_cel));
                 if (r < 0)
                         return r;
         }
 
-        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_CONDITION(!!rec_cel, "record", SD_JSON_BUILD_VARIANT(rec_cel)));
+        return 0;
+}
+
+static int vl_method_list_components(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        _cleanup_(event_log_freep) EventLog *el = NULL;
+        int r;
+
+        assert(link);
+        assert(FLAGS_SET(flags, SD_VARLINK_METHOD_MORE));
+
+        r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, /* userdata= */ NULL);
+        if (r != 0)
+                return r;
+
+        r = event_log_load_and_process_components(&el);
+        if (r < 0)
+                return r;
+
+        r = sd_varlink_set_sentinel(link, NULL);
+        if (r < 0)
+                return r;
+
+        FOREACH_ARRAY(c, el->components, el->n_components) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *variants = NULL;
+
+                FOREACH_ARRAY(variant, (*c)->variants, (*c)->n_variants) {
+                        r = sd_json_variant_append_arraybo(
+                                        &variants,
+                                        SD_JSON_BUILD_PAIR_STRING("id", (*variant)->id),
+                                        SD_JSON_BUILD_PAIR_STRING("path", (*variant)->path));
+                        if (r < 0)
+                                return r;
+                }
+
+                if (!variants) {
+                        r = sd_json_variant_new_array(&variants, NULL, 0);
+                        if (r < 0)
+                                return r;
+                }
+
+                r = sd_varlink_replybo(
+                                link,
+                                SD_JSON_BUILD_PAIR_STRING("id", (*c)->id),
+                                SD_JSON_BUILD_PAIR_VARIANT("variants", variants));
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
 }
 
 typedef struct MethodMakePolicyParameters {
@@ -5413,7 +5710,7 @@ static int vl_method_remove_policy(sd_varlink *link, sd_json_variant *parameters
 
         assert(link);
 
-        r = sd_varlink_dispatch(link, parameters, /* dispatch_table = */ NULL, /* userdata = */ NULL);
+        r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, /* userdata= */ NULL);
         if (r != 0)
                 return r;
 
@@ -5424,8 +5721,103 @@ static int vl_method_remove_policy(sd_varlink *link, sd_json_variant *parameters
         return sd_varlink_reply(link, NULL);
 }
 
+typedef enum LockCategory {
+        LOCK_CATEGORY_FIRMWARE_CODE,
+        LOCK_CATEGORY_FIRMWARE_CONFIG,
+        LOCK_CATEGORY_SECUREBOOT_POLICY,
+        LOCK_CATEGORY_SECUREBOOT_AUTHORITY,
+        _LOCK_CATEGORY_MAX,
+        _LOCK_CATEGORY_INVALID = -EINVAL,
+} LockCategory;
+
+static const char* const lock_category_table[_LOCK_CATEGORY_MAX] = {
+        [LOCK_CATEGORY_FIRMWARE_CODE]        = "firmwareCode",
+        [LOCK_CATEGORY_FIRMWARE_CONFIG]      = "firmwareConfig",
+        [LOCK_CATEGORY_SECUREBOOT_POLICY]    = "secureBootPolicy",
+        [LOCK_CATEGORY_SECUREBOOT_AUTHORITY] = "secureBootAuthority",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(lock_category, LockCategory);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_lock_category, LockCategory, lock_category_from_string);
+
+typedef struct MethodLockParameters {
+        LockCategory category;
+        bool lock;
+} MethodLockParameters;
+
+static int vl_method_lock(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "category", SD_JSON_VARIANT_STRING,  dispatch_lock_category,   offsetof(MethodLockParameters, category), SD_JSON_MANDATORY },
+                { "lock",     SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MethodLockParameters, lock),     0                 },
+                {}
+        };
+        MethodLockParameters p = {
+                .category = _LOCK_CATEGORY_INVALID,
+                .lock = true,
+        };
+        int r;
+
+        assert(link);
+
+        r = sd_varlink_dispatch(link, parameters, dispatch_table, &p);
+        if (r != 0)
+                return r;
+
+        switch (p.category) {
+
+        case LOCK_CATEGORY_FIRMWARE_CODE:
+                r = p.lock ? lock_firmware(/* is_code= */ true) : unlock_firmware(/* is_code= */ true);
+                break;
+
+        case LOCK_CATEGORY_FIRMWARE_CONFIG:
+                r = p.lock ? lock_firmware(/* is_code= */ false) : unlock_firmware(/* is_code= */ false);
+                break;
+
+        case LOCK_CATEGORY_SECUREBOOT_POLICY:
+                r = p.lock ? lock_secureboot_policy() : unlink_pcrlock(PCRLOCK_SECUREBOOT_POLICY_PATH);
+                break;
+
+        case LOCK_CATEGORY_SECUREBOOT_AUTHORITY:
+                r = p.lock ? lock_secureboot_authority() : unlink_pcrlock(PCRLOCK_SECUREBOOT_AUTHORITY_PATH);
+                break;
+
+        default:
+                assert_not_reached();
+        }
+        if (r < 0)
+                return r;
+
+        return sd_varlink_reply(link, NULL);
+}
+
+static int vl_method_on_completed_update(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        int r;
+
+        assert(link);
+
+        /* Triggered by systemd-sysupdate after an update completed. We deliberately ignore all parameters
+         * (we don't even dispatch them) and simply recompute the PCR policy unconditionally, since the set
+         * of measured components might have changed. */
+
+        /* Only honour update notifications if they come from root */
+        r = varlink_check_privileged_peer(link);
+        if (r < 0)
+                return r;
+
+        r = make_policy(/* force= */ false, /* recovery_pin_mode= */ RECOVERY_PIN_HIDE);
+        if (r < 0)
+                return r;
+
+        return sd_varlink_reply(link, NULL);
+}
+
 static int run(int argc, char *argv[]) {
         int r;
+
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTO_NOTE(required);
+        LIBSELINUX_NOTE(recommended);
+        TPM2_NOTE(suggested);
 
         log_setup();
 
@@ -5433,8 +5825,13 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return r;
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
+                return r;
+
+        r = dlopen_libcrypto(LOG_ERR);
+        if (r < 0)
                 return r;
 
         if (arg_varlink) {
@@ -5442,19 +5839,27 @@ static int run(int argc, char *argv[]) {
 
                 /* Invocation as Varlink service */
 
-                r = varlink_server_new(&varlink_server, SD_VARLINK_SERVER_ROOT_ONLY, NULL);
+                r = varlink_server_new(&varlink_server,
+                                       SD_VARLINK_SERVER_ROOT_ONLY | SD_VARLINK_SERVER_MYSELF_ONLY,
+                                       /* userdata= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to allocate Varlink server: %m");
 
-                r = sd_varlink_server_add_interface(varlink_server, &vl_interface_io_systemd_PCRLock);
+                r = sd_varlink_server_add_interface_many(
+                                varlink_server,
+                                &vl_interface_io_systemd_PCRLock,
+                                &vl_interface_io_systemd_SysUpdate_Notify);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to add Varlink interface: %m");
+                        return log_error_errno(r, "Failed to add Varlink interfaces: %m");
 
                 r = sd_varlink_server_bind_method_many(
                                 varlink_server,
-                                "io.systemd.PCRLock.ReadEventLog", vl_method_read_event_log,
-                                "io.systemd.PCRLock.MakePolicy",   vl_method_make_policy,
-                                "io.systemd.PCRLock.RemovePolicy", vl_method_remove_policy);
+                                "io.systemd.PCRLock.ReadEventLog",                  vl_method_read_event_log,
+                                "io.systemd.PCRLock.ListComponents",                vl_method_list_components,
+                                "io.systemd.PCRLock.MakePolicy",                    vl_method_make_policy,
+                                "io.systemd.PCRLock.RemovePolicy",                  vl_method_remove_policy,
+                                "io.systemd.PCRLock.Lock",                          vl_method_lock,
+                                "io.systemd.SysUpdate.Notify.OnCompletedUpdate",    vl_method_on_completed_update);
                 if (r < 0)
                         return log_error_errno(r, "Failed to bind Varlink methods: %m");
 
@@ -5465,7 +5870,7 @@ static int run(int argc, char *argv[]) {
                 return EXIT_SUCCESS;
         }
 
-        return pcrlock_main(argc, argv);
+        return dispatch_verb(args, NULL);
 }
 
 DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);

@@ -16,6 +16,8 @@
 char* sysctl_normalize(char *s) {
         char *n;
 
+        assert(s);
+
         n = strpbrk(s, "/.");
 
         /* If the first separator is a slash, the path is
@@ -112,6 +114,43 @@ int sysctl_writef(const char *property, const char *format, ...) {
         return sysctl_write(property, v);
 }
 
+int sysctl_write_verify(const char *property, const char *value) {
+        int r;
+
+        assert(property);
+        assert(value);
+
+        /* Some sysctl settings accept invalid values on write, but refuses on read. E.g. coredump pattern,
+         * be1e0283021ec73c2eb92839db9a471a068709d9 (v6.17) and 7d7c1fb85cba5627bbe741fb7539c709435e3848
+         * (v6.16.8), which is fixed by a779e27f24aeb679969ddd1fdd7f636e22ddbc1e (v6.18) and
+         * 304aa560385720baf3660fe8500f6dd425b63ea9 (v6.17.5). Let's first save the original value, and
+         * restore to the saved value if the new value is refused. */
+
+        _cleanup_free_ char *original = NULL;
+        r = sysctl_read(property, &original);
+        if (r >= 0 && streq(original, value))
+                return 0; /* Already set. */
+
+        r = sysctl_write(property, value);
+        if (r >= 0) {
+                _cleanup_free_ char *current = NULL;
+                r = sysctl_read(property, &current);
+                if (r >= 0) {
+                        if (streq(current, value))
+                                return 0; /* Yay! */
+
+                        /* At least for coredump pattern, this does not happen, but let's handle this as the
+                         * same as we wrote something invalid. */
+                        r = -EINVAL;
+                }
+        }
+
+        if (original)
+                (void) sysctl_write(property, original);
+
+        return r;
+}
+
 static const char* af_to_sysctl_dir(int af) {
         if (af == AF_MPLS)
                 return "mpls";
@@ -188,6 +227,48 @@ int sysctl_read(const char *property, char **ret) {
                 delete_trailing_chars(*ret, NEWLINE);
 
         return r;
+}
+
+int sysctl_read_int(const char *property, int *ret) {
+        _cleanup_free_ char *s = NULL;
+        int r;
+
+        assert(property);
+        assert(ret);
+
+        r = sysctl_read(property, &s);
+        if (r < 0)
+                return r;
+
+        return safe_atoi(s, ret);
+}
+
+int sysctl_read_unsigned(const char *property, unsigned *ret) {
+        _cleanup_free_ char *s = NULL;
+        int r;
+
+        assert(property);
+        assert(ret);
+
+        r = sysctl_read(property, &s);
+        if (r < 0)
+                return r;
+
+        return safe_atou(s, ret);
+}
+
+int sysctl_read_uint64(const char *property, uint64_t *ret) {
+        _cleanup_free_ char *s = NULL;
+        int r;
+
+        assert(property);
+        assert(ret);
+
+        r = sysctl_read(property, &s);
+        if (r < 0)
+                return r;
+
+        return safe_atou64(s, ret);
 }
 
 int sysctl_read_ip_property(int af, const char *ifname, const char *property, char **ret) {

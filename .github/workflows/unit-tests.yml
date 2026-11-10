@@ -16,7 +16,7 @@ jobs:
   build:
     runs-on: ${{ matrix.runner }}
     concurrency:
-      group: ${{ github.workflow }}-${{ matrix.run_phase }}-${{ github.ref }}-${{ matrix.runner }}
+      group: ${{ github.workflow }}-${{ matrix.run_phase }}-${{ matrix.cross_arch || 'native' }}-${{ github.ref }}-${{ matrix.runner }}
       cancel-in-progress: true
     strategy:
       fail-fast: false
@@ -28,6 +28,9 @@ jobs:
           - run_phase: GCC
             runner: ubuntu-24.04-arm
           - run_phase: GCC
+            runner: ubuntu-24.04-arm
+            cross_arch: armhf
+          - run_phase: GCC
             runner: ubuntu-24.04-ppc64le
           - run_phase: GCC
             runner: ubuntu-24.04-s390x
@@ -35,12 +38,19 @@ jobs:
           - run_phase: CLANG
             runner: ubuntu-24.04-arm
           - run_phase: CLANG
+            runner: ubuntu-24.04-arm
+            cross_arch: armhf
+          - run_phase: CLANG
             runner: ubuntu-24.04-ppc64le
           - run_phase: CLANG
             runner: ubuntu-24.04-s390x
+    env:
+      CROSS_ARCH: ${{ matrix.cross_arch || '' }}
     steps:
       - name: Repository checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - name: Install build dependencies
         run: |
           # Drop XDG_* stuff from /etc/environment, so we don't get the user
@@ -48,6 +58,48 @@ jobs:
           sudo sed -i '/^XDG_/d' /etc/environment
           # Pass only specific env variables through sudo, to avoid having
           # the already existing XDG_* stuff on the "other side"
-          sudo --preserve-env=GITHUB_ACTIONS,CI .github/workflows/unit-tests.sh SETUP
+          sudo --preserve-env=GITHUB_ACTIONS,CI,CROSS_ARCH .github/workflows/unit-tests.sh SETUP
       - name: Build & test
-        run: sudo --preserve-env=GITHUB_ACTIONS,CI .github/workflows/unit-tests.sh RUN_${{ matrix.run_phase }}
+        run: sudo --preserve-env=GITHUB_ACTIONS,CI,CROSS_ARCH .github/workflows/unit-tests.sh RUN_${{ matrix.run_phase }}
+
+  build-musl:
+    name: Build & test (musl, Nura)
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ${{ github.workflow }}-musl-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Repository checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: systemd/mkosi@71d7b67e01dc47ab5c51f24866c3e2195b9701d2
+        with:
+          # Bootstrapping a Nura tools tree on the Ubuntu host needs apk
+          apk: true
+
+      - name: Build tools tree
+        run: |
+          tee mkosi/mkosi.local.conf <<EOF
+          [Build]
+          ToolsTreeDistribution=nura
+          EOF
+
+          mkosi -f box -- true
+
+      - name: Build
+        run: |
+          mkosi box -- \
+              meson setup \
+                  --werror \
+                  -Dtests=unsafe \
+                  -Dslow-tests=true \
+                  -Dfuzz-tests=true \
+                  -Dlibc=musl \
+                  -Ddlopen-tests=true \
+                  build
+          mkosi box -- ninja -v -C build
+
+      - name: Test
+        run: mkosi box -- meson test -C build --print-errorlogs --no-stdsplit --quiet

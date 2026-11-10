@@ -3,7 +3,6 @@
   Copyright © 2010 ProFUSION embedded systems
 ***/
 
-#include <getopt.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
@@ -11,11 +10,13 @@
 #include <unistd.h>
 
 #include "sd-daemon.h"
+#include "sd-json.h"
 #include "sd-messages.h"
 
 #include "alloc-util.h"
 #include "async.h"
 #include "binfmt-util.h"
+#include "build.h"
 #include "cgroup-setup.h"
 #include "cgroup-util.h"
 #include "constants.h"
@@ -24,18 +25,21 @@
 #include "detach-loopback.h"
 #include "detach-md.h"
 #include "detach-swap.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "exec-util.h"
-#include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
-#include "getopt-defs.h"
 #include "initrd-util.h"
 #include "killall.h"
 #include "log.h"
+#include "luo-util.h"
+#include "main-func.h"
+#include "options.h"
 #include "parse-util.h"
 #include "pidref.h"
+#include "printk-util.h"
 #include "process-util.h"
 #include "reboot-util.h"
 #include "rlimit-util.h"
@@ -43,124 +47,131 @@
 #include "signal-util.h"
 #include "string-util.h"
 #include "switch-root.h"
-#include "sysctl-util.h"
 #include "terminal-util.h"
 #include "time-util.h"
 #include "umount.h"
+#include "verbs.h"
 #include "virt.h"
 #include "watchdog.h"
 
 #define SYNC_PROGRESS_ATTEMPTS 3
 #define SYNC_TIMEOUT_USEC (10*USEC_PER_SEC)
+#define DEFAULT_MINIMUM_UPTIME_USEC (15U * USEC_PER_SEC)
 
-static const char *arg_verb = NULL;
+static char *arg_verb = NULL;
 static uint8_t arg_exit_code = 0;
 static usec_t arg_timeout = DEFAULT_TIMEOUT_USEC;
 
+STATIC_DESTRUCTOR_REGISTER(arg_verb, freep);
+
+COMMAND(
+        "systemd-shutdown\0",
+        "Execute the final phase of system shutdown.",
+        .argspec = "reboot|poweroff|halt|kexec|exit\0",
+        .man_pages = "systemd-shutdown(8)\0",
+);
+
 static int parse_argv(int argc, char *argv[]) {
-        enum {
-                COMMON_GETOPT_ARGS,
-                SHUTDOWN_GETOPT_ARGS,
-        };
-
-        static const struct option options[] = {
-                COMMON_GETOPT_OPTIONS,
-                SHUTDOWN_GETOPT_OPTIONS,
-                {}
-        };
-
-        int c, r;
-
         assert(argc >= 1);
         assert(argv);
 
-        /* Resetting to 0 forces the invocation of an internal initialization routine of getopt_long()
-         * that checks for GNU extensions in optstring ('-' or '+' at the beginning). */
-        optind = 0;
+        /* The interface is: the verb must stay in argv[1]. Any extra positional arguments
+         * are warned about and ignored. See 4b5d8d0f22ae61ceb45a25391354ba53b43ee992.
+         *
+         * Note: when new options are added here, also add them to the exclusion list in proc-cmdline.c! */
 
-        /* "-" prevents getopt from permuting argv[] and moving the verb away
-         * from argv[1]. Our interface to initrd promises it'll be there. */
-        while ((c = getopt_long(argc, argv, "-", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv, OPTION_PARSER_RETURN_POSITIONAL_ARGS };
+        int r;
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case ARG_LOG_LEVEL:
-                        r = log_set_max_level_from_string(optarg);
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
+                        return version();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
+
+                OPTION_COMMON_LOG_LEVEL:
+                        r = log_set_max_level_from_string(opts.arg);
                         if (r < 0)
-                                log_warning_errno(r, "Failed to parse log level %s, ignoring: %m", optarg);
+                                log_warning_errno(r, "Failed to parse log level %s, ignoring: %m", opts.arg);
 
                         break;
 
-                case ARG_LOG_TARGET:
-                        r = log_set_target_from_string(optarg);
+                OPTION_COMMON_LOG_TARGET:
+                        r = log_set_target_from_string(opts.arg);
                         if (r < 0)
-                                log_warning_errno(r, "Failed to parse log target %s, ignoring: %m", optarg);
+                                log_warning_errno(r, "Failed to parse log target %s, ignoring: %m", opts.arg);
 
                         break;
 
-                case ARG_LOG_COLOR:
-
-                        if (optarg) {
-                                r = log_show_color_from_string(optarg);
+                OPTION_LONG_FLAGS(OPTION_OPTIONAL_ARG, "log-color", "BOOL",
+                                  "Highlight important messages"):
+                        if (opts.arg) {
+                                r = log_show_color_from_string(opts.arg);
                                 if (r < 0)
-                                        log_warning_errno(r, "Failed to parse log color setting %s, ignoring: %m", optarg);
+                                        log_warning_errno(r, "Failed to parse log color setting %s, ignoring: %m", opts.arg);
                         } else
                                 log_show_color(true);
 
                         break;
 
-                case ARG_LOG_LOCATION:
-                        if (optarg) {
-                                r = log_show_location_from_string(optarg);
+                OPTION_LONG_FLAGS(OPTION_OPTIONAL_ARG, "log-location", "BOOL",
+                                  "Include code location in messages"):
+                        if (opts.arg) {
+                                r = log_show_location_from_string(opts.arg);
                                 if (r < 0)
-                                        log_warning_errno(r, "Failed to parse log location setting %s, ignoring: %m", optarg);
+                                        log_warning_errno(r, "Failed to parse log location setting %s, ignoring: %m", opts.arg);
                         } else
                                 log_show_location(true);
 
                         break;
 
-                case ARG_LOG_TIME:
-
-                        if (optarg) {
-                                r = log_show_time_from_string(optarg);
+                OPTION_LONG_FLAGS(OPTION_OPTIONAL_ARG, "log-time", "BOOL",
+                                  "Prefix messages with current time"):
+                        if (opts.arg) {
+                                r = log_show_time_from_string(opts.arg);
                                 if (r < 0)
-                                        log_warning_errno(r, "Failed to parse log time setting %s, ignoring: %m", optarg);
+                                        log_warning_errno(r, "Failed to parse log time setting %s, ignoring: %m", opts.arg);
                         } else
                                 log_show_time(true);
 
                         break;
 
-                case ARG_EXIT_CODE:
-                        r = safe_atou8(optarg, &arg_exit_code);
+                OPTION_LONG("exit-code", "N",
+                            "Exit code for reboot/kexec"):
+                        r = safe_atou8(opts.arg, &arg_exit_code);
                         if (r < 0)
-                                log_warning_errno(r, "Failed to parse exit code %s, ignoring: %m", optarg);
+                                log_warning_errno(r, "Failed to parse exit code %s, ignoring: %m", opts.arg);
 
                         break;
 
-                case ARG_TIMEOUT:
-                        r = parse_sec(optarg, &arg_timeout);
+                OPTION_LONG("timeout", "TIME",
+                            "Overall shutdown timeout"):
+                        r = parse_sec(opts.arg, &arg_timeout);
                         if (r < 0)
-                                log_warning_errno(r, "Failed to parse shutdown timeout %s, ignoring: %m", optarg);
+                                log_warning_errno(r, "Failed to parse shutdown timeout %s, ignoring: %m", opts.arg);
 
                         break;
 
-                case '\001':
-                        if (!arg_verb)
-                                arg_verb = optarg;
-                        else
-                                log_warning("Got extraneous arguments, ignoring.");
+                OPTION_POSITIONAL:
+                        if (!arg_verb) {
+                                arg_verb = strdup(opts.arg);
+                                if (!arg_verb)
+                                        return log_oom();
+                        } else
+                                log_warning("Got extraneous argument, ignoring.");
                         break;
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
                 }
 
         if (!arg_verb)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Verb argument missing.");
 
-        return 0;
+        return 1; /* Further action */
 }
 
 static int switch_root_initramfs(void) {
@@ -229,8 +240,6 @@ int sync_with_progress(int fd) {
         _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
         int r;
 
-        BLOCK_SIGNALS(SIGCHLD);
-
         /* Due to the possibility of the sync operation hanging, we fork a child process and monitor
          * the progress. If the timeout lapses, the assumption is that the particular sync stalled. */
 
@@ -253,12 +262,15 @@ int sync_with_progress(int fd) {
          * SYNC_PROGRESS_ATTEMPTS lapse without progress being made,
          * we assume that the sync is stalled */
         for (unsigned checks = 0; checks < SYNC_PROGRESS_ATTEMPTS; checks++) {
-                r = wait_for_terminate_with_timeout(pidref.pid, SYNC_TIMEOUT_USEC);
-                if (r == 0)
+                siginfo_t si;
+
+                r = pidref_wait_for_terminate_full(&pidref, SYNC_TIMEOUT_USEC, &si);
+                if (r >= 0 && si.si_code == CLD_EXITED && si.si_status == EXIT_SUCCESS)
                         /* Sync finished without error (sync() call itself does not return an error code) */
                         return 0;
                 if (r != -ETIMEDOUT)
-                        return log_error_errno(r, "Failed to sync %s: %m", what);
+                        return log_error_errno(r < 0 ? r : SYNTHETIC_ERRNO(EPROTO),
+                                               "Failed to sync %s: %m", what);
 
                 /* Reset the check counter if we made some progress */
                 if (sync_making_progress(&dirty) > 0)
@@ -272,56 +284,44 @@ int sync_with_progress(int fd) {
         return r;
 }
 
-static int read_current_sysctl_printk_log_level(void) {
-        _cleanup_free_ char *sysctl_printk_vals = NULL, *sysctl_printk_curr = NULL;
-        int current_lvl;
-        const char *p;
-        int r;
-
-        r = sysctl_read("kernel/printk", &sysctl_printk_vals);
-        if (r < 0)
-                return log_debug_errno(r, "Cannot read sysctl kernel.printk: %m");
-
-        p = sysctl_printk_vals;
-        r = extract_first_word(&p, &sysctl_printk_curr, NULL, 0);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to split out kernel printk priority: %m");
-        if (r == 0)
-                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Short read while reading kernel.printk sysctl");
-
-        r = safe_atoi(sysctl_printk_curr, &current_lvl);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to parse kernel.printk sysctl: %s", sysctl_printk_vals);
-
-        return current_lvl;
-}
-
 static void bump_sysctl_printk_log_level(int min_level) {
-        int current_lvl, r;
-
         /* Set the logging level to be able to see messages with log level smaller or equal to min_level */
 
-        current_lvl = read_current_sysctl_printk_log_level();
+        int current_lvl = sysctl_printk_read();
         if (current_lvl < 0 || current_lvl >= min_level + 1)
                 return;
 
-        r = sysctl_writef("kernel/printk", "%i", min_level + 1);
-        if (r < 0)
-                log_debug_errno(r, "Failed to bump kernel.printk to %i: %m", min_level + 1);
+        (void) sysctl_printk_write(min_level + 1);
 }
 
 static void init_watchdog(void) {
         const char *s;
         int r;
 
-        s = getenv("WATCHDOG_DEVICE");
+        /* NB: we do not insist on $WATCHDOG_PID being set because old systemd versions didn't set it at all,
+         * and we want to retain some basic compatibility between an old service manager and a new shutdown
+         * binary. If it *is* set we'll insist on it being set to 1 however. */
+        s = secure_getenv("WATCHDOG_PID");
+        if (s) {
+                pid_t pid;
+
+                r = parse_pid(s, &pid);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse $WATCHDOG_PID, ignoring: %s", s);
+                else if (pid != getpid_cached()) {
+                        log_warning("$WATCHDOG_PID set, but not to " PID_FMT ", skipping watchdog logic.", getpid_cached());
+                        return;
+                }
+        }
+
+        s = secure_getenv("WATCHDOG_DEVICE");
         if (s) {
                 r = watchdog_set_device(s);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to set watchdog device to %s, ignoring: %m", s);
+                        log_warning_errno(r, "Failed to set watchdog device to '%s', ignoring: %m", s);
         }
 
-        s = getenv("WATCHDOG_USEC");
+        s = secure_getenv("WATCHDOG_USEC");
         if (s) {
                 usec_t usec;
 
@@ -355,19 +355,67 @@ static void notify_supervisor(void) {
                                   arg_exit_code, arg_verb);
 }
 
-int main(int argc, char *argv[]) {
+static void sleep_until_minimum_uptime(void) {
+        uint64_t minimum_uptime_usec = DEFAULT_MINIMUM_UPTIME_USEC;
+        int r;
+
+        const char *e = secure_getenv("MINIMUM_UPTIME_USEC");
+        if (e) {
+                r = safe_atou64(e, &minimum_uptime_usec);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse $MINIMUM_UPTIME_USEC, ignoring: %s", e);
+        } else if (detect_virtualization() != VIRTUALIZATION_NONE)
+                /* Enforce the minimum uptime, but don't bother with it in containers/VMs, since – unlike on
+                 * bare metal – the screen output isn't flushed out immediately when we reboot (as real PC
+                 * firmwares do). But skip only if there wasn't an explicit configuration, to let users
+                 * override this. */
+                return;
+
+        if (minimum_uptime_usec <= 0) /* turned off? */
+                return;
+
+        for (;;) {
+                usec_t n = now(CLOCK_BOOTTIME);
+                if (n >= minimum_uptime_usec)
+                        break;
+
+                usec_t m = minimum_uptime_usec - n;
+                log_notice("Delaying shutdown for %s, in order to reach minimum uptime of %s.",
+                           FORMAT_TIMESPAN(m, USEC_PER_SEC),
+                           FORMAT_TIMESPAN(minimum_uptime_usec, USEC_PER_SEC));
+
+                /* Sleep for up to 3s, then show message again, as a progress indicator. */
+                usleep_safe(MIN(m, 3 * USEC_PER_SEC));
+        }
+}
+
+static int run(int argc, char *argv[]) {
         static const char* const dirs[] = {
                 SYSTEM_SHUTDOWN_PATH,
                 NULL
         };
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *luo_serialization = NULL;
+        _cleanup_close_ int luo_session_fd = -EBADF;
+        _cleanup_free_ int *luo_fds = NULL;
         _cleanup_free_ char *cgroup = NULL;
+        dual_timestamp shutdown_late_start;
+        size_t n_luo_fds = 0;
         int cmd, r;
+
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+
+        /* LUO will preserve these across kexec */
+        dual_timestamp_now(&shutdown_late_start);
+
+        /* If PID 1 passed us an LUO serialization fd, parse it first so we know which fds to keep open. */
+        (void) luo_parse_serialization(&luo_serialization, &luo_fds, &n_luo_fds);
 
         /* Close random fds we might have get passed, just for paranoia, before we open any new fds, for
          * example for logging. After all this tool's purpose is about detaching any pinned resources, and
          * open file descriptors are the primary way to pin resources. Note that we don't really expect any
-         * fds to be passed here. */
-        (void) close_all_fds(NULL, 0);
+         * fds to be passed here, except for LUO fds that need to survive until kexec. */
+        (void) close_all_fds(luo_fds, n_luo_fds);
 
         /* The log target defaults to console, but the original systemd process will pass its log target in through a
          * command line argument, which will override this default. Also, ensure we'll never log to the journal or
@@ -377,9 +425,16 @@ int main(int argc, char *argv[]) {
         log_set_prohibit_ipc(true);
         log_parse_environment();
 
+        r = parse_argv(argc, argv);
         if (getpid_cached() != 1) {
-                log_error("Not executed by init (PID 1). Refusing to operate.");
-                return EXIT_FAILURE;
+                /* If we're a normal user space process, our work is done. Either we hit an error, or were
+                 * called with --help, --version, or another option that was handled by parse_argv(), or it
+                 * looks like we're being asked to do some real work, but we should do that only as part of
+                 * the real shutdown sequence. */
+                if (r <= 0)
+                        return r;
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Not executed by init (PID 1). Refusing to operate.");
         }
 
         log_set_always_reopen_console(true);
@@ -389,8 +444,7 @@ int main(int argc, char *argv[]) {
          * through kernel. */
         (void) reboot(RB_ENABLE_CAD);
 
-        r = parse_argv(argc, argv);
-        if (r < 0)
+        if (r <= 0)
                 goto error;
 
         log_open();
@@ -429,8 +483,9 @@ int main(int argc, char *argv[]) {
 
         init_watchdog();
 
-        /* Lock us into memory */
-        (void) mlockall(MCL_CURRENT|MCL_FUTURE);
+        /* Lock us into memory. If the first mlockall call fails, don't attempt it again. */
+        if (safe_mlockall(MCL_FUTURE|MCL_ONFAULT) >= 0)
+                (void) mlockall(MCL_CURRENT);
 
         /* We need to make mounts private so that we can MS_MOVE in unmount_all(). Kernel does not allow
          * MS_MOVE when parent mountpoints have shared propagation. */
@@ -575,7 +630,15 @@ int main(int argc, char *argv[]) {
                 arg_verb,
                 NULL,
         };
-        (void) execute_directories(dirs, DEFAULT_TIMEOUT_USEC, NULL, NULL, (char**) arguments, NULL, EXEC_DIR_PARALLEL | EXEC_DIR_IGNORE_ERRORS);
+        (void) execute_directories(
+                        "system-shutdown",
+                        dirs,
+                        DEFAULT_TIMEOUT_USEC,
+                        /* callbacks= */ NULL,
+                        /* callback_args= */ NULL,
+                        (char**) arguments,
+                        /* envp= */ NULL,
+                        EXEC_DIR_PARALLEL | EXEC_DIR_IGNORE_ERRORS);
 
         (void) rlimit_nofile_safe();
 
@@ -585,13 +648,18 @@ int main(int argc, char *argv[]) {
                         argv[0] = (char*) "/shutdown";
 
                         (void) setsid();
-                        (void) make_console_stdio();
+                        /* Preserve a graphical splash retained across the exitrd handoff. */
+                        (void) make_console_stdio(/* switch_to_text= */ false);
 
                         log_info("Successfully changed into root pivot.\n"
                                  "Entering exitrd...");
 
                         execv("/shutdown", argv);
-                        log_error_errno(errno, "Failed to execute shutdown binary: %m");
+                        r = -errno;
+
+                        /* The exitrd could not take over. Make subsequent diagnostics visible again. */
+                        (void) make_console_stdio(/* switch_to_text= */ true);
+                        log_error_errno(r, "Failed to execute shutdown binary: %m");
                 } else
                         log_error_errno(r, "Failed to switch root to \"/run/initramfs\": %m");
         }
@@ -614,6 +682,14 @@ int main(int argc, char *argv[]) {
 
         notify_supervisor();
 
+        sleep_until_minimum_uptime();
+
+        /* This is conceptually where shutdown is complete and only the final syscall to bring the machine
+         * down is left, so record the late shutdown timestamp here. */
+        dual_timestamp shutdown_late_finish;
+        dual_timestamp_now(&shutdown_late_finish);
+        (void) luo_serialization_add_shutdown_timestamps(&luo_serialization, &shutdown_late_start, &shutdown_late_finish);
+
         if (streq(arg_verb, "exit")) {
                 if (in_container) {
                         log_info("Exiting container.");
@@ -626,22 +702,14 @@ int main(int argc, char *argv[]) {
         switch (cmd) {
 
         case LINUX_REBOOT_CMD_KEXEC:
-
                 if (!in_container) {
-                        /* We cheat and exec kexec to avoid doing all its work */
+                        /* Preserve fd stores via the kernel Live Update Orchestrator before kexec.
+                         * The session fd must stay open until the kexec syscall. */
+                        (void) luo_preserve_fd_stores(luo_serialization, &luo_session_fd);
+
                         log_info("Rebooting with kexec.");
 
-                        r = safe_fork("(sd-kexec)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_LOG|FORK_WAIT, NULL);
-                        if (r == 0) {
-                                /* Child */
-
-                                (void) execl(KEXEC, KEXEC, "-e", NULL);
-                                log_debug_errno(errno, "Failed to execute '" KEXEC "' binary, proceeding with reboot(RB_KEXEC): %m");
-
-                                /* execv failed (kexec binary missing?), so try simply reboot(RB_KEXEC) */
-                                (void) reboot(cmd);
-                                _exit(EXIT_FAILURE);
-                        }
+                        (void) kexec();
 
                         /* If we are still running, then the kexec can't have worked, let's fall through */
                 }
@@ -671,14 +739,24 @@ int main(int argc, char *argv[]) {
                 /* If we are in a container, and we lacked CAP_SYS_BOOT just exit, this will kill our
                  * container for good. */
                 log_info("Exiting container.");
-                return EXIT_SUCCESS;
+                return 0;
         }
 
         r = log_error_errno(errno, "Failed to invoke reboot(): %m");
 
 error:
-        log_struct_errno(LOG_EMERG, r,
-                         LOG_MESSAGE("Critical error while doing system shutdown: %m"),
-                         LOG_MESSAGE_ID(SD_MESSAGE_SHUTDOWN_ERROR_STR));
+        /* Do not leave a graphical splash covering the fatal error before freezing. */
+        (void) make_console_stdio(/* switch_to_text= */ true);
+
+        if (r == 0)
+                log_struct(LOG_EMERG,
+                           LOG_MESSAGE("Non-shutdown operation requested, cannot operate."),
+                           LOG_MESSAGE_ID(SD_MESSAGE_SHUTDOWN_ERROR_STR));
+        else
+                log_struct_errno(LOG_EMERG, r,
+                                 LOG_MESSAGE("Critical error while doing system shutdown: %m"),
+                                 LOG_MESSAGE_ID(SD_MESSAGE_SHUTDOWN_ERROR_STR));
         freeze();
 }
+
+DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);
